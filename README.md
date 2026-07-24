@@ -401,7 +401,117 @@ scroll_amount = 3
 aggregate_search = true
 show_cover = true
 max_fps = 20
+
+
 ```
+
+## 键位配置
+
+voicefox 支持通过配置文件自定义快捷键，无需修改代码。配置文件位置：`~/.config/voicefox/config.toml`。
+
+未在配置中指定的键位保持默认行为，因此你只需要修改想要改变的键位即可。
+
+### 键位格式
+
+| 格式 | 示例 | 说明 |
+|------|------|------|
+| 单字符 | `"q"` `"n"` `"j"` | 字母、数字、标点 |
+| 特殊键 | `"Space"` `"Tab"` `"Esc"` `"Enter"` `"Backspace"` | 功能键名 |
+| 方向键 | `"Up"` `"Down"` `"Left"` `"Right"` | 方向键 |
+| 翻页键 | `"PageUp"` `"PageDown"` `"Home"` `"End"` | 翻页和跳转 |
+| 功能键 | `"F1"` ~ `"F12"` | F1 到 F12 |
+| 组合键 | `"Ctrl+l"` `"Shift+Tab"` `"Alt+Enter"` | Ctrl / Shift / Alt 组合 |
+
+键名不区分大小写，`"k"` 和 `"K"` 效果相同。
+
+### 全局可配置动作
+
+在 `[keybindings.global]` 下配置，以下动作在所有页面都生效：
+
+| 配置项 | 默认值 | 功能 |
+|--------|--------|------|
+| `global_quit` | `"q"` | 退出应用 |
+| `global_play_pause` | `"Space"` | 播放 / 暂停 |
+| `global_next_track` | `"n"` | 下一首 |
+| `global_prev_track` | `"b"` | 上一首 |
+| `global_cycle_mode` | `"m"` | 切换播放模式 |
+| `global_seek_forward` | `"]"` | 快进 5 秒 |
+| `global_seek_backward` | `"["` | 后退 5 秒 |
+| `global_volume_up` | `"."` | 音量增加 |
+| `global_volume_down` | `","` | 音量减少 |
+| `global_next_tab` | `"Tab"` | 下一个标签页 |
+| `global_prev_tab` | `"Shift+Tab"` | 上一个标签页 |
+| `global_go_to_main` | `"Esc"` | 返回主界面 |
+| `global_toggle_favorite` | `"Ctrl+l"` | 收藏 / 取消收藏 |
+
+### 页面级可配置动作
+
+在 `[keybindings.pages.<页面名>]` 下配置。以下动作只在对应页面生效。
+
+**通用列表动作**（搜索、队列、排行榜、歌单、收藏、历史、本地音乐、设置 都支持）：
+
+| 配置项 | 默认值 | 功能 |
+|--------|--------|------|
+| `list_select_up` | `"k"` | 选择上一项 |
+| `list_select_down` | `"j"` | 选择下一项 |
+| `list_select_first` | `"g"` | 跳到第一项 |
+| `list_select_last` | `"G"` | 跳到最后一项 |
+| `list_page_up` | `"Ctrl+u"` | 向上翻页 |
+| `list_page_down` | `"Ctrl+d"` | 向下翻页 |
+| `list_activate` | `"Enter"` 或 `"l"` | 播放 / 进入 / 激活 |
+| `list_go_back` | `"Esc"` | 返回 / 退出 |
+| `list_add_to_queue` | `"a"` | 添加到队列尾部 |
+| `list_add_to_queue_next` | `"A"` | 插到下一首播放 |
+
+**搜索页面专用**：
+
+| 配置项 | 默认值 | 功能 |
+|--------|--------|------|
+| `search_input_mode` | `"i"` | 进入搜索输入模式 |
+| `search_start` | `"Enter"` | 开始搜索 / 播放结果 |
+| `search_toggle_aggregate` | `"v"` | 切换聚合 / 单音源搜索 |
+| `search_cycle_source_prev` | `"Left"` | 切换上一个音源 |
+| `search_cycle_source_next` | `"Right"` | 切换下一个音源 |
+
+**收藏页面专用**：
+
+| 配置项 | 默认值 | 功能 |
+|--------|--------|------|
+| `favorites_filter` | `"/"` | 进入过滤模式 |
+| `favorites_remove` | `"d"` | 取消收藏选中歌曲 |
+
+**本地音乐页面专用**：
+
+| 配置项 | 默认值 | 功能 |
+|--------|--------|------|
+| `local_rescan` | `"r"` | 重新扫描本地目录 |
+| `local_delete` | `"d"` | 删除选中文件（弹出确认） |
+
+### 配置示例
+
+以下示例只修改了部分键位，其余未指定的键位保持默认：
+
+```toml
+[keybindings.global]
+global_next_track = "k"
+
+[keybindings.pages.search]
+list_select_up = "e"
+list_select_down = "n"
+```
+
+### 页面名列表
+
+`[keybindings.pages.<页面名>]` 中的 `<页面名>` 必须是以下之一：
+
+- `main` — 队列页面（主页）
+- `search` — 搜索页面
+- `leaderboard` — 排行榜页面
+- `playlists` — 热门歌单页面
+- `favorites` — 收藏页面
+- `history` — 历史页面
+- `local` — 本地音乐页面
+- `settings` — 设置页面
 
 ## 音源说明
 

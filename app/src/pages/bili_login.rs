@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lx_core::events::AppAction;
+use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_source::bili::{BiliQrPoll, BiliQrStatus, BiliSource};
 use qrcode::{Color, QrCode};
 use ratatui::buffer::Buffer;
@@ -222,7 +223,15 @@ impl BiliLoginPage {
         };
     }
 
-    pub fn handle_input(&mut self, key: KeyEvent) -> AppAction {
+    pub fn handle_input(&mut self, key: KeyEvent, resolver: &KeybindingResolver) -> AppAction {
+        if let Some(Action::ListGoBack) = resolver.resolve("bili_login", &key) {
+            if matches!(self.state, BiliLoginState::Success { .. }) {
+                return AppAction::BiliLoginSuccess;
+            } else {
+                return AppAction::GoBack;
+            }
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Backspace)
             | (KeyModifiers::NONE, KeyCode::Char('q')) => {
@@ -417,6 +426,7 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use lx_core::events::AppAction;
+    use lx_core::keybinding::KeybindingResolver;
     use lx_source::bili::BiliSource;
     use qrcode::QrCode;
 
@@ -444,7 +454,8 @@ mod tests {
     fn closing_an_error_does_not_report_login_success() {
         let mut page = BiliLoginPage::new(Arc::new(BiliSource::new()));
         page.state = BiliLoginState::Error("network".to_string());
-        let action = page.handle_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let resolver = KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+        let action = page.handle_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &resolver);
         assert!(matches!(action, AppAction::GoBack));
     }
 }
