@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
@@ -6,7 +8,37 @@ use serde_json::Value;
 
 use crate::http;
 
+const PLAYLIST_PAGE_SIZE: usize = 36;
+const MAX_PLAYLIST_REQUESTS: u32 = 4;
+const DETAIL_REQUEST_SIZE: u32 = 1000;
+const MAX_DETAIL_PAGES: u32 = 100;
+
 pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
+    let mut playlists = Vec::with_capacity(PLAYLIST_PAGE_SIZE);
+    let mut seen = HashSet::new();
+
+    // Kuwo sometimes ignores rn=36 and returns only ten entries. Pull the next
+    // server pages until the TUI has a complete logical page.
+    for offset in 0..MAX_PLAYLIST_REQUESTS {
+        let items = fetch_list_page(page.saturating_add(offset)).await?;
+        let item_count = items.len();
+        for playlist in items.iter().filter_map(parse_playlist) {
+            if seen.insert(playlist.id.clone()) {
+                playlists.push(playlist);
+            }
+            if playlists.len() >= PLAYLIST_PAGE_SIZE {
+                return Ok(playlists);
+            }
+        }
+        if item_count == 0 || item_count >= PLAYLIST_PAGE_SIZE {
+            break;
+        }
+    }
+
+    Ok(playlists)
+}
+
+async fn fetch_list_page(page: u32) -> Result<Vec<Value>, FetchError> {
     let url = format!(
         "http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList?loginUid=0&loginSid=0&appUid=76039576&pn={page}&rn=36&order=hot"
     );
@@ -24,7 +56,7 @@ pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
     let items = json["data"]["data"]
         .as_array()
         .ok_or_else(|| FetchError::Parse("酷我热门歌单列表为空".to_string()))?;
-    Ok(items.iter().filter_map(parse_playlist).collect())
+    Ok(items.clone())
 }
 
 pub async fn get_detail(raw_id: &str, page: u32) -> Result<Vec<SongInfo>, FetchError> {
@@ -34,12 +66,49 @@ pub async fn get_detail(raw_id: &str, page: u32) -> Result<Vec<SongInfo>, FetchE
     } else {
         id.to_string()
     };
+    let first_page = page.saturating_sub(1);
+    let json = fetch_detail_page(&id, first_page, DETAIL_REQUEST_SIZE).await?;
+    let raw_items = json["musiclist"]
+        .as_array()
+        .ok_or_else(|| FetchError::Parse("酷我歌单歌曲列表为空".to_string()))?;
+    let total = value_u64(&json["total"]).unwrap_or(raw_items.len() as u64) as usize;
+    let mut songs = Vec::with_capacity(total.min(DETAIL_REQUEST_SIZE as usize));
+    let mut seen = HashSet::new();
+    append_unique_songs(&mut songs, &mut seen, raw_items);
+
+    // Some Kuwo nodes cap a response at ten tracks even when rn=1000. Continue
+    // with the effective page size returned by the first response.
+    let effective_page_size = raw_items.len() as u32;
+    if effective_page_size == 0 || songs.len() >= total {
+        return Ok(songs);
+    }
+    let page_count = (total as u32)
+        .div_ceil(effective_page_size)
+        .min(MAX_DETAIL_PAGES);
+    for offset in 1..page_count {
+        let json =
+            fetch_detail_page(&id, first_page.saturating_add(offset), effective_page_size).await?;
+        let Some(items) = json["musiclist"].as_array() else {
+            break;
+        };
+        if items.is_empty() {
+            break;
+        }
+        append_unique_songs(&mut songs, &mut seen, items);
+        if songs.len() >= total {
+            break;
+        }
+    }
+    Ok(songs)
+}
+
+async fn fetch_detail_page(id: &str, page: u32, page_size: u32) -> Result<Value, FetchError> {
     let url = format!(
-        "http://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid={id}&pn={}&rn=1000&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1",
-        page.saturating_sub(1)
+        "http://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid={id}&pn={page}&rn={page_size}&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1"
     );
     let json: Value = http::client()
         .get(url)
+        .header("Referer", "http://www.kuwo.cn/")
         .send()
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
@@ -49,13 +118,15 @@ pub async fn get_detail(raw_id: &str, page: u32) -> Result<Vec<SongInfo>, FetchE
     if json["result"].as_str() != Some("ok") {
         return Err(FetchError::Other("酷我歌单详情请求失败".to_string()));
     }
-    let items = json["musiclist"]
-        .as_array()
-        .ok_or_else(|| FetchError::Parse("酷我歌单歌曲列表为空".to_string()))?;
-    Ok(items
-        .iter()
-        .filter_map(super::leaderboard::parse_song)
-        .collect())
+    Ok(json)
+}
+
+fn append_unique_songs(songs: &mut Vec<SongInfo>, seen: &mut HashSet<String>, items: &[Value]) {
+    for song in items.iter().filter_map(super::leaderboard::parse_song) {
+        if seen.insert(song.id.clone()) {
+            songs.push(song);
+        }
+    }
 }
 
 fn parse_playlist(item: &Value) -> Option<Playlist> {

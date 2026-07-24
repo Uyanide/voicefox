@@ -12,6 +12,7 @@ const MUSIC_HOT: &str = "https://api.bilibili.com/x/centralization/interface/mus
 const REGION_RECOMMEND: &str = "https://api.bilibili.com/x/web-interface/region/feed/rcmd";
 const POPULAR: &str = "https://api.bilibili.com/x/web-interface/popular";
 const RANKING_V2: &str = "https://api.bilibili.com/x/web-interface/ranking/v2";
+const RECOMMEND_PAGE_SIZE: u32 = 20;
 
 pub fn get_boards() -> Result<Vec<LeaderboardInfo>, SearchError> {
     Ok(vec![
@@ -84,7 +85,10 @@ async fn get_recommend(
     page: u32,
     limit: u32,
 ) -> Result<SearchResult, SearchError> {
-    let request_limit = limit.clamp(1, 50);
+    // region/feed/rcmd currently rejects oversized request_cnt values. Azusa uses
+    // the endpoint's native page size of 20, so keep this request independent of
+    // the larger limit used by the TUI leaderboard page.
+    let request_limit = limit.clamp(1, RECOMMEND_PAGE_SIZE);
     let json = source
         .get_json(
             REGION_RECOMMEND,
@@ -101,17 +105,22 @@ async fn get_recommend(
     tracing::debug!("bili recommend response: code={code}");
     if code != 0 {
         let msg = json["message"].as_str().unwrap_or("unknown");
-        return Err(SearchError::Api(format!(
-            "哔哩哔哩热门推荐失败 (code={code}, msg={msg})",
-        )));
+        tracing::warn!("bili recommend failed (code={code}, msg={msg}), falling back to popular");
+        return get_popular(source, page, limit).await;
     }
-    let items = json["data"]["archives"]
-        .as_array()
-        .ok_or_else(|| SearchError::Parse("哔哩哔哩热门推荐数据为空".to_string()))?
+    let Some(archives) = json["data"]["archives"].as_array() else {
+        tracing::warn!("bili recommend response has no archives, falling back to popular");
+        return get_popular(source, page, limit).await;
+    };
+    let items = archives
         .iter()
         .filter_map(parse_recommend_song)
         .take(request_limit as usize)
         .collect::<Vec<_>>();
+    if items.is_empty() {
+        tracing::warn!("bili recommend response has no playable items, falling back to popular");
+        return get_popular(source, page, limit).await;
+    }
     Ok(SearchResult {
         total: items.len() as u32
             + if items.len() >= request_limit as usize {

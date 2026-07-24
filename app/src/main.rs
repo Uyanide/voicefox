@@ -1627,7 +1627,17 @@ fn draw_app(
         }
 
         if let Some(page) = bili_login_page {
+            use ratatui::widgets::{Clear, Widget};
+
             let overlay_area = calculate_bili_login_area(area);
+            Clear.render(overlay_area, frame.buffer_mut());
+            ratatui::widgets::Block::default()
+                .style(
+                    Style::new()
+                        .bg(crate::theme::base(ctx))
+                        .fg(crate::theme::text(ctx)),
+                )
+                .render(overlay_area, frame.buffer_mut());
             let p = page.lock().unwrap();
             p.render(overlay_area, frame.buffer_mut());
         }
