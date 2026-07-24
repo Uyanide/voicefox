@@ -2,6 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
+use lx_core::keybinding::{Action, KeybindingResolver};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -68,7 +69,7 @@ impl SettingsPage {
         }
     }
 
-    pub fn handle_input(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
+    pub fn handle_input(&mut self, key: KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
         if self.local_path_mode {
             return self.handle_local_path_input(key, ctx);
         }
@@ -100,21 +101,40 @@ impl SettingsPage {
         } else {
             // 先判断焦点区域：local 区域的按键优先处理
             if self.focus == "local" {
-                return self.handle_local_keys(key, ctx);
+                return self.handle_local_keys(key, ctx, resolver);
             }
 
             let sources = ctx.config.read().unwrap().source.js_sources.clone();
+
+            if let Some(action) = resolver.resolve_page("settings", &key) {
+                match action {
+                    Action::ListSelectUp => {
+                        if self.selected_source > 0 {
+                            self.selected_source -= 1;
+                        }
+                        return AppAction::None;
+                    }
+                    Action::ListSelectDown => {
+                        if self.selected_source + 1 < sources.len() {
+                            self.selected_source += 1;
+                        }
+                        return AppAction::None;
+                    }
+                    _ => {}
+                }
+            }
+
             match (key.modifiers, key.code) {
                 (KeyModifiers::NONE, KeyCode::Char('a')) => {
                     self.input_mode = true;
                     self.status_msg = None;
                 }
-                (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+                (KeyModifiers::NONE, KeyCode::Up) => {
                     if self.selected_source > 0 {
                         self.selected_source -= 1;
                     }
                 }
-                (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+                (KeyModifiers::NONE, KeyCode::Down) => {
                     if self.selected_source + 1 < sources.len() {
                         self.selected_source += 1;
                     }
@@ -242,8 +262,27 @@ impl SettingsPage {
     }
 
     /// 处理本地音乐区域的按键（非输入模式）
-    fn handle_local_keys(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
+    fn handle_local_keys(&mut self, key: KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
         let paths = ctx.config.read().unwrap().local_music.paths.clone();
+
+        if let Some(action) = resolver.resolve_page("settings", &key) {
+            match action {
+                Action::ListSelectUp => {
+                    if self.selected_local_path > 0 {
+                        self.selected_local_path -= 1;
+                    }
+                    return AppAction::None;
+                }
+                Action::ListSelectDown => {
+                    if self.selected_local_path + 1 < paths.len() {
+                        self.selected_local_path += 1;
+                    }
+                    return AppAction::None;
+                }
+                _ => {}
+            }
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char('s')) => {
                 self.focus = "js".to_string();
@@ -255,13 +294,13 @@ impl SettingsPage {
                 self.status_msg = None;
                 AppAction::None
             }
-            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            (KeyModifiers::NONE, KeyCode::Up) => {
                 if self.selected_local_path > 0 {
                     self.selected_local_path -= 1;
                 }
                 AppAction::None
             }
-            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            (KeyModifiers::NONE, KeyCode::Down) => {
                 if self.selected_local_path + 1 < paths.len() {
                     self.selected_local_path += 1;
                 }
@@ -595,7 +634,7 @@ impl SettingsPage {
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect, ctx: &AppContext) -> AppAction {
+    pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
         if self.input_mode {
             return AppAction::None;
         }
@@ -625,6 +664,7 @@ impl SettingsPage {
                         return self.handle_input(
                             KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
                             ctx,
+                            resolver,
                         );
                     }
                 }

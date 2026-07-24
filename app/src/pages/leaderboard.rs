@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::{AppAction, InsertPosition};
+use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::leaderboard::LeaderboardInfo;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
@@ -151,7 +152,83 @@ impl LeaderboardPage {
         self.selected = 0;
     }
 
-    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext) -> AppAction {
+    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
+        if let Some(action) = resolver.resolve_page("leaderboard", key) {
+            match action {
+                Action::ListSelectUp => {
+                    self.move_selection_up(ctx);
+                    return AppAction::None;
+                }
+                Action::ListSelectDown => {
+                    self.move_selection_down(ctx);
+                    return AppAction::None;
+                }
+                Action::ListSelectFirst => {
+                    self.selected = 0;
+                    return AppAction::None;
+                }
+                Action::ListSelectLast => {
+                    self.selected = self.current_list_len().saturating_sub(1);
+                    return AppAction::None;
+                }
+                Action::ListPageUp => {
+                    self.selected = self.selected.saturating_sub(10);
+                    return AppAction::None;
+                }
+                Action::ListPageDown => {
+                    self.selected = (self.selected + 10).min(self.current_list_len().saturating_sub(1));
+                    return AppAction::None;
+                }
+                Action::ListActivate => {
+                    if self.selected_board.is_some() && !self.songs.is_empty() {
+                        return AppAction::PlaySong {
+                            songs: self.songs.clone(),
+                            index: self.selected,
+                        };
+                    }
+                    self.enter_selected_board();
+                    return AppAction::None;
+                }
+                Action::ListAddToQueue => {
+                    if self.selected_board.is_some() {
+                        if let Some(song) = self.songs.get(self.selected).cloned() {
+                            return AppAction::AddToQueue {
+                                song: Box::new(song),
+                                position: InsertPosition::End,
+                            };
+                        }
+                    }
+                    return AppAction::None;
+                }
+                Action::ListAddToQueueNext => {
+                    if self.selected_board.is_some() {
+                        if let Some(song) = self.songs.get(self.selected).cloned() {
+                            return AppAction::AddToQueue {
+                                song: Box::new(song),
+                                position: InsertPosition::Next,
+                            };
+                        }
+                    }
+                    return AppAction::None;
+                }
+                Action::ListGoBack => {
+                    if self.selected_board.is_some() {
+                        self.leave_board();
+                    }
+                    return AppAction::None;
+                }
+                Action::SearchCycleSourcePrev => {
+                    self.select_previous_source();
+                    return AppAction::None;
+                }
+                Action::SearchCycleSourceNext => {
+                    self.select_next_source();
+                    return AppAction::None;
+                }
+                _ => {}
+            }
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Left)
             | (KeyModifiers::CONTROL, KeyCode::Char('h'))
@@ -165,10 +242,10 @@ impl LeaderboardPage {
             (KeyModifiers::NONE, KeyCode::Right) if self.selected_board.is_none() => {
                 self.select_next_source();
             }
-            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            (KeyModifiers::NONE, KeyCode::Up) => {
                 self.move_selection_up(ctx);
             }
-            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            (KeyModifiers::NONE, KeyCode::Down) => {
                 self.move_selection_down(ctx);
             }
             (KeyModifiers::NONE, KeyCode::Home) | (KeyModifiers::NONE, KeyCode::Char('g')) => {

@@ -2,6 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::{AppAction, InsertPosition};
+use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::song::SongInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -34,7 +35,7 @@ impl FavoritesPage {
         self.search_mode
     }
 
-    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext) -> AppAction {
+    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
         if self.search_mode {
             match (key.modifiers, key.code) {
                 (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -74,6 +75,114 @@ impl FavoritesPage {
         self.clamp_selection(filtered.len());
         let half_page = (self.viewport_height / 2).max(1);
 
+        if let Some(action) = resolver.resolve_page("favorites", key) {
+            match action {
+                Action::FavoritesFilter => {
+                    self.search_mode = true;
+                    return AppAction::None;
+                }
+                Action::ListSelectUp => {
+                    if !filtered.is_empty() {
+                        if self.selected > 0 {
+                            self.selected -= 1;
+                        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                            self.selected = filtered.len().saturating_sub(1);
+                        }
+                    }
+                    return AppAction::None;
+                }
+                Action::ListSelectDown => {
+                    if !filtered.is_empty() {
+                        if self.selected + 1 < filtered.len() {
+                            self.selected += 1;
+                        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                            self.selected = 0;
+                        }
+                    }
+                    return AppAction::None;
+                }
+                Action::ListSelectFirst => {
+                    self.selected = 0;
+                    return AppAction::None;
+                }
+                Action::ListSelectLast => {
+                    self.selected = filtered.len().saturating_sub(1);
+                    return AppAction::None;
+                }
+                Action::ListPageUp => {
+                    self.selected = self.selected.saturating_sub(half_page);
+                    return AppAction::None;
+                }
+                Action::ListPageDown => {
+                    self.selected = (self.selected + half_page).min(filtered.len().saturating_sub(1));
+                    return AppAction::None;
+                }
+                Action::ListActivate => {
+                    if self.selected < filtered.len() {
+                        let songs = filtered
+                            .iter()
+                            .filter_map(|index| favorites.get(*index).cloned())
+                            .collect();
+                        return AppAction::PlaySong {
+                            songs,
+                            index: self.selected,
+                        };
+                    }
+                    return AppAction::None;
+                }
+                Action::ListAddToQueue => {
+                    if let Some(song) = filtered
+                        .get(self.selected)
+                        .and_then(|index| favorites.get(*index))
+                        .cloned()
+                    {
+                        return AppAction::AddToQueue {
+                            song: Box::new(song),
+                            position: InsertPosition::End,
+                        };
+                    }
+                    return AppAction::None;
+                }
+                Action::ListAddToQueueNext => {
+                    if let Some(song) = filtered
+                        .get(self.selected)
+                        .and_then(|index| favorites.get(*index))
+                        .cloned()
+                    {
+                        return AppAction::AddToQueue {
+                            song: Box::new(song),
+                            position: InsertPosition::Next,
+                        };
+                    }
+                    return AppAction::None;
+                }
+                Action::FavoritesRemove => {
+                    if let Some(original_index) = filtered.get(self.selected).copied()
+                        && let Some(song) = favorites.get(original_index)
+                        && ctx.storage.remove_favorite(song)
+                    {
+                        let remaining = ctx.storage.load_favorites();
+                        let remaining_len = self.filtered_indices(&remaining).len();
+                        self.clamp_selection(remaining_len);
+                        return AppAction::ShowNotification(lx_core::events::Notification::info(
+                            "已取消收藏",
+                        ));
+                    }
+                    return AppAction::None;
+                }
+                Action::ListGoBack => {
+                    if self.query.is_empty() {
+                        return AppAction::GoBack;
+                    }
+                    self.query.clear();
+                    self.selected = 0;
+                    self.scroll = 0;
+                    return AppAction::None;
+                }
+                _ => {}
+            }
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char('/')) => {
                 self.search_mode = true;
@@ -86,7 +195,7 @@ impl FavoritesPage {
                 self.selected = 0;
                 self.scroll = 0;
             }
-            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            (KeyModifiers::NONE, KeyCode::Up) => {
                 if !filtered.is_empty() {
                     if self.selected > 0 {
                         self.selected -= 1;
@@ -95,7 +204,7 @@ impl FavoritesPage {
                     }
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            (KeyModifiers::NONE, KeyCode::Down) => {
                 if !filtered.is_empty() {
                     if self.selected + 1 < filtered.len() {
                         self.selected += 1;

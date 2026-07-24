@@ -24,6 +24,7 @@ use crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 use lx_core::events::{AppAction, InsertPosition, Notification};
+use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::leaderboard::LeaderboardInfo;
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
@@ -230,6 +231,10 @@ fn run_app(
     let search_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let mut leaderboard_request_id: u64 = 0;
     let mut playlist_request_id: u64 = 0;
+
+    // 键位解析器（从配置加载自定义键位）
+    let keybindings = ctx.config.read().unwrap().keybindings.clone();
+    let kb_resolver = KeybindingResolver::from_config(&keybindings);
 
     // 导航状态
     let mut active_tab = NavTab::Main;
@@ -742,7 +747,7 @@ fn run_app(
                 settings_input_mode || search_input_mode || favorites_input_mode;
 
             if let Some(ref page) = bili_login_page {
-                let action = page.lock().unwrap().handle_input(key);
+                let action = page.lock().unwrap().handle_input(key, &kb_resolver);
                 match action {
                     AppAction::BiliLoginSuccess => {
                         let _ = action_tx.send(AppAction::BiliLoginSuccess);
@@ -826,53 +831,174 @@ fn run_app(
                 continue;
             }
 
-            // 1b. 全局快捷键
-            match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Char('q')) if !text_input_active => {
-                    tracing::info!("quit requested");
-                    ctx.player.stop();
-                    ctx.cover_service.clear_display();
-                    return Ok(());
-                }
-                (KeyModifiers::NONE, KeyCode::Char(' ')) if !text_input_active => {
-                    ctx.player.toggle();
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Char('n')) if !text_input_active => {
-                    if let Some((songs, index)) = ctx.playlist.next_manual_entry() {
-                        execute_action(
-                            AppAction::PlaySong { songs, index },
-                            &ctx,
-                            rt,
-                            &action_tx,
-                            &search_page,
-                            &settings_page,
-                            &search_seq,
-                        );
+            // 1b. 全局快捷键（查表模式，保留完全相同的默认行为）
+            if let Some(action) = kb_resolver.resolve_global(&key) {
+                match action {
+                    Action::GlobalQuit if !text_input_active => {
+                        tracing::info!("quit requested");
+                        ctx.player.stop();
+                        ctx.cover_service.clear_display();
+                        return Ok(());
                     }
-                    needs_render = true;
-                    continue;
+                    Action::GlobalPlayPause if !text_input_active => {
+                        ctx.player.toggle();
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalNextTrack if !text_input_active => {
+                        if let Some((songs, index)) = ctx.playlist.next_manual_entry() {
+                            execute_action(
+                                AppAction::PlaySong { songs, index },
+                                &ctx,
+                                rt,
+                                &action_tx,
+                                &search_page,
+                                &settings_page,
+                                &search_seq,
+                            );
+                        }
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalPrevTrack
+                        if !text_input_active && active_tab != NavTab::Settings =>
+                    {
+                        if let Some((songs, index)) = ctx.playlist.prev_manual_entry() {
+                            execute_action(
+                                AppAction::PlaySong { songs, index },
+                                &ctx,
+                                rt,
+                                &action_tx,
+                                &search_page,
+                                &settings_page,
+                                &search_seq,
+                            );
+                        }
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalCycleMode if !text_input_active => {
+                        let mode = ctx.playlist.cycle_mode();
+                        let save_result = {
+                            let mut config = ctx.config.write().unwrap();
+                            config.player.play_mode = mode.as_config().to_string();
+                            crate::config::loader::save(&config, &ctx.config_path)
+                        };
+                        let notification = match save_result {
+                            Ok(()) => Notification::info(format!("播放模式: {}", mode.label())),
+                            Err(error) => {
+                                Notification::error(format!("播放模式已切换，但保存失败: {}", error))
+                            }
+                        };
+                        ctx.notifications.write().unwrap().push_back(notification);
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalSeekForward
+                        if !text_input_active
+                            && active_tab != NavTab::Leaderboard
+                            && active_tab != NavTab::Playlists =>
+                    {
+                        let pos = *ctx.position.borrow();
+                        ctx.player.seek(pos + Duration::from_secs(5));
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalSeekBackward
+                        if !text_input_active
+                            && active_tab != NavTab::Leaderboard
+                            && active_tab != NavTab::Playlists =>
+                    {
+                        let pos = *ctx.position.borrow();
+                        if pos > Duration::from_secs(5) {
+                            ctx.player.seek(pos - Duration::from_secs(5));
+                        } else {
+                            ctx.player.seek(Duration::ZERO);
+                        }
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalVolumeUp if !text_input_active => {
+                        ctx.player.volume_up(5);
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalVolumeDown if !text_input_active => {
+                        ctx.player.volume_down(5);
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalNextTab if !text_input_active => {
+                        active_tab = match active_tab {
+                            NavTab::Main => NavTab::Search,
+                            NavTab::Search => NavTab::Leaderboard,
+                            NavTab::Leaderboard => NavTab::Playlists,
+                            NavTab::Playlists => NavTab::Favorites,
+                            NavTab::Favorites => NavTab::History,
+                            NavTab::History => NavTab::LocalMusic,
+                            NavTab::LocalMusic => NavTab::Settings,
+                            NavTab::Settings => NavTab::Main,
+                        };
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalPrevTab if !text_input_active => {
+                        active_tab = match active_tab {
+                            NavTab::Main => NavTab::Settings,
+                            NavTab::Search => NavTab::Main,
+                            NavTab::Leaderboard => NavTab::Search,
+                            NavTab::Playlists => NavTab::Leaderboard,
+                            NavTab::Favorites => NavTab::Playlists,
+                            NavTab::History => NavTab::Favorites,
+                            NavTab::LocalMusic => NavTab::History,
+                            NavTab::Settings => NavTab::LocalMusic,
+                        };
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalGoToMain
+                        if !settings_input_mode
+                            && active_tab != NavTab::Main
+                            && active_tab != NavTab::Search
+                            && active_tab != NavTab::Favorites
+                            && !(active_tab == NavTab::Playlists
+                                && playlists.selected_playlist.is_some())
+                            && !(active_tab == NavTab::Leaderboard
+                                && leaderboard.selected_board.is_some()) =>
+                    {
+                        active_tab = NavTab::Main;
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalToggleFavorite
+                        if !text_input_active
+                            && active_tab != NavTab::Favorites
+                            && active_tab != NavTab::Playlists =>
+                    {
+                        if let Some(song) = ctx.current_song.read().unwrap().as_ref() {
+                            if ctx.storage.is_favorite(song) {
+                                ctx.storage.remove_favorite(song);
+                                let _ = action_tx.send(AppAction::ShowNotification(
+                                    Notification::info("已取消收藏"),
+                                ));
+                            } else {
+                                ctx.storage.add_favorite(song);
+                                let _ = action_tx.send(AppAction::ShowNotification(
+                                    Notification::info("已添加收藏"),
+                                ));
+                            }
+                        }
+                        needs_render = true;
+                        continue;
+                    }
+                    _ => {}
                 }
+            }
+
+            // Fallback：不在自定义配置中的全局键位别名（保持向后兼容）
+            match (key.modifiers, key.code) {
                 (KeyModifiers::SHIFT, KeyCode::Char('>')) if !text_input_active => {
                     if let Some((songs, index)) = ctx.playlist.next_manual_entry() {
-                        execute_action(
-                            AppAction::PlaySong { songs, index },
-                            &ctx,
-                            rt,
-                            &action_tx,
-                            &search_page,
-                            &settings_page,
-                            &search_seq,
-                        );
-                    }
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Char('b'))
-                    if !text_input_active && active_tab != NavTab::Settings =>
-                {
-                    if let Some((songs, index)) = ctx.playlist.prev_manual_entry() {
                         execute_action(
                             AppAction::PlaySong { songs, index },
                             &ctx,
@@ -898,23 +1024,6 @@ fn run_app(
                             &search_seq,
                         );
                     }
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Char('m')) if !text_input_active => {
-                    let mode = ctx.playlist.cycle_mode();
-                    let save_result = {
-                        let mut config = ctx.config.write().unwrap();
-                        config.player.play_mode = mode.as_config().to_string();
-                        crate::config::loader::save(&config, &ctx.config_path)
-                    };
-                    let notification = match save_result {
-                        Ok(()) => Notification::info(format!("播放模式: {}", mode.label())),
-                        Err(error) => {
-                            Notification::error(format!("播放模式已切换，但保存失败: {}", error))
-                        }
-                    };
-                    ctx.notifications.write().unwrap().push_back(notification);
                     needs_render = true;
                     continue;
                 }
@@ -944,30 +1053,6 @@ fn run_app(
                     needs_render = true;
                     continue;
                 }
-                (KeyModifiers::NONE, KeyCode::Char(']'))
-                    if !text_input_active
-                        && active_tab != NavTab::Leaderboard
-                        && active_tab != NavTab::Playlists =>
-                {
-                    let pos = *ctx.position.borrow();
-                    ctx.player.seek(pos + Duration::from_secs(5));
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Char('['))
-                    if !text_input_active
-                        && active_tab != NavTab::Leaderboard
-                        && active_tab != NavTab::Playlists =>
-                {
-                    let pos = *ctx.position.borrow();
-                    if pos > Duration::from_secs(5) {
-                        ctx.player.seek(pos - Duration::from_secs(5));
-                    } else {
-                        ctx.player.seek(Duration::ZERO);
-                    }
-                    needs_render = true;
-                    continue;
-                }
                 (KeyModifiers::NONE, KeyCode::Up) if active_tab == NavTab::Main => {
                     ctx.player.volume_up(5);
                     needs_render = true;
@@ -975,80 +1060,6 @@ fn run_app(
                 }
                 (KeyModifiers::NONE, KeyCode::Down) if active_tab == NavTab::Main => {
                     ctx.player.volume_down(5);
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Char('.')) if !text_input_active => {
-                    ctx.player.volume_up(5);
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Char(',')) if !text_input_active => {
-                    ctx.player.volume_down(5);
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Tab) if !text_input_active => {
-                    active_tab = match active_tab {
-                        NavTab::Main => NavTab::Search,
-                        NavTab::Search => NavTab::Leaderboard,
-                        NavTab::Leaderboard => NavTab::Playlists,
-                        NavTab::Playlists => NavTab::Favorites,
-                        NavTab::Favorites => NavTab::History,
-                        NavTab::History => NavTab::LocalMusic,
-                        NavTab::LocalMusic => NavTab::Settings,
-                        NavTab::Settings => NavTab::Main,
-                    };
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::SHIFT, KeyCode::BackTab) if !text_input_active => {
-                    active_tab = match active_tab {
-                        NavTab::Main => NavTab::Settings,
-                        NavTab::Search => NavTab::Main,
-                        NavTab::Leaderboard => NavTab::Search,
-                        NavTab::Playlists => NavTab::Leaderboard,
-                        NavTab::Favorites => NavTab::Playlists,
-                        NavTab::History => NavTab::Favorites,
-                        NavTab::LocalMusic => NavTab::History,
-                        NavTab::Settings => NavTab::LocalMusic,
-                    };
-                    needs_render = true;
-                    continue;
-                }
-                (KeyModifiers::NONE, KeyCode::Esc)
-                    if !settings_input_mode
-                        && active_tab != NavTab::Main
-                        && active_tab != NavTab::Search
-                        && active_tab != NavTab::Favorites
-                        && !(active_tab == NavTab::Playlists
-                            && playlists.selected_playlist.is_some())
-                        && !(active_tab == NavTab::Leaderboard
-                            && leaderboard.selected_board.is_some()) =>
-                {
-                    active_tab = NavTab::Main;
-                    needs_render = true;
-                    continue;
-                }
-                // Ctrl+L: 收藏/取消收藏当前歌曲
-                (KeyModifiers::CONTROL, KeyCode::Char('l'))
-                    if !text_input_active
-                        && active_tab != NavTab::Favorites
-                        && active_tab != NavTab::Playlists =>
-                {
-                    if let Some(song) = ctx.current_song.read().unwrap().as_ref() {
-                        if ctx.storage.is_favorite(song) {
-                            ctx.storage.remove_favorite(song);
-                            let _ = action_tx.send(AppAction::ShowNotification(
-                                Notification::info("已取消收藏"),
-                            ));
-                        } else {
-                            ctx.storage.add_favorite(song);
-                            let _ = action_tx.send(AppAction::ShowNotification(
-                                Notification::info("已添加收藏"),
-                            ));
-                        }
-                    }
                     needs_render = true;
                     continue;
                 }
@@ -1060,7 +1071,7 @@ fn run_app(
                 NavTab::Search => {
                     let action = {
                         let mut sp = search_page.lock().unwrap();
-                        sp.handle_input(key)
+                        sp.handle_input(key, &kb_resolver)
                     };
                     if matches!(action, AppAction::GoBack) {
                         active_tab = NavTab::Main;
@@ -1078,7 +1089,7 @@ fn run_app(
                     );
                 }
                 NavTab::Main => {
-                    let action = main_page.handle_input(&key, &ctx);
+                    let action = main_page.handle_input(&key, &ctx, &kb_resolver);
                     execute_action(
                         action,
                         &ctx,
@@ -1090,7 +1101,7 @@ fn run_app(
                     );
                 }
                 NavTab::Leaderboard => {
-                    let action = leaderboard.handle_input(&key, &ctx);
+                    let action = leaderboard.handle_input(&key, &ctx, &kb_resolver);
                     execute_action(
                         action,
                         &ctx,
@@ -1102,7 +1113,7 @@ fn run_app(
                     );
                 }
                 NavTab::Playlists => {
-                    let action = playlists.handle_input(&key, &ctx);
+                    let action = playlists.handle_input(&key, &ctx, &kb_resolver);
                     execute_action(
                         action,
                         &ctx,
@@ -1114,7 +1125,7 @@ fn run_app(
                     );
                 }
                 NavTab::Favorites => {
-                    let action = favorites_page.handle_input(&key, &ctx);
+                    let action = favorites_page.handle_input(&key, &ctx, &kb_resolver);
                     if matches!(action, AppAction::GoBack) {
                         active_tab = NavTab::Main;
                         needs_render = true;
@@ -1131,7 +1142,7 @@ fn run_app(
                     );
                 }
                 NavTab::History => {
-                    let action = pages::history::handle_input(&key, &ctx, &mut history_selected);
+                    let action = pages::history::handle_input(&key, &ctx, &mut history_selected, &kb_resolver);
                     // 保持在历史页面，不强制切换到主页
                     execute_action(
                         action,
@@ -1146,7 +1157,7 @@ fn run_app(
                 NavTab::Settings => {
                     let action = {
                         let mut sp = settings_page.lock().unwrap();
-                        sp.handle_input(key, &ctx)
+                        sp.handle_input(key, &ctx, &kb_resolver)
                     };
                     // BiliLogin/BiliLogout 需要发到 channel 让主循环处理（生成 QR 码等）
                     if matches!(
@@ -1178,63 +1189,13 @@ fn run_app(
                 NavTab::LocalMusic => {
                     let local_src = ctx.source_manager.local_source();
                     let songs = local_src.all_songs();
-                    match (key.modifiers, key.code) {
-                        (KeyModifiers::NONE, KeyCode::Char('r')) => {
-                            let paths = ctx.config.read().unwrap().local_music.paths.clone();
-                            let max_depth = ctx.config.read().unwrap().local_music.max_depth;
-                            execute_action(
-                                AppAction::ScanLocalMusic { paths, max_depth },
-                                &ctx,
-                                rt,
-                                &action_tx,
-                                &search_page,
-                                &settings_page,
-                                &search_seq,
-                            );
-                            local_selected = 0;
-                            local_scroll = 0;
-                        }
-                        (KeyModifiers::NONE, KeyCode::Up)
-                        | (KeyModifiers::NONE, KeyCode::Char('k')) => {
-                            local_selected = previous_list_index(
-                                local_selected,
-                                songs.len(),
-                                ctx.config.read().unwrap().ui.wrap_navigation,
-                            );
-                        }
-                        (KeyModifiers::NONE, KeyCode::Down)
-                        | (KeyModifiers::NONE, KeyCode::Char('j')) => {
-                            local_selected = next_list_index(
-                                local_selected,
-                                songs.len(),
-                                ctx.config.read().unwrap().ui.wrap_navigation,
-                            );
-                        }
-                        (KeyModifiers::NONE, KeyCode::Home)
-                        | (KeyModifiers::NONE, KeyCode::Char('g')) => {
-                            local_selected = 0;
-                        }
-                        (KeyModifiers::NONE, KeyCode::End)
-                        | (KeyModifiers::NONE, KeyCode::Char('G'))
-                        | (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
-                            local_selected = songs.len().saturating_sub(1);
-                        }
-                        (KeyModifiers::CONTROL, KeyCode::Char('u'))
-                        | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                            local_selected = local_selected.saturating_sub(10);
-                        }
-                        (KeyModifiers::CONTROL, KeyCode::Char('d'))
-                        | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                            local_selected =
-                                (local_selected + 10).min(songs.len().saturating_sub(1));
-                        }
-                        _ if pages::is_song_activation_key(&key) => {
-                            if !songs.is_empty() && local_selected < songs.len() {
+                    if let Some(action) = kb_resolver.resolve_page("local", &key) {
+                        match action {
+                            Action::LocalRescan => {
+                                let paths = ctx.config.read().unwrap().local_music.paths.clone();
+                                let max_depth = ctx.config.read().unwrap().local_music.max_depth;
                                 execute_action(
-                                    AppAction::PlaySong {
-                                        songs,
-                                        index: local_selected,
-                                    },
+                                    AppAction::ScanLocalMusic { paths, max_depth },
                                     &ctx,
                                     rt,
                                     &action_tx,
@@ -1242,57 +1203,215 @@ fn run_app(
                                     &settings_page,
                                     &search_seq,
                                 );
+                                local_selected = 0;
+                                local_scroll = 0;
                             }
-                        }
-                        (KeyModifiers::NONE, KeyCode::Char('a')) => {
-                            if let Some(song) = songs.get(local_selected).cloned() {
-                                execute_action(
-                                    AppAction::AddToQueue {
-                                        song: Box::new(song),
-                                        position: InsertPosition::End,
-                                    },
-                                    &ctx,
-                                    rt,
-                                    &action_tx,
-                                    &search_page,
-                                    &settings_page,
-                                    &search_seq,
+                            Action::ListSelectUp => {
+                                local_selected = previous_list_index(
+                                    local_selected,
+                                    songs.len(),
+                                    ctx.config.read().unwrap().ui.wrap_navigation,
                                 );
                             }
-                        }
-                        (KeyModifiers::NONE, KeyCode::Char('A'))
-                        | (KeyModifiers::SHIFT, KeyCode::Char('A')) => {
-                            if let Some(song) = songs.get(local_selected).cloned() {
-                                execute_action(
-                                    AppAction::AddToQueue {
-                                        song: Box::new(song),
-                                        position: InsertPosition::Next,
-                                    },
-                                    &ctx,
-                                    rt,
-                                    &action_tx,
-                                    &search_page,
-                                    &settings_page,
-                                    &search_seq,
+                            Action::ListSelectDown => {
+                                local_selected = next_list_index(
+                                    local_selected,
+                                    songs.len(),
+                                    ctx.config.read().unwrap().ui.wrap_navigation,
                                 );
                             }
-                        }
-                        (KeyModifiers::NONE, KeyCode::Char('d'))
-                        | (KeyModifiers::NONE, KeyCode::Delete) => {
-                            if let Some(song) = songs.get(local_selected) {
-                                if let Some(path) = &song.file_path {
-                                    confirm_delete = Some(LocalDeleteConfirmation {
-                                        name: song.name.clone(),
-                                        path: path.clone(),
-                                    });
-                                } else {
-                                    ctx.notifications.write().unwrap().push_back(
-                                        Notification::error("无法删除：没有本地文件路径"),
+                            Action::ListSelectFirst => {
+                                local_selected = 0;
+                            }
+                            Action::ListSelectLast => {
+                                local_selected = songs.len().saturating_sub(1);
+                            }
+                            Action::ListPageUp => {
+                                local_selected = local_selected.saturating_sub(10);
+                            }
+                            Action::ListPageDown => {
+                                local_selected =
+                                    (local_selected + 10).min(songs.len().saturating_sub(1));
+                            }
+                            Action::ListAddToQueue => {
+                                if let Some(song) = songs.get(local_selected).cloned() {
+                                    execute_action(
+                                        AppAction::AddToQueue {
+                                            song: Box::new(song),
+                                            position: InsertPosition::End,
+                                        },
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
                                     );
                                 }
                             }
+                            Action::ListAddToQueueNext => {
+                                if let Some(song) = songs.get(local_selected).cloned() {
+                                    execute_action(
+                                        AppAction::AddToQueue {
+                                            song: Box::new(song),
+                                            position: InsertPosition::Next,
+                                        },
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                            }
+                            Action::LocalDelete => {
+                                if let Some(song) = songs.get(local_selected) {
+                                    if let Some(path) = &song.file_path {
+                                        confirm_delete = Some(LocalDeleteConfirmation {
+                                            name: song.name.clone(),
+                                            path: path.clone(),
+                                        });
+                                    } else {
+                                        ctx.notifications.write().unwrap().push_back(
+                                            Notification::error("无法删除：没有本地文件路径"),
+                                        );
+                                    }
+                                }
+                            }
+                            Action::ListActivate => {
+                                if !songs.is_empty() && local_selected < songs.len() {
+                                    execute_action(
+                                        AppAction::PlaySong {
+                                            songs,
+                                            index: local_selected,
+                                        },
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    } else {
+                        match (key.modifiers, key.code) {
+                            (KeyModifiers::NONE, KeyCode::Char('r')) => {
+                                let paths = ctx.config.read().unwrap().local_music.paths.clone();
+                                let max_depth = ctx.config.read().unwrap().local_music.max_depth;
+                                execute_action(
+                                    AppAction::ScanLocalMusic { paths, max_depth },
+                                    &ctx,
+                                    rt,
+                                    &action_tx,
+                                    &search_page,
+                                    &settings_page,
+                                    &search_seq,
+                                );
+                                local_selected = 0;
+                                local_scroll = 0;
+                            }
+                            (KeyModifiers::NONE, KeyCode::Up) => {
+                                local_selected = previous_list_index(
+                                    local_selected,
+                                    songs.len(),
+                                    ctx.config.read().unwrap().ui.wrap_navigation,
+                                );
+                            }
+                            (KeyModifiers::NONE, KeyCode::Down) => {
+                                local_selected = next_list_index(
+                                    local_selected,
+                                    songs.len(),
+                                    ctx.config.read().unwrap().ui.wrap_navigation,
+                                );
+                            }
+                            (KeyModifiers::NONE, KeyCode::Home)
+                            | (KeyModifiers::NONE, KeyCode::Char('g')) => {
+                                local_selected = 0;
+                            }
+                            (KeyModifiers::NONE, KeyCode::End)
+                            | (KeyModifiers::NONE, KeyCode::Char('G'))
+                            | (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
+                                local_selected = songs.len().saturating_sub(1);
+                            }
+                            (KeyModifiers::CONTROL, KeyCode::Char('u'))
+                            | (KeyModifiers::NONE, KeyCode::PageUp) => {
+                                local_selected = local_selected.saturating_sub(10);
+                            }
+                            (KeyModifiers::CONTROL, KeyCode::Char('d'))
+                            | (KeyModifiers::NONE, KeyCode::PageDown) => {
+                                local_selected =
+                                    (local_selected + 10).min(songs.len().saturating_sub(1));
+                            }
+                            _ if pages::is_song_activation_key(&key) => {
+                                if !songs.is_empty() && local_selected < songs.len() {
+                                    execute_action(
+                                        AppAction::PlaySong {
+                                            songs,
+                                            index: local_selected,
+                                        },
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                            }
+                            (KeyModifiers::NONE, KeyCode::Char('a')) => {
+                                if let Some(song) = songs.get(local_selected).cloned() {
+                                    execute_action(
+                                        AppAction::AddToQueue {
+                                            song: Box::new(song),
+                                            position: InsertPosition::End,
+                                        },
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                            }
+                            (KeyModifiers::NONE, KeyCode::Char('A'))
+                            | (KeyModifiers::SHIFT, KeyCode::Char('A')) => {
+                                if let Some(song) = songs.get(local_selected).cloned() {
+                                    execute_action(
+                                        AppAction::AddToQueue {
+                                            song: Box::new(song),
+                                            position: InsertPosition::Next,
+                                        },
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                            }
+                            (KeyModifiers::NONE, KeyCode::Char('d'))
+                            | (KeyModifiers::NONE, KeyCode::Delete) => {
+                                if let Some(song) = songs.get(local_selected) {
+                                    if let Some(path) = &song.file_path {
+                                        confirm_delete = Some(LocalDeleteConfirmation {
+                                            name: song.name.clone(),
+                                            path: path.clone(),
+                                        });
+                                    } else {
+                                        ctx.notifications.write().unwrap().push_back(
+                                            Notification::error("无法删除：没有本地文件路径"),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -1355,7 +1474,7 @@ fn run_app(
                         settings_page
                             .lock()
                             .unwrap()
-                            .handle_mouse(mouse, ui_areas.content, &ctx)
+                            .handle_mouse(mouse, ui_areas.content, &ctx, &kb_resolver)
                     }
                     NavTab::LocalMusic => AppAction::None,
                 };

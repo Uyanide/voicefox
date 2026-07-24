@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::source::{Quality, SourceId};
+use crate::keybinding::KeybindingConfig;
 
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
@@ -211,6 +212,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub local_music: LocalMusicConfig,
+    #[serde(default)]
+    pub keybindings: KeybindingConfig,
 }
 
 impl Default for Config {
@@ -224,6 +227,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             ui: UiConfig::default(),
             local_music: LocalMusicConfig::default(),
+            keybindings: KeybindingConfig::default(),
         }
     }
 }

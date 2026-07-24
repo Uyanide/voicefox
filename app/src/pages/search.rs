@@ -2,6 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::{AppAction, InsertPosition};
+use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
 use lx_core::traits::source::SearchResult;
@@ -75,7 +76,7 @@ impl SearchPage {
         }
     }
 
-    pub fn handle_input(&mut self, key: KeyEvent) -> AppAction {
+    pub fn handle_input(&mut self, key: KeyEvent, resolver: &KeybindingResolver) -> AppAction {
         if !self.variant_indices.is_empty() {
             return self.handle_variant_input(key);
         }
@@ -124,6 +125,119 @@ impl SearchPage {
                         self.selected = 0;
                         self.scroll_offset = 0;
                     }
+                }
+                _ => {}
+            }
+            return AppAction::None;
+        }
+
+        if let Some(action) = resolver.resolve("search", &key) {
+            match action {
+                Action::SearchInputMode => {
+                    self.input_mode = true;
+                }
+                Action::SearchStart => {
+                    let keyword = self.input.trim().to_string();
+                    if keyword.is_empty() {
+                        return AppAction::None;
+                    }
+                    if self.is_searching && self.last_searched_input == keyword {
+                        return AppAction::None;
+                    }
+                    if self.result_keyword == keyword && !self.results.is_empty() {
+                        let songs = self.results.clone();
+                        let index = self.selected;
+                        return AppAction::PlaySong { songs, index };
+                    }
+                    self.last_input_time = std::time::Instant::now();
+                    self.last_searched_input = keyword.clone();
+                    return AppAction::Search {
+                        keyword,
+                        source: self.source_filter,
+                    };
+                }
+                Action::SearchToggleAggregate => {
+                    self.open_variants();
+                }
+                Action::ListAddToQueue => {
+                    if let Some(song) = self.results.get(self.selected).cloned() {
+                        return AppAction::AddToQueue {
+                            song: Box::new(song),
+                            position: InsertPosition::End,
+                        };
+                    }
+                }
+                Action::ListAddToQueueNext => {
+                    if let Some(song) = self.results.get(self.selected).cloned() {
+                        return AppAction::AddToQueue {
+                            song: Box::new(song),
+                            position: InsertPosition::Next,
+                        };
+                    }
+                }
+                Action::ListActivate => {
+                    if !self.results.is_empty() {
+                        return AppAction::PlaySong {
+                            songs: self.results.clone(),
+                            index: self.selected,
+                        };
+                    }
+                }
+                Action::ListSelectUp => {
+                    if !self.results.is_empty() {
+                        if self.selected > 0 {
+                            self.selected -= 1;
+                        } else if self.wrap_navigation {
+                            self.selected = self.results.len().saturating_sub(1);
+                        }
+                    }
+                }
+                Action::ListSelectDown => {
+                    if !self.results.is_empty() {
+                        if self.selected + 1 < self.results.len() {
+                            self.selected += 1;
+                        } else if self.can_load_more() {
+                            return AppAction::SearchMore {
+                                keyword: self.result_keyword.clone(),
+                                page: self.current_page + 1,
+                                source: self.source_filter,
+                            };
+                        } else if self.wrap_navigation {
+                            self.selected = 0;
+                        }
+                    }
+                }
+                Action::ListSelectFirst => {
+                    self.selected = 0;
+                }
+                Action::ListSelectLast => {
+                    self.selected = self.results.len().saturating_sub(1);
+                }
+                Action::ListPageUp => {
+                    if !self.results.is_empty() {
+                        self.selected = self.selected.saturating_sub(10);
+                    }
+                }
+                Action::ListPageDown => {
+                    if !self.results.is_empty() {
+                        self.selected = (self.selected + 10).min(self.results.len().saturating_sub(1));
+                        if self.selected + 1 == self.results.len() && self.can_load_more() {
+                            return AppAction::SearchMore {
+                                keyword: self.result_keyword.clone(),
+                                page: self.current_page + 1,
+                                source: self.source_filter,
+                            };
+                        }
+                    }
+                }
+                Action::SearchCycleSourcePrev => {
+                    return self.cycle_source(-1);
+                }
+                Action::SearchCycleSourceNext => {
+                    return self.cycle_source(1);
+                }
+                Action::ListGoBack => {
+                    return AppAction::GoBack;
                 }
                 _ => {}
             }
@@ -186,7 +300,7 @@ impl SearchPage {
                     source: self.source_filter,
                 };
             }
-            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            (KeyModifiers::NONE, KeyCode::Up) => {
                 if !self.results.is_empty() {
                     if self.selected > 0 {
                         self.selected -= 1;
@@ -195,7 +309,7 @@ impl SearchPage {
                     }
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            (KeyModifiers::NONE, KeyCode::Down) => {
                 if !self.results.is_empty() {
                     if self.selected + 1 < self.results.len() {
                         self.selected += 1;
@@ -644,8 +758,7 @@ impl SearchPage {
                 self.close_variants();
             }
             (KeyModifiers::NONE, KeyCode::Up)
-            | (KeyModifiers::NONE, KeyCode::Left)
-            | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            | (KeyModifiers::NONE, KeyCode::Left) => {
                 if self.variant_selected > 0 {
                     self.variant_selected -= 1;
                 } else if self.wrap_navigation {
@@ -653,8 +766,7 @@ impl SearchPage {
                 }
             }
             (KeyModifiers::NONE, KeyCode::Down)
-            | (KeyModifiers::NONE, KeyCode::Right)
-            | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            | (KeyModifiers::NONE, KeyCode::Right) => {
                 if self.variant_selected + 1 < self.variant_indices.len() {
                     self.variant_selected += 1;
                 } else if self.wrap_navigation {
@@ -874,6 +986,7 @@ mod tests {
     use super::{SearchPage, matching_variant_indices};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use lx_core::events::AppAction;
+    use lx_core::keybinding::KeybindingResolver;
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
@@ -885,8 +998,9 @@ mod tests {
     fn right_arrow_cycles_search_scope() {
         let mut page = SearchPage::new(None, true, 3);
         page.input_mode = false;
+        let resolver = KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
 
-        let action = page.handle_input(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let action = page.handle_input(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &resolver);
 
         assert_eq!(page.source_filter, Some(SourceId::Kw));
         assert!(matches!(action, AppAction::None));
@@ -897,8 +1011,9 @@ mod tests {
         let mut page = SearchPage::new(None, true, 3);
         page.input_mode = false;
         page.results = vec![song("kw-1", SourceId::Kw, "晴天", "周杰伦")];
+        let resolver = KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
 
-        let action = page.handle_input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        let action = page.handle_input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &resolver);
 
         assert!(matches!(action, AppAction::PlaySong { index: 0, .. }));
     }

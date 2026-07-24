@@ -2,6 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::{AppAction, InsertPosition};
+use lx_core::keybinding::{Action, KeybindingResolver};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -92,11 +93,84 @@ pub fn render(
     }
 }
 
-pub fn handle_input(key: &KeyEvent, ctx: &AppContext, selected: &mut usize) -> AppAction {
+pub fn handle_input(
+    key: &KeyEvent,
+    ctx: &AppContext,
+    selected: &mut usize,
+    resolver: &KeybindingResolver,
+) -> AppAction {
     let history = ctx.storage.load_history();
 
+    if let Some(action) = resolver.resolve_page("history", key) {
+        match action {
+            Action::ListSelectUp => {
+                if !history.is_empty() {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                        *selected = history.len().saturating_sub(1);
+                    }
+                }
+                return AppAction::None;
+            }
+            Action::ListSelectDown => {
+                if !history.is_empty() {
+                    if *selected + 1 < history.len() {
+                        *selected += 1;
+                    } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                        *selected = 0;
+                    }
+                }
+                return AppAction::None;
+            }
+            Action::ListSelectFirst => {
+                *selected = 0;
+                return AppAction::None;
+            }
+            Action::ListSelectLast => {
+                *selected = history.len().saturating_sub(1);
+                return AppAction::None;
+            }
+            Action::ListPageUp => {
+                *selected = selected.saturating_sub(10);
+                return AppAction::None;
+            }
+            Action::ListPageDown => {
+                *selected = (*selected + 10).min(history.len().saturating_sub(1));
+                return AppAction::None;
+            }
+            Action::ListAddToQueue => {
+                if let Some(song) = history.get(*selected).cloned() {
+                    return AppAction::AddToQueue {
+                        song: Box::new(song),
+                        position: InsertPosition::End,
+                    };
+                }
+                return AppAction::None;
+            }
+            Action::ListAddToQueueNext => {
+                if let Some(song) = history.get(*selected).cloned() {
+                    return AppAction::AddToQueue {
+                        song: Box::new(song),
+                        position: InsertPosition::Next,
+                    };
+                }
+                return AppAction::None;
+            }
+            Action::ListActivate => {
+                if !history.is_empty() && *selected < history.len() {
+                    let songs = history.clone();
+                    let index = *selected;
+                    return AppAction::PlaySong { songs, index };
+                }
+                return AppAction::None;
+            }
+            _ => {}
+        }
+    }
+
     match (key.modifiers, key.code) {
-        (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+        (KeyModifiers::NONE, KeyCode::Up) => {
             if !history.is_empty() {
                 if *selected > 0 {
                     *selected -= 1;
@@ -105,7 +179,7 @@ pub fn handle_input(key: &KeyEvent, ctx: &AppContext, selected: &mut usize) -> A
                 }
             }
         }
-        (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+        (KeyModifiers::NONE, KeyCode::Down) => {
             if !history.is_empty() {
                 if *selected + 1 < history.len() {
                     *selected += 1;

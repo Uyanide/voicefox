@@ -2,6 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
+use lx_core::keybinding::{Action, KeybindingResolver};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -50,7 +51,7 @@ impl MainPage {
         }
     }
 
-    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext) -> AppAction {
+    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
         let (songs, current) = ctx.playlist.snapshot();
         if self.selected >= songs.len() {
             self.selected = current.min(songs.len().saturating_sub(1));
@@ -107,8 +108,65 @@ impl MainPage {
             };
         }
 
+        if let Some(action) = resolver.resolve_page("main", key) {
+            match action {
+                Action::ListSelectUp => {
+                    if !songs.is_empty() {
+                        self.selected = if self.selected == 0 {
+                            if ctx.config.read().unwrap().ui.wrap_navigation {
+                                songs.len() - 1
+                            } else {
+                                0
+                            }
+                        } else {
+                            self.selected - 1
+                        };
+                    }
+                    return AppAction::None;
+                }
+                Action::ListSelectDown => {
+                    if !songs.is_empty() {
+                        self.selected = if self.selected + 1 < songs.len() {
+                            self.selected + 1
+                        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                            0
+                        } else {
+                            self.selected
+                        };
+                    }
+                    return AppAction::None;
+                }
+                Action::ListSelectFirst => {
+                    self.selected = 0;
+                    return AppAction::None;
+                }
+                Action::ListSelectLast => {
+                    self.selected = songs.len().saturating_sub(1);
+                    return AppAction::None;
+                }
+                Action::ListPageUp => {
+                    self.selected = self.selected.saturating_sub(5);
+                    return AppAction::None;
+                }
+                Action::ListPageDown => {
+                    self.selected = (self.selected + 5).min(songs.len().saturating_sub(1));
+                    return AppAction::None;
+                }
+                Action::ListActivate => {
+                    if self.selected < songs.len() {
+                        return AppAction::PlaySong {
+                            songs,
+                            index: self.selected,
+                        };
+                    }
+                    return AppAction::None;
+                }
+                _ => {}
+            }
+        }
+
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            (KeyModifiers::NONE, KeyCode::Up) => {
                 if !songs.is_empty() {
                     self.selected = if self.selected == 0 {
                         if ctx.config.read().unwrap().ui.wrap_navigation {
@@ -121,7 +179,7 @@ impl MainPage {
                     };
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            (KeyModifiers::NONE, KeyCode::Down) => {
                 if !songs.is_empty() {
                     self.selected = if self.selected + 1 < songs.len() {
                         self.selected + 1
