@@ -187,7 +187,7 @@ impl Default for UiConfig {
 }
 
 /// 本地音乐配置
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalMusicConfig {
     pub enabled: bool,
@@ -195,6 +195,16 @@ pub struct LocalMusicConfig {
     pub paths: Vec<String>,
     /// 扫描深度，0 为不限制
     pub max_depth: u32,
+}
+
+impl Default for LocalMusicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paths: Vec::new(),
+            max_depth: 0,
+        }
+    }
 }
 
 /// 应用完整配置
@@ -234,4 +244,33 @@ impl Default for Config {
 
 fn legacy_config_version() -> u32 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalMusicConfig;
+
+    #[test]
+    fn legacy_local_music_config_remains_enabled() {
+        let config: LocalMusicConfig = serde_json::from_value(serde_json::json!({
+            "paths": ["/music"],
+            "max_depth": 4
+        }))
+        .unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(config.paths, vec!["/music"]);
+        assert_eq!(config.max_depth, 4);
+    }
+
+    #[test]
+    fn explicit_local_music_disable_is_preserved() {
+        let config: LocalMusicConfig = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "paths": ["/music"]
+        }))
+        .unwrap();
+
+        assert!(!config.enabled);
+    }
 }

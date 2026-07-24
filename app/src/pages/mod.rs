@@ -5,6 +5,7 @@ pub mod components;
 pub mod favorites;
 pub mod history;
 pub mod leaderboard;
+pub mod local_music;
 pub mod main_page;
 pub mod playlists;
 pub mod search;

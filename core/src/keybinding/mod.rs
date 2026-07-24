@@ -119,8 +119,7 @@ pub enum Action {
 /// select_up = "k"
 /// select_down = "j"
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct KeybindingConfig {
     /// 全局键位映射：动作 -> 键位字符串
     #[serde(default = "default_global_bindings")]
@@ -128,6 +127,37 @@ pub struct KeybindingConfig {
     /// 页面级键位映射：页面名 -> (动作 -> 键位字符串)
     #[serde(default = "default_page_bindings")]
     pub pages: HashMap<String, HashMap<Action, String>>,
+}
+
+impl Default for KeybindingConfig {
+    fn default() -> Self {
+        Self {
+            global: default_global_bindings(),
+            pages: default_page_bindings(),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PartialKeybindingConfig {
+    global: HashMap<Action, String>,
+    pages: HashMap<String, HashMap<Action, String>>,
+}
+
+impl<'de> Deserialize<'de> for KeybindingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let partial = PartialKeybindingConfig::deserialize(deserializer)?;
+        let mut config = Self::default();
+        config.global.extend(partial.global);
+        for (page, bindings) in partial.pages {
+            config.pages.entry(page).or_default().extend(bindings);
+        }
+        Ok(config)
+    }
 }
 
 /// 默认全局键位（与现有硬编码完全一致）
@@ -288,10 +318,7 @@ pub struct KeyBinding {
 impl KeyBinding {
     /// 从 `KeyEvent` 创建
     pub fn from_event(event: KeyEvent) -> Self {
-        Self {
-            modifiers: event.modifiers,
-            code: event.code,
-        }
+        normalize_char_binding(event.modifiers, event.code)
     }
 
     /// 匹配一个 `KeyEvent`（忽略 kind 和 state）
@@ -349,7 +376,21 @@ pub fn parse_keybinding(desc: &str) -> Option<KeyBinding> {
     // 解析键码
     let code = parse_keycode(remaining)?;
 
-    Some(KeyBinding { modifiers, code })
+    Some(normalize_char_binding(modifiers, code))
+}
+
+fn normalize_char_binding(mut modifiers: KeyModifiers, mut code: KeyCode) -> KeyBinding {
+    if let KeyCode::Char(character) = code
+        && modifiers.contains(KeyModifiers::SHIFT)
+    {
+        modifiers.remove(KeyModifiers::SHIFT);
+        code = KeyCode::Char(if character.is_ascii_lowercase() {
+            character.to_ascii_uppercase()
+        } else {
+            character
+        });
+    }
+    KeyBinding { modifiers, code }
 }
 
 fn parse_keycode(s: &str) -> Option<KeyCode> {
@@ -374,12 +415,12 @@ fn parse_keycode(s: &str) -> Option<KeyCode> {
         "Null" => Some(KeyCode::Null),
         _ => {
             // 尝试解析 F1-F12
-            if s.len() >= 2 && s.starts_with('F') {
-                if let Ok(n) = s[1..].parse::<u8>() {
-                    if (1..=12).contains(&n) {
-                        return Some(KeyCode::F(n));
-                    }
-                }
+            if s.len() >= 2
+                && s.starts_with('F')
+                && let Ok(n) = s[1..].parse::<u8>()
+                && (1..=12).contains(&n)
+            {
+                return Some(KeyCode::F(n));
             }
             // 尝试解析单个字符
             if s.len() == 1 {
@@ -457,17 +498,31 @@ impl KeybindingResolver {
 ///
 /// 可作为 `config.toml` 中 `[keybindings]` 节的参考示例。
 pub fn colemak_preset() -> KeybindingConfig {
-    let mut global = HashMap::new();
-    global.insert(Action::GlobalNextTrack, "k".to_string());
-    global.insert(Action::GlobalPrevTrack, "h".to_string());
+    let mut config = KeybindingConfig::default();
+    config
+        .global
+        .insert(Action::GlobalNextTrack, "k".to_string());
+    config
+        .global
+        .insert(Action::GlobalPrevTrack, "h".to_string());
 
-    let mut pages = HashMap::new();
-    let mut search = HashMap::new();
-    search.insert(Action::ListSelectUp, "e".to_string());
-    search.insert(Action::ListSelectDown, "n".to_string());
-    pages.insert("search".to_string(), search);
+    for page in [
+        "search",
+        "main",
+        "leaderboard",
+        "playlists",
+        "favorites",
+        "history",
+        "local",
+        "settings",
+    ] {
+        if let Some(bindings) = config.pages.get_mut(page) {
+            bindings.insert(Action::ListSelectUp, "e".to_string());
+            bindings.insert(Action::ListSelectDown, "n".to_string());
+        }
+    }
 
-    KeybindingConfig { global, pages }
+    config
 }
 
 #[cfg(test)]
@@ -521,7 +576,9 @@ mod tests {
     #[test]
     fn resolver_page_priority() {
         let mut config = KeybindingConfig::default();
-        config.global.insert(Action::ListSelectDown, "j".to_string());
+        config
+            .global
+            .insert(Action::ListSelectDown, "j".to_string());
 
         let mut search = HashMap::new();
         search.insert(Action::ListSelectDown, "n".to_string());
@@ -532,6 +589,113 @@ mod tests {
         assert_eq!(
             resolver.resolve("search", &event),
             Some(Action::ListSelectDown)
+        );
+    }
+
+    #[test]
+    fn default_config_contains_all_default_scopes() {
+        let config = KeybindingConfig::default();
+
+        assert_eq!(
+            config.global.get(&Action::GlobalQuit),
+            Some(&"q".to_string())
+        );
+        assert_eq!(
+            config
+                .pages
+                .get("local")
+                .and_then(|page| page.get(&Action::LocalRescan)),
+            Some(&"r".to_string())
+        );
+    }
+
+    #[test]
+    fn partial_config_keeps_unspecified_defaults() {
+        let config: KeybindingConfig = serde_json::from_value(serde_json::json!({
+            "global": {
+                "global_quit": "Ctrl+q"
+            },
+            "pages": {
+                "local": {
+                    "list_select_up": "e"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.global.get(&Action::GlobalQuit),
+            Some(&"Ctrl+q".to_string())
+        );
+        assert_eq!(
+            config.global.get(&Action::GlobalPlayPause),
+            Some(&"Space".to_string())
+        );
+        assert_eq!(
+            config
+                .pages
+                .get("local")
+                .and_then(|page| page.get(&Action::ListSelectUp)),
+            Some(&"e".to_string())
+        );
+        assert_eq!(
+            config
+                .pages
+                .get("local")
+                .and_then(|page| page.get(&Action::ListSelectDown)),
+            Some(&"j".to_string())
+        );
+        assert!(config.pages.contains_key("search"));
+    }
+
+    #[test]
+    fn uppercase_binding_matches_kitty_shift_event() {
+        let mut config = KeybindingConfig::default();
+        config
+            .pages
+            .get_mut("local")
+            .unwrap()
+            .insert(Action::ListSelectLast, "G".to_string());
+        let resolver = KeybindingResolver::from_config(&config);
+        let event = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+
+        assert_eq!(
+            resolver.resolve_page("local", &event),
+            Some(Action::ListSelectLast)
+        );
+    }
+
+    #[test]
+    fn colemak_preset_keeps_defaults_and_updates_every_list_page() {
+        let config = colemak_preset();
+
+        assert_eq!(
+            config.global.get(&Action::GlobalPlayPause),
+            Some(&"Space".to_string())
+        );
+        for page in [
+            "search",
+            "main",
+            "leaderboard",
+            "playlists",
+            "favorites",
+            "history",
+            "local",
+            "settings",
+        ] {
+            let bindings = config.pages.get(page).unwrap();
+            assert_eq!(bindings.get(&Action::ListSelectUp), Some(&"e".to_string()));
+            assert_eq!(
+                bindings.get(&Action::ListSelectDown),
+                Some(&"n".to_string())
+            );
+        }
+        assert_eq!(
+            config
+                .pages
+                .get("local")
+                .and_then(|page| page.get(&Action::LocalRescan)),
+            Some(&"r".to_string())
         );
     }
 }

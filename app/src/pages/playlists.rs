@@ -178,7 +178,12 @@ impl PlaylistsPage {
         self.selected = 0;
     }
 
-    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
+    pub fn handle_input(
+        &mut self,
+        key: &KeyEvent,
+        ctx: &AppContext,
+        resolver: &KeybindingResolver,
+    ) -> AppAction {
         if let Some(action) = resolver.resolve_page("playlists", key) {
             match action {
                 Action::ListSelectUp => {
@@ -202,7 +207,8 @@ impl PlaylistsPage {
                     return AppAction::None;
                 }
                 Action::ListPageDown => {
-                    self.selected = (self.selected + 10).min(self.current_list_len().saturating_sub(1));
+                    self.selected =
+                        (self.selected + 10).min(self.current_list_len().saturating_sub(1));
                     return AppAction::None;
                 }
                 Action::ListActivate => {
@@ -216,24 +222,24 @@ impl PlaylistsPage {
                     return AppAction::None;
                 }
                 Action::ListAddToQueue => {
-                    if self.selected_playlist.is_some() {
-                        if let Some(song) = self.songs.get(self.selected).cloned() {
-                            return AppAction::AddToQueue {
-                                song: Box::new(song),
-                                position: InsertPosition::End,
-                            };
-                        }
+                    if self.selected_playlist.is_some()
+                        && let Some(song) = self.songs.get(self.selected).cloned()
+                    {
+                        return AppAction::AddToQueue {
+                            song: Box::new(song),
+                            position: InsertPosition::End,
+                        };
                     }
                     return AppAction::None;
                 }
                 Action::ListAddToQueueNext => {
-                    if self.selected_playlist.is_some() {
-                        if let Some(song) = self.songs.get(self.selected).cloned() {
-                            return AppAction::AddToQueue {
-                                song: Box::new(song),
-                                position: InsertPosition::Next,
-                            };
-                        }
+                    if self.selected_playlist.is_some()
+                        && let Some(song) = self.songs.get(self.selected).cloned()
+                    {
+                        return AppAction::AddToQueue {
+                            song: Box::new(song),
+                            position: InsertPosition::Next,
+                        };
                     }
                     return AppAction::None;
                 }

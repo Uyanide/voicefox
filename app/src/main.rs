@@ -1279,21 +1279,21 @@ fn run_app(
                                     }
                                 }
                             }
-                            Action::ListActivate => {
-                                if !songs.is_empty() && local_selected < songs.len() {
-                                    execute_action(
-                                        AppAction::PlaySong {
-                                            songs,
-                                            index: local_selected,
-                                        },
-                                        &ctx,
-                                        rt,
-                                        &action_tx,
-                                        &search_page,
-                                        &settings_page,
-                                        &search_seq,
-                                    );
-                                }
+                            Action::ListActivate
+                                if !songs.is_empty() && local_selected < songs.len() =>
+                            {
+                                execute_action(
+                                    AppAction::PlaySong {
+                                        songs,
+                                        index: local_selected,
+                                    },
+                                    &ctx,
+                                    rt,
+                                    &action_tx,
+                                    &search_page,
+                                    &settings_page,
+                                    &search_seq,
+                                );
                             }
                             _ => {}
                         }
@@ -1476,7 +1476,14 @@ fn run_app(
                             .unwrap()
                             .handle_mouse(mouse, ui_areas.content, &ctx, &kb_resolver)
                     }
-                    NavTab::LocalMusic => AppAction::None,
+                    NavTab::LocalMusic => pages::local_music::handle_mouse(
+                        mouse,
+                        ui_areas.content,
+                        &ctx,
+                        &mut local_selected,
+                        local_scroll,
+                        activate,
+                    ),
                 };
 
                 execute_action(
