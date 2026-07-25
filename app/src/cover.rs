@@ -1,3 +1,6 @@
+use std::ffi::OsString;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -6,6 +9,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use reqwest::header::{ACCEPT, REFERER};
+
+const VOICEFOX_KITTY_IMAGE_ID: u32 = 0x56_46_58;
 
 /// 封面状态
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +30,8 @@ pub struct CoverService {
     display_gen: AtomicU64,
     /// 已显示到终端的版本号
     displayed_gen: AtomicU64,
+    /// 上次显示封面时使用的终端区域
+    displayed_area: RwLock<Option<Rect>>,
     /// Kitty 图层中当前是否有 voicefox 封面
     image_visible: AtomicBool,
 }
@@ -47,6 +54,7 @@ impl CoverService {
             request_id: AtomicU64::new(0),
             display_gen: AtomicU64::new(0),
             displayed_gen: AtomicU64::new(0),
+            displayed_area: RwLock::new(None),
             image_visible: AtomicBool::new(false),
         }
     }
@@ -59,10 +67,15 @@ impl CoverService {
     }
 
     fn delete_kitty_image(&self) {
-        use std::io::Write;
-        // 删除所有 Kitty 图片
-        let _ = std::io::stdout().write_all(b"\x1b_Ga=d\x1b\\");
-        let _ = std::io::stdout().flush();
+        let mut stdout = std::io::stdout();
+        if is_tmux_session() {
+            let command = format!("a=d,d=I,i={VOICEFOX_KITTY_IMAGE_ID},q=2");
+            let _ = write_kitty_apc(&mut stdout, command.as_bytes(), true);
+        } else {
+            // viuer 不暴露 Kitty 图片 ID，非 tmux 环境只能清除当前终端图片图层。
+            let _ = write_kitty_apc(&mut stdout, b"a=d", false);
+        }
+        let _ = stdout.flush();
     }
 
     pub fn has_image(&self) -> bool {
@@ -196,19 +209,22 @@ impl CoverService {
 
     /// 在终端中使用 Kitty 协议显示封面（必须在 terminal.draw() 之后调用）
     pub fn display_kitty(&self, area: Rect) {
-        use std::io::Write;
-
         let current_gen = self.display_gen.load(Ordering::SeqCst);
+        let area = cover_image_area(area);
+        let in_tmux = is_tmux_session();
         if current_gen == 0
             || area.width == 0
             || area.height == 0
-            || !supports_kitty_graphics()
-            || viuer::get_kitty_support() == viuer::KittySupport::None
+            || !in_tmux
+                && (!supports_kitty_graphics()
+                    || viuer::get_kitty_support() == viuer::KittySupport::None)
         {
             return;
         }
-        // 如果版本没变，说明同一张图已经显示过了，跳过
-        if current_gen == self.displayed_gen.load(Ordering::SeqCst) {
+        // 同一张图且终端区域未变化时不重复传输。
+        if current_gen == self.displayed_gen.load(Ordering::SeqCst)
+            && self.displayed_area.read().unwrap().as_ref() == Some(&area)
+        {
             return;
         }
 
@@ -224,31 +240,146 @@ impl CoverService {
         // 先清除旧图片，避免新旧图层重叠
         self.clear_display();
 
-        // 用 viuer 在指定位置显示图片
-        let config = viuer::Config {
-            x: area.x,
-            y: area.y as i16,
-            width: Some(area.width as u32),
-            height: Some(area.height as u32),
-            restore_cursor: true,
-            use_iterm: false,
-            ..Default::default()
+        let displayed = if in_tmux {
+            display_with_kitten(&path, area)
+        } else {
+            // 普通终端继续使用 viuer 的 Kitty 协议支持。
+            let config = viuer::Config {
+                x: area.x,
+                y: area.y as i16,
+                width: Some(area.width as u32),
+                height: Some(area.height as u32),
+                restore_cursor: true,
+                use_iterm: false,
+                ..Default::default()
+            };
+            viuer::print_from_file(&path, &config).is_ok()
         };
 
-        if viuer::print_from_file(&path, &config).is_ok() {
+        if displayed {
             let _ = std::io::stdout().flush();
             self.image_visible.store(true, Ordering::SeqCst);
             self.displayed_gen.store(current_gen, Ordering::SeqCst);
+            *self.displayed_area.write().unwrap() = Some(area);
         }
     }
 
     /// 清除终端中的封面图片
     pub fn clear_display(&self) {
         self.displayed_gen.store(0, Ordering::SeqCst);
+        *self.displayed_area.write().unwrap() = None;
         if self.image_visible.swap(false, Ordering::SeqCst) {
             self.delete_kitty_image();
         }
     }
+}
+
+fn cover_image_area(area: Rect) -> Rect {
+    if area.width <= 2 || area.height <= 2 {
+        return Rect::default();
+    }
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn display_with_kitten(path: &str, area: Rect) -> bool {
+    let args = kitten_icat_args(path, area, terminal_window_size());
+    for (program, prefix) in [("kitten", &[][..]), ("kitty", &["+kitten"][..])] {
+        let result = Command::new(program)
+            .args(prefix)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::null())
+            .status();
+        match result {
+            Ok(status) => return status.success(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn kitten_icat_args(
+    path: &str,
+    area: Rect,
+    window_size: Option<(u16, u16, u16, u16)>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "icat".into(),
+        "--stdin=no".into(),
+        "--transfer-mode=stream".into(),
+        "--passthrough=tmux".into(),
+        "--unicode-placeholder".into(),
+        "--align=center".into(),
+        "--scale-up=yes".into(),
+        format!("--image-id={VOICEFOX_KITTY_IMAGE_ID}").into(),
+        format!(
+            "--place={}x{}@{}x{}",
+            area.width, area.height, area.x, area.y
+        )
+        .into(),
+        "--no-trailing-newline".into(),
+    ];
+    if let Some((columns, rows, width, height)) = window_size {
+        args.push(format!("--use-window-size={columns},{rows},{width},{height}").into());
+    }
+    args.extend([OsString::from("--"), OsString::from(path)]);
+    args
+}
+
+fn terminal_window_size() -> Option<(u16, u16, u16, u16)> {
+    if let Ok(size) = crossterm::terminal::window_size() {
+        let width = if size.width == 0 {
+            size.columns.saturating_mul(10)
+        } else {
+            size.width
+        };
+        let height = if size.height == 0 {
+            size.rows.saturating_mul(20)
+        } else {
+            size.height
+        };
+        return Some((size.columns, size.rows, width, height));
+    }
+
+    crossterm::terminal::size().ok().map(|(columns, rows)| {
+        (
+            columns,
+            rows,
+            columns.saturating_mul(10),
+            rows.saturating_mul(20),
+        )
+    })
+}
+
+fn write_kitty_apc(output: &mut impl Write, command: &[u8], tmux: bool) -> std::io::Result<()> {
+    let mut apc = Vec::with_capacity(command.len() + 5);
+    apc.extend_from_slice(b"\x1b_G");
+    apc.extend_from_slice(command);
+    apc.extend_from_slice(b"\x1b\\");
+
+    if !tmux {
+        return output.write_all(&apc);
+    }
+
+    output.write_all(b"\x1bPtmux;")?;
+    for byte in apc {
+        if byte == b'\x1b' {
+            output.write_all(b"\x1b")?;
+        }
+        output.write_all(&[byte])?;
+    }
+    output.write_all(b"\x1b\\")
+}
+
+fn is_tmux_session() -> bool {
+    std::env::var_os("TMUX").is_some()
 }
 
 fn supports_kitty_graphics() -> bool {
@@ -297,4 +428,46 @@ fn simple_hash(data: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
     format!("{:x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use ratatui::layout::Rect;
+
+    use super::{cover_image_area, kitten_icat_args, write_kitty_apc};
+
+    #[test]
+    fn cover_image_stays_inside_the_border() {
+        assert_eq!(
+            cover_image_area(Rect::new(4, 7, 30, 12)),
+            Rect::new(5, 8, 28, 10)
+        );
+        assert_eq!(cover_image_area(Rect::new(0, 0, 2, 2)), Rect::default());
+    }
+
+    #[test]
+    fn tmux_kitty_apc_escapes_inner_escape_bytes() {
+        let mut output = Vec::new();
+        write_kitty_apc(&mut output, b"a=d", true).unwrap();
+
+        assert_eq!(output, b"\x1bPtmux;\x1b\x1b_Ga=d\x1b\x1b\\\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn kitten_uses_tmux_passthrough_and_exact_placement() {
+        let args = kitten_icat_args(
+            "/tmp/cover.jpg",
+            Rect::new(5, 8, 28, 10),
+            Some((120, 40, 1200, 800)),
+        );
+        let args: Vec<&OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
+
+        assert!(args.contains(&OsStr::new("--passthrough=tmux")));
+        assert!(args.contains(&OsStr::new("--unicode-placeholder")));
+        assert!(args.contains(&OsStr::new("--place=28x10@5x8")));
+        assert!(args.contains(&OsStr::new("--use-window-size=120,40,1200,800")));
+        assert_eq!(args.last(), Some(&OsStr::new("/tmp/cover.jpg")));
+    }
 }

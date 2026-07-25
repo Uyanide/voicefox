@@ -38,6 +38,7 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - **在线播放**：通过 mpv 播放高品质音乐
 - **本地音乐**：扫描本地音乐目录，支持 MP3/FLAC/M4A/OGG/WAV，自动读取封面、同名 LRC 和音频内嵌歌词，并可确认后删除本地文件
 - **封面显示**：支持 Kitty/WezTerm/Ghostty 终端原生图片协议，真实显示专辑封面
+- **tmux 封面**：在 Kitty 中通过 tmux passthrough 和 Unicode placeholder 显示封面
 - **歌词支持**：支持 LRC、KRC、QRC、YRC 多种歌词格式，支持翻译歌词
 - **收藏管理**：添加/取消收藏歌曲和热门歌单
 - **播放历史**：自动记录播放记录
@@ -121,6 +122,23 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
   - Linux：`sudo pacman -S mpv`（Arch） / `sudo apt install mpv`（Debian/Ubuntu）
   - macOS：`brew install mpv`
   - Windows：从 https://mpv.io/ 下载安装
+- **Kitty/kitten**（tmux 中显示封面时需要）：Kitty 安装包通常已包含 `kitten`
+
+### tmux 中显示封面
+
+在 `~/.tmux.conf` 中启用终端控制序列透传：
+
+```tmux
+set -g allow-passthrough on
+```
+
+重新加载配置并重启 voicefox：
+
+```bash
+tmux source-file ~/.tmux.conf
+```
+
+voicefox 在 tmux 中会自动调用 `kitten icat` 的 passthrough 和 Unicode placeholder 模式。普通 Kitty、WezTerm 和 Ghostty 会继续使用内置的终端图片输出。
 
 ### 从源码编译
 
