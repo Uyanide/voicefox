@@ -5,9 +5,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::Widget;
 use reqwest::header::{ACCEPT, REFERER};
 
 const VOICEFOX_KITTY_IMAGE_ID: u32 = 0x56_46_58;
@@ -30,10 +28,12 @@ pub struct CoverService {
     display_gen: AtomicU64,
     /// 已显示到终端的版本号
     displayed_gen: AtomicU64,
-    /// 上次显示封面时使用的终端区域
+    /// 上次显示封面时使用的终端区域，区域变化（如窗口缩放）时需要重新传输
     displayed_area: RwLock<Option<Rect>>,
     /// Kitty 图层中当前是否有 voicefox 封面
     image_visible: AtomicBool,
+    /// 最近一帧封面的目标区域（封面框的 inner），由 set_display_area 记录
+    display_area: RwLock<Rect>,
 }
 
 impl CoverService {
@@ -56,6 +56,7 @@ impl CoverService {
             displayed_gen: AtomicU64::new(0),
             displayed_area: RwLock::new(None),
             image_visible: AtomicBool::new(false),
+            display_area: RwLock::new(Rect::ZERO),
         }
     }
 
@@ -194,31 +195,29 @@ impl CoverService {
         Ok(cache_path.to_string_lossy().to_string())
     }
 
-    /// 在指定的终端区域显示封面（使用 Kitty 协议）
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        // 在 TUI 中留出空白区域（Kitty 图片会浮动在上方）
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(ratatui::style::Style::new().fg(ratatui::style::Color::DarkGray))
-            .title("封面");
-        block.render(area, buf);
+    /// 当前终端是否支持用 Kitty 图形协议显示封面
+    pub fn kitty_available(&self) -> bool {
+        // tmux 里 TERM 是 screen/tmux，环境探测必然失败，改由 kitten icat 透传承担
+        is_tmux_session()
+            || supports_kitty_graphics() && viuer::get_kitty_support() != viuer::KittySupport::None
+    }
+
+    /// 记录本帧封面图片应占据的区域（TUI 中该区域留空，Kitty 图片浮动在上方）。
+    /// 必须传入封面框的 inner，否则图片会盖住边框。
+    pub fn set_display_area(&self, area: Rect) {
+        *self.display_area.write().unwrap() = area;
     }
 
     /// 在终端中使用 Kitty 协议显示封面（必须在 terminal.draw() 之后调用）
-    pub fn display_kitty(&self, area: Rect) {
+    pub fn display_kitty(&self) {
+        let area = *self.display_area.read().unwrap();
+        if area.width == 0 || area.height == 0 {
+            // 本帧没有封面位置（窗口过窄、或没画封面框），移除已经显示的图片
+            self.clear_display();
+            return;
+        }
         let current_gen = self.display_gen.load(Ordering::SeqCst);
-        let area = cover_image_area(area);
-        let in_tmux = is_tmux_session();
-        if current_gen == 0
-            || area.width == 0
-            || area.height == 0
-            || !in_tmux
-                && (!supports_kitty_graphics()
-                    || viuer::get_kitty_support() == viuer::KittySupport::None)
-        {
+        if current_gen == 0 || !self.kitty_available() {
             return;
         }
         // 同一张图且终端区域未变化时不重复传输。
@@ -240,7 +239,7 @@ impl CoverService {
         // 先清除旧图片，避免新旧图层重叠
         self.clear_display();
 
-        let displayed = if in_tmux {
+        let displayed = if is_tmux_session() {
             display_with_kitten(&path, area)
         } else {
             // 普通终端继续使用 viuer 的 Kitty 协议支持。
@@ -272,18 +271,6 @@ impl CoverService {
             self.delete_kitty_image();
         }
     }
-}
-
-fn cover_image_area(area: Rect) -> Rect {
-    if area.width <= 2 || area.height <= 2 {
-        return Rect::default();
-    }
-    Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    )
 }
 
 fn display_with_kitten(path: &str, area: Rect) -> bool {
@@ -436,16 +423,7 @@ mod tests {
 
     use ratatui::layout::Rect;
 
-    use super::{cover_image_area, kitten_icat_args, write_kitty_apc};
-
-    #[test]
-    fn cover_image_stays_inside_the_border() {
-        assert_eq!(
-            cover_image_area(Rect::new(4, 7, 30, 12)),
-            Rect::new(5, 8, 28, 10)
-        );
-        assert_eq!(cover_image_area(Rect::new(0, 0, 2, 2)), Rect::default());
-    }
+    use super::{kitten_icat_args, write_kitty_apc};
 
     #[test]
     fn tmux_kitty_apc_escapes_inner_escape_bytes() {

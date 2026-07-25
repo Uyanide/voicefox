@@ -385,8 +385,9 @@ fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         .title(" Cover ");
     let inner = block.inner(area);
     block.render(area, buf);
-    if ctx.cover_service.has_image() {
-        ctx.cover_service.render(inner, buf);
+    // 只有终端真的能显示 Kitty 图片时才把 inner 留空，否则退回文字占位
+    if ctx.cover_service.has_image() && ctx.cover_service.kitty_available() {
+        ctx.cover_service.set_display_area(inner);
         return;
     }
     let cover_state = ctx.cover_service.state();
