@@ -27,6 +27,7 @@ pub struct LocalSource {
     /// 当前加载的目录列表
     loaded_paths: RwLock<Vec<PathBuf>>,
     scan_generation: AtomicU64,
+    scan_in_progress: AtomicU64,
 }
 
 impl LocalSource {
@@ -35,11 +36,19 @@ impl LocalSource {
             songs: RwLock::new(HashMap::new()),
             loaded_paths: RwLock::new(Vec::new()),
             scan_generation: AtomicU64::new(0),
+            scan_in_progress: AtomicU64::new(0),
         }
     }
 
     pub fn begin_scan(&self) -> u64 {
-        self.scan_generation.fetch_add(1, Ordering::SeqCst) + 1
+        let generation = self.scan_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.scan_in_progress
+            .fetch_max(generation, Ordering::SeqCst);
+        generation
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.scan_in_progress.load(Ordering::SeqCst) != 0
     }
 
     /// 扫描指定目录并加载歌曲
@@ -54,6 +63,10 @@ impl LocalSource {
         max_depth: u32,
         generation: u64,
     ) -> Vec<String> {
+        let _completion = ScanCompletion {
+            source: self,
+            generation,
+        };
         let mut all_songs: HashMap<PathBuf, Vec<LocalSong>> = HashMap::new();
         let mut errors = Vec::new();
 
@@ -96,6 +109,10 @@ impl LocalSource {
             .collect()
     }
 
+    pub fn song_count(&self) -> usize {
+        self.songs.read().unwrap().values().map(Vec::len).sum()
+    }
+
     /// 从当前扫描结果中移除一个文件，避免异步复扫完成前仍显示已删除歌曲。
     pub fn remove_by_path(&self, path: &Path) -> bool {
         let mut groups = self.songs.write().unwrap();
@@ -122,6 +139,22 @@ impl LocalSource {
     /// 获取已加载的目录
     pub fn loaded_paths(&self) -> Vec<PathBuf> {
         self.loaded_paths.read().unwrap().clone()
+    }
+}
+
+struct ScanCompletion<'a> {
+    source: &'a LocalSource,
+    generation: u64,
+}
+
+impl Drop for ScanCompletion<'_> {
+    fn drop(&mut self) {
+        let _ = self.source.scan_in_progress.compare_exchange(
+            self.generation,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -270,6 +303,20 @@ mod tests {
         source.scan_for_generation(&[".".to_string()], 0, stale_generation);
 
         assert!(source.loaded_paths().is_empty());
+        assert!(!source.is_scanning());
+    }
+
+    #[test]
+    fn stale_scan_completion_does_not_clear_newer_scan_state() {
+        let source = LocalSource::new();
+        let stale_generation = source.begin_scan();
+        let current_generation = source.begin_scan();
+
+        source.scan_for_generation(&[], 0, stale_generation);
+        assert!(source.is_scanning());
+
+        source.scan_for_generation(&[], 0, current_generation);
+        assert!(!source.is_scanning());
     }
 
     #[test]

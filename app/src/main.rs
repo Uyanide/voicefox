@@ -238,6 +238,7 @@ fn run_app(
 
     // 导航状态
     let mut active_tab = NavTab::Main;
+    let mut observed_active_tab = active_tab;
 
     // 页面状态
     let (search_source_filter, wrap_navigation, scroll_amount) = {
@@ -348,6 +349,39 @@ fn run_app(
                 let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
             }
             mouse_capture_enabled = mouse_requested;
+        }
+
+        if observed_active_tab != active_tab {
+            let previous_tab = observed_active_tab;
+            observed_active_tab = active_tab;
+            let local_source = ctx.source_manager.local_source();
+            let config = ctx.config.read().unwrap();
+            if should_scan_local_music_on_entry(
+                previous_tab,
+                active_tab,
+                config.local_music.enabled,
+                !config.local_music.paths.is_empty(),
+                local_source.song_count() == 0,
+                local_source.is_scanning(),
+            ) {
+                let action = AppAction::ScanLocalMusic {
+                    paths: config.local_music.paths.clone(),
+                    max_depth: config.local_music.max_depth,
+                };
+                drop(config);
+                execute_action(
+                    action,
+                    &ctx,
+                    rt,
+                    &action_tx,
+                    &search_page,
+                    &settings_page,
+                    &search_seq,
+                );
+                local_selected = 0;
+                local_scroll = 0;
+                needs_render = true;
+            }
         }
 
         // === 0. 排空异步 action ===
@@ -1645,11 +1679,16 @@ fn draw_app(
                 let local_src = ctx.source_manager.local_source();
                 let paths = ctx.config.read().unwrap().local_music.paths.clone();
                 let songs = local_src.all_songs();
+                let is_scanning = local_src.is_scanning();
 
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::new().fg(crate::theme::muted(ctx)))
-                    .title(format!("本地音乐 ({} 首)", songs.len()));
+                    .title(if is_scanning {
+                        format!("本地音乐 ({} 首，扫描中)", songs.len())
+                    } else {
+                        format!("本地音乐 ({} 首)", songs.len())
+                    });
                 let inner = block.inner(content_area);
                 block.render(content_area, frame.buffer_mut());
 
@@ -1659,6 +1698,13 @@ fn draw_app(
 
                 if paths.is_empty() {
                     Paragraph::new(Line::from(" 未配置音乐目录，请在设置（8）中添加"))
+                        .style(Style::new().fg(Color::DarkGray))
+                        .render(inner, frame.buffer_mut());
+                    return;
+                }
+
+                if songs.is_empty() && is_scanning {
+                    Paragraph::new(Line::from(" 正在扫描本地音乐，请稍候..."))
                         .style(Style::new().fg(Color::DarkGray))
                         .render(inner, frame.buffer_mut());
                     return;
@@ -2282,6 +2328,22 @@ fn next_generation(sequence: &AtomicU64) -> u64 {
     sequence.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+fn should_scan_local_music_on_entry(
+    previous_tab: NavTab,
+    active_tab: NavTab,
+    enabled: bool,
+    has_paths: bool,
+    songs_empty: bool,
+    is_scanning: bool,
+) -> bool {
+    previous_tab != NavTab::LocalMusic
+        && active_tab == NavTab::LocalMusic
+        && enabled
+        && has_paths
+        && songs_empty
+        && !is_scanning
+}
+
 fn previous_list_index(selected: usize, len: usize, wrap: bool) -> usize {
     match (selected, len, wrap) {
         (_, 0, _) => 0,
@@ -2492,7 +2554,9 @@ mod tests {
 
     use super::{
         DeleteConfirmationAction, delete_confirmation_action, next_list_index, previous_list_index,
+        should_scan_local_music_on_entry,
     };
+    use crate::pages::sidebar::NavTab;
 
     #[test]
     fn local_list_navigation_wraps_at_both_ends() {
@@ -2525,5 +2589,45 @@ mod tests {
                 DeleteConfirmationAction::Cancel
             );
         }
+    }
+
+    #[test]
+    fn entering_empty_local_music_page_starts_scan() {
+        assert!(should_scan_local_music_on_entry(
+            NavTab::History,
+            NavTab::LocalMusic,
+            true,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_music_entry_does_not_start_invalid_or_duplicate_scan() {
+        for (enabled, has_paths, songs_empty, is_scanning) in [
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            assert!(!should_scan_local_music_on_entry(
+                NavTab::History,
+                NavTab::LocalMusic,
+                enabled,
+                has_paths,
+                songs_empty,
+                is_scanning,
+            ));
+        }
+
+        assert!(!should_scan_local_music_on_entry(
+            NavTab::LocalMusic,
+            NavTab::LocalMusic,
+            true,
+            true,
+            true,
+            false,
+        ));
     }
 }
