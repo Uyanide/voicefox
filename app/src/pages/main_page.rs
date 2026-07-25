@@ -305,7 +305,7 @@ impl MainPage {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(format!(" Queue · {} songs ", songs.len()));
+            .title(format!(" 队列 · {} 歌曲 ", songs.len()));
         let inner = block.inner(area);
         block.render(area, buf);
         if songs.is_empty() {
@@ -393,7 +393,7 @@ fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext, cell
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(crate::theme::border(ctx)))
-        .title(" Cover ");
+        .title(" 封面 ");
     let inner = block.inner(area);
     block.render(area, buf);
     // 只有终端真的能显示 Kitty 图片时才把 inner 留空，否则退回文字占位
@@ -409,7 +409,7 @@ fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext, cell
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "NO COVER",
+                    "等待播放",
                     Style::new().fg(crate::theme::muted(ctx)),
                 )),
             ]
@@ -432,8 +432,10 @@ fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext, cell
                     match &cover_state {
                         crate::cover::CoverState::Loading => "封面加载中...",
                         crate::cover::CoverState::Unavailable(_) => "封面不可用",
-                        crate::cover::CoverState::Empty => "等待播放",
-                        crate::cover::CoverState::Ready => "封面已就绪",
+                        // current_song 非 None 但无封面 <-> 封面被禁用
+                        crate::cover::CoverState::Empty => "",
+                        // 封面就绪但是终端无法显示
+                        crate::cover::CoverState::Ready => "封面无法显示",
                     },
                     Style::new().fg(crate::theme::muted(ctx)),
                 )),
