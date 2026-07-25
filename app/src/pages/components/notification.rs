@@ -5,7 +5,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
 
@@ -38,7 +38,8 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
             style,
         ));
 
-        if area.height > 0 {
+        if area.height > 0 && area.width > 0 {
+            Clear.render(area, buf);
             Block::default().style(style).render(area, buf);
             Paragraph::new(line).render(Rect::new(area.x, area.y, area.width, 1), buf);
         }
