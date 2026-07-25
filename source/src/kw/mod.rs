@@ -60,10 +60,9 @@ impl MusicSource for KwSource {
     }
 
     async fn get_cover_url(&self, song: &SongInfo) -> Result<String, FetchError> {
-        Ok(format!(
-            "http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500&size=500&rid={}",
-            song.id
-        ))
+        url::resolve_cover_url(&super::http::client(), &song.id)
+            .await
+            .ok_or(FetchError::NotFound)
     }
 
     fn supported_qualities(&self) -> Vec<Quality> {
