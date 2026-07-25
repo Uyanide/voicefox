@@ -273,6 +273,51 @@ impl CoverService {
     }
 }
 
+/// 终端单元格的高宽比。失败返回 2.0
+pub fn cell_aspect() -> f32 {
+    let Some((columns, rows, width, height)) = terminal_window_size() else {
+        return 2.0;
+    };
+    if columns == 0 || rows == 0 || width == 0 || height == 0 {
+        return 2.0;
+    }
+    let cell_width = f32::from(width) / f32::from(columns);
+    let cell_height = f32::from(height) / f32::from(rows);
+    if cell_width <= 0.0 {
+        return 2.0;
+    }
+    (cell_height / cell_width).clamp(1.0, 4.0)
+}
+
+/// 封面框应有的高度，返回 0 表示放不下。
+pub fn cover_box_height(box_width: u16, max_height: u16, cell_aspect: f32) -> u16 {
+    let inner_width = box_width.saturating_sub(2);
+    if inner_width == 0 || max_height < 3 {
+        return 0;
+    }
+    let inner_height = (f32::from(inner_width) / cell_aspect).round().max(1.0) as u16;
+    inner_height.saturating_add(2).min(max_height)
+}
+
+/// 封面图片在框内 inner 区域中的实际位置。
+/// - 高度不够时压缩高度、水平居中、两侧留边
+/// - 返回的矩形永远落在 inner 之内
+/// - 封面尺寸假设 1:1，以避免额外的解码路径开销
+pub fn cover_image_rect(inner: Rect, cell_aspect: f32) -> Rect {
+    if inner.width == 0 || inner.height == 0 {
+        return Rect::ZERO;
+    }
+    let fit_height = (f32::from(inner.width) / cell_aspect).round().max(1.0) as u16;
+    if fit_height <= inner.height {
+        let y = inner.y + (inner.height - fit_height) / 2;
+        return Rect::new(inner.x, y, inner.width, fit_height);
+    }
+    let fit_width = ((f32::from(inner.height) * cell_aspect).round().max(1.0) as u16)
+        .clamp(1, inner.width);
+    let x = inner.x + (inner.width - fit_width) / 2;
+    Rect::new(x, inner.y, fit_width, inner.height)
+}
+
 fn display_with_kitten(path: &str, area: Rect) -> bool {
     let args = kitten_icat_args(path, area, terminal_window_size());
     for (program, prefix) in [("kitten", &[][..]), ("kitty", &["+kitten"][..])] {
@@ -423,7 +468,35 @@ mod tests {
 
     use ratatui::layout::Rect;
 
-    use super::{kitten_icat_args, write_kitty_apc};
+    use super::{cover_box_height, cover_image_rect, kitten_icat_args, write_kitty_apc};
+
+    #[test]
+    fn cover_box_height_follows_the_cell_aspect() {
+        // inner 宽 41 → 41/2 ≈ 21 行内容，加上下边框 = 23
+        assert_eq!(cover_box_height(43, 24, 2.0), 23);
+        // 高度不够时被 max_height 压住
+        assert_eq!(cover_box_height(43, 8, 2.0), 8);
+        // 连一行内容都放不下就整个不画
+        assert_eq!(cover_box_height(43, 2, 2.0), 0);
+        assert_eq!(cover_box_height(2, 24, 2.0), 0);
+    }
+
+    #[test]
+    fn cover_image_is_centered_and_never_leaves_the_box() {
+        // 高度充足：正好占满 inner
+        let inner = Rect::new(5, 8, 40, 20);
+        assert_eq!(cover_image_rect(inner, 2.0), inner);
+
+        // 高度被压缩：按高度反推宽度，水平居中留边
+        let squashed = Rect::new(5, 8, 40, 6);
+        let rect = cover_image_rect(squashed, 2.0);
+        assert_eq!(rect, Rect::new(19, 8, 12, 6));
+        assert_eq!(squashed.union(rect), squashed);
+
+        // 极端窄框也不会溢出
+        let tiny = Rect::new(0, 0, 3, 9);
+        assert_eq!(tiny.union(cover_image_rect(tiny, 2.0)), tiny);
+    }
 
     #[test]
     fn tmux_kitty_apc_escapes_inner_escape_bytes() {

@@ -12,6 +12,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::context::AppContext;
 
+/// 歌词区最小可用高度（含边框）。
+///
+/// 当前行固定在 inner 的正中（visible_rows / 2），翻译紧跟其后占一行。
+/// 要让「上一句 + 当前行 + 翻译 + 下一句」同时可见，inner 至少要 5 行，
+/// 加上下边框即 7
+pub const MIN_HEIGHT: u16 = 7;
+
 /// 渲染歌词显示
 /// area: 可用区域
 /// 显示当前行前后各 N 行，使当前行尽量居中
