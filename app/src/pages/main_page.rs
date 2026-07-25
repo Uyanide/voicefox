@@ -223,20 +223,19 @@ impl MainPage {
                 .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
                 .split(area);
             // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_LYRIC_HEIGHT。
-            let cell_aspect = crate::cover::cell_aspect();
-            let cover_height = crate::cover::cover_box_height(
+            let geometry = crate::cover::CoverGeometry::detect(&ctx.cover_service);
+            let cover_height = geometry.box_height(
                 columns[0].width,
                 columns[0]
                     .height
                     .saturating_sub(super::components::lyric::MIN_HEIGHT),
-                cell_aspect,
             );
             let left = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(cover_height), Constraint::Min(0)])
                 .split(columns[0]);
             if cover_height > 0 {
-                render_cover_placeholder(left[0], buf, ctx, cell_aspect);
+                render_cover_placeholder(left[0], buf, ctx, geometry);
             }
             super::components::lyric::render(left[1], buf, ctx);
             self.render_queue(columns[1], buf, ctx);
@@ -389,7 +388,12 @@ fn queue_area(area: Rect) -> Rect {
     }
 }
 
-fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext, cell_aspect: f32) {
+fn render_cover_placeholder(
+    area: Rect,
+    buf: &mut Buffer,
+    ctx: &AppContext,
+    geometry: crate::cover::CoverGeometry,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(crate::theme::border(ctx)))
@@ -399,7 +403,7 @@ fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext, cell
     // 只有终端真的能显示 Kitty 图片时才把 inner 留空，否则退回文字占位
     if ctx.cover_service.has_image() && ctx.cover_service.kitty_available() {
         ctx.cover_service
-            .set_display_area(crate::cover::cover_image_rect(inner, cell_aspect));
+            .set_display_area(geometry.image_rect(inner));
         return;
     }
     let cover_state = ctx.cover_service.state();

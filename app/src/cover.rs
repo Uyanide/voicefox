@@ -10,6 +10,15 @@ use reqwest::header::{ACCEPT, REFERER};
 
 const VOICEFOX_KITTY_IMAGE_ID: u32 = 0x56_46_58;
 
+/// 封面宽高比的合理范围
+const MIN_IMAGE_ASPECT: f32 = 0.2;
+const MAX_IMAGE_ASPECT: f32 = 5.0;
+/// 回退方图
+const DEFAULT_IMAGE_ASPECT: f32 = 1.0;
+
+/// 终端单元格的高宽比回退值
+const DEFAULT_CELL_ASPECT: f32 = 2.0;
+
 /// 封面状态
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoverState {
@@ -19,9 +28,17 @@ pub enum CoverState {
     Unavailable(String),
 }
 
+/// 已就绪的封面
+#[derive(Debug, Clone)]
+struct CoverImage {
+    path: String,
+    /// 像素 宽/高
+    aspect: f32,
+}
+
 pub struct CoverService {
     client: reqwest::Client,
-    image_path: RwLock<Option<String>>,
+    image: RwLock<Option<CoverImage>>,
     state: RwLock<CoverState>,
     request_id: AtomicU64,
     /// 封面版本号，每次加载新封面时递增。display_kitty 只在新版本时传输图片。
@@ -49,7 +66,7 @@ impl CoverService {
         let client = builder.build().unwrap_or_default();
         Self {
             client,
-            image_path: RwLock::new(None),
+            image: RwLock::new(None),
             state: RwLock::new(CoverState::Empty),
             request_id: AtomicU64::new(0),
             display_gen: AtomicU64::new(0),
@@ -62,7 +79,7 @@ impl CoverService {
 
     pub fn clear(&self) {
         self.request_id.fetch_add(1, Ordering::SeqCst);
-        *self.image_path.write().unwrap() = None;
+        *self.image.write().unwrap() = None;
         *self.state.write().unwrap() = CoverState::Empty;
         self.clear_display();
     }
@@ -80,7 +97,16 @@ impl CoverService {
     }
 
     pub fn has_image(&self) -> bool {
-        self.image_path.read().unwrap().is_some()
+        self.image.read().unwrap().is_some()
+    }
+
+    /// 当前封面的像素宽高比
+    pub fn image_aspect(&self) -> f32 {
+        self.image
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(DEFAULT_IMAGE_ASPECT, |image| image.aspect)
     }
 
     pub fn state(&self) -> CoverState {
@@ -89,7 +115,7 @@ impl CoverService {
 
     pub async fn load(&self, url: Option<String>) -> Result<(), String> {
         let request_id = self.request_id.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.image_path.write().unwrap() = None;
+        *self.image.write().unwrap() = None;
         self.clear_display();
 
         let Some(url) = url
@@ -103,15 +129,15 @@ impl CoverService {
         *self.state.write().unwrap() = CoverState::Loading;
 
         let mut last_error = "封面请求失败".to_string();
-        let mut result_path: Option<String> = None;
+        let mut result: Option<CoverImage> = None;
 
         for attempt in 0..3 {
             if self.request_id.load(Ordering::SeqCst) != request_id {
                 return Ok(());
             }
             match self.download_and_cache(&url).await {
-                Ok(path) => {
-                    result_path = Some(path);
+                Ok(image) => {
+                    result = Some(image);
                     break;
                 }
                 Err(error) => {
@@ -124,8 +150,8 @@ impl CoverService {
         }
 
         if self.request_id.load(Ordering::SeqCst) == request_id {
-            if let Some(ref path) = result_path {
-                *self.image_path.write().unwrap() = Some(path.clone());
+            if result.is_some() {
+                *self.image.write().unwrap() = result.clone();
                 *self.state.write().unwrap() = CoverState::Ready;
                 self.display_gen.fetch_add(1, Ordering::SeqCst);
             } else {
@@ -133,14 +159,14 @@ impl CoverService {
             }
         }
 
-        match result_path {
+        match result {
             Some(_) => Ok(()),
             None => Err(last_error),
         }
     }
 
-    /// 下载封面到本地缓存，返回缓存路径
-    async fn download_and_cache(&self, url: &str) -> Result<String, String> {
+    /// 下载封面到本地缓存，返回缓存路径与像素宽高比
+    async fn download_and_cache(&self, url: &str) -> Result<CoverImage, String> {
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
             .join("voicefox")
@@ -153,10 +179,13 @@ impl CoverService {
         // 本地文件直接返回路径
         if url.starts_with('/') || url.starts_with("file://") {
             let path = url.strip_prefix("file://").unwrap_or(url);
-            if std::path::Path::new(path).exists() {
-                return Ok(path.to_string());
+            if !std::path::Path::new(path).exists() {
+                return Err("封面文件不存在".to_string());
             }
-            return Err("封面文件不存在".to_string());
+            return Ok(CoverImage {
+                path: path.to_string(),
+                aspect: probe_aspect(path).await.unwrap_or(DEFAULT_IMAGE_ASPECT),
+            });
         }
 
         // 远程文件：下载到缓存
@@ -164,7 +193,12 @@ impl CoverService {
         let cache_path = cache_dir.join(format!("{}.jpg", hash));
 
         if cache_path.exists() {
-            return Ok(cache_path.to_string_lossy().to_string());
+            return Ok(CoverImage {
+                path: cache_path.to_string_lossy().to_string(),
+                aspect: probe_aspect(&cache_path)
+                    .await
+                    .unwrap_or(DEFAULT_IMAGE_ASPECT),
+            });
         }
 
         // HTTP 下载
@@ -192,7 +226,12 @@ impl CoverService {
         .await
         .ok();
 
-        Ok(cache_path.to_string_lossy().to_string())
+        Ok(CoverImage {
+            path: cache_path.to_string_lossy().to_string(),
+            aspect: probe_aspect(&cache_path)
+                .await
+                .unwrap_or(DEFAULT_IMAGE_ASPECT),
+        })
     }
 
     /// 当前终端是否支持用 Kitty 图形协议显示封面
@@ -227,8 +266,8 @@ impl CoverService {
             return;
         }
 
-        let path = match self.image_path.read().unwrap().clone() {
-            Some(p) => p,
+        let path = match self.image.read().unwrap().as_ref() {
+            Some(image) => image.path.clone(),
             None => return,
         };
 
@@ -273,49 +312,117 @@ impl CoverService {
     }
 }
 
-/// 终端单元格的高宽比。失败返回 2.0
-pub fn cell_aspect() -> f32 {
+/// 读图片文件头取像素宽高比，错误返回 None
+fn probe_aspect_blocking(path: &std::path::Path) -> Option<f32> {
+    let (width, height) = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(width as f32 / height as f32)
+}
+
+async fn probe_aspect(path: impl AsRef<std::path::Path>) -> Option<f32> {
+    let path = path.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || probe_aspect_blocking(&path))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 终端单元格的高宽比。失败返回回退值
+fn cell_aspect() -> f32 {
     let Some((columns, rows, width, height)) = terminal_window_size() else {
-        return 2.0;
+        return DEFAULT_CELL_ASPECT;
     };
-    if columns == 0 || rows == 0 || width == 0 || height == 0 {
-        return 2.0;
+    if columns == 0 || rows == 0 {
+        return DEFAULT_CELL_ASPECT;
     }
     let cell_width = f32::from(width) / f32::from(columns);
     let cell_height = f32::from(height) / f32::from(rows);
-    if cell_width <= 0.0 {
-        return 2.0;
-    }
-    (cell_height / cell_width).clamp(1.0, 4.0)
+    cell_height / cell_width
 }
 
-/// 封面框应有的高度，返回 0 表示放不下。
-pub fn cover_box_height(box_width: u16, max_height: u16, cell_aspect: f32) -> u16 {
-    let inner_width = box_width.saturating_sub(2);
-    if inner_width == 0 || max_height < 3 {
-        return 0;
-    }
-    let inner_height = (f32::from(inner_width) / cell_aspect).round().max(1.0) as u16;
-    inner_height.saturating_add(2).min(max_height)
+/// 封面排版参数
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoverGeometry {
+    /// 终端单元格的 高/宽
+    cell_aspect: f32,
+    /// 封面像素的 宽/高
+    image_aspect: f32,
 }
 
-/// 封面图片在框内 inner 区域中的实际位置。
-/// - 高度不够时压缩高度、水平居中、两侧留边
-/// - 返回的矩形永远落在 inner 之内
-/// - 封面尺寸假设 1:1，以避免额外的解码路径开销
-pub fn cover_image_rect(inner: Rect, cell_aspect: f32) -> Rect {
-    if inner.width == 0 || inner.height == 0 {
-        return Rect::ZERO;
+impl CoverGeometry {
+    /// 读当前终端和封面服务的实际参数
+    pub fn detect(cover: &CoverService) -> Self {
+        Self::new(cell_aspect(), cover.image_aspect())
     }
-    let fit_height = (f32::from(inner.width) / cell_aspect).round().max(1.0) as u16;
-    if fit_height <= inner.height {
-        let y = inner.y + (inner.height - fit_height) / 2;
-        return Rect::new(inner.x, y, inner.width, fit_height);
+
+    /// 拒绝 NaN、无穷、非正数等极端值
+    fn sanitize(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+        if value.is_finite() && value > 0.0 {
+            value.clamp(min, max)
+        } else {
+            fallback
+        }
     }
-    let fit_width =
-        ((f32::from(inner.height) * cell_aspect).round().max(1.0) as u16).clamp(1, inner.width);
-    let x = inner.x + (inner.width - fit_width) / 2;
-    Rect::new(x, inner.y, fit_width, inner.height)
+
+    pub fn new(cell_aspect: f32, image_aspect: f32) -> Self {
+        Self {
+            cell_aspect: cell_aspect,
+            image_aspect: CoverGeometry::sanitize(
+                image_aspect,
+                MIN_IMAGE_ASPECT,
+                MAX_IMAGE_ASPECT,
+                DEFAULT_IMAGE_ASPECT,
+            ),
+        }
+    }
+
+    /// 封面铺满 columns 列时要占的行数，至少 1 行
+    fn rows_for(self, columns: u16) -> u16 {
+        (f32::from(columns) / (self.image_aspect * self.cell_aspect))
+            .round()
+            .clamp(1.0, f32::from(u16::MAX)) as u16
+    }
+
+    /// 封面铺满 rows 行时要占的列数，至少 1 列
+    fn columns_for(self, rows: u16) -> u16 {
+        (f32::from(rows) * self.image_aspect * self.cell_aspect)
+            .round()
+            .clamp(1.0, f32::from(u16::MAX)) as u16
+    }
+
+    /// 封面框应有的高度（含边框），返回 0 表示放不下
+    pub fn box_height(self, box_width: u16, max_height: u16) -> u16 {
+        let inner_width = box_width.saturating_sub(2);
+        if inner_width == 0 || max_height < 3 {
+            return 0;
+        }
+        self.rows_for(inner_width).saturating_add(2).min(max_height)
+    }
+
+    /// 封面图片在框内 inner 区域中的实际位置。
+    /// - 高度充足时按宽度铺满、垂直居中
+    /// - 高度不够时压缩高度、水平居中、两侧留边
+    /// - 返回的矩形永远落在 inner 之内
+    pub fn image_rect(self, inner: Rect) -> Rect {
+        if inner.width == 0 || inner.height == 0 {
+            return Rect::ZERO;
+        }
+        let fit_height = self.rows_for(inner.width);
+        if fit_height <= inner.height {
+            let y = inner.y + (inner.height - fit_height) / 2;
+            return Rect::new(inner.x, y, inner.width, fit_height);
+        }
+        let fit_width = self.columns_for(inner.height).min(inner.width);
+        let x = inner.x + (inner.width - fit_width) / 2;
+        Rect::new(x, inner.y, fit_width, inner.height)
+    }
 }
 
 fn display_with_kitten(path: &str, area: Rect) -> bool {
@@ -468,34 +575,85 @@ mod tests {
 
     use ratatui::layout::Rect;
 
-    use super::{cover_box_height, cover_image_rect, kitten_icat_args, write_kitty_apc};
+    use super::{CoverGeometry, kitten_icat_args, probe_aspect_blocking, write_kitty_apc};
+
+    /// 方形封面 + 2:1 单元格
+    fn square() -> CoverGeometry {
+        CoverGeometry::new(2.0, 1.0)
+    }
 
     #[test]
-    fn cover_box_height_follows_the_cell_aspect() {
+    fn box_height_follows_the_cell_aspect() {
         // inner 宽 41 → 41/2 ≈ 21 行内容，加上下边框 = 23
-        assert_eq!(cover_box_height(43, 24, 2.0), 23);
+        assert_eq!(square().box_height(43, 24), 23);
         // 高度不够时被 max_height 压住
-        assert_eq!(cover_box_height(43, 8, 2.0), 8);
+        assert_eq!(square().box_height(43, 8), 8);
         // 连一行内容都放不下就整个不画
-        assert_eq!(cover_box_height(43, 2, 2.0), 0);
-        assert_eq!(cover_box_height(2, 24, 2.0), 0);
+        assert_eq!(square().box_height(43, 2), 0);
+        assert_eq!(square().box_height(2, 24), 0);
+    }
+
+    #[test]
+    fn box_height_follows_the_image_aspect() {
+        assert_eq!(CoverGeometry::new(2.0, 0.745).box_height(43, 40), 30);
+        assert_eq!(square().box_height(43, 40), 23);
+        assert_eq!(CoverGeometry::new(2.0, 1.78).box_height(43, 40), 14);
     }
 
     #[test]
     fn cover_image_is_centered_and_never_leaves_the_box() {
         // 高度充足：正好占满 inner
         let inner = Rect::new(5, 8, 40, 20);
-        assert_eq!(cover_image_rect(inner, 2.0), inner);
+        assert_eq!(square().image_rect(inner), inner);
 
         // 高度被压缩：按高度反推宽度，水平居中留边
         let squashed = Rect::new(5, 8, 40, 6);
-        let rect = cover_image_rect(squashed, 2.0);
-        assert_eq!(rect, Rect::new(19, 8, 12, 6));
-        assert_eq!(squashed.union(rect), squashed);
+        assert_eq!(square().image_rect(squashed), Rect::new(19, 8, 12, 6));
 
-        // 极端窄框也不会溢出
-        let tiny = Rect::new(0, 0, 3, 9);
-        assert_eq!(tiny.union(cover_image_rect(tiny, 2.0)), tiny);
+        // 任何比例、任何尺寸的框，图片都不能越界
+        for aspect in [0.2, 0.444, 0.745, 1.0, 1.78, 5.0] {
+            let geometry = CoverGeometry::new(2.0, aspect);
+            for width in [1, 3, 12, 41, 200] {
+                for height in [1, 2, 7, 23, 90] {
+                    let inner = Rect::new(5, 8, width, height);
+                    let rect = geometry.image_rect(inner);
+                    assert_eq!(inner.union(rect), inner, "{aspect} {width}x{height}");
+                    assert!(rect.width > 0 && rect.height > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn geometry_falls_back_on_degenerate_ratios() {
+        // 错误回退
+        assert_eq!(
+            CoverGeometry::new(0.0, f32::NAN),
+            CoverGeometry::new(0.0, super::DEFAULT_IMAGE_ASPECT)
+        );
+    }
+
+    #[test]
+    fn geometry_clamps_on_extreme_ratios() {
+        // 极端但有限的比例被夹进合理区间
+        assert_eq!(
+            CoverGeometry::new(2.0, 1000.0),
+            CoverGeometry::new(2.0, super::MAX_IMAGE_ASPECT)
+        );
+        assert_eq!(
+            CoverGeometry::new(2.0, 0.001),
+            CoverGeometry::new(2.0, super::MIN_IMAGE_ASPECT)
+        );
+    }
+
+    #[test]
+    fn probe_reads_dimensions_even_when_the_extension_lies() {
+        // 缓存文件名一律是 .jpg，实际内容却可能是任何格式
+        let path = std::env::temp_dir().join("voicefox-cover-probe.jpg");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(20, 10))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(probe_aspect_blocking(&path), Some(2.0));
     }
 
     #[test]
