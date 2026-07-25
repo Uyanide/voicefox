@@ -22,12 +22,19 @@ fn quality_to_bitrate(quality: Quality) -> u32 {
     }
 }
 
-/// 封面 fallback URL
-fn fallback_cover_url(song_id: &str) -> String {
-    format!(
-        "http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500&size=500&rid={}",
-        song_id
-    )
+/// 解析封面图片直链。
+///
+/// 优先走 musicInfo API；失败时退回 artistpicserver。后者不是图片地址，
+/// 而是个跳转服务，响应体是一行纯文本形式的真实图片地址。
+pub(super) async fn resolve_cover_url(client: &reqwest::Client, song_id: &str) -> Option<String> {
+    match fetch_cover_url(client, song_id).await {
+        Some(url) => Some(url),
+        None => fetch_artist_pic_url(client, song_id).await,
+    }
+}
+
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 /// 通过 musicInfo API 获取封面图片 URL
@@ -50,17 +57,35 @@ async fn fetch_cover_url(client: &reqwest::Client, song_id: &str) -> Option<Stri
         return None;
     }
 
-    json["data"]["pic"].as_str().map(|s| s.to_string())
+    json["data"]["pic"]
+        .as_str()
+        .map(str::trim)
+        .filter(|pic| is_http_url(pic))
+        .map(str::to_string)
+}
+
+/// 向 artistpicserver 要真实图片地址
+async fn fetch_artist_pic_url(client: &reqwest::Client, song_id: &str) -> Option<String> {
+    let url = format!(
+        "http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500&size=500&rid={}",
+        song_id
+    );
+
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let pic = resp.text().await.ok()?.trim().to_string();
+    is_http_url(&pic).then_some(pic)
 }
 
 pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, FetchError> {
     let client = http::client();
     let song_id = &song.id;
 
-    // Step 1: 获取封面（优先用 musicInfo，失败用 fallback）
-    let cover_url = fetch_cover_url(&client, song_id)
-        .await
-        .unwrap_or_else(|| fallback_cover_url(song_id));
+    // Step 1: 获取封面；拿不到则留空
+    let cover_url = resolve_cover_url(&client, song_id).await;
 
     // Step 2: 构造播放 URL 请求
     let bitrate = quality_to_bitrate(quality);
@@ -107,7 +132,7 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         url: url_text,
         quality,
         duration: song.duration,
-        cover_url: Some(cover_url),
+        cover_url,
         qualities,
         headers: vec![],
     })

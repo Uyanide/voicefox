@@ -222,11 +222,22 @@ impl MainPage {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
                 .split(area);
+            // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_LYRIC_HEIGHT。
+            let cell_aspect = crate::cover::cell_aspect();
+            let cover_height = crate::cover::cover_box_height(
+                columns[0].width,
+                columns[0]
+                    .height
+                    .saturating_sub(super::components::lyric::MIN_HEIGHT),
+                cell_aspect,
+            );
             let left = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .constraints([Constraint::Length(cover_height), Constraint::Min(0)])
                 .split(columns[0]);
-            render_cover_placeholder(left[0], buf, ctx);
+            if cover_height > 0 {
+                render_cover_placeholder(left[0], buf, ctx, cell_aspect);
+            }
             super::components::lyric::render(left[1], buf, ctx);
             self.render_queue(columns[1], buf, ctx);
         } else {
@@ -294,7 +305,7 @@ impl MainPage {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(format!(" Queue · {} songs ", songs.len()));
+            .title(format!(" 队列 · {} 歌曲 ", songs.len()));
         let inner = block.inner(area);
         block.render(area, buf);
         if songs.is_empty() {
@@ -378,15 +389,17 @@ fn queue_area(area: Rect) -> Rect {
     }
 }
 
-fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext, cell_aspect: f32) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(crate::theme::border(ctx)))
-        .title(" Cover ");
+        .title(" 封面 ");
     let inner = block.inner(area);
     block.render(area, buf);
-    if ctx.cover_service.has_image() {
-        ctx.cover_service.render(inner, buf);
+    // 只有终端真的能显示 Kitty 图片时才把 inner 留空，否则退回文字占位
+    if ctx.cover_service.has_image() && ctx.cover_service.kitty_available() {
+        ctx.cover_service
+            .set_display_area(crate::cover::cover_image_rect(inner, cell_aspect));
         return;
     }
     let cover_state = ctx.cover_service.state();
@@ -396,7 +409,7 @@ fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "NO COVER",
+                    "等待播放",
                     Style::new().fg(crate::theme::muted(ctx)),
                 )),
             ]
@@ -419,8 +432,10 @@ fn render_cover_placeholder(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
                     match &cover_state {
                         crate::cover::CoverState::Loading => "封面加载中...",
                         crate::cover::CoverState::Unavailable(_) => "封面不可用",
-                        crate::cover::CoverState::Empty => "等待播放",
-                        crate::cover::CoverState::Ready => "封面已就绪",
+                        // current_song 非 None 但无封面 <-> 封面被禁用
+                        crate::cover::CoverState::Empty => "",
+                        // 封面就绪但是终端无法显示
+                        crate::cover::CoverState::Ready => "封面无法显示",
                     },
                     Style::new().fg(crate::theme::muted(ctx)),
                 )),

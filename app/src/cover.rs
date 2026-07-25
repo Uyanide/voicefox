@@ -5,9 +5,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::Widget;
 use reqwest::header::{ACCEPT, REFERER};
 
 const VOICEFOX_KITTY_IMAGE_ID: u32 = 0x56_46_58;
@@ -30,10 +28,12 @@ pub struct CoverService {
     display_gen: AtomicU64,
     /// 已显示到终端的版本号
     displayed_gen: AtomicU64,
-    /// 上次显示封面时使用的终端区域
+    /// 上次显示封面时使用的终端区域，区域变化（如窗口缩放）时需要重新传输
     displayed_area: RwLock<Option<Rect>>,
     /// Kitty 图层中当前是否有 voicefox 封面
     image_visible: AtomicBool,
+    /// 最近一帧封面的目标区域（封面框的 inner），由 set_display_area 记录
+    display_area: RwLock<Rect>,
 }
 
 impl CoverService {
@@ -56,6 +56,7 @@ impl CoverService {
             displayed_gen: AtomicU64::new(0),
             displayed_area: RwLock::new(None),
             image_visible: AtomicBool::new(false),
+            display_area: RwLock::new(Rect::ZERO),
         }
     }
 
@@ -194,31 +195,29 @@ impl CoverService {
         Ok(cache_path.to_string_lossy().to_string())
     }
 
-    /// 在指定的终端区域显示封面（使用 Kitty 协议）
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        // 在 TUI 中留出空白区域（Kitty 图片会浮动在上方）
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(ratatui::style::Style::new().fg(ratatui::style::Color::DarkGray))
-            .title("封面");
-        block.render(area, buf);
+    /// 当前终端是否支持用 Kitty 图形协议显示封面
+    pub fn kitty_available(&self) -> bool {
+        // tmux 里 TERM 是 screen/tmux，环境探测必然失败，改由 kitten icat 透传承担
+        is_tmux_session()
+            || supports_kitty_graphics() && viuer::get_kitty_support() != viuer::KittySupport::None
+    }
+
+    /// 记录本帧封面图片应占据的区域（TUI 中该区域留空，Kitty 图片浮动在上方）。
+    /// 必须传入封面框的 inner，否则图片会盖住边框。
+    pub fn set_display_area(&self, area: Rect) {
+        *self.display_area.write().unwrap() = area;
     }
 
     /// 在终端中使用 Kitty 协议显示封面（必须在 terminal.draw() 之后调用）
-    pub fn display_kitty(&self, area: Rect) {
+    pub fn display_kitty(&self) {
+        let area = *self.display_area.read().unwrap();
+        if area.width == 0 || area.height == 0 {
+            // 本帧没有封面位置（窗口过窄、或没画封面框），移除已经显示的图片
+            self.clear_display();
+            return;
+        }
         let current_gen = self.display_gen.load(Ordering::SeqCst);
-        let area = cover_image_area(area);
-        let in_tmux = is_tmux_session();
-        if current_gen == 0
-            || area.width == 0
-            || area.height == 0
-            || !in_tmux
-                && (!supports_kitty_graphics()
-                    || viuer::get_kitty_support() == viuer::KittySupport::None)
-        {
+        if current_gen == 0 || !self.kitty_available() {
             return;
         }
         // 同一张图且终端区域未变化时不重复传输。
@@ -240,7 +239,7 @@ impl CoverService {
         // 先清除旧图片，避免新旧图层重叠
         self.clear_display();
 
-        let displayed = if in_tmux {
+        let displayed = if is_tmux_session() {
             display_with_kitten(&path, area)
         } else {
             // 普通终端继续使用 viuer 的 Kitty 协议支持。
@@ -274,16 +273,49 @@ impl CoverService {
     }
 }
 
-fn cover_image_area(area: Rect) -> Rect {
-    if area.width <= 2 || area.height <= 2 {
-        return Rect::default();
+/// 终端单元格的高宽比。失败返回 2.0
+pub fn cell_aspect() -> f32 {
+    let Some((columns, rows, width, height)) = terminal_window_size() else {
+        return 2.0;
+    };
+    if columns == 0 || rows == 0 || width == 0 || height == 0 {
+        return 2.0;
     }
-    Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    )
+    let cell_width = f32::from(width) / f32::from(columns);
+    let cell_height = f32::from(height) / f32::from(rows);
+    if cell_width <= 0.0 {
+        return 2.0;
+    }
+    (cell_height / cell_width).clamp(1.0, 4.0)
+}
+
+/// 封面框应有的高度，返回 0 表示放不下。
+pub fn cover_box_height(box_width: u16, max_height: u16, cell_aspect: f32) -> u16 {
+    let inner_width = box_width.saturating_sub(2);
+    if inner_width == 0 || max_height < 3 {
+        return 0;
+    }
+    let inner_height = (f32::from(inner_width) / cell_aspect).round().max(1.0) as u16;
+    inner_height.saturating_add(2).min(max_height)
+}
+
+/// 封面图片在框内 inner 区域中的实际位置。
+/// - 高度不够时压缩高度、水平居中、两侧留边
+/// - 返回的矩形永远落在 inner 之内
+/// - 封面尺寸假设 1:1，以避免额外的解码路径开销
+pub fn cover_image_rect(inner: Rect, cell_aspect: f32) -> Rect {
+    if inner.width == 0 || inner.height == 0 {
+        return Rect::ZERO;
+    }
+    let fit_height = (f32::from(inner.width) / cell_aspect).round().max(1.0) as u16;
+    if fit_height <= inner.height {
+        let y = inner.y + (inner.height - fit_height) / 2;
+        return Rect::new(inner.x, y, inner.width, fit_height);
+    }
+    let fit_width =
+        ((f32::from(inner.height) * cell_aspect).round().max(1.0) as u16).clamp(1, inner.width);
+    let x = inner.x + (inner.width - fit_width) / 2;
+    Rect::new(x, inner.y, fit_width, inner.height)
 }
 
 fn display_with_kitten(path: &str, area: Rect) -> bool {
@@ -436,15 +468,34 @@ mod tests {
 
     use ratatui::layout::Rect;
 
-    use super::{cover_image_area, kitten_icat_args, write_kitty_apc};
+    use super::{cover_box_height, cover_image_rect, kitten_icat_args, write_kitty_apc};
 
     #[test]
-    fn cover_image_stays_inside_the_border() {
-        assert_eq!(
-            cover_image_area(Rect::new(4, 7, 30, 12)),
-            Rect::new(5, 8, 28, 10)
-        );
-        assert_eq!(cover_image_area(Rect::new(0, 0, 2, 2)), Rect::default());
+    fn cover_box_height_follows_the_cell_aspect() {
+        // inner 宽 41 → 41/2 ≈ 21 行内容，加上下边框 = 23
+        assert_eq!(cover_box_height(43, 24, 2.0), 23);
+        // 高度不够时被 max_height 压住
+        assert_eq!(cover_box_height(43, 8, 2.0), 8);
+        // 连一行内容都放不下就整个不画
+        assert_eq!(cover_box_height(43, 2, 2.0), 0);
+        assert_eq!(cover_box_height(2, 24, 2.0), 0);
+    }
+
+    #[test]
+    fn cover_image_is_centered_and_never_leaves_the_box() {
+        // 高度充足：正好占满 inner
+        let inner = Rect::new(5, 8, 40, 20);
+        assert_eq!(cover_image_rect(inner, 2.0), inner);
+
+        // 高度被压缩：按高度反推宽度，水平居中留边
+        let squashed = Rect::new(5, 8, 40, 6);
+        let rect = cover_image_rect(squashed, 2.0);
+        assert_eq!(rect, Rect::new(19, 8, 12, 6));
+        assert_eq!(squashed.union(rect), squashed);
+
+        // 极端窄框也不会溢出
+        let tiny = Rect::new(0, 0, 3, 9);
+        assert_eq!(tiny.union(cover_image_rect(tiny, 2.0)), tiny);
     }
 
     #[test]

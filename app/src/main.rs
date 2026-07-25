@@ -73,7 +73,6 @@ struct UiAreas {
     tabs: Rect,
     content: Rect,
     progress: Rect,
-    cover: Rect,
 }
 
 #[derive(Debug, Default)]
@@ -278,6 +277,8 @@ fn run_app(
 
     // 事件驱动渲染：借鉴 rmpc，只在有事件或需要渲染时才 draw()
     let mut needs_render = true;
+    // 播放器状态由播放线程改写，没有事件通知，只能靠比对上一轮的值发现变化
+    let mut last_player_state = *ctx.player_state.borrow();
     let max_fps = ctx.config.read().unwrap().ui.max_fps.clamp(1, 60);
     let render_interval = Duration::from_millis(1_000 / u64::from(max_fps));
     let mut last_periodic_render = Instant::now();
@@ -718,9 +719,15 @@ fn run_app(
             last_notification_cleanup = Instant::now();
         }
 
+        // borrow 很便宜，所以不受 render_interval 门控
+        let state = *ctx.player_state.borrow();
+        if state != last_player_state {
+            last_player_state = state;
+            needs_render = true;
+        }
+
         if last_periodic_render.elapsed() >= render_interval {
             ctx.lyric_service.update_position(*ctx.position.borrow());
-            let state = *ctx.player_state.borrow();
             let input_active = active_tab == NavTab::Search
                 && search_page.lock().unwrap().input_mode
                 || active_tab == NavTab::Settings && settings_page.lock().unwrap().input_mode
@@ -1531,6 +1538,8 @@ fn run_app(
                 );
             }
             needs_render = true;
+        } else if matches!(terminal_event, Some(Event::Resize(_, _))) {
+            needs_render = true;
         }
 
         if active_tab == NavTab::Leaderboard {
@@ -1601,6 +1610,8 @@ fn draw_app(
     if active_tab != NavTab::Main {
         ctx.cover_service.clear_display();
     }
+    // 封面位置每帧重新记录，先清零，避免窗口过窄不画封面时沿用上一帧的区域
+    ctx.cover_service.set_display_area(Rect::ZERO);
     terminal.draw(|frame| {
         let area = frame.area();
         frame.render_widget(
@@ -1625,20 +1636,10 @@ fn draw_app(
         components::header::render(main_chunks[0], frame.buffer_mut(), ctx);
         pages::sidebar::render(main_chunks[1], frame.buffer_mut(), active_tab, ctx);
         let content_area = main_chunks[2];
-        // 封面区域：匹配 main_page 中 render_cover_placeholder 的位置
-        let cover_area = if active_tab == NavTab::Main && content_area.width >= 72 {
-            let col_w = content_area.width * 36 / 100;
-            let left_w = col_w;
-            let left_h = content_area.height * 62 / 100;
-            Rect::new(content_area.x, content_area.y, left_w, left_h)
-        } else {
-            Rect::default()
-        };
         *ui_areas = UiAreas {
             tabs: main_chunks[1],
             content: content_area,
             progress: main_chunks[3],
-            cover: cover_area,
         };
 
         match active_tab {
@@ -1820,7 +1821,7 @@ fn draw_app(
     })?;
     // 在 Kitty 终端中显示封面（draw 之后，浮动在 TUI 上方）
     if active_tab == NavTab::Main {
-        ctx.cover_service.display_kitty(ui_areas.cover);
+        ctx.cover_service.display_kitty();
     }
     Ok(())
 }
@@ -2079,13 +2080,18 @@ fn start_song_playback(
     let lyric_generation = ctx.lyric_service.prepare();
     let show_cover = ctx.config.read().unwrap().ui.show_cover;
     let cover_service = Arc::clone(&ctx.cover_service);
+    // 队列里的 SongInfo 通常已经带了封面地址，先用它加载一次，不必等播放地址解析完。
+    let initial_cover = song.cover_url.clone();
     if show_cover {
-        let initial_cover = song.cover_url.clone();
+        let initial_cover = initial_cover.clone();
         let cover = Arc::clone(&cover_service);
+        let wake_tx = action_tx.clone();
         rt.spawn(async move {
             if let Err(error) = cover.load(initial_cover).await {
                 tracing::debug!("load initial cover failed: {}", error);
             }
+            // 封面加载不会产生任何事件，暂停时必须主动唤醒渲染循环
+            let _ = wake_tx.send(AppAction::None);
         });
     } else {
         cover_service.clear();
@@ -2202,9 +2208,16 @@ fn start_song_playback(
             resolved_song.source.as_str()
         ))));
 
-        if show_cover && let Err(error) = cover_service.load(resolved_song.cover_url.clone()).await
+        // - 解析结果无封面时不加载
+        // - 解析后的封面地址跟队列里的相同时不再重复加载
+        if show_cover
+            && resolved_song.cover_url.is_some()
+            && resolved_song.cover_url != initial_cover
         {
-            tracing::debug!("load cover failed: {}", error);
+            if let Err(error) = cover_service.load(resolved_song.cover_url.clone()).await {
+                tracing::debug!("load cover failed: {}", error);
+            }
+            let _ = tx.send(AppAction::None);
         }
     });
 }
