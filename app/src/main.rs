@@ -277,6 +277,8 @@ fn run_app(
 
     // 事件驱动渲染：借鉴 rmpc，只在有事件或需要渲染时才 draw()
     let mut needs_render = true;
+    // 播放器状态由播放线程改写，没有事件通知，只能靠比对上一轮的值发现变化
+    let mut last_player_state = *ctx.player_state.borrow();
     let max_fps = ctx.config.read().unwrap().ui.max_fps.clamp(1, 60);
     let render_interval = Duration::from_millis(1_000 / u64::from(max_fps));
     let mut last_periodic_render = Instant::now();
@@ -717,9 +719,15 @@ fn run_app(
             last_notification_cleanup = Instant::now();
         }
 
+        // borrow 很便宜，所以不受 render_interval 门控
+        let state = *ctx.player_state.borrow();
+        if state != last_player_state {
+            last_player_state = state;
+            needs_render = true;
+        }
+
         if last_periodic_render.elapsed() >= render_interval {
             ctx.lyric_service.update_position(*ctx.position.borrow());
-            let state = *ctx.player_state.borrow();
             let input_active = active_tab == NavTab::Search
                 && search_page.lock().unwrap().input_mode
                 || active_tab == NavTab::Settings && settings_page.lock().unwrap().input_mode
@@ -1530,6 +1538,8 @@ fn run_app(
                 );
             }
             needs_render = true;
+        } else if matches!(terminal_event, Some(Event::Resize(_, _))) {
+            needs_render = true;
         }
 
         if active_tab == NavTab::Leaderboard {
@@ -2193,9 +2203,12 @@ fn start_song_playback(
             resolved_song.source.as_str()
         ))));
 
-        if show_cover && let Err(error) = cover_service.load(resolved_song.cover_url.clone()).await
-        {
-            tracing::debug!("load cover failed: {}", error);
+        if show_cover {
+            if let Err(error) = cover_service.load(resolved_song.cover_url.clone()).await {
+                tracing::debug!("load cover failed: {}", error);
+            }
+            // 封面加载不会产生任何事件，暂停时必须主动唤醒渲染循环
+            let _ = tx.send(AppAction::None);
         }
     });
 }
