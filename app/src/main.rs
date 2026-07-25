@@ -2080,13 +2080,18 @@ fn start_song_playback(
     let lyric_generation = ctx.lyric_service.prepare();
     let show_cover = ctx.config.read().unwrap().ui.show_cover;
     let cover_service = Arc::clone(&ctx.cover_service);
+    // 队列里的 SongInfo 通常已经带了封面地址，先用它加载一次，不必等播放地址解析完。
+    let initial_cover = song.cover_url.clone();
     if show_cover {
-        let initial_cover = song.cover_url.clone();
+        let initial_cover = initial_cover.clone();
         let cover = Arc::clone(&cover_service);
+        let wake_tx = action_tx.clone();
         rt.spawn(async move {
             if let Err(error) = cover.load(initial_cover).await {
                 tracing::debug!("load initial cover failed: {}", error);
             }
+            // 封面加载不会产生任何事件，暂停时必须主动唤醒渲染循环
+            let _ = wake_tx.send(AppAction::None);
         });
     } else {
         cover_service.clear();
@@ -2203,11 +2208,15 @@ fn start_song_playback(
             resolved_song.source.as_str()
         ))));
 
-        if show_cover {
+        // - 解析结果无封面时不加载
+        // - 解析后的封面地址跟队列里的相同时不再重复加载
+        if show_cover
+            && resolved_song.cover_url.is_some()
+            && resolved_song.cover_url != initial_cover
+        {
             if let Err(error) = cover_service.load(resolved_song.cover_url.clone()).await {
                 tracing::debug!("load cover failed: {}", error);
             }
-            // 封面加载不会产生任何事件，暂停时必须主动唤醒渲染循环
             let _ = tx.send(AppAction::None);
         }
     });

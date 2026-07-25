@@ -312,8 +312,8 @@ pub fn cover_image_rect(inner: Rect, cell_aspect: f32) -> Rect {
         let y = inner.y + (inner.height - fit_height) / 2;
         return Rect::new(inner.x, y, inner.width, fit_height);
     }
-    let fit_width = ((f32::from(inner.height) * cell_aspect).round().max(1.0) as u16)
-        .clamp(1, inner.width);
+    let fit_width =
+        ((f32::from(inner.height) * cell_aspect).round().max(1.0) as u16).clamp(1, inner.width);
     let x = inner.x + (inner.width - fit_width) / 2;
     Rect::new(x, inner.y, fit_width, inner.height)
 }
