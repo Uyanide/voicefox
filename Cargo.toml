@@ -25,7 +25,7 @@ clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["default-formats"] }
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
