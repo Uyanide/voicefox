@@ -6,6 +6,9 @@ mod cli;
 mod config;
 mod context;
 mod cover;
+#[cfg(target_os = "linux")]
+mod mpris;
+mod notification;
 mod pages;
 mod playlist;
 mod storage;
@@ -38,6 +41,7 @@ use tokio::sync::mpsc;
 
 use context::AppContext;
 use pages::components;
+use pages::components::context_menu::{MenuOutcome, SongContextMenu, SongMenuAction, SongMenuKind};
 use pages::sidebar::NavTab;
 
 enum LeaderboardResponse {
@@ -73,6 +77,7 @@ struct UiAreas {
     tabs: Rect,
     content: Rect,
     progress: Rect,
+    notification: Rect,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +124,88 @@ fn delete_confirmation_action(key: &crossterm::event::KeyEvent) -> DeleteConfirm
         | (KeyModifiers::NONE, KeyCode::Esc) => DeleteConfirmationAction::Cancel,
         _ => DeleteConfirmationAction::Ignore,
     }
+}
+
+fn nav_page_scope(tab: NavTab) -> &'static str {
+    match tab {
+        NavTab::Main => "main",
+        NavTab::Search => "search",
+        NavTab::Leaderboard => "leaderboard",
+        NavTab::Playlists => "playlists",
+        NavTab::Favorites => "favorites",
+        NavTab::History => "history",
+        NavTab::LocalMusic => "local",
+        NavTab::Settings => "settings",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_song_menu_action(
+    action: SongMenuAction,
+    menu: &SongContextMenu,
+    main_page: &mut pages::main_page::MainPage,
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    search_seq: &Arc<AtomicU64>,
+    confirm_delete: &mut Option<LocalDeleteConfirmation>,
+) {
+    let app_action = match action {
+        SongMenuAction::Play => AppAction::PlaySong {
+            songs: menu.songs().to_vec(),
+            index: menu.index(),
+        },
+        SongMenuAction::PlayNext => AppAction::AddToQueue {
+            song: Box::new(menu.song().clone()),
+            position: InsertPosition::Next,
+        },
+        SongMenuAction::AddToQueue => AppAction::AddToQueue {
+            song: Box::new(menu.song().clone()),
+            position: InsertPosition::End,
+        },
+        SongMenuAction::ToggleFavorite => {
+            let song = menu.song();
+            let message = if ctx.storage.is_favorite(song) {
+                ctx.storage.remove_favorite(song);
+                "已取消收藏"
+            } else {
+                ctx.storage.add_favorite(song);
+                "已添加收藏"
+            };
+            ctx.notify(Notification::success(message));
+            AppAction::None
+        }
+        SongMenuAction::RemoveFromQueue => {
+            let action = main_page.remove_at(menu.index(), ctx);
+            ctx.notify(Notification::success(format!(
+                "已从队列移除: {}",
+                menu.song().name
+            )));
+            action
+        }
+        SongMenuAction::DeleteLocal => {
+            if let Some(path) = &menu.song().file_path {
+                *confirm_delete = Some(LocalDeleteConfirmation {
+                    name: menu.song().name.clone(),
+                    path: path.clone(),
+                });
+            } else {
+                ctx.notify(Notification::error("无法删除：没有本地文件路径"));
+            }
+            AppAction::None
+        }
+    };
+    execute_action(
+        app_action,
+        ctx,
+        rt,
+        action_tx,
+        search_page,
+        settings_page,
+        search_seq,
+    );
 }
 
 fn main() -> anyhow::Result<()> {
@@ -215,6 +302,32 @@ fn configure_background_command(command: &mut std::process::Command) {
     let _ = command;
 }
 
+fn open_external_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    configure_background_command(&mut command);
+    if let Err(error) = command.spawn() {
+        tracing::warn!("failed to open notification URL: {error}");
+    }
+}
+
 #[allow(unused_assignments)]
 fn run_app(
     terminal: &mut DefaultTerminal,
@@ -225,6 +338,19 @@ fn run_app(
     let (leaderboard_tx, mut leaderboard_rx) = mpsc::unbounded_channel::<LeaderboardResponse>();
     let (playlist_tx, mut playlist_rx) = mpsc::unbounded_channel::<PlaylistResponse>();
     let mut player_event_rx = ctx.player.take_event_receiver();
+    #[cfg(target_os = "linux")]
+    let (mpris_handle, mut mpris_command_rx) = if ctx.config.read().unwrap().integration.mpris {
+        match rt.block_on(mpris::start()) {
+            Ok((handle, receiver)) => (Some(handle), Some(receiver)),
+            Err(error) => {
+                tracing::warn!("MPRIS unavailable: {error}");
+                ctx.notify(Notification::warning(format!("MPRIS 启动失败: {error}")).tui_only());
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     // 搜索请求序列号（用于取消过时请求）
     let search_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -268,6 +394,7 @@ fn run_app(
     let mut local_selected: usize = 0;
     let mut local_scroll: usize = 0;
     let mut confirm_delete: Option<LocalDeleteConfirmation> = None;
+    let mut song_menu: Option<SongContextMenu> = None;
     let mut ui_areas = UiAreas::default();
     let mut click_tracker = ClickTracker::default();
     let mut bili_login_page: Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>> = None;
@@ -284,6 +411,10 @@ fn run_app(
     let mut last_periodic_render = Instant::now();
     let mut last_notification_cleanup = Instant::now();
     let mut mouse_capture_enabled = ctx.config.read().unwrap().ui.enable_mouse;
+    #[cfg(target_os = "linux")]
+    let mut last_mpris_snapshot: Option<mpris::MprisSnapshot> = None;
+    #[cfg(target_os = "linux")]
+    let mut last_mpris_update = Instant::now() - Duration::from_secs(1);
 
     // === 后台异步加载 JS 音源（不阻塞启动） ===
     let js_urls = ctx.config.read().unwrap().source.js_sources.clone();
@@ -330,7 +461,7 @@ fn run_app(
             match tokio::time::timeout(Duration::from_secs(8), bili_source.login_status()).await {
                 Ok(Ok(Some(_))) => {}
                 Ok(Ok(None)) => {
-                    let _ = tx.send(AppAction::ShowNotification(Notification::info(
+                    let _ = tx.send(AppAction::ShowNotification(Notification::warning(
                         "哔哩哔哩登录已失效，请重新扫码",
                     )));
                 }
@@ -342,6 +473,27 @@ fn run_app(
     }
 
     loop {
+        #[cfg(target_os = "linux")]
+        if let Some(receiver) = mpris_command_rx.as_mut() {
+            while let Ok(command) = receiver.try_recv() {
+                if execute_mpris_command(
+                    command,
+                    &ctx,
+                    rt,
+                    &action_tx,
+                    &search_page,
+                    &settings_page,
+                    &search_seq,
+                ) {
+                    tracing::info!("quit requested through MPRIS");
+                    ctx.player.stop();
+                    ctx.cover_service.clear_display();
+                    return Ok(());
+                }
+                needs_render = true;
+            }
+        }
+
         let mouse_requested = ctx.config.read().unwrap().ui.enable_mouse;
         if mouse_requested != mouse_capture_enabled {
             if mouse_requested {
@@ -435,10 +587,7 @@ fn run_app(
                     } else {
                         "哔哩哔哩登录成功".to_string()
                     };
-                    ctx.notifications
-                        .write()
-                        .unwrap()
-                        .push_back(Notification::info(msg));
+                    ctx.notify(Notification::success(msg));
                     needs_render = true;
                     continue;
                 }
@@ -451,10 +600,10 @@ fn run_app(
                     }
                     bili_login_page = None;
                     let notification = match ctx.bili_source.logout() {
-                        Ok(()) => Notification::info("已退出哔哩哔哩登录"),
+                        Ok(()) => Notification::success("已退出哔哩哔哩登录"),
                         Err(error) => Notification::error(error),
                     };
-                    ctx.notifications.write().unwrap().push_back(notification);
+                    ctx.notify(notification);
                     needs_render = true;
                     continue;
                 }
@@ -498,17 +647,14 @@ fn run_app(
                             tracing::warn!("current source playback failed: {}", error);
                             if let Some(song) = retry_song {
                                 let _ = action_tx.send(AppAction::ShowNotification(
-                                    Notification::info("当前音源播放失败，正在尝试其他音源"),
+                                    Notification::warning("当前音源播放失败，正在尝试其他音源"),
                                 ));
                                 let _ = action_tx.send(AppAction::RetrySong {
                                     song: Box::new(song),
                                 });
                             }
                         } else {
-                            ctx.notifications
-                                .write()
-                                .unwrap()
-                                .push_back(Notification::error(format!("播放器错误: {}", error)));
+                            ctx.notify(Notification::error(format!("播放器错误: {}", error)));
                         }
                     }
                     PlayerEvent::Buffering(_) => {}
@@ -532,12 +678,7 @@ fn run_app(
                             let request =
                                 pages::leaderboard::LeaderboardLoadRequest::Boards { source };
                             leaderboard.update_error(&request, error.clone());
-                            ctx.notifications
-                                .write()
-                                .unwrap()
-                                .push_back(Notification::error(format!(
-                                    "加载榜单目录失败: {error}"
-                                )));
+                            ctx.notify(Notification::error(format!("加载榜单目录失败: {error}")));
                         }
                     }
                     needs_render = true;
@@ -560,12 +701,7 @@ fn run_app(
                                 board_id,
                             };
                             leaderboard.update_error(&request, error.clone());
-                            ctx.notifications
-                                .write()
-                                .unwrap()
-                                .push_back(Notification::error(format!(
-                                    "加载榜单歌曲失败: {error}"
-                                )));
+                            ctx.notify(Notification::error(format!("加载榜单歌曲失败: {error}")));
                         }
                     }
                     needs_render = true;
@@ -587,12 +723,7 @@ fn run_app(
                         Err(error) => {
                             let request = pages::playlists::PlaylistLoadRequest::List { source };
                             playlists.update_error(&request, error.clone());
-                            ctx.notifications
-                                .write()
-                                .unwrap()
-                                .push_back(Notification::error(format!(
-                                    "加载热门歌单失败: {error}"
-                                )));
+                            ctx.notify(Notification::error(format!("加载热门歌单失败: {error}")));
                         }
                     }
                     needs_render = true;
@@ -616,12 +747,7 @@ fn run_app(
                                 playlist_id,
                             };
                             playlists.update_error(&request, error.clone());
-                            ctx.notifications
-                                .write()
-                                .unwrap()
-                                .push_back(Notification::error(format!(
-                                    "加载歌单歌曲失败: {error}"
-                                )));
+                            ctx.notify(Notification::error(format!("加载歌单歌曲失败: {error}")));
                         }
                     }
                     needs_render = true;
@@ -710,9 +836,15 @@ fn run_app(
         }
 
         if last_notification_cleanup.elapsed() >= Duration::from_millis(250) {
+            let notifications_enabled = ctx.config.read().unwrap().notification.in_app;
+            let lifetime = ctx.notification_timeout();
             let mut notifs = ctx.notifications.write().unwrap();
             let previous_len = notifs.len();
-            notifs.retain(|notification| !notification.is_expired(Duration::from_secs(5)));
+            if notifications_enabled {
+                notifs.retain(|notification| !notification.is_expired(lifetime));
+            } else {
+                notifs.clear();
+            }
             if notifs.len() != previous_len {
                 needs_render = true;
             }
@@ -724,6 +856,17 @@ fn run_app(
         if state != last_player_state {
             last_player_state = state;
             needs_render = true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = mpris_handle.as_ref()
+            && last_mpris_update.elapsed() >= Duration::from_millis(250)
+        {
+            let snapshot = current_mpris_snapshot(&ctx);
+            if last_mpris_snapshot.as_ref() != Some(&snapshot) {
+                handle.update(snapshot.clone());
+                last_mpris_snapshot = Some(snapshot);
+            }
+            last_mpris_update = Instant::now();
         }
 
         if last_periodic_render.elapsed() >= render_interval {
@@ -762,6 +905,7 @@ fn run_app(
                 &mut local_scroll,
                 &mut ui_areas,
                 &confirm_delete,
+                &song_menu,
                 &bili_login_page,
             )?;
             needs_render = false;
@@ -820,13 +964,10 @@ fn run_app(
                                 local_selected = local_selected.min(remaining.saturating_sub(1));
                                 local_scroll = local_scroll.min(remaining.saturating_sub(1));
 
-                                ctx.notifications
-                                    .write()
-                                    .unwrap()
-                                    .push_back(Notification::info(format!(
-                                        "已删除本地文件: {}",
-                                        confirmation.name
-                                    )));
+                                ctx.notify(Notification::success(format!(
+                                    "已删除本地文件: {}",
+                                    confirmation.name
+                                )));
                                 let config = ctx.config.read().unwrap();
                                 let paths = config.local_music.paths.clone();
                                 let max_depth = config.local_music.max_depth;
@@ -842,13 +983,10 @@ fn run_app(
                                 );
                             }
                             Err(error) => {
-                                ctx.notifications
-                                    .write()
-                                    .unwrap()
-                                    .push_back(Notification::error(format!(
-                                        "删除本地文件失败: {}",
-                                        error
-                                    )));
+                                ctx.notify(Notification::error(format!(
+                                    "删除本地文件失败: {}",
+                                    error
+                                )));
                             }
                         }
                     }
@@ -856,6 +994,33 @@ fn run_app(
                         confirm_delete = None;
                     }
                     DeleteConfirmationAction::Ignore => {}
+                }
+                needs_render = true;
+                continue;
+            }
+
+            if let Some(menu) = song_menu.as_mut() {
+                let outcome = menu.handle_key(&key, &kb_resolver, nav_page_scope(active_tab));
+                match outcome {
+                    MenuOutcome::None => {}
+                    MenuOutcome::Close => {
+                        song_menu = None;
+                    }
+                    MenuOutcome::Action(action) => {
+                        let menu = song_menu.take().unwrap();
+                        execute_song_menu_action(
+                            action,
+                            &menu,
+                            &mut main_page,
+                            &ctx,
+                            rt,
+                            &action_tx,
+                            &search_page,
+                            &settings_page,
+                            &search_seq,
+                            &mut confirm_delete,
+                        );
+                    }
                 }
                 needs_render = true;
                 continue;
@@ -926,12 +1091,13 @@ fn run_app(
                             crate::config::loader::save(&config, &ctx.config_path)
                         };
                         let notification = match save_result {
-                            Ok(()) => Notification::info(format!("播放模式: {}", mode.label())),
-                            Err(error) => {
-                                Notification::error(format!("播放模式已切换，但保存失败: {}", error))
-                            }
+                            Ok(()) => Notification::success(format!("播放模式: {}", mode.label())),
+                            Err(error) => Notification::error(format!(
+                                "播放模式已切换，但保存失败: {}",
+                                error
+                            )),
                         };
-                        ctx.notifications.write().unwrap().push_back(notification);
+                        ctx.notify(notification);
                         needs_render = true;
                         continue;
                     }
@@ -1020,12 +1186,12 @@ fn run_app(
                             if ctx.storage.is_favorite(song) {
                                 ctx.storage.remove_favorite(song);
                                 let _ = action_tx.send(AppAction::ShowNotification(
-                                    Notification::info("已取消收藏"),
+                                    Notification::success("已取消收藏"),
                                 ));
                             } else {
                                 ctx.storage.add_favorite(song);
                                 let _ = action_tx.send(AppAction::ShowNotification(
-                                    Notification::info("已添加收藏"),
+                                    Notification::success("已添加收藏"),
                                 ));
                             }
                         }
@@ -1183,7 +1349,12 @@ fn run_app(
                     );
                 }
                 NavTab::History => {
-                    let action = pages::history::handle_input(&key, &ctx, &mut history_selected, &kb_resolver);
+                    let action = pages::history::handle_input(
+                        &key,
+                        &ctx,
+                        &mut history_selected,
+                        &kb_resolver,
+                    );
                     // 保持在历史页面，不强制切换到主页
                     execute_action(
                         action,
@@ -1314,9 +1485,9 @@ fn run_app(
                                             path: path.clone(),
                                         });
                                     } else {
-                                        ctx.notifications.write().unwrap().push_back(
-                                            Notification::error("无法删除：没有本地文件路径"),
-                                        );
+                                        ctx.notify(Notification::error(
+                                            "无法删除：没有本地文件路径",
+                                        ));
                                     }
                                 }
                             }
@@ -1445,9 +1616,9 @@ fn run_app(
                                             path: path.clone(),
                                         });
                                     } else {
-                                        ctx.notifications.write().unwrap().push_back(
-                                            Notification::error("无法删除：没有本地文件路径"),
-                                        );
+                                        ctx.notify(Notification::error(
+                                            "无法删除：没有本地文件路径",
+                                        ));
                                     }
                                 }
                             }
@@ -1463,9 +1634,49 @@ fn run_app(
                 continue;
             }
             let mouse = *mouse;
+
+            if let Some(menu) = song_menu.as_mut() {
+                let outcome = menu.handle_mouse(mouse, ui_areas.content);
+                match outcome {
+                    MenuOutcome::None => {}
+                    MenuOutcome::Close => {
+                        song_menu = None;
+                    }
+                    MenuOutcome::Action(action) => {
+                        let menu = song_menu.take().unwrap();
+                        execute_song_menu_action(
+                            action,
+                            &menu,
+                            &mut main_page,
+                            &ctx,
+                            rt,
+                            &action_tx,
+                            &search_page,
+                            &settings_page,
+                            &search_seq,
+                            &mut confirm_delete,
+                        );
+                    }
+                }
+                needs_render = true;
+                continue;
+            }
+
             let activate = click_tracker.is_double_click(mouse);
             let position = Position::new(mouse.column, mouse.row);
-            if ui_areas.tabs.contains(position)
+            if ui_areas.notification.contains(position)
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            {
+                if let Some(url) = components::notification::action_url_at(
+                    ui_areas.notification,
+                    mouse.column,
+                    mouse.row,
+                    &ctx,
+                ) {
+                    open_external_url(&url);
+                }
+                ctx.dismiss_notification();
+            } else if ui_areas.tabs.contains(position)
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             {
                 if let Some(tab) = pages::sidebar::hit_test(ui_areas.tabs, position) {
@@ -1486,6 +1697,51 @@ fn run_app(
                     ));
                 }
             } else if ui_areas.content.contains(position) {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                    let target = match active_tab {
+                        NavTab::Main => main_page
+                            .context_song_at(mouse, ui_areas.content, &ctx)
+                            .map(|target| (target, SongMenuKind::Queue)),
+                        NavTab::Search => search_page
+                            .lock()
+                            .unwrap()
+                            .context_song_at(mouse, ui_areas.content)
+                            .map(|target| (target, SongMenuKind::Standard)),
+                        NavTab::Leaderboard => leaderboard
+                            .context_song_at(mouse, ui_areas.content)
+                            .map(|target| (target, SongMenuKind::Standard)),
+                        NavTab::Playlists => playlists
+                            .context_song_at(mouse, ui_areas.content)
+                            .map(|target| (target, SongMenuKind::Standard)),
+                        NavTab::Favorites => favorites_page
+                            .context_song_at(mouse, ui_areas.content, &ctx)
+                            .map(|target| (target, SongMenuKind::Standard)),
+                        NavTab::History => pages::history::context_song_at(
+                            mouse,
+                            ui_areas.content,
+                            &ctx,
+                            &mut history_selected,
+                            history_scroll,
+                        )
+                        .map(|target| (target, SongMenuKind::Standard)),
+                        NavTab::LocalMusic => pages::local_music::context_song_at(
+                            mouse,
+                            ui_areas.content,
+                            &ctx,
+                            &mut local_selected,
+                            local_scroll,
+                        )
+                        .map(|target| (target, SongMenuKind::Local)),
+                        NavTab::Settings => None,
+                    };
+                    if let Some(((songs, index), kind)) = target {
+                        let is_favorite = ctx.storage.is_favorite(&songs[index]);
+                        song_menu = SongContextMenu::new(position, songs, index, kind, is_favorite);
+                        needs_render = true;
+                        continue;
+                    }
+                }
+
                 let action = match active_tab {
                     NavTab::Main => main_page.handle_mouse(mouse, ui_areas.content, &ctx, activate),
                     NavTab::Search => {
@@ -1511,12 +1767,12 @@ fn run_app(
                         history_scroll,
                         activate,
                     ),
-                    NavTab::Settings => {
-                        settings_page
-                            .lock()
-                            .unwrap()
-                            .handle_mouse(mouse, ui_areas.content, &ctx, &kb_resolver)
-                    }
+                    NavTab::Settings => settings_page.lock().unwrap().handle_mouse(
+                        mouse,
+                        ui_areas.content,
+                        &ctx,
+                        &kb_resolver,
+                    ),
                     NavTab::LocalMusic => pages::local_music::handle_mouse(
                         mouse,
                         ui_areas.content,
@@ -1580,6 +1836,7 @@ fn run_app(
                 &mut local_scroll,
                 &mut ui_areas,
                 &confirm_delete,
+                &song_menu,
                 &bili_login_page,
             )?;
             needs_render = false;
@@ -1604,6 +1861,7 @@ fn draw_app(
     local_scroll: &mut usize,
     ui_areas: &mut UiAreas,
     confirm_delete: &Option<LocalDeleteConfirmation>,
+    song_menu: &Option<SongContextMenu>,
     bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
 ) -> anyhow::Result<()> {
     // Kitty 图片是终端外部图层，必须在绘制非主页前清除，避免它短暂覆盖本地/历史页面。
@@ -1640,6 +1898,7 @@ fn draw_app(
             tabs: main_chunks[1],
             content: content_area,
             progress: main_chunks[3],
+            notification: Rect::default(),
         };
 
         match active_tab {
@@ -1677,124 +1936,125 @@ fn draw_app(
                 use ratatui::text::{Line, Span};
                 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
-                let local_src = ctx.source_manager.local_source();
-                let paths = ctx.config.read().unwrap().local_music.paths.clone();
-                let songs = local_src.all_songs();
-                let is_scanning = local_src.is_scanning();
+                'local_content: {
+                    let local_src = ctx.source_manager.local_source();
+                    let paths = ctx.config.read().unwrap().local_music.paths.clone();
+                    let songs = local_src.all_songs();
+                    let is_scanning = local_src.is_scanning();
 
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(crate::theme::muted(ctx)))
-                    .title(if is_scanning {
-                        format!("本地音乐 ({} 首，扫描中)", songs.len())
-                    } else {
-                        format!("本地音乐 ({} 首)", songs.len())
-                    });
-                let inner = block.inner(content_area);
-                block.render(content_area, frame.buffer_mut());
-
-                if inner.height < 2 {
-                    return;
-                }
-
-                if paths.is_empty() {
-                    Paragraph::new(Line::from(" 未配置音乐目录，请在设置（8）中添加"))
-                        .style(Style::new().fg(Color::DarkGray))
-                        .render(inner, frame.buffer_mut());
-                    return;
-                }
-
-                if songs.is_empty() && is_scanning {
-                    Paragraph::new(Line::from(" 正在扫描本地音乐，请稍候..."))
-                        .style(Style::new().fg(Color::DarkGray))
-                        .render(inner, frame.buffer_mut());
-                    return;
-                }
-
-                if songs.is_empty() {
-                    Paragraph::new(Line::from(" 目录下未找到音频文件，按 r 重新扫描"))
-                        .style(Style::new().fg(Color::DarkGray))
-                        .render(inner, frame.buffer_mut());
-                    return;
-                }
-
-                // 显示歌曲列表标题
-                let header = pages::components::song_table::header(inner.width);
-                Paragraph::new(Line::from(Span::styled(
-                    header,
-                    Style::new()
-                        .fg(crate::theme::text(ctx))
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                )))
-                .render(
-                    Rect::new(inner.x, inner.y, inner.width, 1),
-                    frame.buffer_mut(),
-                );
-
-                if inner.height < 3 {
-                    return;
-                }
-
-                // 显示歌曲列表
-                let visible_height = (inner.height.saturating_sub(2)) as usize;
-                let sel = *local_selected;
-                let mut sc = *local_scroll;
-
-                if sel >= sc + visible_height {
-                    sc = sel.saturating_sub(visible_height.saturating_sub(1));
-                } else if sel < sc {
-                    sc = sel;
-                }
-                sc = sc.min(songs.len().saturating_sub(visible_height));
-                *local_scroll = sc;
-
-                let end = (sc + visible_height).min(songs.len());
-                for (i, song) in songs.iter().enumerate().take(end).skip(sc) {
-                    let row = i - sc;
-                    let text = pages::components::song_table::row(song, i, inner.width);
-                    let line_area = Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1);
-                    let style = if i == sel {
-                        Style::new()
-                            .bg(crate::theme::accent(ctx))
-                            .fg(crate::theme::selection_fg(ctx))
-                    } else {
-                        Style::new().fg(crate::theme::text(ctx))
-                    };
-                    Paragraph::new(Line::from(Span::styled(text, style)))
-                        .render(line_area, frame.buffer_mut());
-                }
-
-                if let Some(confirmation) = confirm_delete {
-                    use ratatui::widgets::{Clear, Wrap};
-                    let dialog_w = inner.width.saturating_sub(2).min(72);
-                    let dialog_h = inner.height.min(7);
-                    let dialog_x = inner.x + (inner.width.saturating_sub(dialog_w)) / 2;
-                    let dialog_y = inner.y + (inner.height.saturating_sub(dialog_h)) / 2;
-                    let dialog_area = Rect::new(dialog_x, dialog_y, dialog_w, dialog_h);
-                    Clear.render(dialog_area, frame.buffer_mut());
                     let block = Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().fg(crate::theme::rosewater(ctx)))
-                        .title("确认删除本地文件");
-                    let inner_dialog = block.inner(dialog_area);
-                    block.render(dialog_area, frame.buffer_mut());
-                    Paragraph::new(vec![
-                        Line::from(Span::styled(
-                            format!("删除「{}」？", confirmation.name),
-                            Style::new().fg(crate::theme::rosewater(ctx)),
-                        )),
-                        Line::from(Span::styled(
-                            confirmation.path.display().to_string(),
-                            Style::new().fg(crate::theme::muted(ctx)),
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "y 确认删除    n / Esc 取消",
-                            Style::new().fg(crate::theme::text(ctx)),
-                        )),
-                    ])
-                    .wrap(Wrap { trim: false })
-                    .render(inner_dialog, frame.buffer_mut());
+                        .border_style(Style::new().fg(crate::theme::muted(ctx)))
+                        .title(if is_scanning {
+                            format!("本地音乐 ({} 首，扫描中)", songs.len())
+                        } else {
+                            format!("本地音乐 ({} 首)", songs.len())
+                        });
+                    let inner = block.inner(content_area);
+                    block.render(content_area, frame.buffer_mut());
+
+                    if inner.height < 2 {
+                        break 'local_content;
+                    }
+
+                    if paths.is_empty() {
+                        Paragraph::new(Line::from(" 未配置音乐目录，请在设置（8）中添加"))
+                            .style(Style::new().fg(Color::DarkGray))
+                            .render(inner, frame.buffer_mut());
+                        break 'local_content;
+                    }
+
+                    if songs.is_empty() && is_scanning {
+                        Paragraph::new(Line::from(" 正在扫描本地音乐，请稍候..."))
+                            .style(Style::new().fg(Color::DarkGray))
+                            .render(inner, frame.buffer_mut());
+                        break 'local_content;
+                    }
+
+                    if songs.is_empty() {
+                        Paragraph::new(Line::from(" 目录下未找到音频文件，按 r 重新扫描"))
+                            .style(Style::new().fg(Color::DarkGray))
+                            .render(inner, frame.buffer_mut());
+                        break 'local_content;
+                    }
+
+                    let header = pages::components::song_table::header(inner.width);
+                    Paragraph::new(Line::from(Span::styled(
+                        header,
+                        Style::new()
+                            .fg(crate::theme::text(ctx))
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )))
+                    .render(
+                        Rect::new(inner.x, inner.y, inner.width, 1),
+                        frame.buffer_mut(),
+                    );
+
+                    if inner.height < 3 {
+                        break 'local_content;
+                    }
+
+                    let visible_height = (inner.height.saturating_sub(2)) as usize;
+                    let sel = *local_selected;
+                    let mut sc = *local_scroll;
+
+                    if sel >= sc + visible_height {
+                        sc = sel.saturating_sub(visible_height.saturating_sub(1));
+                    } else if sel < sc {
+                        sc = sel;
+                    }
+                    sc = sc.min(songs.len().saturating_sub(visible_height));
+                    *local_scroll = sc;
+
+                    let end = (sc + visible_height).min(songs.len());
+                    for (i, song) in songs.iter().enumerate().take(end).skip(sc) {
+                        let row = i - sc;
+                        let text = pages::components::song_table::row(song, i, inner.width);
+                        let line_area =
+                            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1);
+                        let style = if i == sel {
+                            Style::new()
+                                .bg(crate::theme::accent(ctx))
+                                .fg(crate::theme::selection_fg(ctx))
+                        } else {
+                            Style::new().fg(crate::theme::text(ctx))
+                        };
+                        Paragraph::new(Line::from(Span::styled(text, style)))
+                            .render(line_area, frame.buffer_mut());
+                    }
+
+                    if let Some(confirmation) = confirm_delete {
+                        use ratatui::widgets::{Clear, Wrap};
+                        let dialog_w = inner.width.saturating_sub(2).min(72);
+                        let dialog_h = inner.height.min(7);
+                        let dialog_x = inner.x + (inner.width.saturating_sub(dialog_w)) / 2;
+                        let dialog_y = inner.y + (inner.height.saturating_sub(dialog_h)) / 2;
+                        let dialog_area = Rect::new(dialog_x, dialog_y, dialog_w, dialog_h);
+                        Clear.render(dialog_area, frame.buffer_mut());
+                        let block = Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::new().fg(crate::theme::rosewater(ctx)))
+                            .title("确认删除本地文件");
+                        let inner_dialog = block.inner(dialog_area);
+                        block.render(dialog_area, frame.buffer_mut());
+                        Paragraph::new(vec![
+                            Line::from(Span::styled(
+                                format!("删除「{}」？", confirmation.name),
+                                Style::new().fg(crate::theme::rosewater(ctx)),
+                            )),
+                            Line::from(Span::styled(
+                                confirmation.path.display().to_string(),
+                                Style::new().fg(crate::theme::muted(ctx)),
+                            )),
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "y 确认删除    n / Esc 取消",
+                                Style::new().fg(crate::theme::text(ctx)),
+                            )),
+                        ])
+                        .wrap(Wrap { trim: false })
+                        .render(inner_dialog, frame.buffer_mut());
+                    }
                 }
             }
         }
@@ -1817,7 +2077,11 @@ fn draw_app(
 
         components::progress_bar::render(main_chunks[3], frame.buffer_mut(), ctx);
         components::status_bar::render(main_chunks[4], frame.buffer_mut(), ctx);
-        components::notification::render(main_chunks[4], frame.buffer_mut(), ctx);
+        ui_areas.notification = components::notification::area(area, ctx).unwrap_or_default();
+        components::notification::render(area, frame.buffer_mut(), ctx);
+        if let Some(menu) = song_menu {
+            menu.render(content_area, frame.buffer_mut(), ctx);
+        }
     })?;
     // 在 Kitty 终端中显示封面（draw 之后，浮动在 TUI 上方）
     if active_tab == NavTab::Main {
@@ -1834,6 +2098,74 @@ fn calculate_bili_login_area(area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+#[cfg(target_os = "linux")]
+fn current_mpris_snapshot(ctx: &AppContext) -> mpris::MprisSnapshot {
+    let song = ctx.current_song.read().unwrap();
+    mpris::MprisSnapshot::new(
+        *ctx.player_state.borrow(),
+        song.as_ref(),
+        *ctx.position.borrow(),
+        *ctx.duration.borrow(),
+        ctx.player.volume(),
+        ctx.playlist.mode(),
+        ctx.playlist.len(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn execute_mpris_command(
+    command: mpris::MprisCommand,
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    search_seq: &Arc<AtomicU64>,
+) -> bool {
+    use mpris::MprisCommand;
+
+    let play_entry = |entry: Option<(Vec<SongInfo>, usize)>| {
+        if let Some((songs, index)) = entry {
+            execute_action(
+                AppAction::PlaySong { songs, index },
+                ctx,
+                rt,
+                action_tx,
+                search_page,
+                settings_page,
+                search_seq,
+            );
+        }
+    };
+
+    match command {
+        MprisCommand::Quit => return true,
+        MprisCommand::Play => ctx.player.resume(),
+        MprisCommand::Pause => ctx.player.pause(),
+        MprisCommand::Toggle => ctx.player.toggle(),
+        MprisCommand::Stop => ctx.player.stop(),
+        MprisCommand::Next => play_entry(ctx.playlist.next_manual_entry()),
+        MprisCommand::Previous => play_entry(ctx.playlist.prev_manual_entry()),
+        MprisCommand::SeekBy(offset) => {
+            let current = ctx.position.borrow().as_micros();
+            let target = if offset >= 0 {
+                current.saturating_add(offset as u128)
+            } else {
+                current.saturating_sub(offset.unsigned_abs() as u128)
+            };
+            ctx.player
+                .seek(Duration::from_micros(target.min(u64::MAX as u128) as u64));
+        }
+        MprisCommand::SetPosition(position) => ctx.player.seek(position),
+        MprisCommand::SetVolume(volume) => {
+            ctx.player
+                .set_volume((volume.clamp(0.0, 1.0) * 100.0).round() as u32);
+        }
+    }
+    false
 }
 
 /// 执行一个 AppAction（简化版，不再处理 Navigate/GoBack）
@@ -1909,16 +2241,13 @@ fn execute_action(
                     format!("下一首播放: {} - {}", song.name, song.singer)
                 }
             };
-            ctx.notifications
-                .write()
-                .unwrap()
-                .push_back(Notification::info(message));
+            ctx.notify(Notification::success(message));
         }
         AppAction::RetrySong { song } => {
             start_song_playback(*song, false, ctx, rt, action_tx);
         }
         AppAction::ShowNotification(n) => {
-            ctx.notifications.write().unwrap().push_back(n);
+            ctx.notify(n);
         }
         AppAction::ImportSource(url) => {
             tracing::info!("importing JS source: {url}");
@@ -1971,15 +2300,9 @@ fn execute_action(
             if let Err(e) = save_result {
                 let mut sp = settings_page.lock().unwrap();
                 sp.status_msg = Some(format!("✗ 音源已启用，但保存配置失败: {}", e));
-                ctx.notifications
-                    .write()
-                    .unwrap()
-                    .push_back(Notification::error(format!("保存 JS 音源配置失败: {}", e)));
+                ctx.notify(Notification::error(format!("保存 JS 音源配置失败: {}", e)));
             } else {
-                ctx.notifications
-                    .write()
-                    .unwrap()
-                    .push_back(Notification::info("JS 音源已加载并启用"));
+                ctx.notify(Notification::success("JS 音源已加载并启用"));
             }
         }
         AppAction::SourceImportFailed { error, generation } => {
@@ -1989,10 +2312,7 @@ fn execute_action(
             tracing::warn!("JS source import failed: {error}");
             let mut sp = settings_page.lock().unwrap();
             sp.status_msg = Some(format!("✗ 音源加载失败: {}", error));
-            ctx.notifications
-                .write()
-                .unwrap()
-                .push_back(Notification::error(format!("JS 音源导入失败: {}", error)));
+            ctx.notify(Notification::error(format!("JS 音源导入失败: {}", error)));
         }
         AppAction::RemoveSource(url) => {
             tracing::info!("removing JS source: {url}");
@@ -2015,7 +2335,7 @@ fn execute_action(
                 action_tx.clone(),
                 rt,
             );
-            let _ = action_tx.send(AppAction::ShowNotification(Notification::info(
+            let _ = action_tx.send(AppAction::ShowNotification(Notification::success(
                 "已移除音源",
             )));
         }
@@ -2044,7 +2364,7 @@ fn execute_action(
                 let mut settings = settings.lock().unwrap();
                 if errors.is_empty() {
                     settings.status_msg = Some(format!("扫描完成，共 {} 首", count));
-                    let _ = tx.send(AppAction::ShowNotification(Notification::info(format!(
+                    let _ = tx.send(AppAction::ShowNotification(Notification::success(format!(
                         "本地音乐扫描完成，共 {} 首",
                         count
                     ))));
@@ -2078,11 +2398,19 @@ fn start_song_playback(
     let request_id = ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1;
     let player_generation = ctx.player.prepare();
     let lyric_generation = ctx.lyric_service.prepare();
-    let show_cover = ctx.config.read().unwrap().ui.show_cover;
+    let (show_cover, album_cover_notification, track_change_notification) = {
+        let config = ctx.config.read().unwrap();
+        (
+            config.ui.show_cover,
+            config.notification.album_cover,
+            config.notification.track_change,
+        )
+    };
     let cover_service = Arc::clone(&ctx.cover_service);
     // 队列里的 SongInfo 通常已经带了封面地址，先用它加载一次，不必等播放地址解析完。
     let initial_cover = song.cover_url.clone();
     if show_cover {
+        cover_service.clear();
         let initial_cover = initial_cover.clone();
         let cover = Arc::clone(&cover_service);
         let wake_tx = action_tx.clone();
@@ -2102,10 +2430,9 @@ fn start_song_playback(
     }
     *ctx.current_song.write().unwrap() = Some(song.clone());
     if add_history {
-        let _ = action_tx.send(AppAction::ShowNotification(Notification::info(format!(
-            "正在加载: {} - {}",
-            song.name, song.singer
-        ))));
+        let _ = action_tx.send(AppAction::ShowNotification(
+            Notification::info(format!("正在加载: {} - {}", song.name, song.singer)).tui_only(),
+        ));
     }
 
     let source_mgr = Arc::clone(&ctx.source_manager);
@@ -2201,12 +2528,18 @@ fn start_song_playback(
             resolved_song.cover_url = Some(url);
         }
         *current_song.write().unwrap() = Some(resolved_song.clone());
-        let _ = tx.send(AppAction::ShowNotification(Notification::info(format!(
-            "正在播放: {} - {} [{}]",
+        let playing_message = format!(
+            "{} - {} [{}]",
             resolved_song.name,
             resolved_song.singer,
             resolved_song.source.as_str()
-        ))));
+        );
+        let playing_title = format!("正在播放: {}", resolved_song.name);
+        let _ = tx.send(AppAction::ShowNotification(
+            Notification::info(playing_message.clone())
+                .with_title(playing_title.clone())
+                .tui_only(),
+        ));
 
         // - 解析结果无封面时不加载
         // - 解析后的封面地址跟队列里的相同时不再重复加载
@@ -2218,6 +2551,31 @@ fn start_song_playback(
                 tracing::debug!("load cover failed: {}", error);
             }
             let _ = tx.send(AppAction::None);
+        }
+
+        let notification_icon = if album_cover_notification {
+            match cover_service
+                .cache_path(resolved_song.cover_url.clone())
+                .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::debug!("cache notification cover failed: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if track_change_notification {
+            let mut notification = Notification::info(playing_message)
+                .with_title(playing_title)
+                .replacing_previous()
+                .desktop_only();
+            if let Some(icon) = notification_icon {
+                notification = notification.with_icon(icon);
+            }
+            let _ = tx.send(AppAction::ShowNotification(notification));
         }
     });
 }
@@ -2310,7 +2668,7 @@ fn spawn_js_source_loader(
                     if !source_manager.set_js_source_if_current(generation, Arc::new(source)) {
                         return;
                     }
-                    let _ = tx.send(AppAction::ShowNotification(Notification::info(
+                    let _ = tx.send(AppAction::ShowNotification(Notification::success(
                         "JS 音源已就绪",
                     )));
                     return;

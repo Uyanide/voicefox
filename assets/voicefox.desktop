@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=voicefox
+Comment=Terminal music player
+Exec=voicefox
+Icon=voicefox
+Terminal=true
+Categories=AudioVideo;Audio;Player;
+Keywords=music;audio;player;tui;
+StartupNotify=false

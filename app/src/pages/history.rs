@@ -268,3 +268,24 @@ pub fn handle_mouse(
     }
     AppAction::None
 }
+
+pub fn context_song_at(
+    event: MouseEvent,
+    area: Rect,
+    ctx: &AppContext,
+    selected: &mut usize,
+    scroll: usize,
+) -> Option<(Vec<lx_core::model::song::SongInfo>, usize)> {
+    let history = ctx.storage.load_history();
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let list_y = inner.y.saturating_add(1);
+    if event.row < list_y || event.row >= inner.bottom() {
+        return None;
+    }
+    let index = scroll + event.row.saturating_sub(list_y) as usize;
+    if index >= history.len() {
+        return None;
+    }
+    *selected = index;
+    Some((history, index))
+}

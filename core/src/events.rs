@@ -73,25 +73,78 @@ pub enum AppAction {
 #[derive(Debug, Clone)]
 pub struct Notification {
     pub level: NotificationLevel,
+    pub title: Option<String>,
     pub message: String,
+    pub icon: Option<String>,
+    pub in_app: bool,
+    pub desktop: bool,
+    pub replace_previous: bool,
+    pub action_label: Option<String>,
+    pub action_url: Option<String>,
     pub created_at: chrono::DateTime<chrono::Local>,
 }
 
 impl Notification {
-    pub fn error(msg: impl Into<String>) -> Self {
+    fn new(level: NotificationLevel, message: impl Into<String>) -> Self {
         Self {
-            level: NotificationLevel::Error,
-            message: msg.into(),
+            level,
+            title: None,
+            message: message.into(),
+            icon: None,
+            in_app: true,
+            desktop: true,
+            replace_previous: false,
+            action_label: None,
+            action_url: None,
             created_at: chrono::Local::now(),
         }
     }
 
+    pub fn error(msg: impl Into<String>) -> Self {
+        Self::new(NotificationLevel::Error, msg)
+    }
+
     pub fn info(msg: impl Into<String>) -> Self {
-        Self {
-            level: NotificationLevel::Info,
-            message: msg.into(),
-            created_at: chrono::Local::now(),
-        }
+        Self::new(NotificationLevel::Info, msg)
+    }
+
+    pub fn success(msg: impl Into<String>) -> Self {
+        Self::new(NotificationLevel::Success, msg)
+    }
+
+    pub fn warning(msg: impl Into<String>) -> Self {
+        Self::new(NotificationLevel::Warn, msg)
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub fn with_icon(mut self, icon: impl Into<String>) -> Self {
+        self.icon = Some(icon.into());
+        self
+    }
+
+    pub fn replacing_previous(mut self) -> Self {
+        self.replace_previous = true;
+        self
+    }
+
+    pub fn tui_only(mut self) -> Self {
+        self.desktop = false;
+        self
+    }
+
+    pub fn desktop_only(mut self) -> Self {
+        self.in_app = false;
+        self
+    }
+
+    pub fn with_action(mut self, label: impl Into<String>, url: impl Into<String>) -> Self {
+        self.action_label = Some(label.into());
+        self.action_url = Some(url.into());
+        self
     }
 
     pub fn timestamp(&self) -> String {
@@ -113,6 +166,7 @@ impl Notification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotificationLevel {
     Info,
+    Success,
     Warn,
     Error,
 }

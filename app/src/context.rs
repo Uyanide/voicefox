@@ -4,6 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use lx_core::events::Notification;
 use lx_core::model::config::Config;
@@ -12,6 +13,7 @@ use lx_core::model::source::PlayerState;
 use lx_core::traits::player::Player;
 
 use crate::cover::CoverService;
+use crate::notification::DesktopNotifier;
 use crate::playlist::manager::PlaylistManager;
 use crate::storage::Storage;
 use lx_lyric::service::LyricService;
@@ -48,6 +50,7 @@ pub struct AppContext {
 
     // --- 通知 ---
     pub notifications: std::sync::RwLock<VecDeque<Notification>>,
+    desktop_notifier: DesktopNotifier,
 
     // --- 存储 ---
     pub storage: Storage,
@@ -103,7 +106,40 @@ impl AppContext {
             config: std::sync::RwLock::new(config),
             config_path,
             notifications: std::sync::RwLock::new(VecDeque::new()),
+            desktop_notifier: DesktopNotifier::new(),
             storage: Storage::new(),
         })
+    }
+
+    pub fn notify(&self, notification: Notification) {
+        let (in_app, desktop) = {
+            let config = self.config.read().unwrap();
+            (config.notification.in_app, config.notification.enable)
+        };
+        if in_app && notification.in_app {
+            let mut notifications = self.notifications.write().unwrap();
+            notifications.push_back(notification.clone());
+            while notifications.len() > 8 {
+                notifications.pop_front();
+            }
+        }
+        if desktop && notification.desktop {
+            self.desktop_notifier.send(notification);
+        }
+    }
+
+    pub fn dismiss_notification(&self) -> bool {
+        self.notifications.write().unwrap().pop_back().is_some()
+    }
+
+    pub fn notification_timeout(&self) -> Duration {
+        let seconds = self
+            .config
+            .read()
+            .unwrap()
+            .notification
+            .in_app_timeout
+            .clamp(1, 60);
+        Duration::from_secs(seconds)
     }
 }

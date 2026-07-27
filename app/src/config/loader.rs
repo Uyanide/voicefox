@@ -54,6 +54,30 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
         config.version = 2;
         changed = true;
     }
+    if config.version < 3 {
+        // 旧版本曾把 local_music.enabled 的默认值保存为 false，导致已经
+        // 配置过目录的用户升级后不会自动扫描。只在版本迁移时恢复一次；
+        // 版本 3 之后用户主动关闭仍会被保留。
+        if !config.local_music.paths.is_empty() && !config.local_music.enabled {
+            config.local_music.enabled = true;
+        }
+        config.version = 3;
+        changed = true;
+    }
+    if config.version < 4 {
+        // 通知原先位于 [ui]，迁移到独立的 [notification]，保留用户已有
+        // 的开关和停留时间；缺失字段继续使用新的默认值。
+        if let Some(enabled) = config.ui.show_notifications {
+            config.notification.in_app = enabled;
+        }
+        if let Some(timeout) = config.ui.notification_timeout {
+            config.notification.in_app_timeout = timeout;
+        }
+        config.ui.show_notifications = None;
+        config.ui.notification_timeout = None;
+        config.version = 4;
+        changed = true;
+    }
     debug_assert!(config.version <= CURRENT_CONFIG_VERSION);
     changed
 }
@@ -156,6 +180,47 @@ mod tests {
         assert!(migrate_legacy_config(&mut config));
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert_eq!(config.source.enabled, vec![SourceId::Kg, SourceId::Wy]);
+    }
+
+    #[test]
+    fn reenables_existing_local_music_paths_during_version_three_migration() {
+        let mut config = Config {
+            version: 2,
+            ..Config::default()
+        };
+        config.local_music.paths = vec!["/music".to_string()];
+        config.local_music.enabled = false;
+
+        assert!(migrate_legacy_config(&mut config));
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert!(config.local_music.enabled);
+    }
+
+    #[test]
+    fn preserves_local_music_disable_after_version_three_migration() {
+        let mut config = Config::default();
+        config.local_music.paths = vec!["/music".to_string()];
+        config.local_music.enabled = false;
+
+        assert!(!migrate_legacy_config(&mut config));
+        assert!(!config.local_music.enabled);
+    }
+
+    #[test]
+    fn migrates_legacy_ui_notification_options() {
+        let mut config = Config {
+            version: 3,
+            ..Config::default()
+        };
+        config.ui.show_notifications = Some(false);
+        config.ui.notification_timeout = Some(9);
+
+        assert!(migrate_legacy_config(&mut config));
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert!(!config.notification.in_app);
+        assert_eq!(config.notification.in_app_timeout, 9);
+        assert_eq!(config.ui.show_notifications, None);
+        assert_eq!(config.ui.notification_timeout, None);
     }
 
     #[test]

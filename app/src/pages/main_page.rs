@@ -51,7 +51,12 @@ impl MainPage {
         }
     }
 
-    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
+    pub fn handle_input(
+        &mut self,
+        key: &KeyEvent,
+        ctx: &AppContext,
+        resolver: &KeybindingResolver,
+    ) -> AppAction {
         let (songs, current) = ctx.playlist.snapshot();
         if self.selected >= songs.len() {
             self.selected = current.min(songs.len().saturating_sub(1));
@@ -73,28 +78,7 @@ impl MainPage {
                     }
                     AppAction::None
                 }
-                QueueEditCommand::RemoveSelected => {
-                    let removing_current = self.selected == current;
-                    ctx.playlist.remove(self.selected);
-                    self.selected = self.selected.min(songs.len().saturating_sub(2));
-                    if removing_current {
-                        let (remaining, next) = ctx.playlist.snapshot();
-                        if remaining.is_empty() {
-                            ctx.player.stop();
-                            ctx.cover_service.clear();
-                            ctx.lyric_service.clear();
-                            *ctx.current_song.write().unwrap() = None;
-                            AppAction::None
-                        } else {
-                            AppAction::PlaySong {
-                                songs: remaining,
-                                index: next,
-                            }
-                        }
-                    } else {
-                        AppAction::None
-                    }
-                }
+                QueueEditCommand::RemoveSelected => self.remove_at(self.selected, ctx),
                 QueueEditCommand::Clear => {
                     ctx.playlist.clear();
                     ctx.player.stop();
@@ -298,6 +282,46 @@ impl MainPage {
         AppAction::None
     }
 
+    pub fn context_song_at(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+        ctx: &AppContext,
+    ) -> Option<(Vec<lx_core::model::song::SongInfo>, usize)> {
+        let (songs, _) = ctx.playlist.snapshot();
+        let index = queue_index_at(event, area, self.scroll, songs.len())?;
+        self.selected = index;
+        self.dragging = None;
+        Some((songs, index))
+    }
+
+    pub fn remove_at(&mut self, index: usize, ctx: &AppContext) -> AppAction {
+        let (songs, current) = ctx.playlist.snapshot();
+        if index >= songs.len() {
+            return AppAction::None;
+        }
+        let removing_current = index == current;
+        ctx.playlist.remove(index);
+        let (remaining, next) = ctx.playlist.snapshot();
+        self.selected = index.min(remaining.len().saturating_sub(1));
+        self.scroll = self.scroll.min(remaining.len().saturating_sub(1));
+        if !removing_current {
+            return AppAction::None;
+        }
+        if remaining.is_empty() {
+            ctx.player.stop();
+            ctx.cover_service.clear();
+            ctx.lyric_service.clear();
+            *ctx.current_song.write().unwrap() = None;
+            AppAction::None
+        } else {
+            AppAction::PlaySong {
+                songs: remaining,
+                index: next,
+            }
+        }
+    }
+
     fn render_queue(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let accent = crate::theme::accent(ctx);
         let (songs, current) = ctx.playlist.snapshot();
@@ -367,7 +391,11 @@ fn queue_index_at(event: MouseEvent, area: Rect, scroll: usize, len: usize) -> O
     let queue_area = queue_area(area);
     let inner = Block::default().borders(Borders::ALL).inner(queue_area);
     let list_y = inner.y.saturating_add(1);
-    if event.row < list_y || event.row >= inner.bottom() {
+    if event.column < inner.x
+        || event.column >= inner.right()
+        || event.row < list_y
+        || event.row >= inner.bottom()
+    {
         return None;
     }
     let index = scroll + event.row.saturating_sub(list_y) as usize;

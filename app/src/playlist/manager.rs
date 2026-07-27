@@ -40,6 +40,10 @@ impl PlaylistManager {
         )
     }
 
+    pub fn len(&self) -> usize {
+        self.current_list.lock().unwrap().len()
+    }
+
     /// 将单首歌曲插入当前播放列表，返回插入后的索引。
     pub fn insert(&self, song: SongInfo, position: InsertPosition) -> usize {
         let mut list = self.current_list.lock().unwrap();

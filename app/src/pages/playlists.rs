@@ -418,6 +418,28 @@ impl PlaylistsPage {
         AppAction::None
     }
 
+    pub fn context_song_at(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+    ) -> Option<(Vec<SongInfo>, usize)> {
+        self.selected_playlist?;
+        let page = page_chunks(area, self.playlists.len());
+        let song_inner = Block::default().borders(Borders::ALL).inner(page.songs);
+        let position = Position::new(event.column, event.row);
+        let list_y = song_inner.y.saturating_add(1);
+        if !song_inner.contains(position) || event.row < list_y || event.row >= song_inner.bottom()
+        {
+            return None;
+        }
+        let index = self.song_scroll_offset + event.row.saturating_sub(list_y) as usize;
+        if index >= self.songs.len() {
+            return None;
+        }
+        self.selected = index;
+        Some((self.songs.clone(), index))
+    }
+
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let page = page_chunks(area, self.playlists.len());
         self.render_scopes(page.scopes, buf, ctx);
@@ -636,10 +658,10 @@ impl PlaylistsPage {
                 }
                 self.sync_favorites(ctx);
             }
-            AppAction::ShowNotification(Notification::info("已取消收藏歌单"))
+            AppAction::ShowNotification(Notification::success("已取消收藏歌单"))
         } else {
             ctx.storage.add_favorite_playlist(&playlist);
-            AppAction::ShowNotification(Notification::info("已收藏歌单"))
+            AppAction::ShowNotification(Notification::success("已收藏歌单"))
         }
     }
 

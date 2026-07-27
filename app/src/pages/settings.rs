@@ -69,7 +69,12 @@ impl SettingsPage {
         }
     }
 
-    pub fn handle_input(&mut self, key: KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
+    pub fn handle_input(
+        &mut self,
+        key: KeyEvent,
+        ctx: &AppContext,
+        resolver: &KeybindingResolver,
+    ) -> AppAction {
         if self.local_path_mode {
             return self.handle_local_path_input(key, ctx);
         }
@@ -172,6 +177,34 @@ impl SettingsPage {
                         ctx.cover_service.clear();
                     }
                 }
+                (KeyModifiers::NONE, KeyCode::Char('o')) => {
+                    self.update_config(ctx, |config| {
+                        config.notification.in_app = !config.notification.in_app;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('O' | 'o'))
+                | (KeyModifiers::NONE, KeyCode::Char('O')) => {
+                    self.update_config(ctx, |config| {
+                        config.notification.in_app_timeout =
+                            match config.notification.in_app_timeout {
+                                0..=2 => 4,
+                                3..=4 => 6,
+                                5..=6 => 8,
+                                _ => 2,
+                            };
+                    });
+                }
+                (KeyModifiers::NONE, KeyCode::Char('x')) => {
+                    self.update_config(ctx, |config| {
+                        config.notification.enable = !config.notification.enable;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('X' | 'x'))
+                | (KeyModifiers::NONE, KeyCode::Char('X')) => {
+                    self.update_config(ctx, |config| {
+                        config.notification.album_cover = !config.notification.album_cover;
+                    });
+                }
                 (KeyModifiers::NONE, KeyCode::Char('m')) => {
                     let mode = ctx.playlist.cycle_mode();
                     let result = {
@@ -262,7 +295,12 @@ impl SettingsPage {
     }
 
     /// 处理本地音乐区域的按键（非输入模式）
-    fn handle_local_keys(&mut self, key: KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
+    fn handle_local_keys(
+        &mut self,
+        key: KeyEvent,
+        ctx: &AppContext,
+        resolver: &KeybindingResolver,
+    ) -> AppAction {
         let paths = ctx.config.read().unwrap().local_music.paths.clone();
 
         if let Some(action) = resolver.resolve_page("settings", &key) {
@@ -372,7 +410,7 @@ impl SettingsPage {
         let options_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(" 界面与播放 · t/g/w/c/m/p · b 哔哩哔哩登录/退出 ");
+            .title(" 界面与播放 · t/g/w/c/o/O/x/X/m/p · b 登录/退出 ");
         let options_inner = options_block.inner(chunks[0]);
         options_block.render(chunks[0], buf);
         let options = vec![
@@ -380,6 +418,23 @@ impl SettingsPage {
             setting_line("聚合搜索", config.ui.aggregate_search, "g", accent, muted),
             setting_line("循环导航", config.ui.wrap_navigation, "w", accent, muted),
             setting_line("封面显示", config.ui.show_cover, "c", accent, muted),
+            setting_line("TUI 通知", config.notification.in_app, "o", accent, muted),
+            Line::from(vec![
+                Span::styled(" [O] ", Style::new().fg(muted)),
+                Span::raw("通知时长   "),
+                Span::styled(
+                    format!("{} 秒", config.notification.in_app_timeout.clamp(1, 60)),
+                    Style::new().fg(accent),
+                ),
+            ]),
+            setting_line("桌面通知", config.notification.enable, "x", accent, muted),
+            setting_line(
+                "通知封面",
+                config.notification.album_cover,
+                "X",
+                accent,
+                muted,
+            ),
             Line::from(vec![
                 Span::styled(" [m] ", Style::new().fg(muted)),
                 Span::raw("播放模式   "),
@@ -393,10 +448,6 @@ impl SettingsPage {
             Line::from(format!(
                 " 自动换源    {}",
                 enabled(config.source.auto_toggle)
-            )),
-            Line::from(Span::styled(
-                format!(" {}", ctx.config_path.display()),
-                Style::new().fg(muted),
             )),
             Line::from(vec![
                 Span::styled(" [b] ", Style::new().fg(muted)),
@@ -634,7 +685,13 @@ impl SettingsPage {
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
+    pub fn handle_mouse(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+        ctx: &AppContext,
+        resolver: &KeybindingResolver,
+    ) -> AppAction {
         if self.input_mode {
             return AppAction::None;
         }
@@ -655,9 +712,13 @@ impl SettingsPage {
                         1 => Some('g'),
                         2 => Some('w'),
                         3 => Some('c'),
-                        4 => Some('m'),
-                        5 => Some('p'),
-                        9 => Some('b'),
+                        4 => Some('o'),
+                        5 => Some('O'),
+                        6 => Some('x'),
+                        7 => Some('X'),
+                        8 => Some('m'),
+                        9 => Some('p'),
+                        12 => Some('b'),
                         _ => None,
                     };
                     if let Some(key) = key {
@@ -721,7 +782,7 @@ fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
         let top = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(Rect::new(area.x, area.y, area.width, 12.min(area.height)));
+            .split(Rect::new(area.x, area.y, area.width, 15.min(area.height)));
         let bottom_y = top[0].bottom();
         let bottom = if bottom_y < area.bottom() {
             Rect::new(
@@ -740,7 +801,7 @@ fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(12.min(h.saturating_div(3))),
+                Constraint::Length(15.min(h.saturating_div(3))),
                 Constraint::Min(6),
                 Constraint::Length(8.min(h.saturating_div(3))),
             ])

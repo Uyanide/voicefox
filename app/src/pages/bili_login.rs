@@ -454,7 +454,8 @@ mod tests {
     fn closing_an_error_does_not_report_login_success() {
         let mut page = BiliLoginPage::new(Arc::new(BiliSource::new()));
         page.state = BiliLoginState::Error("network".to_string());
-        let resolver = KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
         let action = page.handle_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &resolver);
         assert!(matches!(action, AppAction::GoBack));
     }

@@ -220,7 +220,8 @@ impl SearchPage {
                 }
                 Action::ListPageDown => {
                     if !self.results.is_empty() {
-                        self.selected = (self.selected + 10).min(self.results.len().saturating_sub(1));
+                        self.selected =
+                            (self.selected + 10).min(self.results.len().saturating_sub(1));
                         if self.selected + 1 == self.results.len() && self.can_load_more() {
                             return AppAction::SearchMore {
                                 keyword: self.result_keyword.clone(),
@@ -738,6 +739,36 @@ impl SearchPage {
         AppAction::None
     }
 
+    pub fn context_song_at(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+    ) -> Option<(Vec<SongInfo>, usize)> {
+        if !self.variant_indices.is_empty() {
+            return None;
+        }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        let inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
+        let list_y = inner.y.saturating_add(1);
+        if event.row < list_y || event.row >= inner.bottom() {
+            return None;
+        }
+        let index = self.scroll_offset + event.row.saturating_sub(list_y) as usize;
+        if index >= self.results.len() {
+            return None;
+        }
+        self.input_mode = false;
+        self.selected = index;
+        Some((self.results.clone(), index))
+    }
+
     fn open_variants(&mut self) {
         self.variant_indices = matching_variant_indices(&self.results, self.selected);
         self.variant_selected = self
@@ -757,16 +788,14 @@ impl SearchPage {
             (KeyModifiers::NONE, KeyCode::Esc) | (KeyModifiers::NONE, KeyCode::Char('v')) => {
                 self.close_variants();
             }
-            (KeyModifiers::NONE, KeyCode::Up)
-            | (KeyModifiers::NONE, KeyCode::Left) => {
+            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Left) => {
                 if self.variant_selected > 0 {
                     self.variant_selected -= 1;
                 } else if self.wrap_navigation {
                     self.variant_selected = self.variant_indices.len().saturating_sub(1);
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Down)
-            | (KeyModifiers::NONE, KeyCode::Right) => {
+            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Right) => {
                 if self.variant_selected + 1 < self.variant_indices.len() {
                     self.variant_selected += 1;
                 } else if self.wrap_navigation {
@@ -998,9 +1027,11 @@ mod tests {
     fn right_arrow_cycles_search_scope() {
         let mut page = SearchPage::new(None, true, 3);
         page.input_mode = false;
-        let resolver = KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
 
-        let action = page.handle_input(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &resolver);
+        let action =
+            page.handle_input(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &resolver);
 
         assert_eq!(page.source_filter, Some(SourceId::Kw));
         assert!(matches!(action, AppAction::None));
@@ -1011,9 +1042,13 @@ mod tests {
         let mut page = SearchPage::new(None, true, 3);
         page.input_mode = false;
         page.results = vec![song("kw-1", SourceId::Kw, "晴天", "周杰伦")];
-        let resolver = KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
 
-        let action = page.handle_input(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &resolver);
+        let action = page.handle_input(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &resolver,
+        );
 
         assert!(matches!(action, AppAction::PlaySong { index: 0, .. }));
     }

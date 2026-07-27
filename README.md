@@ -50,10 +50,23 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - **换源匹配**：获取地址或实际播放失败时自动跨源搜索替代
 - **JS 自定义音源**：加载社区维护的音源脚本（兼容 lx-music user API 协议）
 - **主题配置**：可自定义颜色主题
-- **鼠标支持**：支持点击和滚轮操作
+- **鼠标支持**：支持点击、滚轮、队列拖拽和歌曲右键操作菜单
+- **TUI 通知**：支持信息、成功、警告、错误四级浮动通知，可配置开关和停留时间
+- **桌面通知**：Linux 上通过 D-Bus 发送系统通知，切歌时支持专辑封面
+- **Waybar / MPRIS**：显示歌曲、歌手、专辑、进度和播放状态，并支持播放控制
 - **键盘快捷键**：完整的键盘操作
 
 ## 最近更新
+
+### 2026-07-27：右键菜单、双通道通知与桌面集成
+
+- 搜索、队列、排行榜歌曲、歌单歌曲、收藏、历史和本地音乐支持歌曲右键菜单。
+- 右键菜单提供播放、设为下一首、加入队尾、收藏切换，以及队列移除或本地文件删除等页面相关操作。
+- TUI 通知升级为信息、成功、警告、错误四个级别，改为浮动 toast，并支持点击关闭。
+- 新增 Linux 桌面通知，播放歌曲时显示歌曲信息并可选用专辑封面。
+- 新增标准 MPRIS 服务，Waybar、playerctl 和桌面媒体键可控制 voicefox。
+- 通知配置迁移到独立的 `[notification]`，旧版 `[ui]` 通知字段会自动迁移。
+- 配置版本升级时会修复旧配置已有本地音乐目录但 `enabled = false` 导致不自动扫描的问题。
 
 ### 2026-07-24：键位配置与本地音乐交互
 
@@ -140,6 +153,32 @@ tmux source-file ~/.tmux.conf
 
 voicefox 在 tmux 中会自动调用 `kitten icat` 的 passthrough 和 Unicode placeholder 模式。普通 Kitty、WezTerm 和 Ghostty 会继续使用内置的终端图片输出。
 
+### Waybar 控制模块
+
+voicefox 在 Linux 上默认注册标准 MPRIS 服务。Waybar 使用内置 `mpris` 模块即可显示和控制，无需额外轮询脚本：
+
+```jsonc
+"mpris": {
+  "format": "{player_icon}  {title}",
+  "format-paused": "{status_icon}  {title}",
+  "format-stopped": "",
+  "player-icons": {
+    "voicefox": "",
+    "default": ""
+  },
+  "status-icons": {
+    "playing": "",
+    "paused": ""
+  },
+  "tooltip-format": "{player} - {status}\n{title}\n{artist} - {album}",
+  "on-click": "play-pause",
+  "on-click-middle": "previous",
+  "on-click-right": "next"
+}
+```
+
+将 `"mpris"` 放入 Waybar 的模块列表并重启 Waybar。也可以使用 `playerctl -l` 检查是否出现 `voicefox`。
+
 ### 从源码编译
 
 ```bash
@@ -164,6 +203,12 @@ cargo build --release
 
 # 安装到系统
 sudo cp target/release/voicefox /usr/local/bin/
+
+# 安装桌面入口和通知图标（当前用户）
+install -Dm644 icons/1.png \
+  ~/.local/share/icons/hicolor/512x512/apps/voicefox.png
+install -Dm644 assets/voicefox.desktop \
+  ~/.local/share/applications/voicefox.desktop
 
 # Arch Linux 安装依赖
 sudo pacman -S mpv
@@ -430,6 +475,20 @@ aggregate_search = true
 show_cover = true
 max_fps = 20
 
+[notification]
+enable = true         # 桌面系统通知
+inApp = true          # TUI 内 toast
+inAppTimeout = 4      # TUI toast 停留秒数，运行时限制为 1-60
+albumCover = true     # 桌面通知显示专辑封面
+trackChange = true    # 切歌时发送桌面通知
+
+[integration]
+mpris = true          # Linux MPRIS / Waybar 集成，修改后重启生效
+
+[local_music]
+enabled = true
+paths = ["/home/user/Music"]
+max_depth = 0
 
 ```
 

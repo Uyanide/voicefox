@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::source::{Quality, SourceId};
 use crate::keybinding::KeybindingConfig;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 2;
+pub const CURRENT_CONFIG_VERSION: u32 = 4;
 
 /// 播放器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +170,12 @@ pub struct UiConfig {
     pub scroll_amount: usize,
     pub aggregate_search: bool,
     pub show_cover: bool,
+    /// 旧版本通知配置，仅用于迁移，不再写入新配置。
+    #[serde(default, skip_serializing)]
+    pub show_notifications: Option<bool>,
+    /// 旧版本通知停留时间，仅用于迁移，不再写入新配置。
+    #[serde(default, skip_serializing)]
+    pub notification_timeout: Option<u64>,
     pub max_fps: u32,
 }
 
@@ -181,8 +187,58 @@ impl Default for UiConfig {
             scroll_amount: 3,
             aggregate_search: true,
             show_cover: true,
+            show_notifications: None,
+            notification_timeout: None,
             max_fps: 20,
         }
+    }
+}
+
+/// 通知配置。
+///
+/// 字段同时接受 camelCase 和 snake_case，生成的配置使用与 go-musicfox
+/// 一致的 camelCase，便于用户迁移已有配置和理解跨项目设置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfig {
+    pub enable: bool,
+    #[serde(rename = "inApp", alias = "in_app")]
+    pub in_app: bool,
+    #[serde(rename = "inAppTimeout", alias = "in_app_timeout")]
+    pub in_app_timeout: u64,
+    #[serde(rename = "albumCover", alias = "album_cover")]
+    pub album_cover: bool,
+    #[serde(
+        rename = "trackChange",
+        alias = "track_change",
+        alias = "notifyOnTrackChange"
+    )]
+    pub track_change: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            in_app: true,
+            in_app_timeout: 4,
+            album_cover: true,
+            track_change: true,
+        }
+    }
+}
+
+/// 外部桌面集成配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntegrationConfig {
+    /// Linux 上注册标准 MPRIS 服务，Waybar 可直接识别和控制。
+    pub mpris: bool,
+}
+
+impl Default for IntegrationConfig {
+    fn default() -> Self {
+        Self { mpris: true }
     }
 }
 
@@ -224,6 +280,10 @@ pub struct Config {
     pub local_music: LocalMusicConfig,
     #[serde(default)]
     pub keybindings: KeybindingConfig,
+    #[serde(default)]
+    pub notification: NotificationConfig,
+    #[serde(default)]
+    pub integration: IntegrationConfig,
 }
 
 impl Default for Config {
@@ -238,6 +298,8 @@ impl Default for Config {
             ui: UiConfig::default(),
             local_music: LocalMusicConfig::default(),
             keybindings: KeybindingConfig::default(),
+            notification: NotificationConfig::default(),
+            integration: IntegrationConfig::default(),
         }
     }
 }

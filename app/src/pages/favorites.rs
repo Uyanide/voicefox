@@ -35,7 +35,12 @@ impl FavoritesPage {
         self.search_mode
     }
 
-    pub fn handle_input(&mut self, key: &KeyEvent, ctx: &AppContext, resolver: &KeybindingResolver) -> AppAction {
+    pub fn handle_input(
+        &mut self,
+        key: &KeyEvent,
+        ctx: &AppContext,
+        resolver: &KeybindingResolver,
+    ) -> AppAction {
         if self.search_mode {
             match (key.modifiers, key.code) {
                 (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -114,7 +119,8 @@ impl FavoritesPage {
                     return AppAction::None;
                 }
                 Action::ListPageDown => {
-                    self.selected = (self.selected + half_page).min(filtered.len().saturating_sub(1));
+                    self.selected =
+                        (self.selected + half_page).min(filtered.len().saturating_sub(1));
                     return AppAction::None;
                 }
                 Action::ListActivate => {
@@ -441,6 +447,33 @@ impl FavoritesPage {
             _ => {}
         }
         AppAction::None
+    }
+
+    pub fn context_song_at(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+        ctx: &AppContext,
+    ) -> Option<(Vec<SongInfo>, usize)> {
+        let favorites = ctx.storage.load_favorites();
+        let filtered = self.filtered_indices(&favorites);
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let search_height = u16::from(self.search_mode || !self.query.is_empty());
+        let list_y = inner.y.saturating_add(search_height).saturating_add(1);
+        if event.row < list_y || event.row >= inner.bottom() {
+            return None;
+        }
+        let index = self.scroll + event.row.saturating_sub(list_y) as usize;
+        if index >= filtered.len() {
+            return None;
+        }
+        let songs = filtered
+            .iter()
+            .filter_map(|original| favorites.get(*original).cloned())
+            .collect::<Vec<_>>();
+        self.search_mode = false;
+        self.selected = index;
+        Some((songs, index))
     }
 
     fn filtered_indices(&self, favorites: &[SongInfo]) -> Vec<usize> {

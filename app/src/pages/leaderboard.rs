@@ -384,6 +384,28 @@ impl LeaderboardPage {
         AppAction::None
     }
 
+    pub fn context_song_at(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+    ) -> Option<(Vec<SongInfo>, usize)> {
+        self.selected_board?;
+        let page = page_chunks(area, self.boards.len());
+        let song_inner = Block::default().borders(Borders::ALL).inner(page.songs);
+        let position = Position::new(event.column, event.row);
+        let list_y = song_inner.y.saturating_add(1);
+        if !song_inner.contains(position) || event.row < list_y || event.row >= song_inner.bottom()
+        {
+            return None;
+        }
+        let index = self.song_scroll_offset + event.row.saturating_sub(list_y) as usize;
+        if index >= self.songs.len() {
+            return None;
+        }
+        self.selected = index;
+        Some((self.songs.clone(), index))
+    }
+
     fn render_sources(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if area.width == 0 || area.height == 0 {
             return;

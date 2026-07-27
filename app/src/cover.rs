@@ -100,6 +100,19 @@ impl CoverService {
         self.image.read().unwrap().is_some()
     }
 
+    /// 仅缓存封面，不修改 TUI 当前图片状态。
+    pub async fn cache_path(&self, url: Option<String>) -> Result<Option<String>, String> {
+        let Some(url) = url
+            .map(|url| normalize_url(&url))
+            .filter(|url| !url.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        self.download_and_cache(&url)
+            .await
+            .map(|image| Some(image.path))
+    }
+
     /// 当前封面的像素宽高比
     pub fn image_aspect(&self) -> f32 {
         self.image
@@ -373,7 +386,7 @@ impl CoverGeometry {
 
     pub fn new(cell_aspect: f32, image_aspect: f32) -> Self {
         Self {
-            cell_aspect: cell_aspect,
+            cell_aspect,
             image_aspect: CoverGeometry::sanitize(
                 image_aspect,
                 MIN_IMAGE_ASPECT,

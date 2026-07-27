@@ -5,43 +5,129 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::context::AppContext;
 
-pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-    let notifs = ctx.notifications.read().unwrap();
-    let latest = notifs.back();
-
-    if let Some(notification) = latest {
-        let level_color = match notification.level {
-            NotificationLevel::Error => crate::theme::red(ctx),
-            NotificationLevel::Warn => crate::theme::yellow(ctx),
-            NotificationLevel::Info => crate::theme::accent(ctx),
-        };
-        let age = notification.age();
-        let style = if age < std::time::Duration::from_secs(3) {
-            Style::new()
-                .bg(level_color)
-                .fg(crate::theme::selection_fg(ctx))
-        } else if age < std::time::Duration::from_secs(4) {
-            Style::new()
-                .bg(crate::theme::surface2(ctx))
-                .fg(crate::theme::text(ctx))
-        } else {
-            Style::new()
-                .bg(crate::theme::mantle(ctx))
-                .fg(crate::theme::muted(ctx))
-        };
-        let line = Line::from(Span::styled(
-            format!(" [{}] {}", notification.timestamp(), notification.message),
-            style,
-        ));
-
-        if area.height > 0 && area.width > 0 {
-            Clear.render(area, buf);
-            Block::default().style(style).render(area, buf);
-            Paragraph::new(line).render(Rect::new(area.x, area.y, area.width, 1), buf);
-        }
+pub fn area(screen: Rect, ctx: &AppContext) -> Option<Rect> {
+    if !ctx.config.read().unwrap().notification.in_app {
+        return None;
     }
+    let notifs = ctx.notifications.read().unwrap();
+    let notification = notifs.back()?;
+    if screen.width < 12 || screen.height < 4 {
+        return None;
+    }
+
+    let available_width = screen.width.saturating_sub(2);
+    let title_width = notification
+        .title
+        .as_deref()
+        .map_or(0, UnicodeWidthStr::width);
+    let action_width = notification
+        .action_label
+        .as_deref()
+        .map_or(0, UnicodeWidthStr::width)
+        .saturating_add(4);
+    let desired_width = UnicodeWidthStr::width(notification.message.as_str())
+        .max(title_width)
+        .max(action_width)
+        .saturating_add(4)
+        .clamp(28, 72) as u16;
+    let width = desired_width.min(available_width);
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let message_width = UnicodeWidthStr::width(notification.message.as_str()).max(1);
+    let title_lines = notification.title.as_deref().map_or(0, |title| {
+        UnicodeWidthStr::width(title).div_ceil(content_width) as u16
+    });
+    let action_lines = u16::from(notification.action_url.is_some());
+    let lines = (message_width.div_ceil(content_width).clamp(1, 4) as u16)
+        .saturating_add(title_lines)
+        .saturating_add(action_lines);
+    let height = lines.saturating_add(2).min(screen.height.saturating_sub(1));
+    let x = screen.right().saturating_sub(width).saturating_sub(1);
+    let y = screen
+        .bottom()
+        .saturating_sub(height)
+        .saturating_sub(2)
+        .max(screen.y);
+    Some(Rect::new(x, y, width, height))
+}
+
+pub fn action_url_at(
+    notification_area: Rect,
+    column: u16,
+    row: u16,
+    ctx: &AppContext,
+) -> Option<String> {
+    let notification = ctx.notifications.read().unwrap().back().cloned()?;
+    let url = notification.action_url?;
+    let label = notification.action_label?;
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .inner(notification_area);
+    if inner.height == 0 || row != inner.bottom().saturating_sub(1) {
+        return None;
+    }
+    let start = inner.x;
+    let end = start
+        .saturating_add(UnicodeWidthStr::width(label.as_str()) as u16)
+        .saturating_add(4)
+        .min(inner.right());
+    (column >= start && column < end).then_some(url)
+}
+
+pub fn render(screen: Rect, buf: &mut Buffer, ctx: &AppContext) {
+    let Some(area) = area(screen, ctx) else {
+        return;
+    };
+    let lifetime = ctx.notification_timeout();
+    let notification = ctx.notifications.read().unwrap().back().cloned();
+    let Some(notification) = notification else {
+        return;
+    };
+    let (label, level_color) = match notification.level {
+        NotificationLevel::Info => ("信息", crate::theme::blue(ctx)),
+        NotificationLevel::Success => ("成功", crate::theme::green(ctx)),
+        NotificationLevel::Warn => ("警告", crate::theme::yellow(ctx)),
+        NotificationLevel::Error => ("错误", crate::theme::red(ctx)),
+    };
+    let faded = notification.age() >= lifetime.mul_f32(0.75);
+    let text_color = if faded {
+        crate::theme::muted(ctx)
+    } else {
+        crate::theme::text(ctx)
+    };
+    let style = Style::new().bg(crate::theme::surface0(ctx)).fg(text_color);
+
+    Clear.render(area, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(level_color))
+        .style(style)
+        .title(format!(" {} · {} ", label, notification.timestamp()));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let mut lines = Vec::new();
+    if let Some(title) = notification.title.as_ref() {
+        lines.push(Line::from(Span::styled(
+            title.as_str(),
+            Style::new().fg(level_color),
+        )));
+    }
+    lines.push(Line::from(notification.message.as_str()));
+    if let (Some(label), Some(_)) = (
+        notification.action_label.as_ref(),
+        notification.action_url.as_ref(),
+    ) {
+        lines.push(Line::from(Span::styled(
+            format!("[ {label} ]"),
+            Style::new().fg(level_color),
+        )));
+    }
+    Paragraph::new(lines)
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
 }

@@ -36,6 +36,20 @@ pub fn handle_mouse(
     AppAction::None
 }
 
+pub fn context_song_at(
+    event: MouseEvent,
+    area: Rect,
+    ctx: &AppContext,
+    selected: &mut usize,
+    scroll: usize,
+) -> Option<(Vec<lx_core::model::song::SongInfo>, usize)> {
+    let songs = ctx.source_manager.local_source().all_songs();
+    let position = Position::new(event.column, event.row);
+    let index = song_index_at(area, position, scroll, songs.len())?;
+    *selected = index;
+    Some((songs, index))
+}
+
 fn song_index_at(area: Rect, position: Position, scroll: usize, len: usize) -> Option<usize> {
     let inner = Block::default().borders(Borders::ALL).inner(area);
     let visible_height = inner.height.saturating_sub(2);
