@@ -3,7 +3,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lx_core::events::Notification;
@@ -42,6 +42,8 @@ pub struct AppContext {
     pub play_request_id: Arc<AtomicU64>,
     pub play_attempted_sources: Arc<std::sync::Mutex<HashSet<lx_core::model::source::SourceId>>>,
     pub local_scan_request_id: Arc<AtomicU64>,
+    /// 每次跳转自增，供 MPRIS 判断进度是否被人为改变（用于 Seeked 信号）。
+    seek_generation: AtomicU64,
 
     // --- 配置 ---
     pub config: std::sync::RwLock<Config>,
@@ -103,12 +105,26 @@ impl AppContext {
             play_request_id: Arc::new(AtomicU64::new(0)),
             play_attempted_sources: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_scan_request_id: Arc::new(AtomicU64::new(0)),
+            seek_generation: AtomicU64::new(0),
             config: std::sync::RwLock::new(config),
             config_path,
             notifications: std::sync::RwLock::new(VecDeque::new()),
             desktop_notifier: DesktopNotifier::new(),
             storage: Storage::new(),
         })
+    }
+
+    /// 跳转到指定进度。
+    ///
+    /// MPRIS 规范要求任何与正常播放 不一致的进度变化都发出 Seeked，因此将该函数作为同一入口。
+    pub fn seek(&self, position: Duration) {
+        self.player.seek(position);
+        self.seek_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 当前跳转代次，变化即代表期间发生过跳转。
+    pub fn seek_generation(&self) -> u64 {
+        self.seek_generation.load(Ordering::Relaxed)
     }
 
     pub fn notify(&self, notification: Notification) {

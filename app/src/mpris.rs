@@ -38,6 +38,8 @@ pub struct MprisSnapshot {
     source_url: String,
     duration_micros: i64,
     position_micros: i64,
+    /// 当前进度所属的连续时间线，跳转会递增
+    position_epoch: u64,
     volume: f64,
     can_go_next: bool,
     can_go_previous: bool,
@@ -57,6 +59,7 @@ impl Default for MprisSnapshot {
             source_url: String::new(),
             duration_micros: 0,
             position_micros: 0,
+            position_epoch: 0,
             volume: 0.8,
             can_go_next: false,
             can_go_previous: false,
@@ -74,6 +77,7 @@ impl MprisSnapshot {
         volume: u32,
         play_mode: crate::playlist::mode::PlayMode,
         queue_len: usize,
+        position_epoch: u64,
     ) -> Self {
         let playback_status = match state {
             PlayerState::Playing | PlayerState::Loading => "Playing",
@@ -91,6 +95,7 @@ impl MprisSnapshot {
             loop_status,
             shuffle,
             position_micros: micros(position),
+            position_epoch,
             duration_micros: micros(duration),
             volume: f64::from(volume.min(100)) / 100.0,
             can_go_next: queue_len > 1,
@@ -111,6 +116,14 @@ impl MprisSnapshot {
         }
 
         snapshot
+    }
+
+    fn can_play(&self) -> bool {
+        !self.title.is_empty()
+    }
+
+    fn can_seek(&self) -> bool {
+        self.duration_micros > 0
     }
 
     fn metadata_changed(&self, other: &Self) -> bool {
@@ -372,17 +385,17 @@ impl MprisPlayer {
 
     #[zbus(property)]
     fn can_play(&self) -> bool {
-        !self.state.title.is_empty()
+        self.state.can_play()
     }
 
     #[zbus(property)]
     fn can_pause(&self) -> bool {
-        !self.state.title.is_empty()
+        self.state.can_play()
     }
 
     #[zbus(property)]
     fn can_seek(&self) -> bool {
-        self.state.duration_micros > 0
+        self.state.can_seek()
     }
 
     #[zbus(property)]
@@ -408,6 +421,9 @@ async fn run_updates(
         let previous = interface.state.clone();
         interface.state = snapshot;
 
+        if previous.position_epoch != interface.state.position_epoch {
+            MprisPlayer::seeked(&emitter, interface.state.position_micros).await?;
+        }
         if previous.playback_status != interface.state.playback_status {
             interface.playback_status_changed(&emitter).await?;
         }
@@ -428,6 +444,13 @@ async fn run_updates(
         }
         if previous.can_go_previous != interface.state.can_go_previous {
             interface.can_go_previous_changed(&emitter).await?;
+        }
+        if previous.can_play() != interface.state.can_play() {
+            interface.can_play_changed(&emitter).await?;
+            interface.can_pause_changed(&emitter).await?;
+        }
+        if previous.can_seek() != interface.state.can_seek() {
+            interface.can_seek_changed(&emitter).await?;
         }
     }
     Ok(())
@@ -482,6 +505,7 @@ mod tests {
             75,
             crate::playlist::mode::PlayMode::SingleLoop,
             3,
+            0,
         );
 
         assert_eq!(snapshot.playback_status, "Playing");

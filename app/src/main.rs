@@ -429,6 +429,8 @@ fn run_app(
     let mut last_mpris_snapshot: Option<mpris::MprisSnapshot> = None;
     #[cfg(target_os = "linux")]
     let mut last_mpris_update = Instant::now() - Duration::from_secs(1);
+    #[cfg(target_os = "linux")]
+    let mut last_seek_generation = ctx.seek_generation();
 
     // === 后台异步加载 JS 音源（不阻塞启动） ===
     let js_urls = ctx.config.read().unwrap().source.js_sources.clone();
@@ -871,15 +873,20 @@ fn run_app(
             needs_render = true;
         }
         #[cfg(target_os = "linux")]
-        if let Some(handle) = mpris_handle.as_ref()
-            && last_mpris_update.elapsed() >= Duration::from_millis(250)
-        {
-            let snapshot = current_mpris_snapshot(&ctx);
-            if last_mpris_snapshot.as_ref() != Some(&snapshot) {
-                handle.update(snapshot.clone());
-                last_mpris_snapshot = Some(snapshot);
+        if let Some(handle) = mpris_handle.as_ref() {
+            // 例行更新按 250ms 限频，但跳转要立刻放行
+            let seek_generation = ctx.seek_generation();
+            if seek_generation != last_seek_generation
+                || last_mpris_update.elapsed() >= Duration::from_millis(250)
+            {
+                last_seek_generation = seek_generation;
+                let snapshot = current_mpris_snapshot(&ctx);
+                if last_mpris_snapshot.as_ref() != Some(&snapshot) {
+                    handle.update(snapshot.clone());
+                    last_mpris_snapshot = Some(snapshot);
+                }
+                last_mpris_update = Instant::now();
             }
-            last_mpris_update = Instant::now();
         }
 
         if last_periodic_render.elapsed() >= render_interval {
@@ -1123,7 +1130,7 @@ fn run_app(
                             && active_tab != NavTab::Playlists =>
                     {
                         let pos = *ctx.position.borrow();
-                        ctx.player.seek(pos + Duration::from_secs(5));
+                        ctx.seek(pos + Duration::from_secs(5));
                         needs_render = true;
                         continue;
                     }
@@ -1134,9 +1141,9 @@ fn run_app(
                     {
                         let pos = *ctx.position.borrow();
                         if pos > Duration::from_secs(5) {
-                            ctx.player.seek(pos - Duration::from_secs(5));
+                            ctx.seek(pos - Duration::from_secs(5));
                         } else {
-                            ctx.player.seek(Duration::ZERO);
+                            ctx.seek(Duration::ZERO);
                         }
                         needs_render = true;
                         continue;
@@ -1257,7 +1264,7 @@ fn run_app(
                         && active_tab != NavTab::Playlists =>
                 {
                     let pos = *ctx.position.borrow();
-                    ctx.player.seek(pos + Duration::from_secs(5));
+                    ctx.seek(pos + Duration::from_secs(5));
                     needs_render = true;
                     continue;
                 }
@@ -1269,9 +1276,9 @@ fn run_app(
                 {
                     let pos = *ctx.position.borrow();
                     if pos > Duration::from_secs(5) {
-                        ctx.player.seek(pos - Duration::from_secs(5));
+                        ctx.seek(pos - Duration::from_secs(5));
                     } else {
-                        ctx.player.seek(Duration::ZERO);
+                        ctx.seek(Duration::ZERO);
                     }
                     needs_render = true;
                     continue;
@@ -1718,7 +1725,7 @@ fn run_app(
                 if !duration.is_zero() && ui_areas.progress.width > 0 {
                     let offset = mouse.column.saturating_sub(ui_areas.progress.x);
                     let ratio = f64::from(offset) / f64::from(ui_areas.progress.width);
-                    ctx.player.seek(Duration::from_secs_f64(
+                    ctx.seek(Duration::from_secs_f64(
                         duration.as_secs_f64() * ratio.clamp(0.0, 1.0),
                     ));
                 }
@@ -2157,6 +2164,7 @@ fn current_mpris_snapshot(ctx: &AppContext) -> mpris::MprisSnapshot {
         ctx.player.volume(),
         ctx.playlist.mode(),
         ctx.playlist.len(),
+        ctx.seek_generation(),
     )
 }
 
@@ -2202,10 +2210,9 @@ fn execute_mpris_command(
             } else {
                 current.saturating_sub(offset.unsigned_abs() as u128)
             };
-            ctx.player
-                .seek(Duration::from_micros(target.min(u64::MAX as u128) as u64));
+            ctx.seek(Duration::from_micros(target.min(u64::MAX as u128) as u64));
         }
-        MprisCommand::SetPosition(position) => ctx.player.seek(position),
+        MprisCommand::SetPosition(position) => ctx.seek(position),
         MprisCommand::SetVolume(volume) => {
             ctx.player
                 .set_volume((volume.clamp(0.0, 1.0) * 100.0).round() as u32);
