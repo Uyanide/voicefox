@@ -37,8 +37,8 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - **多音源搜索**：网易云音乐、酷狗音乐、酷我音乐、QQ 音乐、咪咕音乐
 - **在线播放**：通过 mpv 播放高品质音乐
 - **本地音乐**：扫描本地音乐目录，支持 MP3/FLAC/M4A/OGG/WAV，自动读取封面、同名 LRC 和音频内嵌歌词，并可确认后删除本地文件
-- **封面显示**：支持 Kitty/WezTerm/Ghostty 终端原生图片协议，真实显示专辑封面
-- **tmux 封面**：在 Kitty 中通过 tmux passthrough 和 Unicode placeholder 显示封面
+- **封面显示**：按终端能力自动选择 Kitty / Sixel / iTerm2 图片协议，都不支持时用 Unicode 半格块渲染
+- **tmux 封面**：在 tmux 中通过 passthrough 传递图形协议序列，封面照常显示
 - **歌词支持**：支持 LRC、KRC、QRC、YRC 多种歌词格式，支持翻译歌词
 - **收藏管理**：添加/取消收藏歌曲和热门歌单
 - **播放历史**：自动记录播放记录
@@ -493,6 +493,7 @@ wrap_navigation = true
 scroll_amount = 3
 aggregate_search = true
 show_cover = true
+cover_protocol = "auto"   # auto | kitty | sixel | iterm2 | halfblocks
 max_fps = 20
 
 [notification]
