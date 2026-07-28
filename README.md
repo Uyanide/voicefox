@@ -129,7 +129,7 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - [ ] **听书模式**：支持有声书、播客内容
 - [ ] **自动补全歌词**：播放时自动从多个源匹配歌词
 - [ ] **歌单管理**：创建和编辑自定义歌单
-- [ ] **非原生图片终端兼容**：为不支持 Kitty/WezTerm/Ghostty 图片协议的终端提供备用封面渲染
+- [x] **非原生图片终端兼容**：Kitty、Sixel、iTerm2 三种图片协议自动探测，都不支持时退回 Unicode 半格块渲染
 - [ ] **跨平台包管理**：支持更多 Linux 发行版、macOS
 - [ ] **更多音源插件**：兼容更多 lx-music 社区音源
 - [ ] **TUI 响应式布局**：自适应终端窗口大小变化
@@ -142,7 +142,6 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
   - Linux：`sudo pacman -S mpv`（Arch） / `sudo apt install mpv`（Debian/Ubuntu）
   - macOS：`brew install mpv`
   - Windows：从 https://mpv.io/ 下载安装
-- **Kitty/kitten**（tmux 中显示封面时需要）：Kitty 安装包通常已包含 `kitten`
 
 ### tmux 中显示封面
 
@@ -158,7 +157,17 @@ set -g allow-passthrough on
 tmux source-file ~/.tmux.conf
 ```
 
-voicefox 在 tmux 中会自动调用 `kitten icat` 的 passthrough 和 Unicode placeholder 模式。普通 Kitty、WezTerm 和 Ghostty 会继续使用内置的终端图片输出。
+### 封面渲染协议
+
+默认自动探测，按终端能力选择 Kitty / Sixel / iTerm2，都不支持时用 Unicode 半格块。探测不准时可以在配置文件里强制指定：
+
+```toml
+[ui]
+# auto（默认）| kitty | sixel | iterm2 | halfblocks | off
+cover_protocol = "auto"
+```
+
+`off` 表示不显示图片，只在封面框里显示歌名和歌手。写错的值会退回 `auto`。
 
 ### Waybar 控制模块
 
@@ -647,8 +656,8 @@ voicefox/
 ## 技术栈
 
 - **语言**：Rust (edition 2024)
-- **TUI 框架**：[ratatui](https://github.com/ratatui/ratatui) 0.29
-- **终端事件**：[crossterm](https://github.com/crossterm-rs/crossterm) 0.28
+- **TUI 框架**：[ratatui](https://github.com/ratatui/ratatui) 0.30
+- **终端事件**：[crossterm](https://github.com/crossterm-rs/crossterm) 0.29
 - **异步运行时**：[tokio](https://github.com/tokio-rs/tokio)
 - **音频播放**：[mpv](https://mpv.io/)（通过 IPC 控制）
 - **HTTP 客户端**：[reqwest](https://github.com/seanmonstar/reqwest)

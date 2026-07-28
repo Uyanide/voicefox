@@ -32,7 +32,7 @@ dirs.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 lru.workspace = true
-viuer.workspace = true
+ratatui-image.workspace = true
 qrcode = { version = "0.4", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]

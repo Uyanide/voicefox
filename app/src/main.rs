@@ -401,7 +401,9 @@ fn run_app(
         scroll_amount,
     )));
     let settings_page = Arc::new(std::sync::Mutex::new(pages::settings::SettingsPage::new()));
-    let mut main_page = pages::main_page::MainPage::new();
+    let cover_protocol = ctx.config.read().unwrap().ui.cover_protocol.clone();
+    let mut main_page =
+        pages::main_page::MainPage::new(cover::CoverRenderer::detect(&cover_protocol));
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -529,7 +531,6 @@ fn run_app(
                         tracing::warn!("save playback session failed: {error}");
                     }
                     ctx.player.stop();
-                    ctx.cover_service.clear_display();
                     return Ok(());
                 }
                 needs_render = true;
@@ -1104,7 +1105,6 @@ fn run_app(
                             tracing::warn!("save playback session failed: {error}");
                         }
                         ctx.player.stop();
-                        ctx.cover_service.clear_display();
                         return Ok(());
                     }
                     Action::GlobalPlayPause if !text_input_active => {
@@ -1999,12 +1999,6 @@ fn draw_app(
     song_menu: &Option<SongContextMenu>,
     bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
 ) -> anyhow::Result<()> {
-    // Kitty 图片是终端外部图层，必须在绘制非主页前清除，避免它短暂覆盖本地/历史页面。
-    if active_tab != NavTab::Main {
-        ctx.cover_service.clear_display();
-    }
-    // 封面位置每帧重新记录，先清零，避免窗口过窄不画封面时沿用上一帧的区域
-    ctx.cover_service.set_display_area(Rect::ZERO);
     terminal.draw(|frame| {
         let area = frame.area();
         frame.render_widget(
@@ -2267,10 +2261,6 @@ fn draw_app(
             menu.render(content_area, frame.buffer_mut(), ctx);
         }
     })?;
-    // 在 Kitty 终端中显示封面（draw 之后，浮动在 TUI 上方）
-    if active_tab == NavTab::Main {
-        ctx.cover_service.display_kitty();
-    }
     Ok(())
 }
 
