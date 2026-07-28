@@ -1,8 +1,13 @@
 //! 封面的获取与本地缓存
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use reqwest::header::{ACCEPT, REFERER};
 
 use super::layout::DEFAULT_IMAGE_ASPECT;
+
+/// 临时文件名的流水号
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 已就绪的封面
 #[derive(Debug, Clone)]
@@ -65,12 +70,11 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
         .await
         .map_err(|error| error.to_string())?;
 
-    let cache_path_clone = cache_path.clone();
-    tokio::task::spawn_blocking(move || {
-        std::fs::write(&cache_path_clone, &bytes).ok();
-    })
-    .await
-    .ok();
+    let target = cache_path.clone();
+    tokio::task::spawn_blocking(move || write_cache_file(&target, &bytes))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("写入封面缓存失败: {error}"))?;
 
     Ok(CoverImage {
         path: cache_path.to_string_lossy().to_string(),
@@ -78,6 +82,20 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
             .await
             .unwrap_or(DEFAULT_IMAGE_ASPECT),
     })
+}
+
+/// 写入缓存文件，确保原子性
+fn write_cache_file(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp_path = target.with_extension(format!(
+        "part.{}.{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&temp_path, bytes)
+        .and_then(|()| std::fs::rename(&temp_path, target))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&temp_path);
+        })
 }
 
 /// 读图片文件头取像素宽高比，错误返回 None

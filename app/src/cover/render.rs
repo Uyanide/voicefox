@@ -155,6 +155,7 @@ impl CoverRenderer {
                 return;
             }
             // 第一次读。保留 Picker 查询的字号(若有)
+            // 依赖 capabilities 非空 => 字号非 arbitrary，无文档
             None if !self.picker.capabilities().is_empty() => return,
             _ => {}
         }
