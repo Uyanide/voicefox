@@ -54,6 +54,11 @@ impl MainPage {
         }
     }
 
+    /// 收取封面后台线程算完的解码/编码结果，返回是否需要重画
+    pub fn poll_cover(&mut self) -> bool {
+        self.cover.poll()
+    }
+
     pub fn handle_input(
         &mut self,
         key: &KeyEvent,

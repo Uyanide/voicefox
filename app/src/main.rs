@@ -939,6 +939,9 @@ fn run_app(
             last_periodic_render = Instant::now();
         }
 
+        // 封面的解码和编码在后台线程上跑，算完了才有东西可画
+        needs_render |= main_page.poll_cover();
+
         // 在读取下一个事件前先补画上一轮状态。这样即使 key repeat 每轮都
         // 触发 continue，界面也不会被连续输入饿死。
         if needs_render {

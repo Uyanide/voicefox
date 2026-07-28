@@ -1,21 +1,50 @@
 //! 封面在终端里的实际绘制
 
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::thread;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui_image::errors::Errors;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
 use ratatui_image::{FilterType, FontSize, Resize, ResizeEncodeRender};
 
-/// 用 Scale 而不是 Fit：Fit 内部是 min(area, image)，只缩不放。
+/// 用 Scale 而不是 Fit：Fit 内部是 min(area, image)，只缩不放
 const RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
+
+/// 主线程 → 解码线程
+struct DecodeJob {
+    path: String,
+    /// 请求序号
+    id: u64,
+}
+
+/// 后台线程 → 主线程
+enum Done {
+    Loaded {
+        id: u64,
+        protocol: Option<Box<StatefulProtocol>>,
+    },
+    Resized(Box<Result<ResizeResponse, Errors>>),
+}
 
 pub struct CoverRenderer {
     picker: Picker,
-    /// cover_protocol = "off" 时关掉，全部退回文字占位
     enabled: bool,
-    protocol: Option<StatefulProtocol>,
-    /// 已经建立 protocol 的封面路径，路径不变就不重新解码
+    /// 解码请求
+    decode_tx: Sender<DecodeJob>,
+    /// 后台线程的结果
+    done_rx: Receiver<Done>,
+    /// 图片状态。内部为空表示后台正在算
+    protocol: ThreadProtocol,
+    /// 当前是否有封面要显示
+    has_image: bool,
+    /// 已经开始解码的路径
     loaded: Option<String>,
+    /// 解码请求序号
+    request_id: u64,
 }
 
 impl CoverRenderer {
@@ -46,11 +75,24 @@ impl CoverRenderer {
             picker.font_size(),
             enabled
         );
+        Self::spawn(picker, enabled)
+    }
+
+    fn spawn(picker: Picker, enabled: bool) -> Self {
+        let (decode_tx, decode_rx) = channel::<DecodeJob>();
+        let (encode_tx, encode_rx) = channel::<ResizeRequest>();
+        let (done_tx, done_rx) = channel::<Done>();
+        let enabled = enabled && spawn_workers(picker.clone(), decode_rx, encode_rx, done_tx);
+
         Self {
+            protocol: ThreadProtocol::new(encode_tx, None),
             picker,
             enabled,
-            protocol: None,
+            decode_tx,
+            done_rx,
+            has_image: false,
             loaded: None,
+            request_id: 0,
         }
     }
 
@@ -59,47 +101,133 @@ impl CoverRenderer {
         self.picker.font_size()
     }
 
-    /// 把渲染器同步到给定封面路径。只有路径变化时才解码，失败也记下来，避免每帧重试。
+    /// 把渲染器同步到给定封面路径。只有路径变化时才派活给后台线程
     pub fn sync(&mut self, path: Option<&str>) {
         if !self.enabled {
             return;
         }
         match path {
             None => {
-                self.protocol = None;
+                if self.loaded.is_none() {
+                    return;
+                }
                 self.loaded = None;
+                self.request_id += 1;
+                self.protocol.empty_protocol();
+                self.has_image = false;
             }
             Some(path) => {
                 if self.loaded.as_deref() == Some(path) {
                     return;
                 }
                 self.loaded = Some(path.to_string());
-                self.protocol = decode(path).map(|image| self.picker.new_resize_protocol(image));
+                self.request_id += 1;
+                // 立刻撤下旧图
+                self.protocol.empty_protocol();
+                self.has_image = self
+                    .decode_tx
+                    .send(DecodeJob {
+                        path: path.to_string(),
+                        id: self.request_id,
+                    })
+                    .is_ok();
             }
         }
     }
 
-    /// 画封面，返回 false 表示没画（调用方应该退回文字占位）
+    /// 收取后台线程算完的结果，返回是否需要重画
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.done_rx.try_recv() {
+                Ok(Done::Loaded { id, protocol }) => {
+                    // 对不上说明封面换过了
+                    if id != self.request_id {
+                        continue;
+                    }
+                    match protocol {
+                        Some(protocol) => self.protocol.replace_protocol(*protocol),
+                        None => {
+                            self.protocol.empty_protocol();
+                            self.has_image = false;
+                        }
+                    }
+                    changed = true;
+                }
+                Ok(Done::Resized(result)) => match *result {
+                    // 过期的结果会被 ThreadProtocol 按 id 丢掉
+                    Ok(response) => changed |= self.protocol.update_resized_protocol(response),
+                    Err(error) => {
+                        tracing::debug!("cover encode failed: {error}");
+                        self.protocol.empty_protocol();
+                        self.has_image = false;
+                        changed = true;
+                    }
+                },
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        changed
+    }
+
+    /// 画封面，返回 false 表示没画
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) -> bool {
-        if area.width == 0 || area.height == 0 {
+        if !self.has_image || area.width == 0 || area.height == 0 {
             return false;
         }
-        let Some(protocol) = self.protocol.as_mut() else {
-            return false;
-        };
-
-        if let Some(size) = protocol.needs_resize(&RESIZE, area.into()) {
-            protocol.resize_encode(&RESIZE, size);
+        if let Some(size) = self.protocol.needs_resize(&RESIZE, area.into()) {
+            self.protocol.resize_encode(&RESIZE, size);
         }
-        if let Some(Err(error)) = protocol.last_encoding_result() {
-            tracing::debug!("cover encode failed: {error}");
-            // 丢掉这张图，下一帧起走文字占位，不再反复尝试
-            self.protocol = None;
-            return false;
-        }
-
-        protocol.render(area, buf);
+        self.protocol.render(area, buf);
         true
+    }
+}
+
+/// 起解码线程和编码线程
+fn spawn_workers(
+    picker: Picker,
+    decode_rx: Receiver<DecodeJob>,
+    encode_rx: Receiver<ResizeRequest>,
+    done_tx: Sender<Done>,
+) -> bool {
+    let decode_tx = done_tx.clone();
+    let decode = thread::Builder::new()
+        .name("voicefox-cover-decode".to_string())
+        .spawn(move || {
+            for job in decode_rx {
+                let protocol =
+                    decode(&job.path).map(|image| Box::new(picker.new_resize_protocol(image)));
+                if decode_tx
+                    .send(Done::Loaded {
+                        id: job.id,
+                        protocol,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+    let encode = thread::Builder::new()
+        .name("voicefox-cover-encode".to_string())
+        .spawn(move || {
+            for request in encode_rx {
+                if done_tx
+                    .send(Done::Resized(Box::new(request.resize_encode())))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+    match (decode, encode) {
+        (Ok(_), Ok(_)) => true,
+        _ => {
+            tracing::warn!("spawn cover worker threads failed, cover rendering disabled");
+            false
+        }
     }
 }
 
@@ -127,7 +255,7 @@ fn parse_protocol(value: &str) -> Option<Option<ProtocolType>> {
         "sixel" | "sixels" => Some(Some(ProtocolType::Sixel)),
         "iterm2" | "iterm" => Some(Some(ProtocolType::Iterm2)),
         "halfblocks" | "blocks" => Some(Some(ProtocolType::Halfblocks)),
-        "off" | "none" | "text" => None,
+        "off" | "none" => None,
         other => {
             tracing::warn!("unknown ui.cover_protocol {other:?}, falling back to auto");
             Some(None)
@@ -137,8 +265,106 @@ fn parse_protocol(value: &str) -> Option<Option<ProtocolType>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_protocol;
-    use ratatui_image::picker::ProtocolType;
+    use std::time::{Duration, Instant};
+
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use ratatui_image::picker::{Picker, ProtocolType};
+
+    use super::{CoverRenderer, parse_protocol};
+
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 4,
+    };
+
+    fn renderer() -> CoverRenderer {
+        CoverRenderer::spawn(Picker::halfblocks(), true)
+    }
+
+    /// 存一张纯色 PNG，返回路径
+    fn write_image(name: &str, color: [u8; 3]) -> String {
+        let path = std::env::temp_dir().join(format!("voicefox-cover-{name}.png"));
+        let pixel = image::Rgb(color);
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 16, pixel))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// 一直转到后台把解码和编码都干完，返回画出来的 buffer
+    fn settle(renderer: &mut CoverRenderer) -> Buffer {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            renderer.poll();
+            let mut buf = Buffer::empty(AREA);
+            assert!(renderer.render(AREA, &mut buf), "应有封面可以显示");
+            if buf != Buffer::empty(AREA) {
+                return buf;
+            }
+            assert!(Instant::now() < deadline, "后台线程应已经完成");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 画面左上角的颜色
+    fn corner(buf: &Buffer) -> (Color, Color) {
+        let cell = buf.cell((AREA.x, AREA.y)).unwrap();
+        (cell.fg, cell.bg)
+    }
+
+    #[test]
+    fn cover_is_decoded_off_thread_and_then_rendered() {
+        let red = write_image("red", [255, 0, 0]);
+        let mut renderer = renderer();
+
+        // 还没有封面
+        let mut buf = Buffer::empty(AREA);
+        assert!(!renderer.render(AREA, &mut buf));
+
+        renderer.sync(Some(&red));
+        // 后台还在解码：框仍然归渲染器管，但这一帧留白
+        let mut buf = Buffer::empty(AREA);
+        assert!(renderer.render(AREA, &mut buf));
+        assert_eq!(buf, Buffer::empty(AREA));
+
+        let buf = settle(&mut renderer);
+        assert_eq!(corner(&buf), (Color::Rgb(255, 0, 0), Color::Rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn a_cover_swapped_mid_decode_beats_the_stale_one() {
+        let red = write_image("stale", [255, 0, 0]);
+        let green = write_image("fresh", [0, 255, 0]);
+        let mut renderer = renderer();
+
+        // 中间不 poll，红色那次的结果回来时序号已经过期，必须被丢掉
+        renderer.sync(Some(&red));
+        renderer.sync(Some(&green));
+
+        let buf = settle(&mut renderer);
+        assert_eq!(corner(&buf), (Color::Rgb(0, 255, 0), Color::Rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn an_undecodable_cover_stops_rendering() {
+        let mut renderer = renderer();
+        renderer.sync(Some("/voicefox/does/not/exist.png"));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            renderer.poll();
+            let mut buf = Buffer::empty(AREA);
+            if !renderer.render(AREA, &mut buf) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "解码失败后应没有封面可以显示");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn protocol_config_is_parsed_leniently() {
