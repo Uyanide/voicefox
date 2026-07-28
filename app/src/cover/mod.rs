@@ -10,6 +10,7 @@ use std::time::Duration;
 
 pub use layout::CoverGeometry;
 pub use render::CoverRenderer;
+pub use source::sweep_temp_files;
 
 use source::CoverImage;
 

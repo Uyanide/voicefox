@@ -495,6 +495,8 @@ fn run_app(
         );
     }
 
+    rt.spawn(cover::sweep_temp_files());
+
     if ctx.bili_source.is_logged_in() {
         let bili_source = Arc::clone(&ctx.bili_source);
         let tx = action_tx.clone();

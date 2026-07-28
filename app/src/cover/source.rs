@@ -1,6 +1,8 @@
 //! 封面的获取与本地缓存
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use reqwest::header::{ACCEPT, REFERER};
 
@@ -8,6 +10,43 @@ use super::layout::DEFAULT_IMAGE_ASPECT;
 
 /// 临时文件名的流水号
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 临时文件名里的记号
+const TEMP_INFIX: &str = ".part.";
+
+/// 比这个新的临时文件当作别的实例正在写，不动
+const TEMP_GRACE: Duration = Duration::from_secs(60);
+
+/// 封面缓存目录
+fn cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("voicefox")
+        .join("covers")
+}
+
+/// 清掉进程被强杀时留在缓存目录里的临时文件
+pub async fn sweep_temp_files() {
+    let Ok(mut entries) = tokio::fs::read_dir(cache_dir()).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_name().to_string_lossy().contains(TEMP_INFIX) {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata().await
+            && metadata
+                .modified()
+                .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < TEMP_GRACE))
+        {
+            continue;
+        }
+        match tokio::fs::remove_file(entry.path()).await {
+            Ok(()) => tracing::debug!("removed stale cover temp file {:?}", entry.path()),
+            Err(error) => tracing::debug!("remove stale cover temp file failed: {error}"),
+        }
+    }
+}
 
 /// 已就绪的封面
 #[derive(Debug, Clone)]
@@ -19,10 +58,7 @@ pub struct CoverImage {
 
 /// 下载封面到本地缓存，返回缓存路径与像素宽高比
 pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<CoverImage, String> {
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("voicefox")
-        .join("covers");
+    let cache_dir = cache_dir();
 
     if !cache_dir.exists() {
         let _ = std::fs::create_dir_all(&cache_dir);
@@ -84,13 +120,20 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
     })
 }
 
-/// 写入缓存文件，确保原子性
-fn write_cache_file(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temp_path = target.with_extension(format!(
-        "part.{}.{}",
+/// 同目录下的临时文件路径
+fn temp_path_for(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        "{TEMP_INFIX}{}.{}",
         std::process::id(),
         TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    target.with_file_name(name)
+}
+
+/// 写入缓存文件，确保原子性
+fn write_cache_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp_path = temp_path_for(target);
     std::fs::write(&temp_path, bytes)
         .and_then(|()| std::fs::rename(&temp_path, target))
         .inspect_err(|_| {
