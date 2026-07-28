@@ -132,7 +132,7 @@ fn default_app_icon() -> String {
     candidates.extend([
         "/usr/local/share/icons/hicolor/512x512/apps/voicefox.png".to_string(),
         "/usr/share/icons/hicolor/512x512/apps/voicefox.png".to_string(),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../icons/1.png").to_string(),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../icons/512.png").to_string(),
     ]);
 
     candidates

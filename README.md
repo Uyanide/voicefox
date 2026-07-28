@@ -212,7 +212,7 @@ cargo build --release
 sudo cp target/release/voicefox /usr/local/bin/
 
 # 安装桌面入口和通知图标（当前用户）
-install -Dm644 icons/1.png \
+install -Dm644 icons/512.png \
   ~/.local/share/icons/hicolor/512x512/apps/voicefox.png
 install -Dm644 assets/voicefox.desktop \
   ~/.local/share/applications/voicefox.desktop
