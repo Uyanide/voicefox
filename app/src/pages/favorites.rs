@@ -484,7 +484,6 @@ impl FavoritesPage {
             })
             .collect()
     }
-    }
 
     fn clamp_selection(&mut self, len: usize) {
         if len == 0 {
@@ -525,8 +524,8 @@ mod tests {
             SongInfo::new("2".into(), SourceId::Kw, "B".into(), "Y".into()),
         ];
 
-        assert_eq!(page.filtered_indices(&songs), vec![1, 0]);
+        assert_eq!(page.filtered_song_indices(&songs), vec![1, 0]);
         assert_eq!(page.cycle_sort(), SortMode::Oldest);
-        assert_eq!(page.filtered_indices(&songs), vec![0, 1]);
+        assert_eq!(page.filtered_song_indices(&songs), vec![0, 1]);
     }
 }
