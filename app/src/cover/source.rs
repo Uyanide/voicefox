@@ -80,19 +80,26 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
     let hash = simple_hash(url.as_bytes());
     let cache_path = cache_dir.join(format!("{}.jpg", hash));
 
-    if cache_path.exists() {
-        return Ok(CoverImage {
-            path: cache_path.to_string_lossy().to_string(),
-            aspect: probe_aspect(&cache_path)
-                .await
-                .unwrap_or(DEFAULT_IMAGE_ASPECT),
-        });
+    match probe_aspect(&cache_path).await {
+        Some(aspect) => {
+            return Ok(CoverImage {
+                path: cache_path.to_string_lossy().to_string(),
+                aspect,
+            });
+        }
+        // 探不出宽高说明文件损坏
+        // 也可能是因为实际为 image crate default-formats 不包括的格式，但反正不认识，和损坏没两样
+        None if cache_path.exists() => {
+            tracing::debug!("cover cache {cache_path:?} is unreadable, downloading again");
+            let _ = tokio::fs::remove_file(&cache_path).await;
+        }
+        None => {}
     }
 
     // HTTP 下载
     let mut request = client
         .get(url)
-        .header(ACCEPT, "image/avif,image/webp,image/apng,image/*,*/*;q=0.8");
+        .header(ACCEPT, "image/webp,image/apng,image/*,*/*;q=0.8");
     if let Some(referer) = cover_referer(url) {
         request = request.header(REFERER, referer);
     }
@@ -196,7 +203,63 @@ fn simple_hash(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::probe_aspect_blocking;
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+
+    use super::{probe_aspect_blocking, write_cache_file};
+
+    /// 建一个空的临时目录，返回路径
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("voicefox-cache-{name}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// 目录里的文件名，排过序
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_cache_write_replaces_the_target_instead_of_truncating_it() {
+        let dir = temp_dir("replace");
+        let target = dir.join("cover.jpg");
+        std::fs::write(&target, b"old").unwrap();
+
+        // 先攥住旧文件的句柄，rename 换掉的只是目录项
+        let mut old_handle = std::fs::File::open(&target).unwrap();
+        write_cache_file(&target, b"new").unwrap();
+
+        let mut old = Vec::new();
+        old_handle.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old", "写入前打开的句柄应仍读到旧内容");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new", "新内容应已就位");
+    }
+
+    #[test]
+    fn a_finished_cache_write_leaves_no_temp_file() {
+        let dir = temp_dir("finished");
+        let target = dir.join("cover.jpg");
+        write_cache_file(&target, b"payload").unwrap();
+        assert_eq!(names(&dir), ["cover.jpg"], "目录里应只剩目标文件");
+    }
+
+    #[test]
+    fn a_failed_cache_write_leaves_no_temp_file() {
+        let dir = temp_dir("failed");
+        // 目标是个目录，rename 过不去
+        let target = dir.join("cover.jpg");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(write_cache_file(&target, b"payload").is_err(), "应该报错");
+        assert_eq!(names(&dir), ["cover.jpg"], "临时文件应已清掉");
+    }
 
     #[test]
     fn probe_reads_dimensions_even_when_the_extension_lies() {

@@ -14,6 +14,9 @@ use ratatui_image::{FilterType, FontSize, Resize, ResizeEncodeRender};
 /// 用 Scale 而不是 Fit：Fit 内部是 min(area, image)，只缩不放
 const RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
 
+/// 解码后的最长边上限
+const MAX_DECODED_EDGE: u32 = 1024;
+
 /// 主线程 → 解码线程
 struct DecodeJob {
     path: String,
@@ -285,12 +288,20 @@ fn decode(path: &str) -> Option<image::DynamicImage> {
         .map_err(|error| error.to_string())
         .and_then(|reader| reader.decode().map_err(|error| error.to_string()))
     {
-        Ok(image) => Some(image),
+        Ok(image) => Some(shrink(image)),
         Err(error) => {
             tracing::debug!("decode cover {path} failed: {error}");
             None
         }
     }
+}
+
+/// 把最长边超过 [`MAX_DECODED_EDGE`] 的图按比例缩到上限
+fn shrink(image: image::DynamicImage) -> image::DynamicImage {
+    if image.width() <= MAX_DECODED_EDGE && image.height() <= MAX_DECODED_EDGE {
+        return image;
+    }
+    image.resize(MAX_DECODED_EDGE, MAX_DECODED_EDGE, FilterType::Triangle)
 }
 
 /// 解析配置里的 ui.cover_protocol，None 表示交给探测
@@ -330,11 +341,16 @@ mod tests {
         CoverRenderer::spawn(Picker::halfblocks())
     }
 
-    /// 存一张纯色 PNG，返回路径
+    /// 存一张 16x16 的纯色 PNG，返回路径
     fn write_image(name: &str, color: [u8; 3]) -> String {
+        write_sized_image(name, 16, 16, color)
+    }
+
+    /// 存一张指定尺寸的纯色 PNG，返回路径
+    fn write_sized_image(name: &str, width: u32, height: u32, color: [u8; 3]) -> String {
         let path = std::env::temp_dir().join(format!("voicefox-cover-{name}.png"));
         let pixel = image::Rgb(color);
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 16, pixel))
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(width, height, pixel))
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
         path.to_string_lossy().to_string()
@@ -409,6 +425,25 @@ mod tests {
             assert!(Instant::now() < deadline, "解码失败后应没有封面可以显示");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn an_oversized_cover_is_shrunk_when_decoded() {
+        let huge = write_sized_image("huge", 3000, 1500, [0, 0, 255]);
+        let image = super::decode(&huge).unwrap();
+        assert_eq!(
+            (image.width(), image.height()),
+            (1024, 512),
+            "最长边应缩到上限，比例应保持"
+        );
+
+        let small = write_sized_image("small", 300, 150, [0, 0, 255]);
+        let image = super::decode(&small).unwrap();
+        assert_eq!(
+            (image.width(), image.height()),
+            (300, 150),
+            "上限以内的图应原样保留"
+        );
     }
 
     #[test]
