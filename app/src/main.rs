@@ -1933,6 +1933,7 @@ fn run_app(
             }
             needs_render = true;
         } else if matches!(terminal_event, Some(Event::Resize(_, _))) {
+            main_page.refresh_cover_font_size();
             needs_render = true;
         }
 

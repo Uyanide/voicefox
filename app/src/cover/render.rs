@@ -17,6 +17,8 @@ const RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
 /// 主线程 → 解码线程
 struct DecodeJob {
     path: String,
+    /// 建 protocol 用，字号变了这里跟着变
+    picker: Picker,
     /// 请求序号
     id: u64,
 }
@@ -82,7 +84,7 @@ impl CoverRenderer {
         let (decode_tx, decode_rx) = channel::<DecodeJob>();
         let (encode_tx, encode_rx) = channel::<ResizeRequest>();
         let (done_tx, done_rx) = channel::<Done>();
-        let enabled = enabled && spawn_workers(picker.clone(), decode_rx, encode_rx, done_tx);
+        let enabled = enabled && spawn_workers(decode_rx, encode_rx, done_tx);
 
         Self {
             protocol: ThreadProtocol::new(encode_tx, None),
@@ -121,17 +123,47 @@ impl CoverRenderer {
                     return;
                 }
                 self.loaded = Some(path.to_string());
-                self.request_id += 1;
-                // 立刻撤下旧图
-                self.protocol.empty_protocol();
-                self.has_image = self
-                    .decode_tx
-                    .send(DecodeJob {
-                        path: path.to_string(),
-                        id: self.request_id,
-                    })
-                    .is_ok();
+                self.dispatch_decode(path.to_string());
             }
+        }
+    }
+
+    /// 派一次解码，旧图立刻撤下
+    fn dispatch_decode(&mut self, path: String) {
+        self.request_id += 1;
+        self.protocol.empty_protocol();
+        self.has_image = self
+            .decode_tx
+            .send(DecodeJob {
+                path,
+                picker: self.picker.clone(),
+                id: self.request_id,
+            })
+            .is_ok();
+    }
+
+    /// 重新读终端的单元格像素尺寸，变了就按新尺寸重新解码当前封面
+    pub fn refresh_font_size(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let Some(font_size) = probe_font_size() else {
+            return;
+        };
+        let current = self.picker.font_size();
+        if font_size.width == current.width && font_size.height == current.height {
+            return;
+        }
+        tracing::debug!("font size changed to {font_size:?}");
+
+        // Picker 没有单独改字号的接口，重建一个，把探测到的协议带过去
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(font_size);
+        picker.set_protocol_type(self.picker.protocol_type());
+        self.picker = picker;
+
+        if let Some(path) = self.loaded.clone() {
+            self.dispatch_decode(path);
         }
     }
 
@@ -185,7 +217,6 @@ impl CoverRenderer {
 
 /// 起解码线程和编码线程
 fn spawn_workers(
-    picker: Picker,
     decode_rx: Receiver<DecodeJob>,
     encode_rx: Receiver<ResizeRequest>,
     done_tx: Sender<Done>,
@@ -196,7 +227,7 @@ fn spawn_workers(
         .spawn(move || {
             for job in decode_rx {
                 let protocol =
-                    decode(&job.path).map(|image| Box::new(picker.new_resize_protocol(image)));
+                    decode(&job.path).map(|image| Box::new(job.picker.new_resize_protocol(image)));
                 if decode_tx
                     .send(Done::Loaded {
                         id: job.id,
@@ -229,6 +260,18 @@ fn spawn_workers(
             false
         }
     }
+}
+
+/// 从终端窗口的像素尺寸和行列数反推单元格大小
+fn probe_font_size() -> Option<FontSize> {
+    let size = crossterm::terminal::window_size().ok()?;
+    if size.width == 0 || size.height == 0 || size.columns == 0 || size.rows == 0 {
+        return None;
+    }
+    Some(FontSize::new(
+        size.width / size.columns,
+        size.height / size.rows,
+    ))
 }
 
 fn decode(path: &str) -> Option<image::DynamicImage> {

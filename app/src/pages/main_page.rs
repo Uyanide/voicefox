@@ -59,6 +59,11 @@ impl MainPage {
         self.cover.poll()
     }
 
+    /// 终端尺寸变化后重新读单元格像素尺寸
+    pub fn refresh_cover_font_size(&mut self) {
+        self.cover.refresh_font_size();
+    }
+
     pub fn handle_input(
         &mut self,
         key: &KeyEvent,
