@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::sort::{SortMode, SortTarget, sorted_indices};
 
 pub struct FavoritesPage {
     selected: usize,
@@ -18,6 +19,7 @@ pub struct FavoritesPage {
     query: String,
     search_mode: bool,
     viewport_height: usize,
+    sort_mode: SortMode,
 }
 
 impl FavoritesPage {
@@ -28,11 +30,27 @@ impl FavoritesPage {
             query: String::new(),
             search_mode: false,
             viewport_height: 1,
+            sort_mode: SortMode::Newest,
         }
     }
 
     pub fn input_mode(&self) -> bool {
         self.search_mode
+    }
+
+    pub fn sort_mode(&self) -> SortMode {
+        self.sort_mode
+    }
+
+    pub fn sort_label(&self) -> &'static str {
+        self.sort_mode.label(SortTarget::Favorites)
+    }
+
+    pub fn cycle_sort(&mut self) -> SortMode {
+        self.sort_mode = self.sort_mode.next();
+        self.selected = 0;
+        self.scroll = 0;
+        self.sort_mode
     }
 
     pub fn handle_input(
@@ -85,6 +103,12 @@ impl FavoritesPage {
                 Action::FavoritesFilter => {
                     self.search_mode = true;
                     return AppAction::None;
+                }
+                Action::ListCycleSort => {
+                    let mode = self.cycle_sort();
+                    return AppAction::ShowNotification(lx_core::events::Notification::info(
+                        format!("收藏排序: {}", mode.label(SortTarget::Favorites)),
+                    ));
                 }
                 Action::ListSelectUp => {
                     if !filtered.is_empty() {
@@ -193,6 +217,13 @@ impl FavoritesPage {
             (KeyModifiers::NONE, KeyCode::Char('/')) => {
                 self.search_mode = true;
             }
+            (KeyModifiers::NONE, KeyCode::Char('s')) => {
+                let mode = self.cycle_sort();
+                return AppAction::ShowNotification(lx_core::events::Notification::info(format!(
+                    "收藏排序: {}",
+                    mode.label(SortTarget::Favorites)
+                )));
+            }
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 if self.query.is_empty() {
                     return AppAction::GoBack;
@@ -300,9 +331,10 @@ impl FavoritesPage {
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(format!(
-                " 收藏 {}/{} · / 筛选 ",
+                " 收藏 {}/{} · 排序 {} · s 切换 · / 筛选 ",
                 filtered.len(),
-                favorites.len()
+                favorites.len(),
+                self.sort_label()
             ));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -478,16 +510,15 @@ impl FavoritesPage {
 
     fn filtered_indices(&self, favorites: &[SongInfo]) -> Vec<usize> {
         let query = self.query.trim().to_lowercase();
-        favorites
-            .iter()
-            .enumerate()
-            .filter_map(|(index, song)| {
-                let matches = query.is_empty()
+        sorted_indices(favorites, self.sort_mode, SortTarget::Favorites)
+            .into_iter()
+            .filter(|index| {
+                let song = &favorites[*index];
+                query.is_empty()
                     || song.name.to_lowercase().contains(&query)
                     || song.singer.to_lowercase().contains(&query)
                     || song.album_name.to_lowercase().contains(&query)
-                    || song.source.as_str().contains(&query);
-                matches.then_some(index)
+                    || song.source.as_str().contains(&query)
             })
             .collect()
     }
@@ -506,6 +537,7 @@ impl FavoritesPage {
 #[cfg(test)]
 mod tests {
     use super::FavoritesPage;
+    use crate::pages::sort::SortMode;
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
@@ -520,5 +552,18 @@ mod tests {
             page.query = query.into();
             assert_eq!(page.filtered_indices(&songs), vec![0]);
         }
+    }
+
+    #[test]
+    fn defaults_to_most_recent_favorite_and_cycles_sorting() {
+        let mut page = FavoritesPage::new();
+        let songs = vec![
+            SongInfo::new("1".into(), SourceId::Kw, "A".into(), "X".into()),
+            SongInfo::new("2".into(), SourceId::Kw, "B".into(), "Y".into()),
+        ];
+
+        assert_eq!(page.filtered_indices(&songs), vec![1, 0]);
+        assert_eq!(page.cycle_sort(), SortMode::Oldest);
+        assert_eq!(page.filtered_indices(&songs), vec![0, 1]);
     }
 }

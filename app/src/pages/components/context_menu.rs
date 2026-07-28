@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::sort::{SortMode, SortTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SongMenuKind {
@@ -24,6 +25,7 @@ pub enum SongMenuAction {
     PlayNext,
     AddToQueue,
     ToggleFavorite,
+    CycleSort(SortTarget),
     RemoveFromQueue,
     DeleteLocal,
 }
@@ -57,6 +59,7 @@ impl SongContextMenu {
         index: usize,
         kind: SongMenuKind,
         is_favorite: bool,
+        sort: Option<(SortTarget, SortMode)>,
     ) -> Option<Self> {
         songs.get(index)?;
         let mut items = vec![MenuItem {
@@ -83,6 +86,12 @@ impl SongContextMenu {
             },
             action: SongMenuAction::ToggleFavorite,
         });
+        if let Some((target, mode)) = sort {
+            items.push(MenuItem {
+                label: format!("排序：{}（切换）", mode.label(target)),
+                action: SongMenuAction::CycleSort(target),
+            });
+        }
         match kind {
             SongMenuKind::Queue => items.push(MenuItem {
                 label: "从队列移除".to_string(),
@@ -248,7 +257,7 @@ fn menu_area(bounds: Rect, origin: Position, item_count: usize) -> Rect {
     if bounds.width == 0 || bounds.height == 0 {
         return Rect::default();
     }
-    let width = 24.min(bounds.width);
+    let width = 30.min(bounds.width);
     let height = (item_count as u16 + 2).min(bounds.height);
     let max_x = bounds.right().saturating_sub(width);
     let max_y = bounds.bottom().saturating_sub(height);
@@ -271,7 +280,11 @@ fn item_at(area: Rect, position: Position, item_count: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{item_at, menu_area};
+    use lx_core::model::song::SongInfo;
+    use lx_core::model::source::SourceId;
+
+    use super::{SongContextMenu, SongMenuAction, SongMenuKind, item_at, menu_area};
+    use crate::pages::sort::{SortMode, SortTarget};
     use ratatui::layout::{Position, Rect};
 
     #[test]
@@ -291,5 +304,29 @@ mod tests {
         assert_eq!(item_at(area, Position::new(12, 6), 5), Some(0));
         assert_eq!(item_at(area, Position::new(12, 10), 5), Some(4));
         assert_eq!(item_at(area, Position::new(10, 6), 5), None);
+    }
+
+    #[test]
+    fn sortable_pages_append_a_sort_action() {
+        let song = SongInfo::new(
+            "1".to_string(),
+            SourceId::Kw,
+            "Song".to_string(),
+            "Artist".to_string(),
+        );
+        let menu = SongContextMenu::new(
+            Position::new(1, 1),
+            vec![song],
+            0,
+            SongMenuKind::Standard,
+            false,
+            Some((SortTarget::Favorites, SortMode::Newest)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            menu.items.last().map(|item| item.action),
+            Some(SongMenuAction::CycleSort(SortTarget::Favorites))
+        );
     }
 }

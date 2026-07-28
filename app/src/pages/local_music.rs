@@ -1,31 +1,32 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
+use lx_core::model::song::SongInfo;
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{Block, Borders};
 
 use crate::context::AppContext;
+use crate::pages::sort::{SortState, SortTarget, sorted_songs};
 
 pub fn handle_mouse(
     event: MouseEvent,
     area: Rect,
     ctx: &AppContext,
-    selected: &mut usize,
-    scroll: usize,
+    state: &mut SortState,
     activate: bool,
 ) -> AppAction {
-    let songs = ctx.source_manager.local_source().all_songs();
+    let songs = sorted_local_songs(ctx, state);
     let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
     match event.kind {
         MouseEventKind::ScrollUp => {
-            *selected = selected.saturating_sub(scroll_amount);
+            state.selected = state.selected.saturating_sub(scroll_amount);
         }
         MouseEventKind::ScrollDown => {
-            *selected = (*selected + scroll_amount).min(songs.len().saturating_sub(1));
+            state.selected = (state.selected + scroll_amount).min(songs.len().saturating_sub(1));
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let position = Position::new(event.column, event.row);
-            if let Some(index) = song_index_at(area, position, scroll, songs.len()) {
-                *selected = index;
+            if let Some(index) = song_index_at(area, position, state.scroll, songs.len()) {
+                state.selected = index;
                 if activate {
                     return AppAction::PlaySong { songs, index };
                 }
@@ -40,14 +41,21 @@ pub fn context_song_at(
     event: MouseEvent,
     area: Rect,
     ctx: &AppContext,
-    selected: &mut usize,
-    scroll: usize,
-) -> Option<(Vec<lx_core::model::song::SongInfo>, usize)> {
-    let songs = ctx.source_manager.local_source().all_songs();
+    state: &mut SortState,
+) -> Option<(Vec<SongInfo>, usize)> {
+    let songs = sorted_local_songs(ctx, state);
     let position = Position::new(event.column, event.row);
-    let index = song_index_at(area, position, scroll, songs.len())?;
-    *selected = index;
+    let index = song_index_at(area, position, state.scroll, songs.len())?;
+    state.selected = index;
     Some((songs, index))
+}
+
+pub fn sorted_local_songs(ctx: &AppContext, state: &SortState) -> Vec<SongInfo> {
+    sorted_songs(
+        ctx.source_manager.local_source().all_songs(),
+        state.mode,
+        SortTarget::Local,
+    )
 }
 
 fn song_index_at(area: Rect, position: Position, scroll: usize, len: usize) -> Option<usize> {

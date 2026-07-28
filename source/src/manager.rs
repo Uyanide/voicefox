@@ -151,6 +151,18 @@ impl SourceManager {
         limit: u32,
         source: Option<SourceId>,
     ) -> Result<SearchResult, SearchError> {
+        if crate::bili::looks_like_video_reference(keyword) {
+            if !self.enabled.contains(&SourceId::Bili) {
+                return Err(SearchError::Other("哔哩哔哩音源未启用".to_string()));
+            }
+            return self
+                .sources
+                .get(&SourceId::Bili)
+                .map(Arc::clone)
+                .ok_or_else(|| SearchError::Other("哔哩哔哩音源不可用".to_string()))?
+                .search(keyword, page, limit)
+                .await;
+        }
         let Some(source) = source else {
             return self.search_all(keyword, page, limit).await;
         };

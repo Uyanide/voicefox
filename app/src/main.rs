@@ -43,6 +43,7 @@ use context::AppContext;
 use pages::components;
 use pages::components::context_menu::{MenuOutcome, SongContextMenu, SongMenuAction, SongMenuKind};
 use pages::sidebar::NavTab;
+use pages::sort::{SortMode, SortState, SortTarget};
 
 enum LeaderboardResponse {
     Boards {
@@ -150,6 +151,9 @@ fn execute_song_menu_action(
     search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
     settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
     search_seq: &Arc<AtomicU64>,
+    favorites_page: &mut pages::favorites::FavoritesPage,
+    history_state: &mut SortState,
+    local_state: &mut SortState,
     confirm_delete: &mut Option<LocalDeleteConfirmation>,
 ) {
     let app_action = match action {
@@ -175,6 +179,18 @@ fn execute_song_menu_action(
                 "已添加收藏"
             };
             ctx.notify(Notification::success(message));
+            AppAction::None
+        }
+        SongMenuAction::CycleSort(target) => {
+            let mode = match target {
+                SortTarget::Favorites => favorites_page.cycle_sort(),
+                SortTarget::History => history_state.cycle(),
+                SortTarget::Local => local_state.cycle(),
+            };
+            ctx.notify(Notification::info(format!(
+                "排序方式: {}",
+                mode.label(target)
+            )));
             AppAction::None
         }
         SongMenuAction::RemoveFromQueue => {
@@ -389,10 +405,8 @@ fn run_app(
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
     let mut favorites_page = pages::favorites::FavoritesPage::new();
-    let mut history_selected: usize = 0;
-    let mut history_scroll: usize = 0;
-    let mut local_selected: usize = 0;
-    let mut local_scroll: usize = 0;
+    let mut history_state = SortState::new(SortMode::Newest);
+    let mut local_state = SortState::new(SortMode::TitleAsc);
     let mut confirm_delete: Option<LocalDeleteConfirmation> = None;
     let mut song_menu: Option<SongContextMenu> = None;
     let mut ui_areas = UiAreas::default();
@@ -531,8 +545,7 @@ fn run_app(
                     &settings_page,
                     &search_seq,
                 );
-                local_selected = 0;
-                local_scroll = 0;
+                local_state.reset_position();
                 needs_render = true;
             }
         }
@@ -899,10 +912,8 @@ fn run_app(
                 &mut leaderboard,
                 &mut playlists,
                 &mut favorites_page,
-                &mut history_selected,
-                &mut history_scroll,
-                &mut local_selected,
-                &mut local_scroll,
+                &mut history_state,
+                &mut local_state,
                 &mut ui_areas,
                 &confirm_delete,
                 &song_menu,
@@ -961,8 +972,10 @@ fn run_app(
                                 let local_source = ctx.source_manager.local_source();
                                 local_source.remove_by_path(&confirmation.path);
                                 let remaining = local_source.all_songs().len();
-                                local_selected = local_selected.min(remaining.saturating_sub(1));
-                                local_scroll = local_scroll.min(remaining.saturating_sub(1));
+                                local_state.selected =
+                                    local_state.selected.min(remaining.saturating_sub(1));
+                                local_state.scroll =
+                                    local_state.scroll.min(remaining.saturating_sub(1));
 
                                 ctx.notify(Notification::success(format!(
                                     "已删除本地文件: {}",
@@ -1018,6 +1031,9 @@ fn run_app(
                             &search_page,
                             &settings_page,
                             &search_seq,
+                            &mut favorites_page,
+                            &mut history_state,
+                            &mut local_state,
                             &mut confirm_delete,
                         );
                     }
@@ -1349,12 +1365,8 @@ fn run_app(
                     );
                 }
                 NavTab::History => {
-                    let action = pages::history::handle_input(
-                        &key,
-                        &ctx,
-                        &mut history_selected,
-                        &kb_resolver,
-                    );
+                    let action =
+                        pages::history::handle_input(&key, &ctx, &mut history_state, &kb_resolver);
                     // 保持在历史页面，不强制切换到主页
                     execute_action(
                         action,
@@ -1399,10 +1411,16 @@ fn run_app(
                     }
                 }
                 NavTab::LocalMusic => {
-                    let local_src = ctx.source_manager.local_source();
-                    let songs = local_src.all_songs();
+                    let songs = pages::local_music::sorted_local_songs(&ctx, &local_state);
                     if let Some(action) = kb_resolver.resolve_page("local", &key) {
                         match action {
+                            Action::ListCycleSort => {
+                                let mode = local_state.cycle();
+                                ctx.notify(Notification::info(format!(
+                                    "本地排序: {}",
+                                    mode.label(SortTarget::Local)
+                                )));
+                            }
                             Action::LocalRescan => {
                                 let paths = ctx.config.read().unwrap().local_music.paths.clone();
                                 let max_depth = ctx.config.read().unwrap().local_music.max_depth;
@@ -1415,38 +1433,37 @@ fn run_app(
                                     &settings_page,
                                     &search_seq,
                                 );
-                                local_selected = 0;
-                                local_scroll = 0;
+                                local_state.reset_position();
                             }
                             Action::ListSelectUp => {
-                                local_selected = previous_list_index(
-                                    local_selected,
+                                local_state.selected = previous_list_index(
+                                    local_state.selected,
                                     songs.len(),
                                     ctx.config.read().unwrap().ui.wrap_navigation,
                                 );
                             }
                             Action::ListSelectDown => {
-                                local_selected = next_list_index(
-                                    local_selected,
+                                local_state.selected = next_list_index(
+                                    local_state.selected,
                                     songs.len(),
                                     ctx.config.read().unwrap().ui.wrap_navigation,
                                 );
                             }
                             Action::ListSelectFirst => {
-                                local_selected = 0;
+                                local_state.selected = 0;
                             }
                             Action::ListSelectLast => {
-                                local_selected = songs.len().saturating_sub(1);
+                                local_state.selected = songs.len().saturating_sub(1);
                             }
                             Action::ListPageUp => {
-                                local_selected = local_selected.saturating_sub(10);
+                                local_state.selected = local_state.selected.saturating_sub(10);
                             }
                             Action::ListPageDown => {
-                                local_selected =
-                                    (local_selected + 10).min(songs.len().saturating_sub(1));
+                                local_state.selected =
+                                    (local_state.selected + 10).min(songs.len().saturating_sub(1));
                             }
                             Action::ListAddToQueue => {
-                                if let Some(song) = songs.get(local_selected).cloned() {
+                                if let Some(song) = songs.get(local_state.selected).cloned() {
                                     execute_action(
                                         AppAction::AddToQueue {
                                             song: Box::new(song),
@@ -1462,7 +1479,7 @@ fn run_app(
                                 }
                             }
                             Action::ListAddToQueueNext => {
-                                if let Some(song) = songs.get(local_selected).cloned() {
+                                if let Some(song) = songs.get(local_state.selected).cloned() {
                                     execute_action(
                                         AppAction::AddToQueue {
                                             song: Box::new(song),
@@ -1478,7 +1495,7 @@ fn run_app(
                                 }
                             }
                             Action::LocalDelete => {
-                                if let Some(song) = songs.get(local_selected) {
+                                if let Some(song) = songs.get(local_state.selected) {
                                     if let Some(path) = &song.file_path {
                                         confirm_delete = Some(LocalDeleteConfirmation {
                                             name: song.name.clone(),
@@ -1492,12 +1509,12 @@ fn run_app(
                                 }
                             }
                             Action::ListActivate
-                                if !songs.is_empty() && local_selected < songs.len() =>
+                                if !songs.is_empty() && local_state.selected < songs.len() =>
                             {
                                 execute_action(
                                     AppAction::PlaySong {
                                         songs,
-                                        index: local_selected,
+                                        index: local_state.selected,
                                     },
                                     &ctx,
                                     rt,
@@ -1511,6 +1528,13 @@ fn run_app(
                         }
                     } else {
                         match (key.modifiers, key.code) {
+                            (KeyModifiers::NONE, KeyCode::Char('s')) => {
+                                let mode = local_state.cycle();
+                                ctx.notify(Notification::info(format!(
+                                    "本地排序: {}",
+                                    mode.label(SortTarget::Local)
+                                )));
+                            }
                             (KeyModifiers::NONE, KeyCode::Char('r')) => {
                                 let paths = ctx.config.read().unwrap().local_music.paths.clone();
                                 let max_depth = ctx.config.read().unwrap().local_music.max_depth;
@@ -1523,47 +1547,46 @@ fn run_app(
                                     &settings_page,
                                     &search_seq,
                                 );
-                                local_selected = 0;
-                                local_scroll = 0;
+                                local_state.reset_position();
                             }
                             (KeyModifiers::NONE, KeyCode::Up) => {
-                                local_selected = previous_list_index(
-                                    local_selected,
+                                local_state.selected = previous_list_index(
+                                    local_state.selected,
                                     songs.len(),
                                     ctx.config.read().unwrap().ui.wrap_navigation,
                                 );
                             }
                             (KeyModifiers::NONE, KeyCode::Down) => {
-                                local_selected = next_list_index(
-                                    local_selected,
+                                local_state.selected = next_list_index(
+                                    local_state.selected,
                                     songs.len(),
                                     ctx.config.read().unwrap().ui.wrap_navigation,
                                 );
                             }
                             (KeyModifiers::NONE, KeyCode::Home)
                             | (KeyModifiers::NONE, KeyCode::Char('g')) => {
-                                local_selected = 0;
+                                local_state.selected = 0;
                             }
                             (KeyModifiers::NONE, KeyCode::End)
                             | (KeyModifiers::NONE, KeyCode::Char('G'))
                             | (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
-                                local_selected = songs.len().saturating_sub(1);
+                                local_state.selected = songs.len().saturating_sub(1);
                             }
                             (KeyModifiers::CONTROL, KeyCode::Char('u'))
                             | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                                local_selected = local_selected.saturating_sub(10);
+                                local_state.selected = local_state.selected.saturating_sub(10);
                             }
                             (KeyModifiers::CONTROL, KeyCode::Char('d'))
                             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                                local_selected =
-                                    (local_selected + 10).min(songs.len().saturating_sub(1));
+                                local_state.selected =
+                                    (local_state.selected + 10).min(songs.len().saturating_sub(1));
                             }
                             _ if pages::is_song_activation_key(&key) => {
-                                if !songs.is_empty() && local_selected < songs.len() {
+                                if !songs.is_empty() && local_state.selected < songs.len() {
                                     execute_action(
                                         AppAction::PlaySong {
                                             songs,
-                                            index: local_selected,
+                                            index: local_state.selected,
                                         },
                                         &ctx,
                                         rt,
@@ -1575,7 +1598,7 @@ fn run_app(
                                 }
                             }
                             (KeyModifiers::NONE, KeyCode::Char('a')) => {
-                                if let Some(song) = songs.get(local_selected).cloned() {
+                                if let Some(song) = songs.get(local_state.selected).cloned() {
                                     execute_action(
                                         AppAction::AddToQueue {
                                             song: Box::new(song),
@@ -1592,7 +1615,7 @@ fn run_app(
                             }
                             (KeyModifiers::NONE, KeyCode::Char('A'))
                             | (KeyModifiers::SHIFT, KeyCode::Char('A')) => {
-                                if let Some(song) = songs.get(local_selected).cloned() {
+                                if let Some(song) = songs.get(local_state.selected).cloned() {
                                     execute_action(
                                         AppAction::AddToQueue {
                                             song: Box::new(song),
@@ -1609,7 +1632,7 @@ fn run_app(
                             }
                             (KeyModifiers::NONE, KeyCode::Char('d'))
                             | (KeyModifiers::NONE, KeyCode::Delete) => {
-                                if let Some(song) = songs.get(local_selected) {
+                                if let Some(song) = songs.get(local_state.selected) {
                                     if let Some(path) = &song.file_path {
                                         confirm_delete = Some(LocalDeleteConfirmation {
                                             name: song.name.clone(),
@@ -1654,6 +1677,9 @@ fn run_app(
                             &search_page,
                             &settings_page,
                             &search_seq,
+                            &mut favorites_page,
+                            &mut history_state,
+                            &mut local_state,
                             &mut confirm_delete,
                         );
                     }
@@ -1701,42 +1727,59 @@ fn run_app(
                     let target = match active_tab {
                         NavTab::Main => main_page
                             .context_song_at(mouse, ui_areas.content, &ctx)
-                            .map(|target| (target, SongMenuKind::Queue)),
+                            .map(|target| (target, SongMenuKind::Queue, None)),
                         NavTab::Search => search_page
                             .lock()
                             .unwrap()
                             .context_song_at(mouse, ui_areas.content)
-                            .map(|target| (target, SongMenuKind::Standard)),
+                            .map(|target| (target, SongMenuKind::Standard, None)),
                         NavTab::Leaderboard => leaderboard
                             .context_song_at(mouse, ui_areas.content)
-                            .map(|target| (target, SongMenuKind::Standard)),
+                            .map(|target| (target, SongMenuKind::Standard, None)),
                         NavTab::Playlists => playlists
                             .context_song_at(mouse, ui_areas.content)
-                            .map(|target| (target, SongMenuKind::Standard)),
+                            .map(|target| (target, SongMenuKind::Standard, None)),
                         NavTab::Favorites => favorites_page
                             .context_song_at(mouse, ui_areas.content, &ctx)
-                            .map(|target| (target, SongMenuKind::Standard)),
+                            .map(|target| {
+                                (
+                                    target,
+                                    SongMenuKind::Standard,
+                                    Some((SortTarget::Favorites, favorites_page.sort_mode())),
+                                )
+                            }),
                         NavTab::History => pages::history::context_song_at(
                             mouse,
                             ui_areas.content,
                             &ctx,
-                            &mut history_selected,
-                            history_scroll,
+                            &mut history_state,
                         )
-                        .map(|target| (target, SongMenuKind::Standard)),
+                        .map(|target| {
+                            (
+                                target,
+                                SongMenuKind::Standard,
+                                Some((SortTarget::History, history_state.mode)),
+                            )
+                        }),
                         NavTab::LocalMusic => pages::local_music::context_song_at(
                             mouse,
                             ui_areas.content,
                             &ctx,
-                            &mut local_selected,
-                            local_scroll,
+                            &mut local_state,
                         )
-                        .map(|target| (target, SongMenuKind::Local)),
+                        .map(|target| {
+                            (
+                                target,
+                                SongMenuKind::Local,
+                                Some((SortTarget::Local, local_state.mode)),
+                            )
+                        }),
                         NavTab::Settings => None,
                     };
-                    if let Some(((songs, index), kind)) = target {
+                    if let Some(((songs, index), kind, sort)) = target {
                         let is_favorite = ctx.storage.is_favorite(&songs[index]);
-                        song_menu = SongContextMenu::new(position, songs, index, kind, is_favorite);
+                        song_menu =
+                            SongContextMenu::new(position, songs, index, kind, is_favorite, sort);
                         needs_render = true;
                         continue;
                     }
@@ -1763,8 +1806,7 @@ fn run_app(
                         mouse,
                         ui_areas.content,
                         &ctx,
-                        &mut history_selected,
-                        history_scroll,
+                        &mut history_state,
                         activate,
                     ),
                     NavTab::Settings => settings_page.lock().unwrap().handle_mouse(
@@ -1777,8 +1819,7 @@ fn run_app(
                         mouse,
                         ui_areas.content,
                         &ctx,
-                        &mut local_selected,
-                        local_scroll,
+                        &mut local_state,
                         activate,
                     ),
                 };
@@ -1830,10 +1871,8 @@ fn run_app(
                 &mut leaderboard,
                 &mut playlists,
                 &mut favorites_page,
-                &mut history_selected,
-                &mut history_scroll,
-                &mut local_selected,
-                &mut local_scroll,
+                &mut history_state,
+                &mut local_state,
                 &mut ui_areas,
                 &confirm_delete,
                 &song_menu,
@@ -1855,10 +1894,8 @@ fn draw_app(
     leaderboard: &mut pages::leaderboard::LeaderboardPage,
     playlists: &mut pages::playlists::PlaylistsPage,
     favorites_page: &mut pages::favorites::FavoritesPage,
-    history_selected: &mut usize,
-    history_scroll: &mut usize,
-    local_selected: &mut usize,
-    local_scroll: &mut usize,
+    history_state: &mut SortState,
+    local_state: &mut SortState,
     ui_areas: &mut UiAreas,
     confirm_delete: &Option<LocalDeleteConfirmation>,
     song_menu: &Option<SongContextMenu>,
@@ -1919,13 +1956,7 @@ fn draw_app(
                 favorites_page.render(content_area, frame.buffer_mut(), ctx);
             }
             NavTab::History => {
-                pages::history::render(
-                    content_area,
-                    frame.buffer_mut(),
-                    ctx,
-                    history_selected,
-                    history_scroll,
-                );
+                pages::history::render(content_area, frame.buffer_mut(), ctx, history_state);
             }
             NavTab::Settings => {
                 let mut sp = settings_page.lock().unwrap();
@@ -1939,16 +1970,25 @@ fn draw_app(
                 'local_content: {
                     let local_src = ctx.source_manager.local_source();
                     let paths = ctx.config.read().unwrap().local_music.paths.clone();
-                    let songs = local_src.all_songs();
+                    let songs = pages::local_music::sorted_local_songs(ctx, local_state);
                     let is_scanning = local_src.is_scanning();
+                    local_state.selected = local_state.selected.min(songs.len().saturating_sub(1));
 
                     let block = Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::new().fg(crate::theme::muted(ctx)))
                         .title(if is_scanning {
-                            format!("本地音乐 ({} 首，扫描中)", songs.len())
+                            format!(
+                                "本地音乐 ({} 首，扫描中) · 排序 {} · s 切换",
+                                songs.len(),
+                                local_state.mode.label(SortTarget::Local)
+                            )
                         } else {
-                            format!("本地音乐 ({} 首)", songs.len())
+                            format!(
+                                "本地音乐 ({} 首) · 排序 {} · s 切换",
+                                songs.len(),
+                                local_state.mode.label(SortTarget::Local)
+                            )
                         });
                     let inner = block.inner(content_area);
                     block.render(content_area, frame.buffer_mut());
@@ -1995,8 +2035,8 @@ fn draw_app(
                     }
 
                     let visible_height = (inner.height.saturating_sub(2)) as usize;
-                    let sel = *local_selected;
-                    let mut sc = *local_scroll;
+                    let sel = local_state.selected;
+                    let mut sc = local_state.scroll;
 
                     if sel >= sc + visible_height {
                         sc = sel.saturating_sub(visible_height.saturating_sub(1));
@@ -2004,7 +2044,7 @@ fn draw_app(
                         sc = sel;
                     }
                     sc = sc.min(songs.len().saturating_sub(visible_height));
-                    *local_scroll = sc;
+                    local_state.scroll = sc;
 
                     let end = (sc + visible_height).min(songs.len());
                     for (i, song) in songs.iter().enumerate().take(end).skip(sc) {
@@ -2076,7 +2116,13 @@ fn draw_app(
         }
 
         components::progress_bar::render(main_chunks[3], frame.buffer_mut(), ctx);
-        components::status_bar::render(main_chunks[4], frame.buffer_mut(), ctx);
+        let sort_status = match active_tab {
+            NavTab::Favorites => Some(favorites_page.sort_label()),
+            NavTab::History => Some(history_state.mode.label(SortTarget::History)),
+            NavTab::LocalMusic => Some(local_state.mode.label(SortTarget::Local)),
+            _ => None,
+        };
+        components::status_bar::render(main_chunks[4], frame.buffer_mut(), ctx, sort_status);
         ui_areas.notification = components::notification::area(area, ctx).unwrap_or_default();
         components::notification::render(area, frame.buffer_mut(), ctx);
         if let Some(menu) = song_menu {

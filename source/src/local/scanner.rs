@@ -1,8 +1,10 @@
 //! 本地音乐目录扫描器
 
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 use crate::local::metadata;
+use lx_core::model::song::EXTRA_FILE_MODIFIED_UNIX_NANOS;
 
 use super::LocalSong;
 
@@ -58,6 +60,15 @@ pub fn scan_directory(path: &Path, max_depth: u32) -> Vec<LocalSong> {
                     .canonicalize()
                     .unwrap_or_else(|_| entry_path.to_path_buf());
                 song.file_path = Some(abs_path.clone());
+                if let Ok(modified) =
+                    std::fs::metadata(entry_path).and_then(|metadata| metadata.modified())
+                    && let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH)
+                {
+                    song.extra.insert(
+                        EXTRA_FILE_MODIFIED_UNIX_NANOS.to_string(),
+                        since_epoch.as_nanos().to_string(),
+                    );
+                }
 
                 songs.push(LocalSong {
                     song,

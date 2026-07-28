@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use super::source::{Quality, SourceId};
 
+pub const EXTRA_FILE_MODIFIED_UNIX_NANOS: &str = "file_modified_unix_nanos";
+
 /// 统一歌曲模型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SongInfo {

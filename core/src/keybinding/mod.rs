@@ -71,6 +71,8 @@ pub enum Action {
     ListAddToQueue,
     /// 添加到队列下一首
     ListAddToQueueNext,
+    /// 循环切换当前列表的排序方式
+    ListCycleSort,
 
     // --- 搜索页面专用 ---
     /// 进入搜索输入模式
@@ -257,6 +259,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     favorites.insert(Action::ListActivate, "Enter".to_string());
     favorites.insert(Action::ListAddToQueue, "a".to_string());
     favorites.insert(Action::ListAddToQueueNext, "A".to_string());
+    favorites.insert(Action::ListCycleSort, "s".to_string());
     favorites.insert(Action::FavoritesRemove, "d".to_string());
     favorites.insert(Action::ListGoBack, "Esc".to_string());
     pages.insert("favorites".to_string(), favorites);
@@ -272,6 +275,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     history.insert(Action::ListActivate, "Enter".to_string());
     history.insert(Action::ListAddToQueue, "a".to_string());
     history.insert(Action::ListAddToQueueNext, "A".to_string());
+    history.insert(Action::ListCycleSort, "s".to_string());
     pages.insert("history".to_string(), history);
 
     // --- 本地音乐 ---
@@ -285,6 +289,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     local.insert(Action::ListActivate, "Enter".to_string());
     local.insert(Action::ListAddToQueue, "a".to_string());
     local.insert(Action::ListAddToQueueNext, "A".to_string());
+    local.insert(Action::ListCycleSort, "s".to_string());
     local.insert(Action::LocalRescan, "r".to_string());
     local.insert(Action::LocalDelete, "d".to_string());
     pages.insert("local".to_string(), local);
@@ -607,6 +612,15 @@ mod tests {
                 .and_then(|page| page.get(&Action::LocalRescan)),
             Some(&"r".to_string())
         );
+        for page in ["favorites", "history", "local"] {
+            assert_eq!(
+                config
+                    .pages
+                    .get(page)
+                    .and_then(|bindings| bindings.get(&Action::ListCycleSort)),
+                Some(&"s".to_string())
+            );
+        }
     }
 
     #[test]

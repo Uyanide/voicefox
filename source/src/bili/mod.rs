@@ -24,6 +24,10 @@ use lx_core::traits::source::{FetchError, MusicSource, SearchError, SearchResult
 
 use crate::http;
 
+pub(crate) fn looks_like_video_reference(input: &str) -> bool {
+    search::looks_like_video_reference(input)
+}
+
 pub(crate) const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0";
 pub(crate) const BILI_REFERER: &str = "https://www.bilibili.com/";

@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::context::AppContext;
 
-pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Option<&'static str>) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -52,7 +52,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
             } else {
                 format!("{} - {}", song.name, song.singer)
             };
-            truncate(&value, song_width(area.width))
+            truncate(&value, song_width(area.width, sort_status.is_some()))
         },
     );
     let source = current_song
@@ -67,14 +67,26 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     };
     let mode = ctx.playlist.mode().label();
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", state_text),
-            Style::new()
-                .fg(state_color)
-                .bg(crate::theme::surface0(ctx))
-                .add_modifier(Modifier::BOLD),
-        ),
+    let mut spans = vec![Span::styled(
+        format!(" {} ", state_text),
+        Style::new()
+            .fg(state_color)
+            .bg(crate::theme::surface0(ctx))
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(sort_status) = sort_status {
+        spans.extend([
+            separator(ctx, background),
+            Span::styled(
+                format!("排序 {} (s)", sort_status),
+                Style::new()
+                    .fg(crate::theme::yellow(ctx))
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    spans.extend([
         separator(ctx, background),
         Span::styled(
             song,
@@ -83,7 +95,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
                 .bg(background)
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]);
 
     if area.width >= 60 {
         spans.extend([
@@ -154,10 +166,13 @@ fn separator(ctx: &AppContext, background: ratatui::style::Color) -> Span<'stati
     )
 }
 
-fn song_width(width: u16) -> usize {
-    match width {
-        0..=59 => width.saturating_sub(16) as usize,
-        _ => 28,
+fn song_width(width: u16, has_sort_status: bool) -> usize {
+    match (width, has_sort_status) {
+        (0..=59, true) => 12,
+        (60..=89, true) => 16,
+        (90.., true) => 24,
+        (0..=59, false) => width.saturating_sub(16) as usize,
+        (_, false) => 28,
     }
 }
 
