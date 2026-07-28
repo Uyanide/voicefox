@@ -41,11 +41,11 @@ pub struct MainPage {
     selected: usize,
     scroll: usize,
     dragging: Option<usize>,
-    cover: CoverRenderer,
+    cover: Option<CoverRenderer>,
 }
 
 impl MainPage {
-    pub fn new(cover: CoverRenderer) -> Self {
+    pub fn new(cover: Option<CoverRenderer>) -> Self {
         Self {
             selected: 0,
             scroll: 0,
@@ -54,14 +54,35 @@ impl MainPage {
         }
     }
 
+    /// 探测终端图形能力，已经探测过就不再探测
+    ///
+    /// 探测期间会独占 stdin，只能在事件循环没在读输入的时候调用
+    pub fn enable_cover(&mut self, cover_protocol: &str) {
+        if self.cover.is_none() {
+            self.cover = Some(CoverRenderer::detect(
+                cover_protocol,
+                crate::cover::SESSION_QUERY_TIMEOUT,
+            ));
+        }
+    }
+
+    /// 放掉解码好的封面
+    pub fn release_cover_image(&mut self) {
+        if let Some(cover) = self.cover.as_mut() {
+            cover.sync(None);
+        }
+    }
+
     /// 收取封面后台线程算完的解码/编码结果，返回是否需要重画
     pub fn poll_cover(&mut self) -> bool {
-        self.cover.poll()
+        self.cover.as_mut().is_some_and(CoverRenderer::poll)
     }
 
     /// 终端尺寸变化后重新读单元格像素尺寸
     pub fn refresh_cover_font_size(&mut self) {
-        self.cover.refresh_font_size();
+        if let Some(cover) = self.cover.as_mut() {
+            cover.refresh_font_size();
+        }
     }
 
     pub fn handle_input(
@@ -220,21 +241,32 @@ impl MainPage {
                 .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
                 .split(area);
             // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_LYRIC_HEIGHT。
-            let geometry = CoverGeometry::from_font_size(
-                self.cover.font_size(),
-                ctx.cover_service.image_aspect(),
-            );
-            let cover_height = geometry.box_height(
-                columns[0].width,
-                columns[0]
-                    .height
-                    .saturating_sub(super::components::lyric::MIN_HEIGHT),
-            );
+            // 关掉封面时左栏整个归歌词
+            let geometry = self
+                .cover
+                .as_ref()
+                .filter(|_| ctx.config.read().unwrap().ui.show_cover)
+                .map(|cover| {
+                    CoverGeometry::from_font_size(
+                        cover.font_size(),
+                        ctx.cover_service.image_aspect(),
+                    )
+                });
+            let cover_height = geometry.map_or(0, |geometry| {
+                geometry.box_height(
+                    columns[0].width,
+                    columns[0]
+                        .height
+                        .saturating_sub(super::components::lyric::MIN_HEIGHT),
+                )
+            });
             let left = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(cover_height), Constraint::Min(0)])
                 .split(columns[0]);
-            if cover_height > 0 {
+            if let Some(geometry) = geometry
+                && cover_height > 0
+            {
                 self.render_cover(left[0], buf, ctx, geometry);
             }
             super::components::lyric::render(left[1], buf, ctx);
@@ -448,9 +480,11 @@ impl MainPage {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        self.cover.sync(ctx.cover_service.image_path().as_deref());
-        if self.cover.render(geometry.image_rect(inner), buf) {
-            return;
+        if let Some(cover) = self.cover.as_mut() {
+            cover.sync(ctx.cover_service.image_path().as_deref());
+            if cover.render(geometry.image_rect(inner), buf) {
+                return;
+            }
         }
         render_cover_text(inner, buf, ctx);
     }

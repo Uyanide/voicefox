@@ -401,9 +401,14 @@ fn run_app(
         scroll_amount,
     )));
     let settings_page = Arc::new(std::sync::Mutex::new(pages::settings::SettingsPage::new()));
-    let cover_protocol = ctx.config.read().unwrap().ui.cover_protocol.clone();
-    let mut main_page =
-        pages::main_page::MainPage::new(cover::CoverRenderer::detect(&cover_protocol));
+    let (cover_protocol, mut cover_enabled) = {
+        let config = ctx.config.read().unwrap();
+        (config.ui.cover_protocol.clone(), config.ui.show_cover)
+    };
+    // 不显示封面就不去查终端能力，那会往终端写查询序列并等回复
+    let cover = cover_enabled
+        .then(|| cover::CoverRenderer::detect(&cover_protocol, cover::STARTUP_QUERY_TIMEOUT));
+    let mut main_page = pages::main_page::MainPage::new(cover);
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -547,6 +552,31 @@ fn run_app(
                 let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
             }
             mouse_capture_enabled = mouse_requested;
+        }
+
+        let cover_requested = ctx.config.read().unwrap().ui.show_cover;
+        if cover_requested != cover_enabled {
+            if cover_requested {
+                main_page.enable_cover(&cover_protocol);
+                let cover_url = ctx
+                    .current_song
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|song| song.cover_url.clone());
+                let cover_service = Arc::clone(&ctx.cover_service);
+                let wake_tx = action_tx.clone();
+                rt.spawn(async move {
+                    if let Err(error) = cover_service.load(cover_url).await {
+                        tracing::debug!("load cover after enabling failed: {error}");
+                    }
+                    let _ = wake_tx.send(AppAction::None);
+                });
+            } else {
+                main_page.release_cover_image();
+            }
+            cover_enabled = cover_requested;
+            needs_render = true;
         }
 
         if observed_active_tab != active_tab {

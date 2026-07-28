@@ -2,10 +2,12 @@
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
+use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui_image::errors::Errors;
+use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
@@ -16,6 +18,15 @@ const RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
 
 /// 解码后的最长边上限
 const MAX_DECODED_EDGE: u32 = 1024;
+
+/// 启动时等终端回答能力查询的上限
+pub const STARTUP_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 事件循环跑起来之后等终端回答能力查询的上限，阻塞可感知所以略短
+pub const SESSION_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 排空 stdin 时等下一个事件的上限
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// 主线程 → 解码线程
 struct DecodeJob {
@@ -57,13 +68,18 @@ pub struct CoverRenderer {
 impl CoverRenderer {
     /// 探测终端图形能力并返回实例
     ///
-    /// 过程中会向终端发查询序列并读回复，必须在进入 alt screen 之后、
-    /// 开始读终端事件之前调用，否则会和事件循环抢 stdin
-    pub fn detect(cover_protocol: &str) -> Self {
-        let mut picker = Picker::from_query_stdio().unwrap_or_else(|error| {
+    /// 过程中会向终端发查询序列并直接读 stdin，调用期间不能有别人也在读，
+    /// 否则会和事件循环抢输入
+    pub fn detect(cover_protocol: &str, timeout: Duration) -> Self {
+        let options = QueryStdioOptions {
+            timeout,
+            ..QueryStdioOptions::default()
+        };
+        let mut picker = Picker::from_query_stdio_with_options(options).unwrap_or_else(|error| {
             tracing::debug!("query terminal graphics capabilities failed: {error}");
             Picker::halfblocks()
         });
+        drain_terminal_replies();
         if let Some(protocol) = parse_protocol(cover_protocol) {
             picker.set_protocol_type(protocol);
         }
@@ -266,6 +282,16 @@ fn spawn_workers(
         _ => {
             tracing::warn!("spawn cover worker threads failed, cover rendering disabled");
             false
+        }
+    }
+}
+
+fn drain_terminal_replies() {
+    // 超时不能给 0：回复解析出来是内部事件，会被 EventFilter 挡掉，
+    // 而 poll 只在还有时间时才接着捞下一个
+    while let Ok(true) = crossterm::event::poll(DRAIN_TIMEOUT) {
+        if crossterm::event::read().is_err() {
+            return;
         }
     }
 }
