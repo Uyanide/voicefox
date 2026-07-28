@@ -430,7 +430,7 @@ fn run_app(
     #[cfg(target_os = "linux")]
     let mut last_mpris_update = Instant::now() - Duration::from_secs(1);
     #[cfg(target_os = "linux")]
-    let mut last_seek_generation = ctx.seek_generation();
+    let mut last_position_epoch = ctx.position_epoch();
 
     // === 后台异步加载 JS 音源（不阻塞启动） ===
     let js_urls = ctx.config.read().unwrap().source.js_sources.clone();
@@ -875,11 +875,11 @@ fn run_app(
         #[cfg(target_os = "linux")]
         if let Some(handle) = mpris_handle.as_ref() {
             // 例行更新按 250ms 限频，但跳转要立刻放行
-            let seek_generation = ctx.seek_generation();
-            if seek_generation != last_seek_generation
+            let position_epoch = ctx.position_epoch();
+            if position_epoch != last_position_epoch
                 || last_mpris_update.elapsed() >= Duration::from_millis(250)
             {
-                last_seek_generation = seek_generation;
+                last_position_epoch = position_epoch;
                 let snapshot = current_mpris_snapshot(&ctx);
                 if last_mpris_snapshot.as_ref() != Some(&snapshot) {
                     handle.update(snapshot.clone());
@@ -2164,7 +2164,7 @@ fn current_mpris_snapshot(ctx: &AppContext) -> mpris::MprisSnapshot {
         ctx.player.volume(),
         ctx.playlist.mode(),
         ctx.playlist.len(),
-        ctx.seek_generation(),
+        ctx.position_epoch(),
     )
 }
 
