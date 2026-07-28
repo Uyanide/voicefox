@@ -45,6 +45,8 @@ pub struct CoverRenderer {
     has_image: bool,
     /// 已经开始解码的路径
     loaded: Option<String>,
+    /// 上一次从 ioctl 读到的单元格尺寸
+    probed: Option<FontSize>,
     /// 解码请求序号
     request_id: u64,
 }
@@ -64,7 +66,7 @@ impl CoverRenderer {
         }
 
         let mut renderer = Self::spawn(picker);
-        // 立即探测一次，与 resize 行为统一
+        // 记下 ioctl 的基准读数
         renderer.refresh_font_size();
         tracing::info!(
             "cover protocol {:?}, font size {:?}",
@@ -88,6 +90,7 @@ impl CoverRenderer {
             done_rx,
             has_image: false,
             loaded: None,
+            probed: None,
             request_id: 0,
         }
     }
@@ -144,11 +147,18 @@ impl CoverRenderer {
         let Some(font_size) = probe_font_size() else {
             return;
         };
-        let current = self.picker.font_size();
-        if font_size.width == current.width && font_size.height == current.height {
-            return;
+        match self.probed.replace(font_size) {
+            // 读数没变
+            Some(previous)
+                if previous.width == font_size.width && previous.height == font_size.height =>
+            {
+                return;
+            }
+            // 第一次读。保留 Picker 查询的字号(若有)
+            None if !self.picker.capabilities().is_empty() => return,
+            _ => {}
         }
-        tracing::debug!("font size changed to {font_size:?}");
+        tracing::debug!("cell size is now {font_size:?}");
 
         // Picker 没有单独改字号的接口，重建一个，把探测到的协议带过去
         #[allow(deprecated)]
