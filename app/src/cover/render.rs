@@ -50,41 +50,35 @@ pub struct CoverRenderer {
 }
 
 impl CoverRenderer {
-    /// 探测终端图形能力并返回实例。
+    /// 探测终端图形能力并返回实例
     ///
     /// 过程中会向终端发查询序列并读回复，必须在进入 alt screen 之后、
-    /// 开始读终端事件之前调用，否则会和事件循环抢 stdin。
+    /// 开始读终端事件之前调用，否则会和事件循环抢 stdin
     pub fn detect(cover_protocol: &str) -> Self {
-        let forced = parse_protocol(cover_protocol);
-        let enabled = forced.is_some();
-
-        let picker = if enabled {
-            let mut picker = Picker::from_query_stdio().unwrap_or_else(|error| {
-                tracing::debug!("query terminal graphics capabilities failed: {error}");
-                Picker::halfblocks()
-            });
-            if let Some(Some(protocol)) = forced {
-                picker.set_protocol_type(protocol);
-            }
-            picker
-        } else {
+        let mut picker = Picker::from_query_stdio().unwrap_or_else(|error| {
+            tracing::debug!("query terminal graphics capabilities failed: {error}");
             Picker::halfblocks()
-        };
+        });
+        if let Some(protocol) = parse_protocol(cover_protocol) {
+            picker.set_protocol_type(protocol);
+        }
 
+        let mut renderer = Self::spawn(picker);
+        // 立即探测一次，与 resize 行为统一
+        renderer.refresh_font_size();
         tracing::info!(
-            "cover protocol {:?}, font size {:?}, enabled {}",
-            picker.protocol_type(),
-            picker.font_size(),
-            enabled
+            "cover protocol {:?}, font size {:?}",
+            renderer.picker.protocol_type(),
+            renderer.picker.font_size()
         );
-        Self::spawn(picker, enabled)
+        renderer
     }
 
-    fn spawn(picker: Picker, enabled: bool) -> Self {
+    fn spawn(picker: Picker) -> Self {
         let (decode_tx, decode_rx) = channel::<DecodeJob>();
         let (encode_tx, encode_rx) = channel::<ResizeRequest>();
         let (done_tx, done_rx) = channel::<Done>();
-        let enabled = enabled && spawn_workers(decode_rx, encode_rx, done_tx);
+        let enabled = spawn_workers(decode_rx, encode_rx, done_tx);
 
         Self {
             protocol: ThreadProtocol::new(encode_tx, None),
@@ -288,20 +282,17 @@ fn decode(path: &str) -> Option<image::DynamicImage> {
     }
 }
 
-/// 解析配置里的 ui.cover_protocol。
-///
-/// Some(None) 表示 auto（交给探测），Some(Some(_)) 表示强制指定，None 表示关闭。
-fn parse_protocol(value: &str) -> Option<Option<ProtocolType>> {
+/// 解析配置里的 ui.cover_protocol，None 表示交给探测
+fn parse_protocol(value: &str) -> Option<ProtocolType> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "auto" => Some(None),
-        "kitty" => Some(Some(ProtocolType::Kitty)),
-        "sixel" | "sixels" => Some(Some(ProtocolType::Sixel)),
-        "iterm2" | "iterm" => Some(Some(ProtocolType::Iterm2)),
-        "halfblocks" | "blocks" => Some(Some(ProtocolType::Halfblocks)),
-        "off" | "none" => None,
+        "" | "auto" => None,
+        "kitty" => Some(ProtocolType::Kitty),
+        "sixel" | "sixels" => Some(ProtocolType::Sixel),
+        "iterm2" | "iterm" => Some(ProtocolType::Iterm2),
+        "halfblocks" | "blocks" => Some(ProtocolType::Halfblocks),
         other => {
             tracing::warn!("unknown ui.cover_protocol {other:?}, falling back to auto");
-            Some(None)
+            None
         }
     }
 }
@@ -325,7 +316,7 @@ mod tests {
     };
 
     fn renderer() -> CoverRenderer {
-        CoverRenderer::spawn(Picker::halfblocks(), true)
+        CoverRenderer::spawn(Picker::halfblocks())
     }
 
     /// 存一张纯色 PNG，返回路径
@@ -411,17 +402,13 @@ mod tests {
 
     #[test]
     fn protocol_config_is_parsed_leniently() {
-        assert_eq!(parse_protocol("auto"), Some(None));
-        assert_eq!(parse_protocol(""), Some(None));
-        assert_eq!(parse_protocol("  Kitty "), Some(Some(ProtocolType::Kitty)));
-        assert_eq!(parse_protocol("SIXEL"), Some(Some(ProtocolType::Sixel)));
-        assert_eq!(parse_protocol("iterm"), Some(Some(ProtocolType::Iterm2)));
-        assert_eq!(
-            parse_protocol("halfblocks"),
-            Some(Some(ProtocolType::Halfblocks))
-        );
-        assert_eq!(parse_protocol("off"), None);
+        assert_eq!(parse_protocol("auto"), None);
+        assert_eq!(parse_protocol(""), None);
+        assert_eq!(parse_protocol("  Kitty "), Some(ProtocolType::Kitty));
+        assert_eq!(parse_protocol("SIXEL"), Some(ProtocolType::Sixel));
+        assert_eq!(parse_protocol("iterm"), Some(ProtocolType::Iterm2));
+        assert_eq!(parse_protocol("halfblocks"), Some(ProtocolType::Halfblocks));
         // 非致命错误
-        assert_eq!(parse_protocol("kity"), Some(None));
+        assert_eq!(parse_protocol("kity"), None);
     }
 }

@@ -172,9 +172,9 @@ pub struct UiConfig {
     pub scroll_amount: usize,
     pub aggregate_search: bool,
     pub show_cover: bool,
-    /// 封面渲染协议：auto / kitty / sixel / iterm2 / halfblocks / off。
-    /// 默认 auto，由终端探测决定；探测不准时可以在这里强制指定。
-    /// 用字符串而不是枚举，写错了只会退回 auto，不至于让整个配置文件加载失败。
+    /// 封面渲染协议：auto / kitty / sixel / iterm2 / halfblocks。
+    /// 默认 auto，由终端探测决定，探测不准时可以在这里强制指定。
+    /// 用字符串存，写错了只会退回 auto，不至于让整个配置文件加载失败。
     pub cover_protocol: String,
     /// 旧版本通知配置，仅用于迁移，不再写入新配置。
     #[serde(default, skip_serializing)]

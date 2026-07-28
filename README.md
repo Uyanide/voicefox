@@ -151,6 +151,12 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 set -g allow-passthrough on
 ```
 
+同时确保 `$TERM` 以 `tmux` 为前缀：
+
+```tmux
+set -g default-terminal "tmux-256color"
+```
+
 重新加载配置并重启 voicefox：
 
 ```bash
@@ -163,11 +169,9 @@ tmux source-file ~/.tmux.conf
 
 ```toml
 [ui]
-# auto（默认）| kitty | sixel | iterm2 | halfblocks | off
+# auto（默认）| kitty | sixel | iterm2 | halfblocks
 cover_protocol = "auto"
 ```
-
-`off` 表示不显示图片，只在封面框里显示歌名和歌手。写错的值会退回 `auto`。
 
 ### Waybar 控制模块
 
