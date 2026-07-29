@@ -94,6 +94,10 @@ pub enum Action {
     /// 进入本地音乐过滤模式
     LocalFilter,
 
+    // --- 历史页面专用 ---
+    /// 进入历史页面过滤模式
+    HistoryFilter,
+
     // --- 收藏页面专用 ---
     /// 进入过滤模式
     FavoritesFilter,
@@ -278,6 +282,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     history.insert(Action::ListAddToQueue, "a".to_string());
     history.insert(Action::ListAddToQueueNext, "A".to_string());
     history.insert(Action::ListCycleSort, "s".to_string());
+    history.insert(Action::HistoryFilter, "/".to_string());
     pages.insert("history".to_string(), history);
 
     // --- 本地音乐 ---
