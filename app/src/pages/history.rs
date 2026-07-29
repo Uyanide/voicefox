@@ -11,29 +11,58 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::components::list_filter::ListFilter;
 use crate::pages::sort::{SortState, SortTarget, sorted_songs};
 
-pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, state: &mut SortState) {
-    let history = sorted_history(ctx, state);
+pub fn render(
+    area: Rect,
+    buf: &mut Buffer,
+    ctx: &AppContext,
+    state: &mut SortState,
+    filter: &ListFilter,
+) {
+    let history = filtered_history(ctx, state, filter.query());
+    let filter_visible = filter.is_active() || !filter.query().is_empty();
+    let filter_suffix = if filter.query().is_empty() {
+        String::new()
+    } else {
+        format!(" · 过滤 '{}' ({} 匹配)", filter.query(), history.len())
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(crate::theme::border(ctx)))
         .title(format!(
-            "播放历史 ({} 首) · 排序 {} · s 切换",
+            "播放历史 ({} 首) · 排序 {} · s 切换{}",
             history.len(),
-            state.mode.label(SortTarget::History)
+            state.mode.label(SortTarget::History),
+            filter_suffix
         ));
 
     let inner = block.inner(area);
     block.render(area, buf);
 
+    if filter_visible {
+        filter.render(Rect::new(inner.x, inner.y, inner.width, 1), buf, ctx);
+    }
+
+    let content_y = if filter_visible { inner.y + 1 } else { inner.y };
+    let content_height = if filter_visible {
+        inner.height.saturating_sub(1)
+    } else {
+        inner.height
+    };
+
     if history.is_empty() {
         Paragraph::new(Line::from(Span::styled(
-            "暂无播放历史",
+            if filter.query().is_empty() {
+                "暂无播放历史"
+            } else {
+                "无匹配历史记录，按 Esc 清除过滤"
+            },
             Style::new().fg(crate::theme::muted(ctx)),
         )))
-        .render(inner, buf);
+        .render(Rect::new(inner.x, content_y, inner.width, content_height), buf);
         return;
     }
 
@@ -48,19 +77,19 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, state: &mut SortSt
         .add_modifier(Modifier::BOLD);
     let normal_style = Style::new().fg(crate::theme::text(ctx));
 
-    if inner.height == 0 {
+    if content_height == 0 {
         return;
     }
     Paragraph::new(Line::from(Span::styled(
         super::components::song_table::header(inner.width),
         Style::new().fg(crate::theme::muted(ctx)),
     )))
-    .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
+    .render(Rect::new(inner.x, content_y, inner.width, 1), buf);
     let list = Rect::new(
         inner.x,
-        inner.y.saturating_add(1),
+        content_y.saturating_add(1),
         inner.width,
-        inner.height.saturating_sub(1),
+        content_height.saturating_sub(1),
     );
     let visible_height = list.height as usize;
     if visible_height == 0 {
@@ -97,9 +126,10 @@ pub fn handle_input(
     key: &KeyEvent,
     ctx: &AppContext,
     state: &mut SortState,
+    filter_query: &str,
     resolver: &KeybindingResolver,
 ) -> AppAction {
-    let history = sorted_history(ctx, state);
+    let history = filtered_history(ctx, state, filter_query);
 
     if let Some(action) = resolver.resolve_page("history", key) {
         match action {
@@ -109,6 +139,9 @@ pub fn handle_input(
                     "历史排序: {}",
                     mode.label(SortTarget::History)
                 )));
+            }
+            Action::HistoryFilter => {
+                return AppAction::None;
             }
             Action::ListSelectUp => {
                 if !history.is_empty() {
@@ -250,9 +283,10 @@ pub fn handle_mouse(
     area: Rect,
     ctx: &AppContext,
     state: &mut SortState,
+    filter_query: &str,
     activate: bool,
 ) -> AppAction {
-    let history = sorted_history(ctx, state);
+    let history = filtered_history(ctx, state, filter_query);
     let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
     match event.kind {
         MouseEventKind::ScrollUp => {
@@ -287,8 +321,9 @@ pub fn context_song_at(
     area: Rect,
     ctx: &AppContext,
     state: &mut SortState,
+    filter_query: &str,
 ) -> Option<(Vec<SongInfo>, usize)> {
-    let history = sorted_history(ctx, state);
+    let history = filtered_history(ctx, state, filter_query);
     let inner = Block::default().borders(Borders::ALL).inner(area);
     let list_y = inner.y.saturating_add(1);
     if event.row < list_y || event.row >= inner.bottom() {
@@ -304,4 +339,19 @@ pub fn context_song_at(
 
 fn sorted_history(ctx: &AppContext, state: &SortState) -> Vec<SongInfo> {
     sorted_songs(ctx.storage.load_history(), state.mode, SortTarget::History)
+}
+
+fn filtered_history(ctx: &AppContext, state: &SortState, filter_query: &str) -> Vec<SongInfo> {
+    let history = sorted_history(ctx, state);
+    if filter_query.is_empty() {
+        return history;
+    }
+
+    let query = filter_query.trim().to_lowercase();
+    history
+        .into_iter()
+        .filter(|song| {
+            song.name.to_lowercase().contains(&query) || song.singer.to_lowercase().contains(&query)
+        })
+        .collect()
 }

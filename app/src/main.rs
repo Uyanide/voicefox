@@ -408,6 +408,7 @@ fn run_app(
     let mut history_state = SortState::new(SortMode::Newest);
     let mut local_state = SortState::new(SortMode::TitleAsc);
     let mut local_filter = components::list_filter::ListFilter::new();
+    let mut history_filter = components::list_filter::ListFilter::new();
     let mut confirm_delete: Option<LocalDeleteConfirmation> = None;
     let mut song_menu: Option<SongContextMenu> = None;
     let mut ui_areas = UiAreas::default();
@@ -922,6 +923,7 @@ fn run_app(
                 &mut favorites_page,
                 &mut history_state,
                 &mut local_state,
+                &history_filter,
                 &local_filter,
                 &mut ui_areas,
                 &confirm_delete,
@@ -950,8 +952,10 @@ fn run_app(
                 active_tab == NavTab::Favorites && favorites_page.input_mode();
             let local_input_mode =
                 active_tab == NavTab::LocalMusic && local_filter.is_active();
+            let history_input_mode =
+                active_tab == NavTab::History && history_filter.is_active();
             let text_input_active =
-                settings_input_mode || search_input_mode || favorites_input_mode || local_input_mode;
+                settings_input_mode || search_input_mode || favorites_input_mode || local_input_mode || history_input_mode;
 
             if let Some(ref page) = bili_login_page {
                 let action = page.lock().unwrap().handle_input(key, &kb_resolver);
@@ -1373,8 +1377,27 @@ fn run_app(
                     );
                 }
                 NavTab::History => {
-                    let action =
-                        pages::history::handle_input(&key, &ctx, &mut history_state, &kb_resolver);
+                    if history_filter.handle_input(&key) {
+                        if !history_filter.is_active() {
+                            history_state.reset_position();
+                        }
+                        needs_render = true;
+                        continue;
+                    }
+
+                    if let Some(Action::HistoryFilter) = kb_resolver.resolve_page("history", &key) {
+                        history_filter.activate();
+                        needs_render = true;
+                        continue;
+                    }
+
+                    let action = pages::history::handle_input(
+                        &key,
+                        &ctx,
+                        &mut history_state,
+                        history_filter.query(),
+                        &kb_resolver,
+                    );
                     // 保持在历史页面，不强制切换到主页
                     execute_action(
                         action,
@@ -1789,6 +1812,7 @@ fn run_app(
                             ui_areas.content,
                             &ctx,
                             &mut history_state,
+                            history_filter.query(),
                         )
                         .map(|target| {
                             (
@@ -1843,6 +1867,7 @@ fn run_app(
                         ui_areas.content,
                         &ctx,
                         &mut history_state,
+                        history_filter.query(),
                         activate,
                     ),
                     NavTab::Settings => settings_page.lock().unwrap().handle_mouse(
@@ -1909,6 +1934,7 @@ fn run_app(
                 &mut favorites_page,
                 &mut history_state,
                 &mut local_state,
+                &history_filter,
                 &local_filter,
                 &mut ui_areas,
                 &confirm_delete,
@@ -1933,6 +1959,7 @@ fn draw_app(
     favorites_page: &mut pages::favorites::FavoritesPage,
     history_state: &mut SortState,
     local_state: &mut SortState,
+    history_filter: &components::list_filter::ListFilter,
     local_filter: &components::list_filter::ListFilter,
     ui_areas: &mut UiAreas,
     confirm_delete: &Option<LocalDeleteConfirmation>,
@@ -1994,7 +2021,13 @@ fn draw_app(
                 favorites_page.render(content_area, frame.buffer_mut(), ctx);
             }
             NavTab::History => {
-                pages::history::render(content_area, frame.buffer_mut(), ctx, history_state);
+                pages::history::render(
+                    content_area,
+                    frame.buffer_mut(),
+                    ctx,
+                    history_state,
+                    history_filter,
+                );
             }
             NavTab::Settings => {
                 let mut sp = settings_page.lock().unwrap();
