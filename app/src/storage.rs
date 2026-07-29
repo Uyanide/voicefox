@@ -1,15 +1,32 @@
-//! JSON 文件存储 — 歌曲/歌单收藏 + 播放历史
+//! JSON 文件存储 — 歌曲/歌单收藏、播放历史和播放会话
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 
 const MAX_HISTORY: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedPlayerState {
+    Playing,
+    Paused,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybackSession {
+    pub playlist: Vec<SongInfo>,
+    pub current_index: usize,
+    pub position: Duration,
+    pub state: SavedPlayerState,
+}
 
 pub struct Storage {
     data_dir: PathBuf,
@@ -134,6 +151,36 @@ impl Storage {
         self.history.read().unwrap().clone()
     }
 
+    // ── 播放会话 ──────────────────────────────────────
+
+    pub fn load_playback_session(&self) -> Option<PlaybackSession> {
+        let path = self.data_dir.join("playback_state.json");
+        let json = fs::read_to_string(path).ok()?;
+        let mut session = serde_json::from_str::<PlaybackSession>(&json).ok()?;
+        if session.playlist.is_empty() {
+            return None;
+        }
+        session.current_index = session
+            .current_index
+            .min(session.playlist.len().saturating_sub(1));
+        Some(session)
+    }
+
+    pub fn save_playback_session(&self, session: &PlaybackSession) -> Result<(), String> {
+        let path = self.data_dir.join("playback_state.json");
+        let json = serde_json::to_vec_pretty(session).map_err(|error| error.to_string())?;
+        save_atomic(&path, &json)
+    }
+
+    pub fn clear_playback_session(&self) -> Result<(), String> {
+        let path = self.data_dir.join("playback_state.json");
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     fn load_file<T: DeserializeOwned>(path: &std::path::Path) -> Vec<T> {
         if path.exists() {
             match fs::read_to_string(path) {
@@ -155,6 +202,25 @@ impl Storage {
             let _ = fs::write(&path, json);
         }
     }
+}
+
+fn save_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let result = (|| {
+        fs::write(&temp_path, content).map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+        fs::rename(&temp_path, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
+    }
+    result
 }
 
 impl Default for Storage {
@@ -198,9 +264,11 @@ fn normalize_singer(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::songs_equivalent;
+    use super::{PlaybackSession, SavedPlayerState, Storage, songs_equivalent};
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
+    use std::sync::RwLock;
+    use std::time::Duration;
 
     fn song(id: &str, source: SourceId, name: &str, singer: &str) -> SongInfo {
         SongInfo::new(id.to_string(), source, name.to_string(), singer.to_string())
@@ -236,5 +304,40 @@ mod tests {
         let right = song("2", SourceId::Wy, "纯音乐", "");
 
         assert!(!songs_equivalent(&left, &right));
+    }
+
+    #[test]
+    fn playback_session_round_trips_and_clamps_the_index() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "voicefox-playback-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = Storage {
+            data_dir: data_dir.clone(),
+            favorites: RwLock::new(Vec::new()),
+            favorite_playlists: RwLock::new(Vec::new()),
+            history: RwLock::new(Vec::new()),
+        };
+        let session = PlaybackSession {
+            playlist: vec![song("1", SourceId::Bili, "第一 P", "UP主")],
+            current_index: 8,
+            position: Duration::from_secs(37),
+            state: SavedPlayerState::Paused,
+        };
+
+        storage.save_playback_session(&session).unwrap();
+        let restored = storage.load_playback_session().unwrap();
+
+        assert_eq!(restored.current_index, 0);
+        assert_eq!(restored.position, Duration::from_secs(37));
+        assert_eq!(restored.state, SavedPlayerState::Paused);
+        storage.clear_playback_session().unwrap();
+        assert!(storage.load_playback_session().is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

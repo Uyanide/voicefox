@@ -23,7 +23,7 @@ impl SourceLyricFetcher {
 impl LyricFetcher for SourceLyricFetcher {
     async fn fetch(&self, song: &SongInfo) -> Result<LyricData, LyricFetchError> {
         self.source_manager
-            .get_lyric(song)
+            .get_lyric_with_fallback(song)
             .await
             .map_err(map_fetch_error)
     }

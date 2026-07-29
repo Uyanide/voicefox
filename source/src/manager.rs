@@ -405,6 +405,29 @@ impl SourceManager {
         source.get_lyric(song).await
     }
 
+    /// 获取歌词，当前音源无内容时自动从同曲候选中补全。
+    pub async fn get_lyric_with_fallback(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
+        if let Ok(data) = self.get_lyric(song).await
+            && lyric_has_content(&data)
+        {
+            return Ok(data);
+        }
+
+        for candidate in self.find_music(song).await {
+            if let Ok(data) = self.get_lyric(&candidate).await
+                && lyric_has_content(&data)
+            {
+                tracing::debug!(
+                    "lyrics for {} matched from {}",
+                    song.name,
+                    candidate.source.as_str()
+                );
+                return Ok(data);
+            }
+        }
+        Err(FetchError::NotFound)
+    }
+
     /// 优先使用搜索结果中的封面，其次请求 JS 音源，最后回退到内置搜索源。
     pub async fn get_cover_url(&self, song: &SongInfo) -> Result<String, FetchError> {
         if let Some(url) = song.cover_url.as_ref().filter(|url| !url.trim().is_empty()) {

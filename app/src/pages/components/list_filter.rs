@@ -154,7 +154,7 @@ impl ListFilter {
 #[cfg(test)]
 mod tests {
     use super::ListFilter;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent};
 
     #[test]
     fn new_filter_is_inactive_with_empty_query() {
@@ -211,5 +211,4 @@ mod tests {
         assert!(!f.handle_input(&key));
         assert_eq!(f.query(), "");
     }
-
 }

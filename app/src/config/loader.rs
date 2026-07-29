@@ -240,6 +240,7 @@ mod tests {
 
         assert_eq!(config.player.volume, 42);
         assert_eq!(config.player.engine, "mpv");
+        assert!(config.player.remember_playback_state);
         assert_eq!(config.network.timeout, 15);
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert_eq!(config.source.enabled, SourceId::all_online());

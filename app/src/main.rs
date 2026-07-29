@@ -44,6 +44,7 @@ use pages::components;
 use pages::components::context_menu::{MenuOutcome, SongContextMenu, SongMenuAction, SongMenuKind};
 use pages::sidebar::NavTab;
 use pages::sort::{SortMode, SortState, SortTarget};
+use storage::SavedPlayerState;
 
 enum LeaderboardResponse {
     Boards {
@@ -425,6 +426,7 @@ fn run_app(
     let render_interval = Duration::from_millis(1_000 / u64::from(max_fps));
     let mut last_periodic_render = Instant::now();
     let mut last_notification_cleanup = Instant::now();
+    let mut last_playback_session_save = Instant::now();
     let mut mouse_capture_enabled = ctx.config.read().unwrap().ui.enable_mouse;
     #[cfg(target_os = "linux")]
     let mut last_mpris_snapshot: Option<mpris::MprisSnapshot> = None;
@@ -452,6 +454,25 @@ fn run_app(
         action_tx.clone(),
         rt,
     );
+
+    if ctx.config.read().unwrap().player.remember_playback_state
+        && let Some(session) = ctx.storage.load_playback_session()
+    {
+        execute_action(
+            AppAction::RestorePlayback {
+                songs: session.playlist,
+                index: session.current_index,
+                position: session.position,
+                paused: session.state != SavedPlayerState::Playing,
+            },
+            &ctx,
+            rt,
+            &action_tx,
+            &search_page,
+            &settings_page,
+            &search_seq,
+        );
+    }
 
     // === 初始扫描本地音乐 ===
     let local_music_paths = ctx.config.read().unwrap().local_music.paths.clone();
@@ -503,6 +524,9 @@ fn run_app(
                     &search_seq,
                 ) {
                     tracing::info!("quit requested through MPRIS");
+                    if let Err(error) = ctx.persist_playback_session() {
+                        tracing::warn!("save playback session failed: {error}");
+                    }
                     ctx.player.stop();
                     ctx.cover_service.clear_display();
                     return Ok(());
@@ -866,6 +890,12 @@ fn run_app(
             }
             last_notification_cleanup = Instant::now();
         }
+        if last_playback_session_save.elapsed() >= Duration::from_secs(5) {
+            if let Err(error) = ctx.persist_playback_session() {
+                tracing::warn!("save playback session failed: {error}");
+            }
+            last_playback_session_save = Instant::now();
+        }
 
         // borrow 很便宜，所以不受 render_interval 门控
         let state = *ctx.player_state.borrow();
@@ -1066,6 +1096,9 @@ fn run_app(
                 match action {
                     Action::GlobalQuit if !text_input_active => {
                         tracing::info!("quit requested");
+                        if let Err(error) = ctx.persist_playback_session() {
+                            tracing::warn!("save playback session failed: {error}");
+                        }
                         ctx.player.stop();
                         ctx.cover_service.clear_display();
                         return Ok(());
@@ -2343,9 +2376,79 @@ fn execute_action(
         }
         AppAction::PlaySong { songs, index } => {
             if let Some(song) = songs.get(index).cloned() {
+                if should_expand_bili_parts(&song) {
+                    let request_id = ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = ctx.player.prepare();
+                    *ctx.current_song.write().unwrap() = Some(song.clone());
+                    ctx.notify(
+                        Notification::info(format!("正在解析分 P: {}", song.name)).tui_only(),
+                    );
+                    let bili_source = Arc::clone(&ctx.bili_source);
+                    let play_request_id = Arc::clone(&ctx.play_request_id);
+                    let tx = action_tx.clone();
+                    rt.spawn(async move {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            bili_source.video_parts(&song),
+                        )
+                        .await;
+                        if play_request_id.load(Ordering::SeqCst) != request_id {
+                            return;
+                        }
+
+                        let mut songs = songs;
+                        let next_index = match result {
+                            Ok(Ok(parts)) if !parts.is_empty() => {
+                                let part_count = parts.len();
+                                songs.splice(index..=index, parts);
+                                let _ = tx.send(AppAction::ShowNotification(
+                                    Notification::success(format!("已展开 {} 个分 P", part_count))
+                                        .tui_only(),
+                                ));
+                                index
+                            }
+                            Ok(Ok(_)) => {
+                                mark_bili_parts_checked(&mut songs[index]);
+                                index
+                            }
+                            Ok(Err(error)) => {
+                                mark_bili_parts_checked(&mut songs[index]);
+                                let _ =
+                                    tx.send(AppAction::ShowNotification(Notification::warning(
+                                        format!("分 P 解析失败，将播放默认分 P: {error}"),
+                                    )));
+                                index
+                            }
+                            Err(_) => {
+                                mark_bili_parts_checked(&mut songs[index]);
+                                let _ = tx.send(AppAction::ShowNotification(
+                                    Notification::warning("分 P 解析超时，将播放默认分 P"),
+                                ));
+                                index
+                            }
+                        };
+                        let _ = tx.send(AppAction::PlaySong {
+                            songs,
+                            index: next_index,
+                        });
+                    });
+                    return;
+                }
                 ctx.playlist.set_playlist(songs, index);
                 ctx.play_attempted_sources.lock().unwrap().clear();
-                start_song_playback(song, true, ctx, rt, action_tx);
+                start_song_playback(song, true, None, ctx, rt, action_tx);
+            }
+        }
+        AppAction::RestorePlayback {
+            songs,
+            index,
+            position,
+            paused,
+        } => {
+            if let Some(song) = songs.get(index).cloned() {
+                ctx.playlist.set_playlist(songs, index);
+                ctx.play_attempted_sources.lock().unwrap().clear();
+                start_song_playback(song, false, Some((position, paused)), ctx, rt, action_tx);
             }
         }
         AppAction::AddToQueue { song, position } => {
@@ -2362,7 +2465,7 @@ fn execute_action(
             ctx.notify(Notification::success(message));
         }
         AppAction::RetrySong { song } => {
-            start_song_playback(*song, false, ctx, rt, action_tx);
+            start_song_playback(*song, false, None, ctx, rt, action_tx);
         }
         AppAction::ShowNotification(n) => {
             ctx.notify(n);
@@ -2509,6 +2612,7 @@ fn execute_action(
 fn start_song_playback(
     song: SongInfo,
     add_history: bool,
+    restored_state: Option<(Duration, bool)>,
     ctx: &AppContext,
     rt: &tokio::runtime::Runtime,
     action_tx: &mpsc::UnboundedSender<AppAction>,
@@ -2577,8 +2681,10 @@ fn start_song_playback(
     let current_song = Arc::clone(&ctx.current_song);
     let play_request_id = Arc::clone(&ctx.play_request_id);
     let attempted_sources = Arc::clone(&ctx.play_attempted_sources);
-    let quality = ctx.config.read().unwrap().player.quality;
-    let auto_toggle = ctx.config.read().unwrap().source.auto_toggle;
+    let (quality, auto_toggle) = {
+        let config = ctx.config.read().unwrap();
+        (config.player.quality, config.source.auto_toggle)
+    };
     let tx = action_tx.clone();
 
     rt.spawn(async move {
@@ -2631,6 +2737,12 @@ fn start_song_playback(
         .unwrap_or(false);
         if !accepted || play_request_id.load(Ordering::SeqCst) != request_id {
             return;
+        }
+        if let Some((position, paused)) = restored_state {
+            player.seek(position);
+            if paused {
+                player.pause();
+            }
         }
 
         if resolved_song.cover_url.is_none() {
@@ -2696,6 +2808,17 @@ fn start_song_playback(
             let _ = tx.send(AppAction::ShowNotification(notification));
         }
     });
+}
+
+fn should_expand_bili_parts(song: &SongInfo) -> bool {
+    song.source == SourceId::Bili
+        && !song.extra.contains_key("page")
+        && !song.extra.contains_key("bili_parts_checked")
+}
+
+fn mark_bili_parts_checked(song: &mut SongInfo) {
+    song.extra
+        .insert("bili_parts_checked".to_string(), "true".to_string());
 }
 
 async fn resolve_playable_song(
@@ -3040,10 +3163,12 @@ fn spawn_playlist_request(
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use lx_core::model::song::SongInfo;
+    use lx_core::model::source::SourceId;
 
     use super::{
         DeleteConfirmationAction, delete_confirmation_action, next_list_index, previous_list_index,
-        should_scan_local_music_on_entry,
+        should_expand_bili_parts, should_scan_local_music_on_entry,
     };
     use crate::pages::sidebar::NavTab;
 
@@ -3118,5 +3243,27 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn only_unresolved_bili_items_need_part_expansion() {
+        let mut song = SongInfo::new(
+            "BV1xx411c7mD".to_string(),
+            SourceId::Bili,
+            "测试视频".to_string(),
+            "UP主".to_string(),
+        );
+        assert!(should_expand_bili_parts(&song));
+
+        song.extra.insert("page".to_string(), "2".to_string());
+        assert!(!should_expand_bili_parts(&song));
+
+        let online_song = SongInfo::new(
+            "1".to_string(),
+            SourceId::Kw,
+            "歌曲".to_string(),
+            "歌手".to_string(),
+        );
+        assert!(!should_expand_bili_parts(&online_song));
     }
 }

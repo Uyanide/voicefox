@@ -145,6 +145,20 @@ impl BiliSource {
         }
     }
 
+    /// 获取一个视频的全部分 P。搜索、榜单和收藏夹接口通常只返回视频级
+    /// 条目，播放前通过 view 接口展开，才能让队列逐 P 播放。
+    pub async fn video_parts(&self, song: &SongInfo) -> Result<Vec<SongInfo>, FetchError> {
+        let bvid = song
+            .extra
+            .get("bvid")
+            .map(String::as_str)
+            .unwrap_or(&song.id);
+        search::fetch_video_parts(self, bvid)
+            .await
+            .map(|result| result.items)
+            .map_err(|error| FetchError::Other(error.to_string()))
+    }
+
     pub fn logout(&self) -> Result<(), String> {
         self.session_generation.fetch_add(1, Ordering::SeqCst);
         *self.session.write().unwrap() = BiliSession::default();

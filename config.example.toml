@@ -3,6 +3,7 @@ engine = "mpv"
 quality = "320k"
 volume = 80
 play_mode = "list-loop"
+remember_playback_state = true
 
 [source]
 enabled = ["kw", "kg", "tx", "wy", "mg", "bili"]

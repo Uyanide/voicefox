@@ -32,6 +32,12 @@ pub enum AppAction {
         songs: Vec<SongInfo>,
         index: usize,
     },
+    RestorePlayback {
+        songs: Vec<SongInfo>,
+        index: usize,
+        position: Duration,
+        paused: bool,
+    },
     AddToQueue {
         song: Box<SongInfo>,
         position: InsertPosition,

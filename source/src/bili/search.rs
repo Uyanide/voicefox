@@ -167,6 +167,20 @@ async fn fetch_video(
     parse_video_result(&json, requested_page)
 }
 
+pub(crate) async fn fetch_video_parts(
+    source: &BiliSource,
+    bvid: &str,
+) -> Result<SearchResult, SearchError> {
+    fetch_video(
+        source,
+        VideoReference::Bvid {
+            bvid: bvid.to_string(),
+            page: None,
+        },
+    )
+    .await
+}
+
 fn parse_video_result(
     json: &Value,
     requested_page: Option<u32>,
@@ -250,6 +264,7 @@ fn parse_video_result(
             song.qualities.extend([Quality::Low128, Quality::High320]);
             song.extra.insert("bvid".to_string(), bvid.to_string());
             song.extra.insert("cid".to_string(), cid);
+            song.extra.insert("page".to_string(), "1".to_string());
             if !aid.is_empty() {
                 song.extra.insert("aid".to_string(), aid);
             }

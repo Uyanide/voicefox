@@ -15,7 +15,7 @@ use lx_core::traits::player::Player;
 use crate::cover::CoverService;
 use crate::notification::DesktopNotifier;
 use crate::playlist::manager::PlaylistManager;
-use crate::storage::Storage;
+use crate::storage::{PlaybackSession, SavedPlayerState, Storage};
 use lx_lyric::service::LyricService;
 use lx_source::bili::BiliSource;
 use lx_source::manager::SourceManager;
@@ -157,5 +157,26 @@ impl AppContext {
             .in_app_timeout
             .clamp(1, 60);
         Duration::from_secs(seconds)
+    }
+
+    pub fn persist_playback_session(&self) -> Result<(), String> {
+        if !self.config.read().unwrap().player.remember_playback_state {
+            return self.storage.clear_playback_session();
+        }
+        let (playlist, current_index) = self.playlist.snapshot();
+        if playlist.is_empty() {
+            return self.storage.clear_playback_session();
+        }
+        let state = match *self.player_state.borrow() {
+            PlayerState::Playing | PlayerState::Loading => SavedPlayerState::Playing,
+            PlayerState::Paused => SavedPlayerState::Paused,
+            PlayerState::Idle | PlayerState::Stopped => SavedPlayerState::Stopped,
+        };
+        self.storage.save_playback_session(&PlaybackSession {
+            playlist,
+            current_index,
+            position: *self.position.borrow(),
+            state,
+        })
     }
 }

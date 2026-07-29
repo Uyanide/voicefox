@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use lx_core::events::AppAction;
 use lx_core::keybinding::{Action, KeybindingResolver};
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
@@ -105,8 +105,10 @@ impl SettingsPage {
             }
         } else {
             // 先判断焦点区域：local 区域的按键优先处理
-            if self.focus == "local" {
-                return self.handle_local_keys(key, ctx, resolver);
+            if self.focus == "local"
+                && let Some(action) = self.handle_local_keys(key, ctx, resolver)
+            {
+                return action;
             }
 
             let sources = ctx.config.read().unwrap().source.js_sources.clone();
@@ -175,6 +177,29 @@ impl SettingsPage {
                     });
                     if !ctx.config.read().unwrap().ui.show_cover {
                         ctx.cover_service.clear();
+                    }
+                }
+                (KeyModifiers::NONE, KeyCode::Char('e')) => {
+                    let enabled = {
+                        let mut config = ctx.config.write().unwrap();
+                        config.player.remember_playback_state =
+                            !config.player.remember_playback_state;
+                        let enabled = config.player.remember_playback_state;
+                        let result = crate::config::loader::save(&config, &ctx.config_path);
+                        self.status_msg = Some(match result {
+                            Ok(()) => "设置已保存".to_string(),
+                            Err(error) => format!("保存设置失败: {}", error),
+                        });
+                        enabled
+                    };
+                    let result = if enabled {
+                        ctx.persist_playback_session()
+                    } else {
+                        ctx.storage.clear_playback_session()
+                    };
+                    if let Err(error) = result {
+                        self.status_msg =
+                            Some(format!("播放状态设置已更新，但会话保存失败: {error}"));
                     }
                 }
                 (KeyModifiers::NONE, KeyCode::Char('o')) => {
@@ -300,7 +325,7 @@ impl SettingsPage {
         key: KeyEvent,
         ctx: &AppContext,
         resolver: &KeybindingResolver,
-    ) -> AppAction {
+    ) -> Option<AppAction> {
         let paths = ctx.config.read().unwrap().local_music.paths.clone();
 
         if let Some(action) = resolver.resolve_page("settings", &key) {
@@ -309,13 +334,13 @@ impl SettingsPage {
                     if self.selected_local_path > 0 {
                         self.selected_local_path -= 1;
                     }
-                    return AppAction::None;
+                    return Some(AppAction::None);
                 }
                 Action::ListSelectDown => {
                     if self.selected_local_path + 1 < paths.len() {
                         self.selected_local_path += 1;
                     }
-                    return AppAction::None;
+                    return Some(AppAction::None);
                 }
                 _ => {}
             }
@@ -324,25 +349,25 @@ impl SettingsPage {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char('s')) => {
                 self.focus = "js".to_string();
-                AppAction::None
+                Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Char('a')) => {
                 self.local_path_mode = true;
                 self.local_path_input.clear();
                 self.status_msg = None;
-                AppAction::None
+                Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Up) => {
                 if self.selected_local_path > 0 {
                     self.selected_local_path -= 1;
                 }
-                AppAction::None
+                Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
                 if self.selected_local_path + 1 < paths.len() {
                     self.selected_local_path += 1;
                 }
-                AppAction::None
+                Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Char('d')) => {
                 if !paths.is_empty() && self.selected_local_path < paths.len() {
@@ -367,19 +392,19 @@ impl SettingsPage {
                         Ok(()) => format!("已移除 {}，正在重新扫描...", removed),
                         Err(error) => format!("已移除，但保存失败: {}", error),
                     });
-                    return AppAction::ScanLocalMusic {
+                    return Some(AppAction::ScanLocalMusic {
                         paths: remaining,
                         max_depth,
-                    };
+                    });
                 }
-                AppAction::None
+                Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Char('r')) => {
                 let max_depth = ctx.config.read().unwrap().local_music.max_depth;
                 self.status_msg = Some("正在扫描本地音乐...".to_string());
-                AppAction::ScanLocalMusic { paths, max_depth }
+                Some(AppAction::ScanLocalMusic { paths, max_depth })
             }
-            _ => AppAction::None,
+            _ => None,
         }
     }
 
@@ -410,7 +435,7 @@ impl SettingsPage {
         let options_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(" 界面与播放 · t/g/w/c/o/O/x/X/m/p · b 登录/退出 ");
+            .title(" 界面与播放 · t/g/w/c/e/o/O/x/X/m/p · b 登录/退出 ");
         let options_inner = options_block.inner(chunks[0]);
         options_block.render(chunks[0], buf);
         let options = vec![
@@ -418,12 +443,22 @@ impl SettingsPage {
             setting_line("聚合搜索", config.ui.aggregate_search, "g", accent, muted),
             setting_line("循环导航", config.ui.wrap_navigation, "w", accent, muted),
             setting_line("封面显示", config.ui.show_cover, "c", accent, muted),
-            setting_line("TUI 通知", config.notification.in_app, "o", accent, muted),
+            setting_line(
+                "保留播放状态",
+                config.player.remember_playback_state,
+                "e",
+                accent,
+                muted,
+            ),
             Line::from(vec![
-                Span::styled(" [O] ", Style::new().fg(muted)),
-                Span::raw("通知时长   "),
+                Span::styled(" [o/O] ", Style::new().fg(muted)),
+                Span::raw("TUI 通知   "),
                 Span::styled(
-                    format!("{} 秒", config.notification.in_app_timeout.clamp(1, 60)),
+                    format!(
+                        "{} · {} 秒",
+                        enabled(config.notification.in_app),
+                        config.notification.in_app_timeout.clamp(1, 60)
+                    ),
                     Style::new().fg(accent),
                 ),
             ]),
@@ -444,9 +479,9 @@ impl SettingsPage {
                 Span::styled(" [p] ", Style::new().fg(muted)),
                 Span::raw(format!("主题强调色  {}", config.theme.accent)),
             ]),
-            Line::from(format!(" 默认音源    {}", config.source.default.as_str())),
             Line::from(format!(
-                " 自动换源    {}",
+                " 音源        {} · 自动换源 {}",
+                config.source.default.as_str(),
                 enabled(config.source.auto_toggle)
             )),
             Line::from(vec![
@@ -469,7 +504,7 @@ impl SettingsPage {
                 ),
             ]),
         ];
-        Paragraph::new(options).render(options_inner, buf);
+        render_setting_options(options, options_inner, buf);
 
         let source_block = Block::default()
             .borders(Borders::ALL)
@@ -707,18 +742,21 @@ impl SettingsPage {
             MouseEventKind::Down(MouseButton::Left) => {
                 let options_inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
                 if options_inner.contains((event.column, event.row).into()) {
-                    let key = match event.row.saturating_sub(options_inner.y) {
+                    let key = match setting_option_index(
+                        options_inner,
+                        Position::new(event.column, event.row),
+                    ) {
                         0 => Some('t'),
                         1 => Some('g'),
                         2 => Some('w'),
                         3 => Some('c'),
-                        4 => Some('o'),
-                        5 => Some('O'),
+                        4 => Some('e'),
+                        5 => Some('o'),
                         6 => Some('x'),
                         7 => Some('X'),
                         8 => Some('m'),
                         9 => Some('p'),
-                        12 => Some('b'),
+                        11 => Some('b'),
                         _ => None,
                     };
                     if let Some(key) = key {
@@ -776,13 +814,69 @@ fn setting_line(label: &str, value: bool, key: &str, accent: Color, muted: Color
     ])
 }
 
+const SETTINGS_OPTION_COUNT: u16 = 12;
+const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 52;
+
+fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
+    if !setting_options_use_two_columns(area) {
+        Paragraph::new(options).render(area, buf);
+        return;
+    }
+
+    let columns = setting_option_columns(area);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for (index, line) in options.into_iter().enumerate() {
+        if index.is_multiple_of(2) {
+            left.push(line);
+        } else {
+            right.push(line);
+        }
+    }
+    Paragraph::new(left).render(columns[0], buf);
+    Paragraph::new(right).render(columns[1], buf);
+}
+
+fn setting_option_index(area: Rect, position: Position) -> u16 {
+    let row = position.y.saturating_sub(area.y);
+    if !setting_options_use_two_columns(area) {
+        return row;
+    }
+    let columns = setting_option_columns(area);
+    let column = u16::from(columns[1].contains(position));
+    row.saturating_mul(2).saturating_add(column)
+}
+
+fn setting_options_use_two_columns(area: Rect) -> bool {
+    area.width >= TWO_COLUMN_OPTIONS_MIN_WIDTH
+}
+
+fn setting_option_columns(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area)
+}
+
+fn setting_options_height(panel_width: u16) -> u16 {
+    let inner_width = panel_width.saturating_sub(2);
+    let rows = if inner_width >= TWO_COLUMN_OPTIONS_MIN_WIDTH {
+        SETTINGS_OPTION_COUNT.div_ceil(2)
+    } else {
+        SETTINGS_OPTION_COUNT
+    };
+    rows.saturating_add(2)
+}
+
 fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
     if area.width >= 72 {
         // 宽屏：上排 options + sources，下排 local music
+        let option_width = area.width.saturating_mul(42) / 100;
+        let top_height = setting_options_height(option_width).min(area.height);
         let top = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(Rect::new(area.x, area.y, area.width, 15.min(area.height)));
+            .split(Rect::new(area.x, area.y, area.width, top_height));
         let bottom_y = top[0].bottom();
         let bottom = if bottom_y < area.bottom() {
             Rect::new(
@@ -792,18 +886,18 @@ fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
                 area.bottom().saturating_sub(bottom_y),
             )
         } else {
-            Rect::new(area.x, bottom_y.saturating_sub(1), area.width, 1)
+            Rect::new(area.x, bottom_y, area.width, 0)
         };
         std::rc::Rc::new([top[0], top[1], bottom])
     } else {
         // 三块垂直布局
-        let h = area.height;
+        let option_height = setting_options_height(area.width).min(area.height);
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(15.min(h.saturating_div(3))),
-                Constraint::Min(6),
-                Constraint::Length(8.min(h.saturating_div(3))),
+                Constraint::Length(option_height),
+                Constraint::Ratio(1, 2),
+                Constraint::Ratio(1, 2),
             ])
             .split(area)
     }
@@ -811,7 +905,10 @@ fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
 
 #[cfg(test)]
 mod tests {
-    use super::shorten_source;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::widgets::{Block, Borders};
+
+    use super::{setting_option_index, settings_chunks, shorten_source};
 
     #[test]
     fn shortens_unicode_source_path_on_character_boundaries() {
@@ -820,5 +917,35 @@ mod tests {
 
         assert_eq!(shortened.chars().count(), 24);
         assert!(shortened.ends_with("..."));
+    }
+
+    #[test]
+    fn narrow_settings_use_two_columns_when_the_width_allows_it() {
+        let chunks = settings_chunks(Rect::new(0, 0, 60, 24));
+
+        assert_eq!(chunks[0].height, 8);
+        assert!(chunks[1].height > 0);
+        assert!(chunks[2].height > 0);
+        assert_eq!(chunks[2].bottom(), 24);
+    }
+
+    #[test]
+    fn setting_mouse_rows_follow_the_two_column_layout() {
+        let panel = settings_chunks(Rect::new(0, 0, 60, 24))[0];
+        let inner = Block::default().borders(Borders::ALL).inner(panel);
+        let right_column_x = inner.x + inner.width / 2 + 1;
+
+        assert_eq!(
+            setting_option_index(inner, Position::new(inner.x, inner.y)),
+            0
+        );
+        assert_eq!(
+            setting_option_index(inner, Position::new(right_column_x, inner.y)),
+            1
+        );
+        assert_eq!(
+            setting_option_index(inner, Position::new(right_column_x, inner.y + 5)),
+            11
+        );
     }
 }

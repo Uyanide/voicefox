@@ -13,6 +13,7 @@ pub struct PlayerConfig {
     pub quality: Quality,
     pub volume: u32,
     pub play_mode: String,
+    pub remember_playback_state: bool,
 }
 
 impl Default for PlayerConfig {
@@ -22,6 +23,7 @@ impl Default for PlayerConfig {
             quality: Quality::High320,
             volume: 80,
             play_mode: "list-loop".to_string(),
+            remember_playback_state: true,
         }
     }
 }
