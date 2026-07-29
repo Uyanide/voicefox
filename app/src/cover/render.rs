@@ -19,14 +19,8 @@ const RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
 /// 解码后的最长边上限
 const MAX_DECODED_EDGE: u32 = 1024;
 
-/// 启动时等终端回答能力查询的上限
-pub const STARTUP_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// 事件循环跑起来之后等终端回答能力查询的上限，阻塞可感知所以略短
-pub const SESSION_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// 排空 stdin 时等下一个事件的上限
-const DRAIN_TIMEOUT: Duration = Duration::from_millis(2);
+/// 等终端回答能力查询的上限
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 主线程 → 解码线程
 struct DecodeJob {
@@ -68,18 +62,16 @@ pub struct CoverRenderer {
 impl CoverRenderer {
     /// 探测终端图形能力并返回实例
     ///
-    /// 过程中会向终端发查询序列并直接读 stdin，调用期间不能有别人也在读，
-    /// 否则会和事件循环抢输入
-    pub fn detect(cover_protocol: &str, timeout: Duration) -> Self {
+    /// 会向终端发查询序列并直接读 stdin，只能在事件循环起来之前调用一次。
+    pub fn detect(cover_protocol: &str) -> Self {
         let options = QueryStdioOptions {
-            timeout,
+            timeout: QUERY_TIMEOUT,
             ..QueryStdioOptions::default()
         };
         let mut picker = Picker::from_query_stdio_with_options(options).unwrap_or_else(|error| {
             tracing::debug!("query terminal graphics capabilities failed: {error}");
             Picker::halfblocks()
         });
-        drain_terminal_replies();
         if let Some(protocol) = parse_protocol(cover_protocol) {
             picker.set_protocol_type(protocol);
         }
@@ -156,6 +148,16 @@ impl CoverRenderer {
                 id: self.request_id,
             })
             .is_ok();
+    }
+
+    /// 强制重新传一遍当前封面
+    pub fn force_reload(&mut self) {
+        if !self.enabled || self.picker.protocol_type() == ProtocolType::Halfblocks {
+            return;
+        }
+        if let Some(path) = self.loaded.clone() {
+            self.dispatch_decode(path);
+        }
     }
 
     /// 重新读终端的单元格像素尺寸，变了就按新尺寸重新解码当前封面
@@ -286,16 +288,6 @@ fn spawn_workers(
     }
 }
 
-fn drain_terminal_replies() {
-    // 超时不能给 0：回复解析出来是内部事件，会被 EventFilter 挡掉，
-    // 而 poll 只在还有时间时才接着捞下一个
-    while let Ok(true) = crossterm::event::poll(DRAIN_TIMEOUT) {
-        if crossterm::event::read().is_err() {
-            return;
-        }
-    }
-}
-
 /// 从终端窗口的像素尺寸和行列数反推单元格大小
 fn probe_font_size() -> Option<FontSize> {
     let size = crossterm::terminal::window_size().ok()?;
@@ -352,6 +344,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use ratatui_image::FontSize;
     use ratatui_image::picker::{Picker, ProtocolType};
 
     use super::{CoverRenderer, parse_protocol};
@@ -365,6 +358,14 @@ mod tests {
 
     fn renderer() -> CoverRenderer {
         CoverRenderer::spawn(Picker::halfblocks())
+    }
+
+    /// 走真正会往终端传图的协议的渲染器
+    fn kitty_renderer() -> CoverRenderer {
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(FontSize::new(8, 16));
+        picker.set_protocol_type(ProtocolType::Kitty);
+        CoverRenderer::spawn(picker)
     }
 
     /// 存一张 16x16 的纯色 PNG，返回路径
@@ -470,6 +471,38 @@ mod tests {
             (300, 150),
             "上限以内的图应原样保留"
         );
+    }
+
+    #[test]
+    fn a_forced_reload_hands_the_current_cover_to_the_workers_again() {
+        let blue = write_image("forced", [0, 0, 255]);
+        let mut renderer = kitty_renderer();
+        renderer.sync(Some(&blue));
+        settle(&mut renderer);
+
+        let before = renderer.request_id;
+        renderer.force_reload();
+        assert!(renderer.request_id > before, "重传应重解码");
+        settle(&mut renderer);
+    }
+
+    #[test]
+    fn a_forced_reload_without_a_cover_does_nothing() {
+        let mut renderer = kitty_renderer();
+        renderer.force_reload();
+        assert_eq!(renderer.request_id, 0, "没有封面时不应响应");
+    }
+
+    #[test]
+    fn halfblocks_ignores_a_forced_reload() {
+        let red = write_image("halfblocks-forced", [255, 0, 0]);
+        let mut renderer = renderer();
+        renderer.sync(Some(&red));
+        settle(&mut renderer);
+
+        let before = renderer.request_id;
+        renderer.force_reload();
+        assert_eq!(renderer.request_id, before);
     }
 
     #[test]

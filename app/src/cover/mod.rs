@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub use layout::CoverGeometry;
-pub use render::{CoverRenderer, SESSION_QUERY_TIMEOUT, STARTUP_QUERY_TIMEOUT};
+pub use render::CoverRenderer;
 pub use source::sweep_temp_files;
 
 use source::CoverImage;

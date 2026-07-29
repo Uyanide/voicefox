@@ -38,7 +38,7 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - **在线播放**：通过 mpv 播放高品质音乐
 - **本地音乐**：扫描本地音乐目录，支持 MP3/FLAC/M4A/OGG/WAV，自动读取封面、同名 LRC 和音频内嵌歌词，并可确认后删除本地文件
 - **封面显示**：按终端能力自动选择 Kitty / Sixel / iTerm2 图片协议，都不支持时用 Unicode 半格块渲染
-- **tmux 封面**：在 tmux 中通过 passthrough 传递图形协议序列，封面照常显示
+- **tmux 封面**：在 tmux 中通过 passthrough 传递图形协议序列，封面照常显示；detach 后再 attach 自动重传，关掉终端、SSH 断线、换机器 attach 都能恢复，前提是这些终端支持同一种图形协议
 - **歌词支持**：支持 LRC、KRC、QRC、YRC 多种歌词格式，支持翻译歌词
 - **收藏管理**：添加/取消收藏歌曲和热门歌单
 - **播放历史**：自动记录播放记录
@@ -162,6 +162,15 @@ set -g default-terminal "tmux-256color"
 ```bash
 tmux source-file ~/.tmux.conf
 ```
+
+detach 再 attach 之后封面会自动恢复。极少数情况下可能可能无法自动恢复，这种情况下可以按 `Ctrl+R` 手动重传。
+
+图形协议只在启动时探测一次，之后不再重探。因此同一个 voicefox 进程的生命周期内，所有 attach 上来的终端模拟器必须支持同一种图形协议：
+
+- 不要从图形协议不兼容的终端同时 attach 到一个 session（例如仅支持 kitty 协议的 Ghostty 和仅支持 sixel 协议的 Foot）
+- 也不要 detach 之后换用不兼容的终端 attach 回来
+
+协议不匹配时封面会显示异常或完全不显示，重启 voicefox 即可按新终端重新探测。都使用同一协议的情况不受影响。混用无法避免时，可以在配置里把 `cover_protocol` 固定成各终端都支持的协议（例如 `halfblocks`）。
 
 ### 封面渲染协议
 

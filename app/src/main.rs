@@ -13,6 +13,7 @@ mod pages;
 mod playlist;
 mod storage;
 mod theme;
+mod tmux;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -345,6 +346,9 @@ fn open_external_url(url: &str) {
     }
 }
 
+/// 两次自动重传封面之间的最小间隔。启用 focus-events 时不止 detach/attach 会发来事件，需要防抖
+const COVER_REDRAW_THROTTLE: Duration = Duration::from_secs(2);
+
 #[allow(unused_assignments)]
 fn run_app(
     terminal: &mut DefaultTerminal,
@@ -405,10 +409,8 @@ fn run_app(
         let config = ctx.config.read().unwrap();
         (config.ui.cover_protocol.clone(), config.ui.show_cover)
     };
-    // 不显示封面就不去查终端能力，那会往终端写查询序列并等回复
-    let cover = cover_enabled
-        .then(|| cover::CoverRenderer::detect(&cover_protocol, cover::STARTUP_QUERY_TIMEOUT));
-    let mut main_page = pages::main_page::MainPage::new(cover);
+    let mut main_page =
+        pages::main_page::MainPage::new(cover::CoverRenderer::detect(&cover_protocol));
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -436,6 +438,9 @@ fn run_app(
     let mut last_notification_cleanup = Instant::now();
     let mut last_playback_session_save = Instant::now();
     let mut mouse_capture_enabled = ctx.config.read().unwrap().ui.enable_mouse;
+    // 装 tmux 的 client-attached hook，析构时自己摘掉
+    let attach_watcher = tmux::AttachWatcher::install();
+    let mut last_cover_redraw = Instant::now() - COVER_REDRAW_THROTTLE;
     #[cfg(target_os = "linux")]
     let mut last_mpris_snapshot: Option<mpris::MprisSnapshot> = None;
     #[cfg(target_os = "linux")]
@@ -521,6 +526,16 @@ fn run_app(
     }
 
     loop {
+        if let Some(watcher) = attach_watcher.as_ref()
+            && watcher.take_attached()
+            && should_retransmit_cover(last_cover_redraw.elapsed())
+        {
+            tracing::debug!("client attached, retransmitting cover");
+            last_cover_redraw = Instant::now();
+            retransmit_cover(terminal, &mut main_page)?;
+            needs_render = true;
+        }
+
         #[cfg(target_os = "linux")]
         if let Some(receiver) = mpris_command_rx.as_mut() {
             while let Ok(command) = receiver.try_recv() {
@@ -557,7 +572,6 @@ fn run_app(
         let cover_requested = ctx.config.read().unwrap().ui.show_cover;
         if cover_requested != cover_enabled {
             if cover_requested {
-                main_page.enable_cover(&cover_protocol);
                 let cover_url = ctx
                     .current_song
                     .read()
@@ -1291,6 +1305,12 @@ fn run_app(
                                 ));
                             }
                         }
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalRedraw if !text_input_active => {
+                        last_cover_redraw = Instant::now();
+                        retransmit_cover(terminal, &mut main_page)?;
                         needs_render = true;
                         continue;
                     }
@@ -3013,6 +3033,26 @@ fn should_scan_local_music_on_entry(
         && has_paths
         && songs_empty
         && !is_scanning
+}
+
+fn should_retransmit_cover(since_last_redraw: Duration) -> bool {
+    since_last_redraw >= COVER_REDRAW_THROTTLE
+}
+
+/// 把封面重新传给终端，并强制下一帧全量重绘
+fn retransmit_cover(
+    terminal: &mut DefaultTerminal,
+    main_page: &mut pages::main_page::MainPage,
+) -> anyhow::Result<()> {
+    main_page.force_cover_reload();
+    // detach 期间照常渲染，缓冲区内容不变，不清屏则不会重发任何序列
+    //
+    // 这里不能用 Terminal::clear，它会先发 ESC[6n 读回光标位置。ratatui-image
+    // 的启动探测把 ESC[5n 包在 tmux passthrough 里发给外层终端，外层终端不应答时
+    // 它那个读 stdin 的线程会一直留着，抢走后续所有终端应答
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))?;
+    Ok(())
 }
 
 fn previous_list_index(selected: usize, len: usize, wrap: bool) -> usize {
