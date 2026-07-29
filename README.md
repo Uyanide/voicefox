@@ -37,8 +37,8 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - **多音源搜索**：网易云音乐、酷狗音乐、酷我音乐、QQ 音乐、咪咕音乐
 - **在线播放**：通过 mpv 播放高品质音乐
 - **本地音乐**：扫描本地音乐目录，支持 MP3/FLAC/M4A/OGG/WAV，自动读取封面、同名 LRC 和音频内嵌歌词，并可确认后删除本地文件
-- **封面显示**：支持 Kitty/WezTerm/Ghostty 终端原生图片协议，真实显示专辑封面
-- **tmux 封面**：在 Kitty 中通过 tmux passthrough 和 Unicode placeholder 显示封面
+- **封面显示**：按终端能力自动选择 Kitty / Sixel / iTerm2 图片协议，都不支持时用 Unicode 半格块渲染
+- **tmux 封面**：在 tmux 中通过 passthrough 传递图形协议序列，封面照常显示
 - **歌词支持**：支持 LRC、KRC、QRC、YRC 多种歌词格式，支持翻译歌词
 - **收藏管理**：添加/取消收藏歌曲和热门歌单
 - **播放历史**：自动记录播放记录
@@ -129,7 +129,7 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - [ ] **听书模式**：支持有声书、播客内容
 - [ ] **自动补全歌词**：播放时自动从多个源匹配歌词
 - [ ] **歌单管理**：创建和编辑自定义歌单
-- [ ] **非原生图片终端兼容**：为不支持 Kitty/WezTerm/Ghostty 图片协议的终端提供备用封面渲染
+- [x] **非原生图片终端兼容**：Kitty、Sixel、iTerm2 三种图片协议自动探测，都不支持时退回 Unicode 半格块渲染
 - [ ] **跨平台包管理**：支持更多 Linux 发行版、macOS
 - [ ] **更多音源插件**：兼容更多 lx-music 社区音源
 - [ ] **TUI 响应式布局**：自适应终端窗口大小变化
@@ -142,7 +142,6 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
   - Linux：`sudo pacman -S mpv`（Arch） / `sudo apt install mpv`（Debian/Ubuntu）
   - macOS：`brew install mpv`
   - Windows：从 https://mpv.io/ 下载安装
-- **Kitty/kitten**（tmux 中显示封面时需要）：Kitty 安装包通常已包含 `kitten`
 
 ### tmux 中显示封面
 
@@ -152,13 +151,27 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 set -g allow-passthrough on
 ```
 
+同时确保 `$TERM` 以 `tmux` 为前缀：
+
+```tmux
+set -g default-terminal "tmux-256color"
+```
+
 重新加载配置并重启 voicefox：
 
 ```bash
 tmux source-file ~/.tmux.conf
 ```
 
-voicefox 在 tmux 中会自动调用 `kitten icat` 的 passthrough 和 Unicode placeholder 模式。普通 Kitty、WezTerm 和 Ghostty 会继续使用内置的终端图片输出。
+### 封面渲染协议
+
+默认自动探测，按终端能力选择 Kitty / Sixel / iTerm2，都不支持时用 Unicode 半格块。探测不准时可以在配置文件里强制指定：
+
+```toml
+[ui]
+# auto（默认）| kitty | sixel | iterm2 | halfblocks
+cover_protocol = "auto"
+```
 
 ### Waybar 控制模块
 
@@ -480,6 +493,7 @@ wrap_navigation = true
 scroll_amount = 3
 aggregate_search = true
 show_cover = true
+cover_protocol = "auto"   # auto | kitty | sixel | iterm2 | halfblocks
 max_fps = 20
 
 [notification]
@@ -647,8 +661,8 @@ voicefox/
 ## 技术栈
 
 - **语言**：Rust (edition 2024)
-- **TUI 框架**：[ratatui](https://github.com/ratatui/ratatui) 0.29
-- **终端事件**：[crossterm](https://github.com/crossterm-rs/crossterm) 0.28
+- **TUI 框架**：[ratatui](https://github.com/ratatui/ratatui) 0.30
+- **终端事件**：[crossterm](https://github.com/crossterm-rs/crossterm) 0.29
 - **异步运行时**：[tokio](https://github.com/tokio-rs/tokio)
 - **音频播放**：[mpv](https://mpv.io/)（通过 IPC 控制）
 - **HTTP 客户端**：[reqwest](https://github.com/seanmonstar/reqwest)

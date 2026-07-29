@@ -401,7 +401,14 @@ fn run_app(
         scroll_amount,
     )));
     let settings_page = Arc::new(std::sync::Mutex::new(pages::settings::SettingsPage::new()));
-    let mut main_page = pages::main_page::MainPage::new();
+    let (cover_protocol, mut cover_enabled) = {
+        let config = ctx.config.read().unwrap();
+        (config.ui.cover_protocol.clone(), config.ui.show_cover)
+    };
+    // 不显示封面就不去查终端能力，那会往终端写查询序列并等回复
+    let cover = cover_enabled
+        .then(|| cover::CoverRenderer::detect(&cover_protocol, cover::STARTUP_QUERY_TIMEOUT));
+    let mut main_page = pages::main_page::MainPage::new(cover);
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -493,6 +500,8 @@ fn run_app(
         );
     }
 
+    rt.spawn(cover::sweep_temp_files());
+
     if ctx.bili_source.is_logged_in() {
         let bili_source = Arc::clone(&ctx.bili_source);
         let tx = action_tx.clone();
@@ -529,7 +538,6 @@ fn run_app(
                         tracing::warn!("save playback session failed: {error}");
                     }
                     ctx.player.stop();
-                    ctx.cover_service.clear_display();
                     return Ok(());
                 }
                 needs_render = true;
@@ -544,6 +552,31 @@ fn run_app(
                 let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
             }
             mouse_capture_enabled = mouse_requested;
+        }
+
+        let cover_requested = ctx.config.read().unwrap().ui.show_cover;
+        if cover_requested != cover_enabled {
+            if cover_requested {
+                main_page.enable_cover(&cover_protocol);
+                let cover_url = ctx
+                    .current_song
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|song| song.cover_url.clone());
+                let cover_service = Arc::clone(&ctx.cover_service);
+                let wake_tx = action_tx.clone();
+                rt.spawn(async move {
+                    if let Err(error) = cover_service.load(cover_url).await {
+                        tracing::debug!("load cover after enabling failed: {error}");
+                    }
+                    let _ = wake_tx.send(AppAction::None);
+                });
+            } else {
+                main_page.release_cover_image();
+            }
+            cover_enabled = cover_requested;
+            needs_render = true;
         }
 
         if observed_active_tab != active_tab {
@@ -938,6 +971,9 @@ fn run_app(
             last_periodic_render = Instant::now();
         }
 
+        // 封面的解码和编码在后台线程上跑，算完了才有东西可画
+        needs_render |= main_page.poll_cover();
+
         // 在读取下一个事件前先补画上一轮状态。这样即使 key repeat 每轮都
         // 触发 continue，界面也不会被连续输入饿死。
         if needs_render {
@@ -1104,7 +1140,6 @@ fn run_app(
                             tracing::warn!("save playback session failed: {error}");
                         }
                         ctx.player.stop();
-                        ctx.cover_service.clear_display();
                         return Ok(());
                     }
                     Action::GlobalPlayPause if !text_input_active => {
@@ -1930,6 +1965,7 @@ fn run_app(
             }
             needs_render = true;
         } else if matches!(terminal_event, Some(Event::Resize(_, _))) {
+            main_page.refresh_cover_font_size();
             needs_render = true;
         }
 
@@ -1999,12 +2035,6 @@ fn draw_app(
     song_menu: &Option<SongContextMenu>,
     bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
 ) -> anyhow::Result<()> {
-    // Kitty 图片是终端外部图层，必须在绘制非主页前清除，避免它短暂覆盖本地/历史页面。
-    if active_tab != NavTab::Main {
-        ctx.cover_service.clear_display();
-    }
-    // 封面位置每帧重新记录，先清零，避免窗口过窄不画封面时沿用上一帧的区域
-    ctx.cover_service.set_display_area(Rect::ZERO);
     terminal.draw(|frame| {
         let area = frame.area();
         frame.render_widget(
@@ -2267,10 +2297,6 @@ fn draw_app(
             menu.render(content_area, frame.buffer_mut(), ctx);
         }
     })?;
-    // 在 Kitty 终端中显示封面（draw 之后，浮动在 TUI 上方）
-    if active_tab == NavTab::Main {
-        ctx.cover_service.display_kitty();
-    }
     Ok(())
 }
 
