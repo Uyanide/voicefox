@@ -130,7 +130,11 @@ impl ListFilter {
     /// 调用方应根据此方法是否产生可见内容来调整列表区域。
     pub fn render(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let mode = if self.active { "INSERT" } else { "FILTER" };
-        let accent = crate::theme::accent(ctx);
+        let accent = if self.active {
+            crate::theme::green(ctx)
+        } else {
+            crate::theme::accent(ctx)
+        };
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!(" / {} ", mode),
