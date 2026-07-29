@@ -16,10 +16,6 @@
 //!     filter.activate();
 //! }
 //!
-//! // 获取过滤后的索引
-//! let filtered = filter.filter(&items, |item, query| {
-//!     item.name.to_lowercase().contains(query)
-//! });
 //! ```
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -127,32 +123,6 @@ impl ListFilter {
         }
     }
 
-    /// 对列表进行过滤，返回匹配项的原始索引。
-    ///
-    /// # 参数
-    /// - `items` — 原始列表
-    /// - `matcher` — 匹配函数，接收 `(item, query)` 返回是否匹配
-    ///
-    /// # 返回值
-    /// 匹配项在原始列表中的索引数组。query 为空时返回全部索引。
-    pub fn filter<T>(
-        &self,
-        items: &[T],
-        matcher: impl Fn(&T, &str) -> bool,
-    ) -> Vec<usize> {
-        let query = self.query.trim().to_lowercase();
-        if query.is_empty() {
-            return (0..items.len()).collect();
-        }
-        items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                matcher(item, &query).then_some(index)
-            })
-            .collect()
-    }
-
     /// 渲染过滤输入栏。
     ///
     /// 在区域顶部渲染一个高度为 1 的行，显示当前模式（INSERT/FILTER）和 query。
@@ -214,23 +184,6 @@ mod tests {
     }
 
     #[test]
-    fn inactive_filter_returns_all_indices() {
-        let f = ListFilter::new();
-        let items = vec!["a", "b", "c"];
-        let filtered = f.filter(&items, |item, q| item.contains(q));
-        assert_eq!(filtered, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn filter_matches_case_insensitive() {
-        let mut f = ListFilter::new();
-        f.query = "hello".into();
-        let items = vec!["Hello World", "goodbye", "HELLO"];
-        let filtered = f.filter(&items, |item, q| item.to_lowercase().contains(q));
-        assert_eq!(filtered, vec![0, 2]);
-    }
-
-    #[test]
     fn handle_input_consumes_when_active() {
         let mut f = ListFilter::new();
         f.activate();
@@ -259,12 +212,4 @@ mod tests {
         assert_eq!(f.query(), "");
     }
 
-    #[test]
-    fn empty_query_returns_all() {
-        let mut f = ListFilter::new();
-        f.query = "   ".into(); // 只有空格，trim 后为空
-        let items = vec!["x", "y"];
-        let filtered = f.filter(&items, |item, q| item.contains(q));
-        assert_eq!(filtered, vec![0, 1]);
-    }
 }
