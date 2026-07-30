@@ -2497,6 +2497,66 @@ fn execute_action(
                 search_seq.clone(),
             );
         }
+        AppAction::ResolveBiliParts {
+            songs,
+            index,
+            request_id,
+        } => {
+            let Some(song) = songs.get(index).cloned() else {
+                return;
+            };
+            let bili_source = Arc::clone(&ctx.bili_source);
+            let search_page = Arc::clone(search_page);
+            let tx = action_tx.clone();
+            rt.spawn(async move {
+                match tokio::time::timeout(Duration::from_secs(15), bili_source.video_parts(&song))
+                    .await
+                {
+                    Ok(Ok(parts)) if !parts.is_empty() => {
+                        if let Some(action) = search_page
+                            .lock()
+                            .unwrap()
+                            .complete_bili_part_request(request_id, songs, index, parts)
+                        {
+                            let _ = tx.send(action);
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        if search_page
+                            .lock()
+                            .unwrap()
+                            .fail_bili_part_request(request_id)
+                        {
+                            let _ = tx.send(AppAction::ShowNotification(
+                                Notification::warning("未找到可播放的分 P").tui_only(),
+                            ));
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        if search_page
+                            .lock()
+                            .unwrap()
+                            .fail_bili_part_request(request_id)
+                        {
+                            let _ = tx.send(AppAction::ShowNotification(
+                                Notification::warning(format!("分 P 解析失败: {error}")).tui_only(),
+                            ));
+                        }
+                    }
+                    Err(_) => {
+                        if search_page
+                            .lock()
+                            .unwrap()
+                            .fail_bili_part_request(request_id)
+                        {
+                            let _ = tx.send(AppAction::ShowNotification(
+                                Notification::warning("分 P 解析超时").tui_only(),
+                            ));
+                        }
+                    }
+                }
+            });
+        }
         AppAction::PlaySong { songs, index } => {
             if let Some(song) = songs.get(index).cloned() {
                 if should_expand_bili_parts(&song) {

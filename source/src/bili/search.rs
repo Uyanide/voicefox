@@ -241,6 +241,8 @@ fn parse_video_result(
             song.extra.insert("cid".to_string(), cid);
             song.extra
                 .insert("page".to_string(), page_number.to_string());
+            song.extra
+                .insert("bili_part_title".to_string(), part.to_string());
             if !aid.is_empty() {
                 song.extra.insert("aid".to_string(), aid.clone());
             }
@@ -492,6 +494,7 @@ mod tests {
         assert!(!result.has_more);
         assert_eq!(result.items[0].name, "测试视频 · P1 第一段");
         assert_eq!(result.items[1].extra["cid"], "1002");
+        assert_eq!(result.items[1].extra["bili_part_title"], "第二段");
         assert_eq!(
             result.items[0].cover_url.as_deref(),
             Some("https://example.com/cover.jpg")

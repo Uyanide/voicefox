@@ -266,4 +266,37 @@ mod tests {
         assert_eq!(current, 0);
         assert_eq!(songs[current].id, "a");
     }
+
+    #[test]
+    fn single_loop_repeats_the_selected_bili_part() {
+        let playlist = PlaylistManager::new(PlayMode::SingleLoop);
+        playlist.set_playlist(
+            vec![
+                SongInfo::new(
+                    "video-p1".to_string(),
+                    SourceId::Bili,
+                    "视频 · P1".to_string(),
+                    "UP主".to_string(),
+                ),
+                SongInfo::new(
+                    "video-p2".to_string(),
+                    SourceId::Bili,
+                    "视频 · P2".to_string(),
+                    "UP主".to_string(),
+                ),
+                SongInfo::new(
+                    "video-p3".to_string(),
+                    SourceId::Bili,
+                    "视频 · P3".to_string(),
+                    "UP主".to_string(),
+                ),
+            ],
+            1,
+        );
+
+        let (songs, index) = playlist.next_entry().expect("single loop has a next entry");
+
+        assert_eq!(index, 1);
+        assert_eq!(songs[index].id, "video-p2");
+    }
 }
