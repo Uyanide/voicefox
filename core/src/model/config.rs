@@ -172,6 +172,9 @@ pub struct UiConfig {
     pub scroll_amount: usize,
     pub aggregate_search: bool,
     pub show_cover: bool,
+    /// 封面渲染协议：auto / kitty / sixel / iterm2 / halfblocks。
+    /// auto 表示由终端探测决定，探测不准时可以指定具体协议。
+    pub cover_protocol: String,
     /// 旧版本通知配置，仅用于迁移，不再写入新配置。
     #[serde(default, skip_serializing)]
     pub show_notifications: Option<bool>,
@@ -189,6 +192,7 @@ impl Default for UiConfig {
             scroll_amount: 3,
             aggregate_search: true,
             show_cover: true,
+            cover_protocol: "auto".to_string(),
             show_notifications: None,
             notification_timeout: None,
             max_fps: 20,

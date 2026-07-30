@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::cover::{CoverGeometry, CoverRenderer, CoverState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueEditCommand {
@@ -40,15 +41,37 @@ pub struct MainPage {
     selected: usize,
     scroll: usize,
     dragging: Option<usize>,
+    cover: CoverRenderer,
 }
 
 impl MainPage {
-    pub fn new() -> Self {
+    pub fn new(cover: CoverRenderer) -> Self {
         Self {
             selected: 0,
             scroll: 0,
             dragging: None,
+            cover,
         }
+    }
+
+    /// 释放已解码的封面
+    pub fn release_cover_image(&mut self) {
+        self.cover.sync(None);
+    }
+
+    /// 收取封面后台线程返回的解码与编码结果，返回是否需要重绘
+    pub fn poll_cover(&mut self) -> bool {
+        self.cover.poll()
+    }
+
+    /// 终端尺寸变化后重新读取单元格的像素尺寸
+    pub fn refresh_cover_font_size(&mut self) {
+        self.cover.refresh_font_size();
+    }
+
+    /// 强制把封面重新传输给终端，用于终端已丢弃此前图片的场合
+    pub fn force_cover_reload(&mut self) {
+        self.cover.force_reload();
     }
 
     pub fn handle_input(
@@ -206,20 +229,30 @@ impl MainPage {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
                 .split(area);
-            // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_LYRIC_HEIGHT。
-            let geometry = crate::cover::CoverGeometry::detect(&ctx.cover_service);
-            let cover_height = geometry.box_height(
-                columns[0].width,
-                columns[0]
-                    .height
-                    .saturating_sub(super::components::lyric::MIN_HEIGHT),
-            );
+            // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_HEIGHT。
+            // 关闭封面时左栏全部用于歌词
+            let geometry = ctx.config.read().unwrap().ui.show_cover.then(|| {
+                CoverGeometry::from_font_size(
+                    self.cover.font_size(),
+                    ctx.cover_service.image_aspect(),
+                )
+            });
+            let cover_height = geometry.map_or(0, |geometry| {
+                geometry.box_height(
+                    columns[0].width,
+                    columns[0]
+                        .height
+                        .saturating_sub(super::components::lyric::MIN_HEIGHT),
+                )
+            });
             let left = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(cover_height), Constraint::Min(0)])
                 .split(columns[0]);
-            if cover_height > 0 {
-                render_cover_placeholder(left[0], buf, ctx, geometry);
+            if let Some(geometry) = geometry
+                && cover_height > 0
+            {
+                self.render_cover(left[0], buf, ctx, geometry);
             }
             super::components::lyric::render(left[1], buf, ctx);
             self.render_queue(columns[1], buf, ctx);
@@ -416,24 +449,32 @@ fn queue_area(area: Rect) -> Rect {
     }
 }
 
-fn render_cover_placeholder(
-    area: Rect,
-    buf: &mut Buffer,
-    ctx: &AppContext,
-    geometry: crate::cover::CoverGeometry,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(crate::theme::border(ctx)))
-        .title(" 封面 ");
-    let inner = block.inner(area);
-    block.render(area, buf);
-    // 只有终端真的能显示 Kitty 图片时才把 inner 留空，否则退回文字占位
-    if ctx.cover_service.has_image() && ctx.cover_service.kitty_available() {
-        ctx.cover_service
-            .set_display_area(geometry.image_rect(inner));
-        return;
+impl MainPage {
+    /// 绘制封面框，无法绘制封面时退回文字占位
+    fn render_cover(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        ctx: &AppContext,
+        geometry: CoverGeometry,
+    ) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(crate::theme::border(ctx)))
+            .title(" 封面 ");
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        self.cover
+            .sync(ctx.cover_service.image_path().as_deref());
+        if self.cover.render(geometry.image_rect(inner), buf) {
+            return;
+        }
+        render_cover_text(inner, buf, ctx);
     }
+}
+
+fn render_cover_text(inner: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let cover_state = ctx.cover_service.state();
     let song = ctx.current_song.read().unwrap();
     let lines = song.as_ref().map_or_else(
@@ -462,17 +503,17 @@ fn render_cover_placeholder(
                 Line::from(""),
                 Line::from(Span::styled(
                     match &cover_state {
-                        crate::cover::CoverState::Loading => "封面加载中...",
-                        crate::cover::CoverState::Unavailable(_) => "封面不可用",
+                        CoverState::Loading => "封面加载中...",
+                        CoverState::Unavailable(_) => "封面不可用",
                         // current_song 非 None 但无封面 <-> 封面被禁用
-                        crate::cover::CoverState::Empty => "",
+                        CoverState::Empty => "",
                         // 封面就绪但是终端无法显示
-                        crate::cover::CoverState::Ready => "封面无法显示",
+                        CoverState::Ready => "封面无法显示",
                     },
                     Style::new().fg(crate::theme::muted(ctx)),
                 )),
                 match &cover_state {
-                    crate::cover::CoverState::Unavailable(error) => Line::from(Span::styled(
+                    CoverState::Unavailable(error) => Line::from(Span::styled(
                         error.chars().take(inner.width as usize).collect::<String>(),
                         Style::new().fg(crate::theme::overlay0(ctx)),
                     )),

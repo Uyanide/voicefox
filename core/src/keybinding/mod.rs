@@ -49,6 +49,8 @@ pub enum Action {
     GlobalGoToMain,
     /// 收藏/取消收藏当前歌曲（Ctrl+L）
     GlobalToggleFavorite,
+    /// 强制重绘，并把封面重新传输给终端（Ctrl+R）
+    GlobalRedraw,
 
     // --- 通用列表动作（多个页面共用） ---
     /// 选择上一项
@@ -184,6 +186,7 @@ fn default_global_bindings() -> HashMap<Action, String> {
     m.insert(Action::GlobalPrevTab, "Shift+Tab".to_string());
     m.insert(Action::GlobalGoToMain, "Esc".to_string());
     m.insert(Action::GlobalToggleFavorite, "Ctrl+l".to_string());
+    m.insert(Action::GlobalRedraw, "Ctrl+r".to_string());
     m
 }
 

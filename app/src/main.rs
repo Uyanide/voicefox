@@ -13,6 +13,7 @@ mod pages;
 mod playlist;
 mod storage;
 mod theme;
+mod tmux;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -345,6 +346,9 @@ fn open_external_url(url: &str) {
     }
 }
 
+/// 两次自动重传封面之间的最小间隔，client-attached hook 可能连续触发，需要防抖
+const COVER_REDRAW_THROTTLE: Duration = Duration::from_secs(2);
+
 #[allow(unused_assignments)]
 fn run_app(
     terminal: &mut DefaultTerminal,
@@ -401,7 +405,12 @@ fn run_app(
         scroll_amount,
     )));
     let settings_page = Arc::new(std::sync::Mutex::new(pages::settings::SettingsPage::new()));
-    let mut main_page = pages::main_page::MainPage::new();
+    let (cover_protocol, mut cover_enabled) = {
+        let config = ctx.config.read().unwrap();
+        (config.ui.cover_protocol.clone(), config.ui.show_cover)
+    };
+    let mut main_page =
+        pages::main_page::MainPage::new(cover::CoverRenderer::detect(&cover_protocol));
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -429,6 +438,9 @@ fn run_app(
     let mut last_notification_cleanup = Instant::now();
     let mut last_playback_session_save = Instant::now();
     let mut mouse_capture_enabled = ctx.config.read().unwrap().ui.enable_mouse;
+    // 安装 tmux 的 client-attached hook，析构时自动卸载
+    let attach_watcher = tmux::AttachWatcher::install();
+    let mut last_cover_redraw = Instant::now() - COVER_REDRAW_THROTTLE;
     #[cfg(target_os = "linux")]
     let mut last_mpris_snapshot: Option<mpris::MprisSnapshot> = None;
     #[cfg(target_os = "linux")]
@@ -493,6 +505,8 @@ fn run_app(
         );
     }
 
+    rt.spawn(cover::sweep_temp_files());
+
     if ctx.bili_source.is_logged_in() {
         let bili_source = Arc::clone(&ctx.bili_source);
         let tx = action_tx.clone();
@@ -512,6 +526,16 @@ fn run_app(
     }
 
     loop {
+        if let Some(watcher) = attach_watcher.as_ref()
+            && should_retransmit_cover(last_cover_redraw.elapsed())
+            && watcher.take_attached()
+        {
+            tracing::debug!("client attached, retransmitting cover");
+            last_cover_redraw = Instant::now();
+            retransmit_cover(terminal, &mut main_page)?;
+            needs_render = true;
+        }
+
         #[cfg(target_os = "linux")]
         if let Some(receiver) = mpris_command_rx.as_mut() {
             while let Ok(command) = receiver.try_recv() {
@@ -529,7 +553,6 @@ fn run_app(
                         tracing::warn!("save playback session failed: {error}");
                     }
                     ctx.player.stop();
-                    ctx.cover_service.clear_display();
                     return Ok(());
                 }
                 needs_render = true;
@@ -544,6 +567,30 @@ fn run_app(
                 let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
             }
             mouse_capture_enabled = mouse_requested;
+        }
+
+        let cover_requested = ctx.config.read().unwrap().ui.show_cover;
+        if cover_requested != cover_enabled {
+            if cover_requested {
+                let cover_url = ctx
+                    .current_song
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|song| song.cover_url.clone());
+                let cover_service = Arc::clone(&ctx.cover_service);
+                let wake_tx = action_tx.clone();
+                rt.spawn(async move {
+                    if let Err(error) = cover_service.load(cover_url).await {
+                        tracing::debug!("load cover after enabling failed: {error}");
+                    }
+                    let _ = wake_tx.send(AppAction::None);
+                });
+            } else {
+                main_page.release_cover_image();
+            }
+            cover_enabled = cover_requested;
+            needs_render = true;
         }
 
         if observed_active_tab != active_tab {
@@ -938,6 +985,9 @@ fn run_app(
             last_periodic_render = Instant::now();
         }
 
+        // 封面的解码与编码在后台线程进行，完成后才有内容可以绘制
+        needs_render |= main_page.poll_cover();
+
         // 在读取下一个事件前先补画上一轮状态。这样即使 key repeat 每轮都
         // 触发 continue，界面也不会被连续输入饿死。
         if needs_render {
@@ -980,12 +1030,13 @@ fn run_app(
                 active_tab == NavTab::Search && search_page.lock().unwrap().input_mode;
             let favorites_input_mode =
                 active_tab == NavTab::Favorites && favorites_page.input_mode();
-            let local_input_mode =
-                active_tab == NavTab::LocalMusic && local_filter.is_active();
-            let history_input_mode =
-                active_tab == NavTab::History && history_filter.is_active();
-            let text_input_active =
-                settings_input_mode || search_input_mode || favorites_input_mode || local_input_mode || history_input_mode;
+            let local_input_mode = active_tab == NavTab::LocalMusic && local_filter.is_active();
+            let history_input_mode = active_tab == NavTab::History && history_filter.is_active();
+            let text_input_active = settings_input_mode
+                || search_input_mode
+                || favorites_input_mode
+                || local_input_mode
+                || history_input_mode;
 
             if let Some(ref page) = bili_login_page {
                 let action = page.lock().unwrap().handle_input(key, &kb_resolver);
@@ -1087,9 +1138,7 @@ fn run_app(
                 continue;
             }
 
-            if !text_input_active
-                && let Some(tab) = pages::sidebar::handle_input(&key)
-            {
+            if !text_input_active && let Some(tab) = pages::sidebar::handle_input(&key) {
                 active_tab = tab;
                 needs_render = true;
                 continue;
@@ -1104,7 +1153,6 @@ fn run_app(
                             tracing::warn!("save playback session failed: {error}");
                         }
                         ctx.player.stop();
-                        ctx.cover_service.clear_display();
                         return Ok(());
                     }
                     Action::GlobalPlayPause if !text_input_active => {
@@ -1256,6 +1304,12 @@ fn run_app(
                                 ));
                             }
                         }
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalRedraw if !text_input_active => {
+                        last_cover_redraw = Instant::now();
+                        retransmit_cover(terminal, &mut main_page)?;
                         needs_render = true;
                         continue;
                     }
@@ -1930,6 +1984,7 @@ fn run_app(
             }
             needs_render = true;
         } else if matches!(terminal_event, Some(Event::Resize(_, _))) {
+            main_page.refresh_cover_font_size();
             needs_render = true;
         }
 
@@ -1999,12 +2054,6 @@ fn draw_app(
     song_menu: &Option<SongContextMenu>,
     bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
 ) -> anyhow::Result<()> {
-    // Kitty 图片是终端外部图层，必须在绘制非主页前清除，避免它短暂覆盖本地/历史页面。
-    if active_tab != NavTab::Main {
-        ctx.cover_service.clear_display();
-    }
-    // 封面位置每帧重新记录，先清零，避免窗口过窄不画封面时沿用上一帧的区域
-    ctx.cover_service.set_display_area(Rect::ZERO);
     terminal.draw(|frame| {
         let area = frame.area();
         frame.render_widget(
@@ -2152,9 +2201,14 @@ fn draw_app(
                         break 'local_content;
                     }
 
-                    let filter_visible = local_filter.is_active() || !local_filter.query().is_empty();
+                    let filter_visible =
+                        local_filter.is_active() || !local_filter.query().is_empty();
                     let content_y = if filter_visible { inner.y + 1 } else { inner.y };
-                    let content_height = if filter_visible { inner.height.saturating_sub(1) } else { inner.height };
+                    let content_height = if filter_visible {
+                        inner.height.saturating_sub(1)
+                    } else {
+                        inner.height
+                    };
 
                     if content_height < 3 {
                         break 'local_content;
@@ -2267,10 +2321,6 @@ fn draw_app(
             menu.render(content_area, frame.buffer_mut(), ctx);
         }
     })?;
-    // 在 Kitty 终端中显示封面（draw 之后，浮动在 TUI 上方）
-    if active_tab == NavTab::Main {
-        ctx.cover_service.display_kitty();
-    }
     Ok(())
 }
 
@@ -2987,6 +3037,26 @@ fn should_scan_local_music_on_entry(
         && has_paths
         && songs_empty
         && !is_scanning
+}
+
+fn should_retransmit_cover(since_last_redraw: Duration) -> bool {
+    since_last_redraw >= COVER_REDRAW_THROTTLE
+}
+
+/// 把封面重新传输给终端，并强制下一帧全量重绘
+fn retransmit_cover(
+    terminal: &mut DefaultTerminal,
+    main_page: &mut pages::main_page::MainPage,
+) -> anyhow::Result<()> {
+    main_page.force_cover_reload();
+    // detach 期间照常渲染，缓冲区内容不变，不清屏则不会重发任何序列
+    //
+    // 此处不能用 Terminal::clear，它会先发 ESC[6n 读回光标位置。ratatui-image
+    // 的启动探测把 ESC[5n 包在 tmux passthrough 里发给外层终端，外层终端不应答时，
+    // 它读 stdin 的线程会一直留存，抢走后续所有终端应答
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))?;
+    Ok(())
 }
 
 fn previous_list_index(selected: usize, len: usize, wrap: bool) -> usize {
