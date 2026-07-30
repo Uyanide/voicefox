@@ -159,7 +159,7 @@ impl Player for MpvEngine {
                         if let Some(ref pos_str) = pos_res
                             && let Some(secs) = parse_mpv_data(pos_str)
                         {
-                            let _ = position_tx.send(Duration::from_secs_f64(secs));
+                            let _ = position_tx.send(Duration::from_secs_f64(secs.max(0.0)));
                         }
 
                         // 总时长变化频率很低，每秒查询一次即可。
@@ -173,7 +173,7 @@ impl Player for MpvEngine {
                             if let Some(ref dur_str) = dur_res
                                 && let Some(secs) = parse_mpv_data(dur_str)
                             {
-                                let _ = duration_tx.send(Duration::from_secs_f64(secs));
+                                let _ = duration_tx.send(Duration::from_secs_f64(secs.max(0.0)));
                             }
                         }
                         tick = tick.wrapping_add(1);
