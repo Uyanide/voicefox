@@ -78,6 +78,11 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
         config.version = 4;
         changed = true;
     }
+    if config.version < 5 {
+        config.player.history_limit = config.player.history_limit.max(1);
+        config.version = 5;
+        changed = true;
+    }
     debug_assert!(config.version <= CURRENT_CONFIG_VERSION);
     changed
 }
@@ -224,6 +229,19 @@ mod tests {
     }
 
     #[test]
+    fn migrates_history_limit_to_a_positive_value() {
+        let mut config = Config {
+            version: 4,
+            ..Config::default()
+        };
+        config.player.history_limit = 0;
+
+        assert!(migrate_legacy_config(&mut config));
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(config.player.history_limit, 1);
+    }
+
+    #[test]
     fn loads_partial_config_with_defaults() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -241,6 +259,7 @@ mod tests {
         assert_eq!(config.player.volume, 42);
         assert_eq!(config.player.engine, "mpv");
         assert!(config.player.remember_playback_state);
+        assert_eq!(config.player.history_limit, 100);
         assert_eq!(config.network.timeout, 15);
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert_eq!(config.source.enabled, SourceId::all_online());

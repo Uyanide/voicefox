@@ -43,6 +43,7 @@ pub struct SearchPage {
     pub result_source_filter: Option<SourceId>,
     pub variant_indices: Vec<usize>,
     pub variant_selected: usize,
+    search_scopes: Vec<(Option<SourceId>, &'static str)>,
     wrap_navigation: bool,
     scroll_amount: usize,
 }
@@ -52,7 +53,14 @@ impl SearchPage {
         source_filter: Option<SourceId>,
         wrap_navigation: bool,
         scroll_amount: usize,
+        enabled_sources: &[SourceId],
     ) -> Self {
+        let search_scopes = enabled_search_scopes(enabled_sources);
+        let source_filter = source_filter.filter(|source| {
+            search_scopes
+                .iter()
+                .any(|(candidate, _)| *candidate == Some(*source))
+        });
         Self {
             input: String::new(),
             results: vec![],
@@ -71,6 +79,7 @@ impl SearchPage {
             result_source_filter: None,
             variant_indices: Vec::new(),
             variant_selected: 0,
+            search_scopes,
             wrap_navigation,
             scroll_amount: scroll_amount.max(1),
         }
@@ -372,16 +381,18 @@ impl SearchPage {
     }
 
     fn cycle_source(&mut self, direction: isize) -> AppAction {
-        let current = SEARCH_SCOPES
+        let current = self
+            .search_scopes
             .iter()
             .position(|(scope, _)| *scope == self.source_filter)
             .unwrap_or(0);
-        let next = (current as isize + direction).rem_euclid(SEARCH_SCOPES.len() as isize) as usize;
+        let next = (current as isize + direction)
+            .rem_euclid(self.search_scopes.len().max(1) as isize) as usize;
         self.select_source(next)
     }
 
     fn select_source(&mut self, index: usize) -> AppAction {
-        let Some((source, _)) = SEARCH_SCOPES.get(index).copied() else {
+        let Some((source, _)) = self.search_scopes.get(index).copied() else {
             return AppAction::None;
         };
         if self.source_filter == source && self.result_source_filter == source {
@@ -409,14 +420,25 @@ impl SearchPage {
         default_source: SourceId,
         wrap_navigation: bool,
         scroll_amount: usize,
+        enabled_sources: &[SourceId],
     ) {
         self.wrap_navigation = wrap_navigation;
         self.scroll_amount = scroll_amount.max(1);
+        self.search_scopes = enabled_search_scopes(enabled_sources);
         self.source_filter = if aggregate_search {
             None
-        } else {
+        } else if enabled_sources.contains(&default_source) {
             Some(default_source)
+        } else {
+            enabled_sources.first().copied()
         };
+        if !self
+            .search_scopes
+            .iter()
+            .any(|(scope, _)| *scope == self.source_filter)
+        {
+            self.source_filter = None;
+        }
     }
 
     /// 搜索防抖 tick：用户停止输入 300ms 后自动触发搜索
@@ -645,15 +667,20 @@ impl SearchPage {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let selected = SEARCH_SCOPES
+        let selected = self
+            .search_scopes
             .iter()
             .position(|(scope, _)| *scope == self.source_filter)
             .unwrap_or(0);
-        for (index, tab_area) in source_tab_areas(area).iter().copied().enumerate() {
+        for (index, tab_area) in source_tab_areas(area, self.search_scopes.len())
+            .iter()
+            .copied()
+            .enumerate()
+        {
             let label = if area.width >= 66 {
-                SEARCH_SCOPES[index].1
+                self.search_scopes[index].1
             } else {
-                SEARCH_SCOPES[index]
+                self.search_scopes[index]
                     .0
                     .map(|source| source.as_str())
                     .unwrap_or("all")
@@ -694,7 +721,7 @@ impl SearchPage {
         }
         if chunks[1].contains((event.column, event.row).into())
             && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(index) = source_tab_areas(chunks[1])
+            && let Some(index) = source_tab_areas(chunks[1], self.search_scopes.len())
                 .iter()
                 .position(|tab| tab.contains((event.column, event.row).into()))
         {
@@ -943,14 +970,29 @@ impl SearchPage {
     }
 }
 
-fn source_tab_areas(area: Rect) -> std::rc::Rc<[Rect]> {
+fn source_tab_areas(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
+    if count == 0 {
+        return std::rc::Rc::from([]);
+    }
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints(std::iter::repeat_n(
-            Constraint::Ratio(1, SEARCH_SCOPES.len() as u32),
-            SEARCH_SCOPES.len(),
+            Constraint::Ratio(1, count as u32),
+            count,
         ))
         .split(area)
+}
+
+fn enabled_search_scopes(enabled_sources: &[SourceId]) -> Vec<(Option<SourceId>, &'static str)> {
+    SEARCH_SCOPES
+        .iter()
+        .copied()
+        .filter(|(source, _)| {
+            source.is_none()
+                || *source == Some(SourceId::Local)
+                || source.is_some_and(|source| enabled_sources.contains(&source))
+        })
+        .collect()
 }
 
 fn variant_popup(area: Rect, count: usize) -> Rect {
@@ -1025,7 +1067,7 @@ mod tests {
 
     #[test]
     fn right_arrow_cycles_search_scope() {
-        let mut page = SearchPage::new(None, true, 3);
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
         page.input_mode = false;
         let resolver =
             KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
@@ -1039,7 +1081,7 @@ mod tests {
 
     #[test]
     fn l_plays_the_selected_search_result() {
-        let mut page = SearchPage::new(None, true, 3);
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
         page.input_mode = false;
         page.results = vec![song("kw-1", SourceId::Kw, "晴天", "周杰伦")];
         let resolver =
@@ -1055,7 +1097,7 @@ mod tests {
 
     #[test]
     fn source_tab_selects_single_source_and_starts_search() {
-        let mut page = SearchPage::new(None, true, 3);
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
         page.input = "晴天".to_string();
 
         let action = page.select_source(2);
@@ -1068,6 +1110,18 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn disabled_sources_are_omitted_from_scope_navigation() {
+        let mut page = SearchPage::new(None, true, 3, &[SourceId::Kw, SourceId::Wy]);
+
+        page.cycle_source(1);
+        assert_eq!(page.source_filter, Some(SourceId::Kw));
+        page.cycle_source(1);
+        assert_eq!(page.source_filter, Some(SourceId::Wy));
+        page.cycle_source(1);
+        assert_eq!(page.source_filter, Some(SourceId::Local));
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub enum AppAction {
         songs: Vec<SongInfo>,
         index: usize,
         position: Duration,
+        start_playback: bool,
         paused: bool,
     },
     AddToQueue {
@@ -65,6 +66,8 @@ pub enum AppAction {
         generation: u64,
     },
     RemoveSource(String),
+    RemoveHistory(Box<SongInfo>),
+    ClearHistory,
     ScanLocalMusic {
         paths: Vec<String>,
         max_depth: u32,

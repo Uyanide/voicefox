@@ -1,6 +1,9 @@
 //! 封面在终端里的实际绘制
 
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{
+    Receiver, Sender, SyncSender, TryRecvError, TrySendError, channel, sync_channel,
+};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -43,8 +46,10 @@ enum Done {
 pub struct CoverRenderer {
     picker: Picker,
     enabled: bool,
-    /// 解码请求的发送端
-    decode_tx: Sender<DecodeJob>,
+    /// 最新的解码请求；新请求会覆盖尚未开始的旧请求
+    decode_pending: Arc<Mutex<Option<DecodeJob>>>,
+    /// 唤醒解码线程的有界通道
+    decode_wake_tx: SyncSender<()>,
     /// 后台线程结果的接收端
     done_rx: Receiver<Done>,
     /// 封面的图形协议状态，内部为空表示后台线程尚未返回结果
@@ -60,21 +65,25 @@ pub struct CoverRenderer {
 }
 
 impl CoverRenderer {
-    /// 探测终端图形能力并返回实例
+    /// 按配置创建渲染器；仅在启用封面且协议为 auto 时探测终端
     ///
-    /// 会向终端发送查询序列并直接读取 stdin，只能在事件循环启动前调用一次。
-    pub fn detect(cover_protocol: &str) -> Self {
-        let options = QueryStdioOptions {
-            timeout: QUERY_TIMEOUT,
-            ..QueryStdioOptions::default()
+    /// 自动探测会发送查询序列并直接读取 stdin，只能在事件循环启动前调用一次。
+    pub fn detect(cover_protocol: &str, cover_enabled: bool) -> Self {
+        let configured = parse_protocol(cover_protocol);
+        let picker = match (configured, cover_enabled) {
+            (Some(protocol), _) => picker_for_protocol(protocol),
+            (None, false) => Picker::halfblocks(),
+            (None, true) => {
+                let options = QueryStdioOptions {
+                    timeout: QUERY_TIMEOUT,
+                    ..QueryStdioOptions::default()
+                };
+                Picker::from_query_stdio_with_options(options).unwrap_or_else(|error| {
+                    tracing::debug!("query terminal graphics capabilities failed: {error}");
+                    Picker::halfblocks()
+                })
+            }
         };
-        let mut picker = Picker::from_query_stdio_with_options(options).unwrap_or_else(|error| {
-            tracing::debug!("query terminal graphics capabilities failed: {error}");
-            Picker::halfblocks()
-        });
-        if let Some(protocol) = parse_protocol(cover_protocol) {
-            picker.set_protocol_type(protocol);
-        }
 
         let mut renderer = Self::spawn(picker);
         // 记录 ioctl 的基准读数
@@ -88,16 +97,23 @@ impl CoverRenderer {
     }
 
     fn spawn(picker: Picker) -> Self {
-        let (decode_tx, decode_rx) = channel::<DecodeJob>();
+        let decode_pending = Arc::new(Mutex::new(None));
+        let (decode_wake_tx, decode_wake_rx) = sync_channel::<()>(1);
         let (encode_tx, encode_rx) = channel::<ResizeRequest>();
         let (done_tx, done_rx) = channel::<Done>();
-        let enabled = spawn_workers(decode_rx, encode_rx, done_tx);
+        let enabled = spawn_workers(
+            decode_wake_rx,
+            Arc::clone(&decode_pending),
+            encode_rx,
+            done_tx,
+        );
 
         Self {
             protocol: ThreadProtocol::new(encode_tx, None),
             picker,
             enabled,
-            decode_tx,
+            decode_pending,
+            decode_wake_tx,
             done_rx,
             has_image: false,
             loaded: None,
@@ -140,14 +156,12 @@ impl CoverRenderer {
     fn dispatch_decode(&mut self, path: String) {
         self.request_id += 1;
         self.protocol.empty_protocol();
-        self.has_image = self
-            .decode_tx
-            .send(DecodeJob {
-                path,
-                picker: self.picker.clone(),
-                id: self.request_id,
-            })
-            .is_ok();
+        let job = DecodeJob {
+            path,
+            picker: self.picker.clone(),
+            id: self.request_id,
+        };
+        self.has_image = queue_decode(&self.decode_pending, &self.decode_wake_tx, job);
     }
 
     /// 强制重新传输当前封面
@@ -161,23 +175,23 @@ impl CoverRenderer {
     }
 
     /// 重新读取终端的单元格像素尺寸，尺寸变化时按新尺寸重新解码当前封面
-    pub fn refresh_font_size(&mut self) {
+    pub fn refresh_font_size(&mut self) -> bool {
         if !self.enabled {
-            return;
+            return false;
         }
         let Some(font_size) = probe_font_size() else {
-            return;
+            return false;
         };
         match self.probed.replace(font_size) {
             // 单元格尺寸与上次读到的一致
             Some(previous)
                 if previous.width == font_size.width && previous.height == font_size.height =>
             {
-                return;
+                return false;
             }
             // 第一次读取时保留 Picker 查询到的字号
             // capabilities 非空说明字号来自终端应答，ratatui-image 未文档化此关系
-            None if !self.picker.capabilities().is_empty() => return,
+            None if !self.picker.capabilities().is_empty() => return false,
             _ => {}
         }
         tracing::debug!("cell size is now {font_size:?}");
@@ -191,6 +205,7 @@ impl CoverRenderer {
         if let Some(path) = self.loaded.clone() {
             self.dispatch_decode(path);
         }
+        true
     }
 
     /// 收取后台线程返回的结果，返回是否需要重绘
@@ -241,9 +256,28 @@ impl CoverRenderer {
     }
 }
 
+/// 覆盖尚未开始的解码请求，并保证唤醒信号最多积压一个
+fn queue_decode(
+    pending: &Mutex<Option<DecodeJob>>,
+    wake_tx: &SyncSender<()>,
+    job: DecodeJob,
+) -> bool {
+    let Ok(mut pending) = pending.lock() else {
+        return false;
+    };
+    *pending = Some(job);
+    drop(pending);
+
+    match wake_tx.try_send(()) {
+        Ok(()) | Err(TrySendError::Full(())) => true,
+        Err(TrySendError::Disconnected(())) => false,
+    }
+}
+
 /// 启动解码线程与编码线程，返回两个线程是否都启动成功
 fn spawn_workers(
-    decode_rx: Receiver<DecodeJob>,
+    decode_wake_rx: Receiver<()>,
+    decode_pending: Arc<Mutex<Option<DecodeJob>>>,
     encode_rx: Receiver<ResizeRequest>,
     done_tx: Sender<Done>,
 ) -> bool {
@@ -251,7 +285,14 @@ fn spawn_workers(
     let decode = thread::Builder::new()
         .name("voicefox-cover-decode".to_string())
         .spawn(move || {
-            for job in decode_rx {
+            for () in decode_wake_rx {
+                let Some(job) = decode_pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.take())
+                else {
+                    continue;
+                };
                 let protocol =
                     decode(&job.path).map(|image| Box::new(job.picker.new_resize_protocol(image)));
                 if decode_tx
@@ -298,6 +339,15 @@ fn probe_font_size() -> Option<FontSize> {
         size.width / size.columns,
         size.height / size.rows,
     ))
+}
+
+/// 使用配置指定的协议构造 Picker，不发送任何终端查询序列
+fn picker_for_protocol(protocol: ProtocolType) -> Picker {
+    let font_size = probe_font_size().unwrap_or_else(|| FontSize::new(10, 20));
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(font_size);
+    picker.set_protocol_type(protocol);
+    picker
 }
 
 fn decode(path: &str) -> Option<image::DynamicImage> {
@@ -347,7 +397,7 @@ mod tests {
     use ratatui_image::FontSize;
     use ratatui_image::picker::{Picker, ProtocolType};
 
-    use super::{CoverRenderer, parse_protocol};
+    use super::{CoverRenderer, DecodeJob, parse_protocol, queue_decode};
 
     const AREA: Rect = Rect {
         x: 0,
@@ -515,5 +565,43 @@ mod tests {
         assert_eq!(parse_protocol("halfblocks"), Some(ProtocolType::Halfblocks));
         // 拼写错误退回 auto
         assert_eq!(parse_protocol("kity"), None);
+    }
+
+    #[test]
+    fn an_explicit_protocol_is_selected_without_terminal_capabilities() {
+        let picker = super::picker_for_protocol(ProtocolType::Kitty);
+        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
+        assert!(picker.capabilities().is_empty());
+    }
+
+    #[test]
+    fn pending_decode_requests_are_coalesced_to_the_latest_one() {
+        let pending = std::sync::Mutex::new(None);
+        let (wake_tx, _wake_rx) = std::sync::mpsc::sync_channel(1);
+        let picker = Picker::halfblocks();
+
+        assert!(queue_decode(
+            &pending,
+            &wake_tx,
+            DecodeJob {
+                path: "old.png".to_string(),
+                picker: picker.clone(),
+                id: 1,
+            },
+        ));
+        assert!(queue_decode(
+            &pending,
+            &wake_tx,
+            DecodeJob {
+                path: "latest.png".to_string(),
+                picker,
+                id: 2,
+            },
+        ));
+
+        let pending = pending.lock().unwrap();
+        let latest = pending.as_ref().unwrap();
+        assert_eq!(latest.path, "latest.png");
+        assert_eq!(latest.id, 2);
     }
 }

@@ -65,6 +65,8 @@ enum PlaylistResponse {
     List {
         request_id: u64,
         source: SourceId,
+        page: u32,
+        append: bool,
         result: Result<Vec<Playlist>, String>,
     },
     Songs {
@@ -203,6 +205,14 @@ fn execute_song_menu_action(
             )));
             action
         }
+        SongMenuAction::RemoveFromHistory => {
+            history_state.selected = menu.index().min(menu.songs().len().saturating_sub(2));
+            AppAction::RemoveHistory(Box::new(menu.song().clone()))
+        }
+        SongMenuAction::ClearHistory => {
+            history_state.reset_position();
+            AppAction::ClearHistory
+        }
         SongMenuAction::DeleteLocal => {
             if let Some(path) = &menu.song().file_path {
                 *confirm_delete = Some(LocalDeleteConfirmation {
@@ -227,6 +237,8 @@ fn execute_song_menu_action(
 }
 
 fn main() -> anyhow::Result<()> {
+    tmux::prepare_ratatui_image_environment();
+
     // 解析 CLI
     let cli = cli::Cli::parse();
 
@@ -387,7 +399,7 @@ fn run_app(
     let mut observed_active_tab = active_tab;
 
     // 页面状态
-    let (search_source_filter, wrap_navigation, scroll_amount) = {
+    let (search_source_filter, wrap_navigation, scroll_amount, enabled_sources) = {
         let config = ctx.config.read().unwrap();
         (
             if config.ui.aggregate_search {
@@ -397,20 +409,24 @@ fn run_app(
             },
             config.ui.wrap_navigation,
             config.ui.scroll_amount,
+            config.source.enabled.clone(),
         )
     };
     let search_page = Arc::new(std::sync::Mutex::new(pages::search::SearchPage::new(
         search_source_filter,
         wrap_navigation,
         scroll_amount,
+        &enabled_sources,
     )));
     let settings_page = Arc::new(std::sync::Mutex::new(pages::settings::SettingsPage::new()));
     let (cover_protocol, mut cover_enabled) = {
         let config = ctx.config.read().unwrap();
         (config.ui.cover_protocol.clone(), config.ui.show_cover)
     };
-    let mut main_page =
-        pages::main_page::MainPage::new(cover::CoverRenderer::detect(&cover_protocol));
+    let mut main_page = pages::main_page::MainPage::new(cover::CoverRenderer::detect(
+        &cover_protocol,
+        cover_enabled,
+    ));
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -471,12 +487,14 @@ fn run_app(
     if ctx.config.read().unwrap().player.remember_playback_state
         && let Some(session) = ctx.storage.load_playback_session()
     {
+        let (start_playback, paused) = playback_restore_flags(session.state);
         execute_action(
             AppAction::RestorePlayback {
                 songs: session.playlist,
                 index: session.current_index,
                 position: session.position,
-                paused: session.state != SavedPlayerState::Playing,
+                start_playback,
+                paused,
             },
             &ctx,
             rt,
@@ -802,14 +820,20 @@ fn run_app(
                 PlaylistResponse::List {
                     request_id,
                     source,
+                    page,
+                    append,
                     result,
                 } if request_id == playlist_request_id
                     && playlists.current_source() == Some(source) =>
                 {
                     match result {
-                        Ok(items) => playlists.update_playlists(source, items),
+                        Ok(items) => playlists.update_playlists(source, page, append, items),
                         Err(error) => {
-                            let request = pages::playlists::PlaylistLoadRequest::List { source };
+                            let request = pages::playlists::PlaylistLoadRequest::List {
+                                source,
+                                page,
+                                append,
+                            };
                             playlists.update_error(&request, error.clone());
                             ctx.notify(Notification::error(format!("加载热门歌单失败: {error}")));
                         }
@@ -1235,12 +1259,12 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalVolumeUp if !text_input_active => {
-                        ctx.player.volume_up(5);
+                        persist_volume(&ctx, ctx.player.volume().saturating_add(5));
                         needs_render = true;
                         continue;
                     }
                     Action::GlobalVolumeDown if !text_input_active => {
-                        ctx.player.volume_down(5);
+                        persist_volume(&ctx, ctx.player.volume().saturating_sub(5));
                         needs_render = true;
                         continue;
                     }
@@ -1508,13 +1532,14 @@ fn run_app(
                     ) {
                         let _ = action_tx.send(action);
                     } else {
-                        if matches!(key.code, KeyCode::Char('g') | KeyCode::Char('w')) {
+                        if matches!(key.code, KeyCode::Char('g' | 'w' | 'j' | 'K')) {
                             let config = ctx.config.read().unwrap();
                             search_page.lock().unwrap().set_preferences(
                                 config.ui.aggregate_search,
                                 config.source.default,
                                 config.ui.wrap_navigation,
                                 config.ui.scroll_amount,
+                                &config.source.enabled,
                             );
                         }
                         execute_action(
@@ -1904,7 +1929,7 @@ fn run_app(
                         .map(|target| {
                             (
                                 target,
-                                SongMenuKind::Standard,
+                                SongMenuKind::History,
                                 Some((SortTarget::History, history_state.mode)),
                             )
                         }),
@@ -2395,11 +2420,26 @@ fn execute_mpris_command(
         }
         MprisCommand::SetPosition(position) => ctx.seek(position),
         MprisCommand::SetVolume(volume) => {
-            ctx.player
-                .set_volume((volume.clamp(0.0, 1.0) * 100.0).round() as u32);
+            persist_volume(ctx, (volume.clamp(0.0, 1.0) * 100.0).round() as u32);
         }
     }
     false
+}
+
+fn persist_volume(ctx: &AppContext, volume: u32) {
+    let volume = volume.clamp(0, 100);
+    ctx.player.set_volume(volume);
+    let save_result = {
+        let mut config = ctx.config.write().unwrap();
+        if config.player.volume == volume {
+            return;
+        }
+        config.player.volume = volume;
+        crate::config::loader::save(&config, &ctx.config_path)
+    };
+    if let Err(error) = save_result {
+        tracing::warn!("save volume failed: {error}");
+    }
 }
 
 /// 执行一个 AppAction（简化版，不再处理 Navigate/GoBack）
@@ -2526,12 +2566,18 @@ fn execute_action(
             songs,
             index,
             position,
+            start_playback,
             paused,
         } => {
             if let Some(song) = songs.get(index).cloned() {
                 ctx.playlist.set_playlist(songs, index);
                 ctx.play_attempted_sources.lock().unwrap().clear();
-                start_song_playback(song, false, Some((position, paused)), ctx, rt, action_tx);
+                if start_playback {
+                    start_song_playback(song, false, Some((position, paused)), ctx, rt, action_tx);
+                } else {
+                    ctx.player.stop();
+                    *ctx.current_song.write().unwrap() = Some(song);
+                }
             }
         }
         AppAction::AddToQueue { song, position } => {
@@ -2571,8 +2617,8 @@ fn execute_action(
                 match lx_source::js::loader::load_source_approving_update(&url, &default_source)
                     .await
                 {
-                    Ok(source) => {
-                        if !source_mgr.set_js_source_if_current(generation, Arc::new(source)) {
+                    Ok(_) => {
+                        if !source_mgr.is_js_source_request_current(generation) {
                             return;
                         }
                         let _ = tx.send(AppAction::SourceImported { url, generation });
@@ -2606,7 +2652,23 @@ fn execute_action(
                 sp.status_msg = Some(format!("✗ 音源已启用，但保存配置失败: {}", e));
                 ctx.notify(Notification::error(format!("保存 JS 音源配置失败: {}", e)));
             } else {
-                ctx.notify(Notification::success("JS 音源已加载并启用"));
+                let (urls, default_source) = {
+                    let config = ctx.config.read().unwrap();
+                    (
+                        config.source.js_sources.clone(),
+                        config.source.default.as_str().to_string(),
+                    )
+                };
+                let generation = ctx.source_manager.begin_js_source_request(true);
+                spawn_js_source_loader(
+                    urls,
+                    default_source,
+                    Arc::clone(&ctx.source_manager),
+                    generation,
+                    action_tx.clone(),
+                    rt,
+                );
+                ctx.notify(Notification::success("JS 音源配置已更新，正在加载全部脚本"));
             }
         }
         AppAction::SourceImportFailed { error, generation } => {
@@ -2642,6 +2704,21 @@ fn execute_action(
             let _ = action_tx.send(AppAction::ShowNotification(Notification::success(
                 "已移除音源",
             )));
+        }
+        AppAction::RemoveHistory(song) => {
+            if ctx.storage.remove_history(&song) {
+                ctx.notify(Notification::success(format!(
+                    "已删除历史记录: {}",
+                    song.name
+                )));
+            }
+        }
+        AppAction::ClearHistory => {
+            if ctx.storage.clear_history() {
+                ctx.notify(Notification::success("播放历史已清空"));
+            } else {
+                ctx.notify(Notification::info("播放历史已经是空的"));
+            }
         }
         AppAction::ScanLocalMusic { paths, max_depth } => {
             let generation = next_generation(&ctx.local_scan_request_id);
@@ -2731,7 +2808,8 @@ fn start_song_playback(
     }
 
     if add_history {
-        ctx.storage.add_history(&song);
+        let limit = ctx.config.read().unwrap().player.history_limit;
+        ctx.storage.add_history(&song, limit);
     }
     *ctx.current_song.write().unwrap() = Some(song.clone());
     if add_history {
@@ -2985,35 +3063,41 @@ fn spawn_js_source_loader(
     }
 
     rt.spawn(async move {
-        let mut last_error = None;
+        let total = urls.len();
+        let mut loaded = Vec::<Arc<dyn lx_core::traits::source::MusicSource>>::with_capacity(total);
+        let mut errors = Vec::new();
         for url in urls {
             match lx_source::js::loader::load_source(&url, &default_source).await {
                 Ok(source) => {
-                    if !source_manager.set_js_source_if_current(generation, Arc::new(source)) {
-                        return;
-                    }
-                    let _ = tx.send(AppAction::ShowNotification(Notification::success(
-                        "JS 音源已就绪",
-                    )));
-                    return;
+                    loaded.push(Arc::new(source));
                 }
                 Err(error) => {
                     if !source_manager.is_js_source_request_current(generation) {
                         return;
                     }
                     tracing::warn!("load JS source failed ({}): {}", url, error);
-                    last_error = Some(error);
+                    errors.push(format!("{url}: {error}"));
                 }
             }
         }
 
-        if !source_manager.clear_js_source_if_current(generation) {
+        let loaded_count = loaded.len();
+        if !source_manager.set_js_sources_if_current(generation, loaded) {
             return;
         }
-        if let Some(error) = last_error {
+        if loaded_count == 0 {
             let _ = tx.send(AppAction::ShowNotification(Notification::error(format!(
                 "没有可用的 JS 音源: {}",
-                error
+                errors.join("; ")
+            ))));
+        } else if errors.is_empty() {
+            let _ = tx.send(AppAction::ShowNotification(Notification::success(format!(
+                "{} 个 JS 音源已就绪",
+                loaded_count
+            ))));
+        } else {
+            let _ = tx.send(AppAction::ShowNotification(Notification::warning(format!(
+                "已加载 {loaded_count}/{total} 个 JS 音源"
             ))));
         }
     });
@@ -3021,6 +3105,14 @@ fn spawn_js_source_loader(
 
 fn next_generation(sequence: &AtomicU64) -> u64 {
     sequence.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn playback_restore_flags(state: SavedPlayerState) -> (bool, bool) {
+    match state {
+        SavedPlayerState::Playing => (true, false),
+        SavedPlayerState::Paused => (true, true),
+        SavedPlayerState::Stopped => (false, false),
+    }
 }
 
 fn should_scan_local_music_on_entry(
@@ -3048,7 +3140,9 @@ fn retransmit_cover(
     terminal: &mut DefaultTerminal,
     main_page: &mut pages::main_page::MainPage,
 ) -> anyhow::Result<()> {
-    main_page.force_cover_reload();
+    if !main_page.refresh_cover_font_size() {
+        main_page.force_cover_reload();
+    }
     // detach 期间照常渲染，缓冲区内容不变，不清屏则不会重发任何序列
     //
     // 此处不能用 Terminal::clear，它会先发 ESC[6n 读回光标位置。ratatui-image
@@ -3217,15 +3311,21 @@ fn spawn_playlist_request(
 ) {
     rt.spawn(async move {
         let response = match request {
-            pages::playlists::PlaylistLoadRequest::List { source } => {
+            pages::playlists::PlaylistLoadRequest::List {
+                source,
+                page,
+                append,
+            } => {
                 let result = tokio::time::timeout(
                     Duration::from_secs(12),
-                    source_manager.playlists(source, 1),
+                    source_manager.playlists(source, page),
                 )
                 .await;
                 PlaylistResponse::List {
                     request_id,
                     source,
+                    page,
+                    append,
                     result: match result {
                         Ok(Ok(playlists)) => Ok(playlists),
                         Ok(Err(error)) => Err(error.to_string()),
@@ -3270,10 +3370,12 @@ mod tests {
     use lx_core::model::source::SourceId;
 
     use super::{
-        DeleteConfirmationAction, delete_confirmation_action, next_list_index, previous_list_index,
-        should_expand_bili_parts, should_scan_local_music_on_entry,
+        DeleteConfirmationAction, delete_confirmation_action, next_list_index,
+        playback_restore_flags, previous_list_index, should_expand_bili_parts,
+        should_scan_local_music_on_entry,
     };
     use crate::pages::sidebar::NavTab;
+    use crate::storage::SavedPlayerState;
 
     #[test]
     fn local_list_navigation_wraps_at_both_ends() {
@@ -3281,6 +3383,22 @@ mod tests {
         assert_eq!(next_list_index(3, 4, true), 0);
         assert_eq!(previous_list_index(0, 4, false), 0);
         assert_eq!(next_list_index(3, 4, false), 3);
+    }
+
+    #[test]
+    fn stopped_sessions_restore_the_queue_without_starting_mpv() {
+        assert_eq!(
+            playback_restore_flags(SavedPlayerState::Playing),
+            (true, false)
+        );
+        assert_eq!(
+            playback_restore_flags(SavedPlayerState::Paused),
+            (true, true)
+        );
+        assert_eq!(
+            playback_restore_flags(SavedPlayerState::Stopped),
+            (false, false)
+        );
     }
 
     #[test]

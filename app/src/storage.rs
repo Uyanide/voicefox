@@ -10,8 +10,6 @@ use std::time::Duration;
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 
-const MAX_HISTORY: usize = 100;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SavedPlayerState {
@@ -125,12 +123,44 @@ impl Storage {
 
     // ── 播放历史 ──────────────────────────────────────
 
-    pub fn add_history(&self, song: &SongInfo) {
+    pub fn add_history(&self, song: &SongInfo, limit: usize) {
         let mut history = self.history.write().unwrap();
         history.retain(|s| !(s.id == song.id && s.source == song.source));
         history.insert(0, song.clone());
-        history.truncate(MAX_HISTORY);
+        history.truncate(limit.max(1));
         self.save_history(&history);
+    }
+
+    pub fn remove_history(&self, song: &SongInfo) -> bool {
+        let mut history = self.history.write().unwrap();
+        let old_len = history.len();
+        history.retain(|item| !(item.id == song.id && item.source == song.source));
+        if history.len() == old_len {
+            return false;
+        }
+        self.save_history(&history);
+        true
+    }
+
+    pub fn clear_history(&self) -> bool {
+        let mut history = self.history.write().unwrap();
+        if history.is_empty() {
+            return false;
+        }
+        history.clear();
+        self.save_history(&history);
+        true
+    }
+
+    pub fn trim_history(&self, limit: usize) -> bool {
+        let mut history = self.history.write().unwrap();
+        let old_len = history.len();
+        history.truncate(limit.max(1));
+        if history.len() == old_len {
+            return false;
+        }
+        self.save_history(&history);
+        true
     }
 
     // ── 内部序列化 ────────────────────────────────────
@@ -304,6 +334,46 @@ mod tests {
         let right = song("2", SourceId::Wy, "纯音乐", "");
 
         assert!(!songs_equivalent(&left, &right));
+    }
+
+    #[test]
+    fn history_limit_delete_and_clear_are_persisted_in_memory() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "voicefox-history-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = Storage {
+            data_dir: data_dir.clone(),
+            favorites: RwLock::new(Vec::new()),
+            favorite_playlists: RwLock::new(Vec::new()),
+            history: RwLock::new(Vec::new()),
+        };
+        let first = song("1", SourceId::Kw, "One", "Artist");
+        let second = song("2", SourceId::Kg, "Two", "Artist");
+        let third = song("3", SourceId::Wy, "Three", "Artist");
+
+        storage.add_history(&first, 2);
+        storage.add_history(&second, 2);
+        storage.add_history(&third, 2);
+        assert_eq!(
+            storage
+                .load_history()
+                .iter()
+                .map(|song| song.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["3", "2"]
+        );
+        assert!(storage.remove_history(&second));
+        assert_eq!(storage.load_history().len(), 1);
+        assert!(storage.clear_history());
+        assert!(storage.load_history().is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

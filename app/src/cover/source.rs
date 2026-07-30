@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT, REFERER};
 
-use super::layout::DEFAULT_IMAGE_ASPECT;
-
 /// 临时文件名的流水号
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -70,9 +68,12 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
         if !std::path::Path::new(path).exists() {
             return Err("封面文件不存在".to_string());
         }
+        let aspect = probe_aspect(path)
+            .await
+            .ok_or_else(|| "封面图片无法完整解码".to_string())?;
         return Ok(CoverImage {
             path: path.to_string(),
-            aspect: probe_aspect(path).await.unwrap_or(DEFAULT_IMAGE_ASPECT),
+            aspect,
         });
     }
 
@@ -114,16 +115,14 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
         .map_err(|error| error.to_string())?;
 
     let target = cache_path.clone();
-    tokio::task::spawn_blocking(move || write_cache_file(&target, &bytes))
+    let aspect = tokio::task::spawn_blocking(move || write_cache_file(&target, &bytes))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("写入封面缓存失败: {error}"))?;
 
     Ok(CoverImage {
         path: cache_path.to_string_lossy().to_string(),
-        aspect: probe_aspect(&cache_path)
-            .await
-            .unwrap_or(DEFAULT_IMAGE_ASPECT),
+        aspect,
     })
 }
 
@@ -138,24 +137,32 @@ fn temp_path_for(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// 写入缓存文件，确保原子性
-fn write_cache_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// 写入临时文件，完整解码验证后再原子替换缓存
+fn write_cache_file(target: &Path, bytes: &[u8]) -> std::io::Result<f32> {
     let temp_path = temp_path_for(target);
-    std::fs::write(&temp_path, bytes)
-        .and_then(|()| std::fs::rename(&temp_path, target))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&temp_path);
-        })
+    let result = (|| {
+        std::fs::write(&temp_path, bytes)?;
+        let aspect = probe_aspect_blocking(&temp_path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "cover image is corrupt")
+        })?;
+        std::fs::rename(&temp_path, target)?;
+        Ok(aspect)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
-/// 读取图片文件头取像素宽高比，失败返回 None
+/// 完整解码图片并取像素宽高比，失败返回 None
 fn probe_aspect_blocking(path: &std::path::Path) -> Option<f32> {
-    let (width, height) = image::ImageReader::open(path)
+    let image = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?
-        .into_dimensions()
+        .decode()
         .ok()?;
+    let (width, height) = (image.width(), image.height());
     if width == 0 || height == 0 {
         return None;
     }
@@ -203,7 +210,7 @@ fn simple_hash(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Cursor, Read};
     use std::path::{Path, PathBuf};
 
     use super::{probe_aspect_blocking, write_cache_file};
@@ -226,27 +233,35 @@ mod tests {
         names
     }
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
     #[test]
     fn a_cache_write_replaces_the_target_instead_of_truncating_it() {
         let dir = temp_dir("replace");
         let target = dir.join("cover.jpg");
         std::fs::write(&target, b"old").unwrap();
+        let new = png_bytes(20, 10);
 
         // 先持有旧文件的句柄，rename 替换的只是目录项
         let mut old_handle = std::fs::File::open(&target).unwrap();
-        write_cache_file(&target, b"new").unwrap();
+        assert_eq!(write_cache_file(&target, &new).unwrap(), 2.0);
 
         let mut old = Vec::new();
         old_handle.read_to_end(&mut old).unwrap();
         assert_eq!(old, b"old", "写入前打开的句柄应仍读到旧内容");
-        assert_eq!(std::fs::read(&target).unwrap(), b"new", "新内容应已就位");
+        assert_eq!(std::fs::read(&target).unwrap(), new, "新内容应已就位");
     }
 
     #[test]
     fn a_finished_cache_write_leaves_no_temp_file() {
         let dir = temp_dir("finished");
         let target = dir.join("cover.jpg");
-        write_cache_file(&target, b"payload").unwrap();
+        write_cache_file(&target, &png_bytes(1, 1)).unwrap();
         assert_eq!(names(&dir), ["cover.jpg"], "目录里应只剩目标文件");
     }
 
@@ -257,7 +272,10 @@ mod tests {
         let target = dir.join("cover.jpg");
         std::fs::create_dir(&target).unwrap();
 
-        assert!(write_cache_file(&target, b"payload").is_err(), "应该报错");
+        assert!(
+            write_cache_file(&target, &png_bytes(1, 1)).is_err(),
+            "应该报错"
+        );
         assert_eq!(names(&dir), ["cover.jpg"], "临时文件应已清掉");
     }
 
@@ -269,5 +287,17 @@ mod tests {
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
         assert_eq!(probe_aspect_blocking(&path), Some(2.0));
+    }
+
+    #[test]
+    fn a_header_only_image_is_rejected_before_it_reaches_the_cache() {
+        let dir = temp_dir("corrupt");
+        let target = dir.join("cover.jpg");
+        let mut bytes = png_bytes(20, 10);
+        bytes.truncate(33);
+
+        assert!(write_cache_file(&target, &bytes).is_err());
+        assert!(!target.exists());
+        assert!(names(&dir).is_empty(), "损坏文件和临时文件都不应保留");
     }
 }

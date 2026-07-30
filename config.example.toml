@@ -4,6 +4,8 @@ quality = "320k"
 volume = 80
 play_mode = "list-loop"
 remember_playback_state = true
+# 播放历史最多保留多少条
+history_limit = 100
 
 [source]
 enabled = ["kw", "kg", "tx", "wy", "mg", "bili"]
@@ -62,6 +64,8 @@ wrap_navigation = true
 scroll_amount = 3
 aggregate_search = true
 show_cover = true
+# auto/kitty/sixel/iterm2/halfblocks；手动指定可跳过终端协议探测
+cover_protocol = "auto"
 max_fps = 20
 
 [local_music]

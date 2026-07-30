@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::source::{Quality, SourceId};
 use crate::keybinding::KeybindingConfig;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 4;
+pub const CURRENT_CONFIG_VERSION: u32 = 5;
 
 /// 播放器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +14,7 @@ pub struct PlayerConfig {
     pub volume: u32,
     pub play_mode: String,
     pub remember_playback_state: bool,
+    pub history_limit: usize,
 }
 
 impl Default for PlayerConfig {
@@ -24,6 +25,7 @@ impl Default for PlayerConfig {
             volume: 80,
             play_mode: "list-loop".to_string(),
             remember_playback_state: true,
+            history_limit: 100,
         }
     }
 }

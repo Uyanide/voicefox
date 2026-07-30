@@ -1,11 +1,15 @@
 //! 音频元数据读取（使用 lofty）
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, Tag};
 
 use lx_core::model::song::SongInfo;
+
+static COVER_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+const COVER_TEMP_INFIX: &str = ".part.";
 
 /// 读取音频文件的元数据
 pub fn read_metadata(path: &Path) -> Result<SongInfo, String> {
@@ -112,15 +116,55 @@ fn extract_cover(tagged: &lofty::file::TaggedFile, audio_path: &Path) -> Option<
     let cover_path = cache_dir.join(format!("{}.jpg", hash));
 
     if cover_path.exists() {
-        return Some(cover_path.to_string_lossy().to_string());
+        if validate_cover(&cover_path) {
+            return Some(cover_path.to_string_lossy().to_string());
+        }
+        tracing::debug!("local cover cache {cover_path:?} is corrupt, rebuilding");
+        let _ = std::fs::remove_file(&cover_path);
     }
 
     let data = picture.data();
-    if std::fs::write(&cover_path, data).is_ok() {
+    if write_cover_cache(&cover_path, data).is_ok() {
         Some(cover_path.to_string_lossy().to_string())
     } else {
         None
     }
+}
+
+fn validate_cover(path: &Path) -> bool {
+    image::ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(|error| error.to_string())
+        .and_then(|reader| reader.decode().map_err(|error| error.to_string()))
+        .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+}
+
+fn cover_temp_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        "{COVER_TEMP_INFIX}{}.{}",
+        std::process::id(),
+        COVER_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    target.with_file_name(name)
+}
+
+fn write_cover_cache(target: &Path, data: &[u8]) -> std::io::Result<()> {
+    let temp_path = cover_temp_path(target);
+    let result = (|| {
+        std::fs::write(&temp_path, data)?;
+        if !validate_cover(&temp_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "embedded cover image is corrupt",
+            ));
+        }
+        std::fs::rename(&temp_path, target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// 简单的字符串哈希
@@ -134,7 +178,9 @@ fn simple_hash(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::embedded_lyric_from_tag;
+    use std::io::Cursor;
+
+    use super::{embedded_lyric_from_tag, validate_cover, write_cover_cache};
     use lofty::tag::{ItemKey, Tag, TagType};
 
     #[test]
@@ -146,5 +192,40 @@ mod tests {
             embedded_lyric_from_tag(&tag).as_deref(),
             Some("[00:01.00]歌词")
         );
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(8, 4));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn embedded_cover_cache_is_validated_before_replacement() {
+        let dir = std::env::temp_dir().join("voicefox-local-cover-valid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cover.jpg");
+        std::fs::write(&target, b"corrupt").unwrap();
+
+        write_cover_cache(&target, &png_bytes()).unwrap();
+
+        assert!(validate_cover(&target));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn corrupt_embedded_cover_data_is_not_cached() {
+        let dir = std::env::temp_dir().join("voicefox-local-cover-corrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cover.jpg");
+        let mut bytes = png_bytes();
+        bytes.truncate(33);
+
+        assert!(write_cover_cache(&target, &bytes).is_err());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }

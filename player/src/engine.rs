@@ -25,6 +25,7 @@ pub struct MpvEngine {
     event_rx: Mutex<Option<mpsc::UnboundedReceiver<PlayerEvent>>>,
     volume: AtomicU32,
     generation: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
     pending_headers: Mutex<HashMap<u64, Vec<(String, String)>>>,
 }
 
@@ -48,6 +49,7 @@ impl MpvEngine {
             event_rx: Mutex::new(Some(event_rx)),
             volume: AtomicU32::new(80),
             generation: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
             pending_headers: Mutex::new(HashMap::new()),
         }
     }
@@ -65,9 +67,14 @@ fn parse_mpv_data(resp: &str) -> Option<f64> {
     v.get("data")?.as_f64()
 }
 
+fn duration_from_mpv_seconds(seconds: f64) -> Duration {
+    Duration::from_secs_f64(seconds.max(0.0))
+}
+
 impl Player for MpvEngine {
     fn prepare(&self) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.paused.store(false, Ordering::SeqCst);
         let _ = self.state_tx.send(PlayerState::Loading);
         let _ = self.position_tx.send(Duration::ZERO);
         let _ = self.duration_tx.send(Duration::ZERO);
@@ -107,6 +114,7 @@ impl Player for MpvEngine {
                     let event_tx = self.event_tx.clone();
                     let state_tx = self.state_tx.clone();
                     let active_generation = Arc::clone(&self.generation);
+                    let paused = Arc::clone(&self.paused);
                     let polling = Arc::clone(&polling);
                     tokio::spawn(async move {
                         let mut rx = ipc_event_rx;
@@ -115,6 +123,28 @@ impl Player for MpvEngine {
                                 break;
                             }
                             match event {
+                                MpvEvent::Loading => {
+                                    let state = if paused.load(Ordering::SeqCst) {
+                                        PlayerState::Paused
+                                    } else {
+                                        PlayerState::Loading
+                                    };
+                                    let _ = state_tx.send(state);
+                                }
+                                MpvEvent::Playing => {
+                                    let state = if paused.load(Ordering::SeqCst) {
+                                        PlayerState::Paused
+                                    } else {
+                                        PlayerState::Playing
+                                    };
+                                    let _ = state_tx.send(state);
+                                }
+                                MpvEvent::Buffering(percent) => {
+                                    if percent < 1.0 && !paused.load(Ordering::SeqCst) {
+                                        let _ = state_tx.send(PlayerState::Loading);
+                                    }
+                                    let _ = event_tx.send(PlayerEvent::Buffering(percent));
+                                }
                                 MpvEvent::EndFile => {
                                     polling.store(false, Ordering::SeqCst);
                                     let _ = event_tx.send(PlayerEvent::Ended);
@@ -159,7 +189,7 @@ impl Player for MpvEngine {
                         if let Some(ref pos_str) = pos_res
                             && let Some(secs) = parse_mpv_data(pos_str)
                         {
-                            let _ = position_tx.send(Duration::from_secs_f64(secs.max(0.0)));
+                            let _ = position_tx.send(duration_from_mpv_seconds(secs));
                         }
 
                         // 总时长变化频率很低，每秒查询一次即可。
@@ -173,7 +203,7 @@ impl Player for MpvEngine {
                             if let Some(ref dur_str) = dur_res
                                 && let Some(secs) = parse_mpv_data(dur_str)
                             {
-                                let _ = duration_tx.send(Duration::from_secs_f64(secs.max(0.0)));
+                                let _ = duration_tx.send(duration_from_mpv_seconds(secs));
                             }
                         }
                         tick = tick.wrapping_add(1);
@@ -212,9 +242,8 @@ impl Player for MpvEngine {
                     let _ = self.event_tx.send(PlayerEvent::Error(error.to_string()));
                     return false;
                 }
-                // 存入 ipc 并更新状态
+                // 存入 ipc；播放状态由 mpv 的 playback-restart 事件确认。
                 *self.ipc.lock().unwrap() = Some(ipc);
-                let _ = self.state_tx.send(PlayerState::Playing);
                 true
             }
             Err(e) => {
@@ -236,33 +265,34 @@ impl Player for MpvEngine {
     }
 
     fn pause(&self) {
-        let _ = self.state_tx.send(PlayerState::Paused);
-        {
-            let guard = self.ipc.lock().unwrap();
-            if let Some(ref ipc) = *guard
-                && let Err(e) =
-                    ipc.send_command("{\"command\": [\"set_property\", \"pause\", true]}")
-            {
-                warn!("mpv pause failed: {}", e);
-            }
+        let guard = self.ipc.lock().unwrap();
+        let Some(ref ipc) = *guard else {
+            return;
+        };
+        if let Err(e) = ipc.send_command("{\"command\": [\"set_property\", \"pause\", true]}") {
+            warn!("mpv pause failed: {}", e);
+            return;
         }
+        self.paused.store(true, Ordering::SeqCst);
+        let _ = self.state_tx.send(PlayerState::Paused);
     }
 
     fn resume(&self) {
-        let _ = self.state_tx.send(PlayerState::Playing);
-        {
-            let guard = self.ipc.lock().unwrap();
-            if let Some(ref ipc) = *guard
-                && let Err(e) =
-                    ipc.send_command("{\"command\": [\"set_property\", \"pause\", false]}")
-            {
-                warn!("mpv resume failed: {}", e);
-            }
+        let guard = self.ipc.lock().unwrap();
+        let Some(ref ipc) = *guard else {
+            return;
+        };
+        if let Err(e) = ipc.send_command("{\"command\": [\"set_property\", \"pause\", false]}") {
+            warn!("mpv resume failed: {}", e);
+            return;
         }
+        self.paused.store(false, Ordering::SeqCst);
+        let _ = self.state_tx.send(PlayerState::Playing);
     }
 
     fn stop(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
         {
             let guard = self.ipc.lock().unwrap();
             if let Some(ref ipc) = *guard
@@ -357,5 +387,26 @@ impl Drop for MpvEngine {
         if let Some(ipc) = ipc {
             ipc.stop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::duration_from_mpv_seconds;
+
+    #[test]
+    fn negative_mpv_times_are_clamped_to_zero() {
+        assert_eq!(duration_from_mpv_seconds(-0.001), Duration::ZERO);
+        assert_eq!(duration_from_mpv_seconds(-42.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn positive_mpv_times_keep_fractional_seconds() {
+        assert_eq!(
+            duration_from_mpv_seconds(1.25),
+            Duration::from_millis(1_250)
+        );
     }
 }

@@ -16,6 +16,7 @@ use crate::pages::sort::{SortMode, SortTarget};
 pub enum SongMenuKind {
     Queue,
     Standard,
+    History,
     Local,
 }
 
@@ -27,6 +28,8 @@ pub enum SongMenuAction {
     ToggleFavorite,
     CycleSort(SortTarget),
     RemoveFromQueue,
+    RemoveFromHistory,
+    ClearHistory,
     DeleteLocal,
 }
 
@@ -97,6 +100,16 @@ impl SongContextMenu {
                 label: "从队列移除".to_string(),
                 action: SongMenuAction::RemoveFromQueue,
             }),
+            SongMenuKind::History => items.extend([
+                MenuItem {
+                    label: "删除这条历史".to_string(),
+                    action: SongMenuAction::RemoveFromHistory,
+                },
+                MenuItem {
+                    label: "清空播放历史".to_string(),
+                    action: SongMenuAction::ClearHistory,
+                },
+            ]),
             SongMenuKind::Local => items.push(MenuItem {
                 label: "删除本地文件".to_string(),
                 action: SongMenuAction::DeleteLocal,

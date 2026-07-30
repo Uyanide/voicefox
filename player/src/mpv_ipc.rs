@@ -44,6 +44,9 @@ pub struct MpvIpc {
 
 #[derive(Debug, Clone)]
 pub enum MpvEvent {
+    Loading,
+    Playing,
+    Buffering(f64),
     EndFile,
     Error(String),
 }
@@ -308,17 +311,22 @@ impl MpvIpc {
 
 fn parse_mpv_event(line: &str) -> Option<MpvEvent> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if value["event"].as_str() != Some("end-file") {
-        return None;
-    }
-    match value["reason"].as_str() {
-        Some("eof") => Some(MpvEvent::EndFile),
-        Some("error") => Some(MpvEvent::Error(
-            value["file_error"]
-                .as_str()
-                .unwrap_or("mpv 无法打开当前音频")
-                .to_string(),
-        )),
+    match value["event"].as_str()? {
+        "start-file" | "file-loaded" => Some(MpvEvent::Loading),
+        "playback-restart" => Some(MpvEvent::Playing),
+        "cache-update" => value["cache-buffering-state"]
+            .as_f64()
+            .map(|percent| MpvEvent::Buffering(percent.clamp(0.0, 100.0) / 100.0)),
+        "end-file" => match value["reason"].as_str() {
+            Some("eof") => Some(MpvEvent::EndFile),
+            Some("error") => Some(MpvEvent::Error(
+                value["file_error"]
+                    .as_str()
+                    .unwrap_or("mpv 无法打开当前音频")
+                    .to_string(),
+            )),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -406,6 +414,22 @@ mod tests {
     #[test]
     fn ignores_manual_stop_events() {
         assert!(parse_mpv_event(r#"{"event":"end-file","reason":"stop"}"#).is_none());
+    }
+
+    #[test]
+    fn parses_loading_playing_and_buffering_events() {
+        assert!(matches!(
+            parse_mpv_event(r#"{"event":"start-file"}"#),
+            Some(MpvEvent::Loading)
+        ));
+        assert!(matches!(
+            parse_mpv_event(r#"{"event":"playback-restart"}"#),
+            Some(MpvEvent::Playing)
+        ));
+        assert!(matches!(
+            parse_mpv_event(r#"{"event":"cache-update","cache-buffering-state":42}"#),
+            Some(MpvEvent::Buffering(value)) if (value - 0.42).abs() < f64::EPSILON
+        ));
     }
 
     #[cfg(windows)]

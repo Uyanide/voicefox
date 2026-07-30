@@ -20,11 +20,20 @@ use crate::context::AppContext;
 pub enum PlaylistLoadRequest {
     List {
         source: SourceId,
+        page: u32,
+        append: bool,
     },
     Songs {
         source: SourceId,
         playlist_id: String,
     },
+}
+
+#[derive(Clone)]
+struct PlaylistListCache {
+    items: Vec<Playlist>,
+    page: u32,
+    has_more: bool,
 }
 
 pub struct PlaylistsPage {
@@ -36,12 +45,14 @@ pub struct PlaylistsPage {
     pub selected_playlist: Option<usize>,
     list_loaded: bool,
     list_loading: bool,
+    list_page: u32,
+    list_has_more: bool,
     songs_loaded: bool,
     songs_loading: bool,
     playlist_scroll_offset: usize,
     song_scroll_offset: usize,
     error_message: Option<String>,
-    list_cache: HashMap<SourceId, Vec<Playlist>>,
+    list_cache: HashMap<SourceId, PlaylistListCache>,
     song_cache: HashMap<(SourceId, String), Vec<SongInfo>>,
 }
 
@@ -59,6 +70,8 @@ impl PlaylistsPage {
             selected_playlist: None,
             list_loaded: true,
             list_loading: false,
+            list_page: 0,
+            list_has_more: false,
             songs_loaded: false,
             songs_loading: false,
             playlist_scroll_offset: 0,
@@ -100,7 +113,23 @@ impl PlaylistsPage {
         }
         let source = self.current_source()?;
         if !self.list_loading && !self.list_loaded {
-            return Some(PlaylistLoadRequest::List { source });
+            return Some(PlaylistLoadRequest::List {
+                source,
+                page: 1,
+                append: false,
+            });
+        }
+        if !self.list_loading
+            && self.list_loaded
+            && self.list_has_more
+            && !self.playlists.is_empty()
+            && self.selected + 1 >= self.playlists.len()
+        {
+            return Some(PlaylistLoadRequest::List {
+                source,
+                page: self.list_page.saturating_add(1).max(1),
+                append: true,
+            });
         }
         None
     }
@@ -108,9 +137,11 @@ impl PlaylistsPage {
     pub fn begin_loading(&mut self, request: &PlaylistLoadRequest) {
         self.error_message = None;
         match request {
-            PlaylistLoadRequest::List { .. } => {
+            PlaylistLoadRequest::List { append, .. } => {
                 self.list_loading = true;
-                self.list_loaded = false;
+                if !append {
+                    self.list_loaded = false;
+                }
             }
             PlaylistLoadRequest::Songs { .. } => {
                 self.songs_loading = true;
@@ -119,17 +150,54 @@ impl PlaylistsPage {
         }
     }
 
-    pub fn update_playlists(&mut self, source: SourceId, playlists: Vec<Playlist>) {
-        self.list_cache.insert(source, playlists.clone());
+    pub fn update_playlists(
+        &mut self,
+        source: SourceId,
+        page: u32,
+        append: bool,
+        playlists: Vec<Playlist>,
+    ) {
+        let received_items = !playlists.is_empty();
+        let mut items = if append {
+            self.list_cache
+                .get(&source)
+                .map(|cache| cache.items.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let previous_len = items.len();
+        for playlist in playlists {
+            if !items
+                .iter()
+                .any(|item| item.id == playlist.id && item.source == playlist.source)
+            {
+                items.push(playlist);
+            }
+        }
+        let added_items = items.len() > previous_len;
+        let has_more = received_items && (!append || added_items);
+        self.list_cache.insert(
+            source,
+            PlaylistListCache {
+                items: items.clone(),
+                page,
+                has_more,
+            },
+        );
         if self.current_source() != Some(source) || self.selected_playlist.is_some() {
             return;
         }
-        self.playlists = playlists;
+        self.playlists = items;
         self.list_loading = false;
         self.list_loaded = true;
+        self.list_page = page;
+        self.list_has_more = has_more;
         self.error_message = None;
         self.selected = self.selected.min(self.playlists.len().saturating_sub(1));
-        self.playlist_scroll_offset = 0;
+        if !append {
+            self.playlist_scroll_offset = 0;
+        }
     }
 
     pub fn update_songs(&mut self, source: SourceId, playlist_id: &str, songs: Vec<SongInfo>) {
@@ -151,13 +219,21 @@ impl PlaylistsPage {
     }
 
     pub fn update_error(&mut self, request: &PlaylistLoadRequest, message: String) {
+        let mut reset_selection = false;
         match request {
-            PlaylistLoadRequest::List { source }
+            PlaylistLoadRequest::List { source, append, .. }
                 if self.current_source() == Some(*source) && self.selected_playlist.is_none() =>
             {
-                self.playlists.clear();
                 self.list_loading = false;
                 self.list_loaded = true;
+                if *append {
+                    self.list_has_more = false;
+                } else {
+                    self.playlists.clear();
+                    self.list_page = 0;
+                    self.list_has_more = false;
+                    reset_selection = true;
+                }
                 self.error_message = Some(message);
             }
             PlaylistLoadRequest::Songs {
@@ -172,10 +248,13 @@ impl PlaylistsPage {
                 self.songs_loading = false;
                 self.songs_loaded = true;
                 self.error_message = Some(message);
+                reset_selection = true;
             }
             _ => {}
         }
-        self.selected = 0;
+        if reset_selection {
+            self.selected = 0;
+        }
     }
 
     pub fn handle_input(
@@ -471,7 +550,19 @@ impl PlaylistsPage {
         } else if self.current_source() == Some(SourceId::Bili) {
             format!("我的收藏夹 ({})", self.playlists.len())
         } else {
-            format!("热门歌单 ({})", self.playlists.len())
+            let suffix = if self.list_loading {
+                " · 加载下一页"
+            } else if self.list_has_more {
+                " · 向下加载更多"
+            } else {
+                ""
+            };
+            format!(
+                "热门歌单 ({}，第 {} 页){}",
+                self.playlists.len(),
+                self.list_page.max(1),
+                suffix
+            )
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -481,13 +572,15 @@ impl PlaylistsPage {
         block.render(area, buf);
 
         if self.selected_playlist.is_none() {
-            if let Some(error) = &self.error_message {
+            if let Some(error) = &self.error_message
+                && self.playlists.is_empty()
+            {
                 Paragraph::new(format!("加载失败: {error}"))
                     .style(Style::new().fg(crate::theme::red(ctx)))
                     .render(inner, buf);
                 return;
             }
-            if self.list_loading {
+            if self.list_loading && self.playlists.is_empty() {
                 let message = if self.current_source() == Some(SourceId::Bili) {
                     "加载哔哩哔哩收藏夹..."
                 } else {
@@ -711,6 +804,8 @@ impl PlaylistsPage {
             self.playlists.clear();
             self.list_loaded = false;
             self.list_loading = false;
+            self.list_page = 0;
+            self.list_has_more = false;
             self.selected = 0;
             self.playlist_scroll_offset = 0;
         } else {
@@ -751,19 +846,25 @@ impl PlaylistsPage {
         self.playlist_scroll_offset = 0;
         self.song_scroll_offset = 0;
         if let Some(source) = self.current_source() {
-            if let Some(playlists) = self.list_cache.get(&source) {
-                self.playlists = playlists.clone();
+            if let Some(cache) = self.list_cache.get(&source) {
+                self.playlists = cache.items.clone();
                 self.list_loaded = true;
                 self.list_loading = false;
+                self.list_page = cache.page;
+                self.list_has_more = cache.has_more;
             } else {
                 self.playlists.clear();
                 self.list_loaded = false;
                 self.list_loading = false;
+                self.list_page = 0;
+                self.list_has_more = false;
             }
         } else {
             self.playlists = ctx.storage.load_favorite_playlists();
             self.list_loaded = true;
             self.list_loading = false;
+            self.list_page = 0;
+            self.list_has_more = false;
         }
     }
 
@@ -786,6 +887,8 @@ impl PlaylistsPage {
         }
         if self.selected + 1 < len {
             self.selected += 1;
+        } else if self.selected_playlist.is_none() && self.list_has_more {
+            // 保持末项选中，主循环会在下一轮请求下一页。
         } else if ctx.config.read().unwrap().ui.wrap_navigation {
             self.selected = 0;
         }
@@ -925,17 +1028,61 @@ mod tests {
         assert_eq!(
             page.next_load_request(),
             Some(PlaylistLoadRequest::List {
-                source: SourceId::Kw
+                source: SourceId::Kw,
+                page: 1,
+                append: false,
             })
         );
-        page.update_playlists(SourceId::Kw, vec![playlist("kw-1", SourceId::Kw)]);
+        page.update_playlists(SourceId::Kw, 1, false, vec![playlist("kw-1", SourceId::Kw)]);
         page.scope_index = 2;
         page.list_loaded = false;
         assert_eq!(
             page.next_load_request(),
             Some(PlaylistLoadRequest::List {
-                source: SourceId::Kg
+                source: SourceId::Kg,
+                page: 1,
+                append: false,
             })
         );
+    }
+
+    #[test]
+    fn reaching_the_end_requests_and_appends_the_next_page() {
+        let mut page = PlaylistsPage::new(vec![SourceId::Kw]);
+        page.scope_index = 1;
+        page.list_loaded = false;
+        page.update_playlists(SourceId::Kw, 1, false, vec![playlist("kw-1", SourceId::Kw)]);
+
+        assert_eq!(
+            page.next_load_request(),
+            Some(PlaylistLoadRequest::List {
+                source: SourceId::Kw,
+                page: 2,
+                append: true,
+            })
+        );
+
+        page.update_playlists(
+            SourceId::Kw,
+            2,
+            true,
+            vec![
+                playlist("kw-1", SourceId::Kw),
+                playlist("kw-2", SourceId::Kw),
+            ],
+        );
+        assert_eq!(page.playlists.len(), 2);
+        assert_eq!(page.list_page, 2);
+    }
+
+    #[test]
+    fn duplicate_or_empty_pages_stop_pagination() {
+        let mut page = PlaylistsPage::new(vec![SourceId::Kw]);
+        page.scope_index = 1;
+        page.update_playlists(SourceId::Kw, 1, false, vec![playlist("kw-1", SourceId::Kw)]);
+        page.update_playlists(SourceId::Kw, 2, true, vec![playlist("kw-1", SourceId::Kw)]);
+
+        assert!(!page.list_has_more);
+        assert_eq!(page.next_load_request(), None);
     }
 }

@@ -62,7 +62,10 @@ pub fn render(
             },
             Style::new().fg(crate::theme::muted(ctx)),
         )))
-        .render(Rect::new(inner.x, content_y, inner.width, content_height), buf);
+        .render(
+            Rect::new(inner.x, content_y, inner.width, content_height),
+            buf,
+        );
         return;
     }
 
@@ -272,6 +275,16 @@ pub fn handle_input(
                     position: InsertPosition::Next,
                 };
             }
+        }
+        (KeyModifiers::NONE, KeyCode::Char('d')) => {
+            if let Some(song) = history.get(state.selected).cloned() {
+                state.selected = state.selected.min(history.len().saturating_sub(2));
+                return AppAction::RemoveHistory(Box::new(song));
+            }
+        }
+        (KeyModifiers::SHIFT, KeyCode::Char('D')) | (KeyModifiers::NONE, KeyCode::Char('D')) => {
+            state.reset_position();
+            return AppAction::ClearHistory;
         }
         _ => {}
     }

@@ -86,6 +86,8 @@ impl AppContext {
         ));
         let play_mode = crate::playlist::mode::PlayMode::from_config(&config.player.play_mode);
         let playlist = Arc::new(PlaylistManager::new(play_mode));
+        let storage = Storage::new();
+        storage.trim_history(config.player.history_limit);
 
         let player_state = player.state_watcher();
         let position = player.position_watcher();
@@ -110,7 +112,7 @@ impl AppContext {
             config_path,
             notifications: std::sync::RwLock::new(VecDeque::new()),
             desktop_notifier: DesktopNotifier::new(),
-            storage: Storage::new(),
+            storage,
         })
     }
 

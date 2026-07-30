@@ -1924,6 +1924,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "hex",
+ "image",
  "lofty",
  "lx-core",
  "md-5",

@@ -65,8 +65,8 @@ impl MainPage {
     }
 
     /// 终端尺寸变化后重新读取单元格的像素尺寸
-    pub fn refresh_cover_font_size(&mut self) {
-        self.cover.refresh_font_size();
+    pub fn refresh_cover_font_size(&mut self) -> bool {
+        self.cover.refresh_font_size()
     }
 
     /// 强制把封面重新传输给终端，用于终端已丢弃此前图片的场合
@@ -465,8 +465,7 @@ impl MainPage {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        self.cover
-            .sync(ctx.cover_service.image_path().as_deref());
+        self.cover.sync(ctx.cover_service.image_path().as_deref());
         if self.cover.render(geometry.image_rect(inner), buf) {
             return;
         }

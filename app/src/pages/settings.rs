@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
 use lx_core::keybinding::{Action, KeybindingResolver};
+use lx_core::model::source::{Quality, SourceId};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -46,6 +47,12 @@ pub struct SettingsPage {
     pub local_path_mode: bool,
     /// 本地路径列表选中索引
     pub selected_local_path: usize,
+    /// 代理地址输入
+    pub proxy_input: String,
+    /// 代理地址输入模式
+    pub proxy_input_mode: bool,
+    /// 内置音源开关当前指向的音源
+    pub enabled_source_index: usize,
     /// 当前聚焦区域: "js" 或 "local"
     pub focus: String,
 }
@@ -53,7 +60,7 @@ pub struct SettingsPage {
 impl SettingsPage {
     /// 检查是否有任何输入模式激活（JS 源输入或本地路径输入）
     pub fn any_input_active(&self) -> bool {
-        self.input_mode || self.local_path_mode
+        self.input_mode || self.local_path_mode || self.proxy_input_mode
     }
 
     pub fn new() -> Self {
@@ -65,6 +72,9 @@ impl SettingsPage {
             local_path_input: String::new(),
             local_path_mode: false,
             selected_local_path: 0,
+            proxy_input: String::new(),
+            proxy_input_mode: false,
+            enabled_source_index: 0,
             focus: "js".to_string(),
         }
     }
@@ -75,6 +85,9 @@ impl SettingsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
+        if self.proxy_input_mode {
+            return self.handle_proxy_input(key, ctx);
+        }
         if self.local_path_mode {
             return self.handle_local_path_input(key, ctx);
         }
@@ -95,7 +108,9 @@ impl SettingsPage {
                     }
                     return AppAction::None;
                 }
-                (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+                (modifiers, KeyCode::Char(c))
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     self.input_url.push(c);
                 }
                 (KeyModifiers::NONE, KeyCode::Backspace) => {
@@ -202,6 +217,121 @@ impl SettingsPage {
                             Some(format!("播放状态设置已更新，但会话保存失败: {error}"));
                     }
                 }
+                (KeyModifiers::NONE, KeyCode::Char('q')) => {
+                    self.update_config(ctx, |config| {
+                        config.player.quality = next_quality(config.player.quality);
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('H' | 'h'))
+                | (KeyModifiers::NONE, KeyCode::Char('H')) => {
+                    let limit = {
+                        let mut config = ctx.config.write().unwrap();
+                        config.player.history_limit =
+                            next_history_limit(config.player.history_limit);
+                        let limit = config.player.history_limit;
+                        let result = crate::config::loader::save(&config, &ctx.config_path);
+                        self.status_msg = Some(match result {
+                            Ok(()) => format!("历史上限: {limit}"),
+                            Err(error) => format!("保存设置失败: {error}"),
+                        });
+                        limit
+                    };
+                    ctx.storage.trim_history(limit);
+                }
+                (KeyModifiers::NONE, KeyCode::Char('j')) => {
+                    self.cycle_default_source(ctx);
+                }
+                (KeyModifiers::NONE, KeyCode::Char('u')) => {
+                    self.update_config(ctx, |config| {
+                        config.source.auto_toggle = !config.source.auto_toggle;
+                    });
+                }
+                (KeyModifiers::NONE, KeyCode::Char('k')) => {
+                    self.enabled_source_index =
+                        (self.enabled_source_index + 1) % SourceId::all_online().len();
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('K' | 'k'))
+                | (KeyModifiers::NONE, KeyCode::Char('K')) => {
+                    self.toggle_selected_source(ctx);
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('T' | 't'))
+                | (KeyModifiers::NONE, KeyCode::Char('T')) => {
+                    let enabled = {
+                        let mut config = ctx.config.write().unwrap();
+                        config.lyric.show_translation = !config.lyric.show_translation;
+                        let enabled = config.lyric.show_translation;
+                        self.status_msg =
+                            save_status(crate::config::loader::save(&config, &ctx.config_path));
+                        enabled
+                    };
+                    ctx.lyric_service.set_translation_enabled(enabled);
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('Y' | 'y'))
+                | (KeyModifiers::NONE, KeyCode::Char('Y')) => {
+                    let enabled = {
+                        let mut config = ctx.config.write().unwrap();
+                        config.lyric.show_yrc = !config.lyric.show_yrc;
+                        let enabled = config.lyric.show_yrc;
+                        self.status_msg =
+                            save_status(crate::config::loader::save(&config, &ctx.config_path));
+                        enabled
+                    };
+                    ctx.lyric_service.set_yrc_enabled(enabled);
+                }
+                (KeyModifiers::NONE, KeyCode::Char('[')) => {
+                    self.adjust_lyric_offset(ctx, -100);
+                }
+                (KeyModifiers::NONE, KeyCode::Char(']')) => {
+                    self.adjust_lyric_offset(ctx, 100);
+                }
+                (KeyModifiers::NONE, KeyCode::Char('n')) => {
+                    self.proxy_input = ctx.config.read().unwrap().network.proxy_url.clone();
+                    self.proxy_input_mode = true;
+                    self.status_msg = None;
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('N' | 'n'))
+                | (KeyModifiers::NONE, KeyCode::Char('N')) => {
+                    let (proxy, timeout) = {
+                        let mut config = ctx.config.write().unwrap();
+                        config.network.timeout = next_network_timeout(config.network.timeout);
+                        let values = (config.network.proxy_url.clone(), config.network.timeout);
+                        self.status_msg =
+                            save_status(crate::config::loader::save(&config, &ctx.config_path));
+                        values
+                    };
+                    lx_source::configure_network(&proxy, timeout);
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('P' | 'p'))
+                | (KeyModifiers::NONE, KeyCode::Char('P')) => {
+                    self.update_config(ctx, |config| {
+                        config.ui.cover_protocol =
+                            next_cover_protocol(&config.ui.cover_protocol).to_string();
+                    });
+                    if self.status_msg.as_deref() == Some("设置已保存") {
+                        self.status_msg = Some("封面协议已保存，下次启动生效".to_string());
+                    }
+                }
+                (KeyModifiers::NONE, KeyCode::Char('f')) => {
+                    self.update_config(ctx, |config| {
+                        config.ui.max_fps = next_fps(config.ui.max_fps);
+                    });
+                    if self.status_msg.as_deref() == Some("设置已保存") {
+                        self.status_msg = Some("刷新率已保存，下次启动生效".to_string());
+                    }
+                }
+                (KeyModifiers::NONE, KeyCode::Char('z')) => {
+                    self.update_config(ctx, |config| {
+                        config.ui.scroll_amount = next_scroll_amount(config.ui.scroll_amount);
+                    });
+                }
+                (KeyModifiers::NONE, KeyCode::Char('i')) => {
+                    self.update_config(ctx, |config| {
+                        config.integration.mpris = !config.integration.mpris;
+                    });
+                    if self.status_msg.as_deref() == Some("设置已保存") {
+                        self.status_msg = Some("MPRIS 设置已保存，下次启动生效".to_string());
+                    }
+                }
                 (KeyModifiers::NONE, KeyCode::Char('o')) => {
                     self.update_config(ctx, |config| {
                         config.notification.in_app = !config.notification.in_app;
@@ -230,6 +360,12 @@ impl SettingsPage {
                         config.notification.album_cover = !config.notification.album_cover;
                     });
                 }
+                (KeyModifiers::SHIFT, KeyCode::Char('R' | 'r'))
+                | (KeyModifiers::NONE, KeyCode::Char('R')) => {
+                    self.update_config(ctx, |config| {
+                        config.notification.track_change = !config.notification.track_change;
+                    });
+                }
                 (KeyModifiers::NONE, KeyCode::Char('m')) => {
                     let mode = ctx.playlist.cycle_mode();
                     let result = {
@@ -254,6 +390,13 @@ impl SettingsPage {
                         .to_string();
                     });
                 }
+                (KeyModifiers::SHIFT, KeyCode::Char('D' | 'd'))
+                | (KeyModifiers::NONE, KeyCode::Char('D')) => {
+                    self.update_config(ctx, |config| {
+                        config.local_music.max_depth =
+                            next_scan_depth(config.local_music.max_depth);
+                    });
+                }
                 (KeyModifiers::NONE, KeyCode::Char('s')) => {
                     self.focus = if self.focus == "js" { "local" } else { "js" }.to_string();
                 }
@@ -268,6 +411,124 @@ impl SettingsPage {
             }
         }
         AppAction::None
+    }
+
+    fn handle_proxy_input(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.proxy_input_mode = false;
+                self.proxy_input.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let proxy = self.proxy_input.trim().to_string();
+                let timeout = {
+                    let mut config = ctx.config.write().unwrap();
+                    config.network.proxy_url = proxy.clone();
+                    let timeout = config.network.timeout;
+                    self.status_msg =
+                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    timeout
+                };
+                lx_source::configure_network(&proxy, timeout);
+                self.proxy_input_mode = false;
+                self.proxy_input.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.proxy_input.pop();
+            }
+            (modifiers, KeyCode::Char(c))
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.proxy_input.push(c);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn cycle_default_source(&mut self, ctx: &AppContext) {
+        let (default, enabled) = {
+            let config = ctx.config.read().unwrap();
+            (config.source.default, config.source.enabled.clone())
+        };
+        if enabled.is_empty() {
+            self.status_msg = Some("请先启用至少一个在线音源".to_string());
+            return;
+        }
+        let current = enabled
+            .iter()
+            .position(|source| *source == default)
+            .unwrap_or(0);
+        let default = enabled[(current + 1) % enabled.len()];
+        let save_result = {
+            let mut config = ctx.config.write().unwrap();
+            config.source.default = default;
+            crate::config::loader::save(&config, &ctx.config_path)
+        };
+        ctx.source_manager
+            .update_source_preferences(default, &enabled);
+        self.status_msg = Some(match save_result {
+            Ok(()) => format!("默认音源: {}", default.as_str()),
+            Err(error) => format!("默认音源已切换，但保存失败: {error}"),
+        });
+    }
+
+    fn toggle_selected_source(&mut self, ctx: &AppContext) {
+        let source = SourceId::all_online()[self.enabled_source_index];
+        let (default, enabled, save_result) = {
+            let mut config = ctx.config.write().unwrap();
+            if config.source.enabled.contains(&source) {
+                if config.source.enabled.len() == 1 {
+                    self.status_msg = Some("至少需要保留一个在线音源".to_string());
+                    return;
+                }
+                config.source.enabled.retain(|item| *item != source);
+                if config.source.default == source {
+                    config.source.default = config.source.enabled[0];
+                }
+            } else {
+                config.source.enabled.push(source);
+                config.source.enabled.sort_by_key(|item| {
+                    SourceId::all_online()
+                        .iter()
+                        .position(|candidate| candidate == item)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+            let default = config.source.default;
+            let enabled = config.source.enabled.clone();
+            let save_result = crate::config::loader::save(&config, &ctx.config_path);
+            (default, enabled, save_result)
+        };
+        ctx.source_manager
+            .update_source_preferences(default, &enabled);
+        self.status_msg = Some(match save_result {
+            Ok(()) => format!(
+                "{}音源 {}",
+                source.as_str(),
+                if enabled.contains(&source) {
+                    "已启用"
+                } else {
+                    "已禁用"
+                }
+            ),
+            Err(error) => format!("音源设置已更新，但保存失败: {error}"),
+        });
+    }
+
+    fn adjust_lyric_offset(&mut self, ctx: &AppContext, delta: i32) {
+        let offset = {
+            let mut config = ctx.config.write().unwrap();
+            config.lyric.offset = config
+                .lyric
+                .offset
+                .saturating_add(delta)
+                .clamp(-5_000, 5_000);
+            let offset = config.lyric.offset;
+            self.status_msg = save_status(crate::config::loader::save(&config, &ctx.config_path));
+            offset
+        };
+        ctx.lyric_service.set_offset_ms(offset);
     }
 
     /// 处理本地音乐路径输入模式
@@ -307,7 +568,9 @@ impl SettingsPage {
                 }
                 AppAction::None
             }
-            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+            (modifiers, KeyCode::Char(c))
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 self.local_path_input.push(c);
                 AppAction::None
             }
@@ -431,11 +694,21 @@ impl SettingsPage {
         let accent = crate::theme::accent(ctx);
         let muted = crate::theme::muted(ctx);
         let chunks = settings_chunks(area);
+        let proxy_label = if config.network.proxy_url.is_empty() {
+            "未设置".to_string()
+        } else {
+            shorten_source(&config.network.proxy_url, 18)
+        };
+        let scan_depth_label = if config.local_music.max_depth == 0 {
+            "不限".to_string()
+        } else {
+            config.local_music.max_depth.to_string()
+        };
 
         let options_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(" 界面与播放 · t/g/w/c/e/o/O/x/X/m/p · b 登录/退出 ");
+            .title(" 设置选项 ");
         let options_inner = options_block.inner(chunks[0]);
         options_block.render(chunks[0], buf);
         let options = vec![
@@ -450,6 +723,83 @@ impl SettingsPage {
                 accent,
                 muted,
             ),
+            setting_value_line(
+                "播放音质",
+                quality_label(config.player.quality),
+                "q",
+                accent,
+                muted,
+            ),
+            setting_value_line("播放模式", ctx.playlist.mode().label(), "m", accent, muted),
+            setting_value_line(
+                "历史上限",
+                &config.player.history_limit.to_string(),
+                "H",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "默认音源",
+                config.source.default.as_str(),
+                "j",
+                accent,
+                muted,
+            ),
+            setting_line("自动换源", config.source.auto_toggle, "u", accent, muted),
+            {
+                let source = SourceId::all_online()
+                    [self.enabled_source_index % SourceId::all_online().len()];
+                setting_value_line(
+                    "音源开关",
+                    &format!(
+                        "{} {}",
+                        source.as_str(),
+                        enabled(config.source.enabled.contains(&source))
+                    ),
+                    "k/K",
+                    accent,
+                    muted,
+                )
+            },
+            setting_line(
+                "歌词翻译",
+                config.lyric.show_translation,
+                "T",
+                accent,
+                muted,
+            ),
+            setting_line("逐字歌词", config.lyric.show_yrc, "Y", accent, muted),
+            setting_value_line(
+                "歌词偏移",
+                &format!("{:+} ms", config.lyric.offset),
+                "[/]",
+                accent,
+                muted,
+            ),
+            setting_value_line("网络代理", &proxy_label, "n", accent, muted),
+            setting_value_line(
+                "网络超时",
+                &format!("{} 秒", config.network.timeout),
+                "N",
+                accent,
+                muted,
+            ),
+            setting_value_line("封面协议", &config.ui.cover_protocol, "P", accent, muted),
+            setting_value_line(
+                "最大 FPS",
+                &config.ui.max_fps.to_string(),
+                "f",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "滚动步长",
+                &config.ui.scroll_amount.to_string(),
+                "z",
+                accent,
+                muted,
+            ),
+            setting_line("MPRIS", config.integration.mpris, "i", accent, muted),
             Line::from(vec![
                 Span::styled(" [o/O] ", Style::new().fg(muted)),
                 Span::raw("TUI 通知   "),
@@ -470,20 +820,18 @@ impl SettingsPage {
                 accent,
                 muted,
             ),
-            Line::from(vec![
-                Span::styled(" [m] ", Style::new().fg(muted)),
-                Span::raw("播放模式   "),
-                Span::styled(ctx.playlist.mode().label(), Style::new().fg(accent)),
-            ]),
+            setting_line(
+                "切歌通知",
+                config.notification.track_change,
+                "R",
+                accent,
+                muted,
+            ),
             Line::from(vec![
                 Span::styled(" [p] ", Style::new().fg(muted)),
                 Span::raw(format!("主题强调色  {}", config.theme.accent)),
             ]),
-            Line::from(format!(
-                " 音源        {} · 自动换源 {}",
-                config.source.default.as_str(),
-                enabled(config.source.auto_toggle)
-            )),
+            setting_value_line("扫描深度", &scan_depth_label, "D", accent, muted),
             Line::from(vec![
                 Span::styled(" [b] ", Style::new().fg(muted)),
                 Span::raw("哔哩哔哩    "),
@@ -517,15 +865,16 @@ impl SettingsPage {
         let source_inner = source_block.inner(chunks[1]);
         source_block.render(chunks[1], buf);
         if source_inner.height > 0 {
-            let source_state = if ctx.source_manager.has_js_source() {
+            let loaded_sources = ctx.source_manager.js_source_count();
+            let source_state = if loaded_sources > 0 {
                 (
-                    "已就绪，播放/歌词/封面由 JS 音源解析",
+                    format!("{loaded_sources} 个音源已就绪，按列表顺序解析"),
                     crate::theme::green(ctx),
                 )
             } else if sources.is_empty() {
-                ("尚未导入 JS 音源", crate::theme::yellow(ctx))
+                ("尚未导入 JS 音源".to_string(), crate::theme::yellow(ctx))
             } else {
-                ("加载中或加载失败", crate::theme::yellow(ctx))
+                ("加载中或加载失败".to_string(), crate::theme::yellow(ctx))
             };
             Paragraph::new(Line::from(Span::styled(
                 format!(" {}", source_state.0),
@@ -718,6 +1067,24 @@ impl SettingsPage {
 
             Paragraph::new(Line::from(format!("{}{}", self.input_url, cursor))).render(inner, buf);
         }
+
+        if self.proxy_input_mode {
+            let width = area.width.saturating_sub(4).min(74);
+            let input_area = Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(3) / 2,
+                width,
+                3.min(area.height),
+            );
+            Clear.render(input_area, buf);
+            let input_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(crate::theme::green(ctx)))
+                .title("输入代理地址，留空表示关闭");
+            let inner = input_block.inner(input_area);
+            input_block.render(input_area, buf);
+            Paragraph::new(Line::from(self.proxy_input.as_str())).render(inner, buf);
+        }
     }
 
     pub fn handle_mouse(
@@ -751,12 +1118,29 @@ impl SettingsPage {
                         2 => Some('w'),
                         3 => Some('c'),
                         4 => Some('e'),
-                        5 => Some('o'),
-                        6 => Some('x'),
-                        7 => Some('X'),
-                        8 => Some('m'),
-                        9 => Some('p'),
-                        11 => Some('b'),
+                        5 => Some('q'),
+                        6 => Some('m'),
+                        7 => Some('H'),
+                        8 => Some('j'),
+                        9 => Some('u'),
+                        10 => Some('K'),
+                        11 => Some('T'),
+                        12 => Some('Y'),
+                        13 => Some(']'),
+                        14 => Some('n'),
+                        15 => Some('N'),
+                        16 => Some('P'),
+                        17 => Some('f'),
+                        18 => Some('z'),
+                        19 => Some('i'),
+                        20 => Some('o'),
+                        21 => Some('O'),
+                        22 => Some('x'),
+                        23 => Some('X'),
+                        24 => Some('R'),
+                        25 => Some('p'),
+                        26 => Some('D'),
+                        27 => Some('b'),
                         _ => None,
                     };
                     if let Some(key) = key {
@@ -814,8 +1198,106 @@ fn setting_line(label: &str, value: bool, key: &str, accent: Color, muted: Color
     ])
 }
 
-const SETTINGS_OPTION_COUNT: u16 = 12;
-const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 52;
+fn setting_value_line(
+    label: &str,
+    value: &str,
+    key: &str,
+    accent: Color,
+    muted: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" [{key}] "), Style::new().fg(muted)),
+        Span::raw(format!("{label:<10} ")),
+        Span::styled(value.to_string(), Style::new().fg(accent)),
+    ])
+}
+
+fn save_status(result: anyhow::Result<()>) -> Option<String> {
+    Some(match result {
+        Ok(()) => "设置已保存".to_string(),
+        Err(error) => format!("保存设置失败: {error}"),
+    })
+}
+
+fn next_quality(quality: Quality) -> Quality {
+    match quality {
+        Quality::Low128 => Quality::High320,
+        Quality::High320 => Quality::Flac,
+        Quality::Flac => Quality::Flac24,
+        Quality::Flac24 => Quality::Low128,
+    }
+}
+
+fn quality_label(quality: Quality) -> &'static str {
+    match quality {
+        Quality::Low128 => "128k",
+        Quality::High320 => "320k",
+        Quality::Flac => "FLAC",
+        Quality::Flac24 => "Hi-Res",
+    }
+}
+
+fn next_history_limit(limit: usize) -> usize {
+    match limit {
+        0..=25 => 50,
+        26..=50 => 100,
+        51..=100 => 200,
+        101..=200 => 500,
+        _ => 25,
+    }
+}
+
+fn next_network_timeout(timeout: u64) -> u64 {
+    match timeout {
+        0..=5 => 10,
+        6..=10 => 15,
+        11..=15 => 30,
+        16..=30 => 60,
+        _ => 5,
+    }
+}
+
+fn next_cover_protocol(protocol: &str) -> &'static str {
+    match protocol {
+        "auto" => "kitty",
+        "kitty" => "sixel",
+        "sixel" => "iterm2",
+        "iterm2" => "halfblocks",
+        _ => "auto",
+    }
+}
+
+fn next_fps(fps: u32) -> u32 {
+    match fps {
+        0..=10 => 20,
+        11..=20 => 30,
+        21..=30 => 60,
+        _ => 10,
+    }
+}
+
+fn next_scroll_amount(amount: usize) -> usize {
+    match amount {
+        0..=1 => 3,
+        2..=3 => 5,
+        4..=5 => 10,
+        _ => 1,
+    }
+}
+
+fn next_scan_depth(depth: u32) -> u32 {
+    match depth {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3..=4 => 8,
+        5..=8 => 16,
+        _ => 0,
+    }
+}
+
+const SETTINGS_OPTION_COUNT: u16 = 28;
+const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
     if !setting_options_use_two_columns(area) {
@@ -870,25 +1352,17 @@ fn setting_options_height(panel_width: u16) -> u16 {
 
 fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
     if area.width >= 72 {
-        // 宽屏：上排 options + sources，下排 local music
-        let option_width = area.width.saturating_mul(42) / 100;
-        let top_height = setting_options_height(option_width).min(area.height);
-        let top = Layout::default()
+        // 宽屏：选项占满上排，JS 音源与本地目录共享下排。
+        let option_height = setting_options_height(area.width).min(area.height);
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(option_height), Constraint::Min(0)])
+            .split(area);
+        let bottom = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(Rect::new(area.x, area.y, area.width, top_height));
-        let bottom_y = top[0].bottom();
-        let bottom = if bottom_y < area.bottom() {
-            Rect::new(
-                area.x,
-                bottom_y,
-                area.width,
-                area.bottom().saturating_sub(bottom_y),
-            )
-        } else {
-            Rect::new(area.x, bottom_y, area.width, 0)
-        };
-        std::rc::Rc::new([top[0], top[1], bottom])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(vertical[1]);
+        std::rc::Rc::new([vertical[0], bottom[0], bottom[1]])
     } else {
         // 三块垂直布局
         let option_height = setting_options_height(area.width).min(area.height);
@@ -923,10 +1397,20 @@ mod tests {
     fn narrow_settings_use_two_columns_when_the_width_allows_it() {
         let chunks = settings_chunks(Rect::new(0, 0, 60, 24));
 
-        assert_eq!(chunks[0].height, 8);
+        assert_eq!(chunks[0].height, 16);
         assert!(chunks[1].height > 0);
         assert!(chunks[2].height > 0);
         assert_eq!(chunks[2].bottom(), 24);
+    }
+
+    #[test]
+    fn wide_settings_keep_both_source_lists_visible() {
+        let chunks = settings_chunks(Rect::new(0, 0, 120, 30));
+
+        assert_eq!(chunks[0].height, 16);
+        assert_eq!(chunks[1].y, chunks[0].bottom());
+        assert_eq!(chunks[2].y, chunks[0].bottom());
+        assert_eq!(chunks[1].width + chunks[2].width, 120);
     }
 
     #[test]

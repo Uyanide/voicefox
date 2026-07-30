@@ -8,8 +8,35 @@ use std::thread;
 /// 图形序列是否需要经 tmux passthrough，判据对齐 ratatui-image 的
 /// detect_tmux_and_outer_protocol_from_env
 pub fn is_passthrough() -> bool {
-    std::env::var("TERM").is_ok_and(|term| term.starts_with("tmux"))
-        || std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "tmux")
+    is_passthrough_from(
+        std::env::var_os("TMUX").is_some(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    )
+}
+
+/// 让 ratatui-image 在 `TERM=screen-*` 的常见 tmux 环境中启用 passthrough。
+///
+/// 必须在程序创建任何线程前调用，因为修改进程环境不是线程安全操作。
+pub fn prepare_ratatui_image_environment() {
+    let tmux_present = std::env::var_os("TMUX").is_some();
+    let ratatui_image_detects_tmux = is_passthrough_from(
+        false,
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    );
+    if tmux_present && !ratatui_image_detects_tmux {
+        // SAFETY: main() 在创建 Tokio runtime 和其他工作线程前调用本函数。
+        unsafe {
+            std::env::set_var("TERM_PROGRAM", "tmux");
+        }
+    }
+}
+
+fn is_passthrough_from(tmux_present: bool, term: Option<&str>, term_program: Option<&str>) -> bool {
+    tmux_present
+        || term.is_some_and(|term| term.starts_with("tmux"))
+        || term_program == Some("tmux")
 }
 
 pub struct AttachWatcher {
@@ -124,7 +151,21 @@ fn tmux(args: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::session_target_from;
+    use super::{is_passthrough_from, session_target_from};
+
+    #[test]
+    fn tmux_environment_variable_detects_screen_term_sessions() {
+        assert!(is_passthrough_from(
+            true,
+            Some("screen-256color"),
+            Some("foot")
+        ));
+        assert!(!is_passthrough_from(
+            false,
+            Some("screen-256color"),
+            Some("foot")
+        ));
+    }
 
     #[test]
     fn the_session_target_comes_from_the_third_field_of_tmux_env() {
