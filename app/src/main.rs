@@ -1169,7 +1169,11 @@ fn run_app(
             }
 
             // 1b. 全局快捷键（查表模式，保留完全相同的默认行为）
-            if let Some(action) = kb_resolver.resolve_global(&key) {
+            // 设置页的选项键覆盖了大半个字母表，与全局键位必然冲突，交由页面独占
+            let settings_owns_key = active_tab == NavTab::Settings
+                && !text_input_active
+                && pages::settings::SettingsPage::consumes_key(&key, &kb_resolver);
+            if !settings_owns_key && let Some(action) = kb_resolver.resolve_global(&key) {
                 match action {
                     Action::GlobalQuit if !text_input_active => {
                         tracing::info!("quit requested");
@@ -1199,9 +1203,7 @@ fn run_app(
                         needs_render = true;
                         continue;
                     }
-                    Action::GlobalPrevTrack
-                        if !text_input_active && active_tab != NavTab::Settings =>
-                    {
+                    Action::GlobalPrevTrack if !text_input_active => {
                         if let Some((songs, index)) = ctx.playlist.prev_manual_entry() {
                             execute_action(
                                 AppAction::PlaySong { songs, index },
@@ -2804,7 +2806,7 @@ fn execute_action(
                 };
                 let mut settings = settings.lock().unwrap();
                 if errors.is_empty() {
-                    settings.status_msg = Some(format!("扫描完成，共 {} 首", count));
+                    settings.status_msg = Some(format!("本地音乐扫描完成，共 {} 首", count));
                     let _ = tx.send(AppAction::ShowNotification(Notification::success(format!(
                         "本地音乐扫描完成，共 {} 首",
                         count
