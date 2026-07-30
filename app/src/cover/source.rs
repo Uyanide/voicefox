@@ -11,10 +11,10 @@ use super::layout::DEFAULT_IMAGE_ASPECT;
 /// 临时文件名的流水号
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 临时文件名里的记号
+/// 临时文件名中的标记
 const TEMP_INFIX: &str = ".part.";
 
-/// 比这个新的临时文件当作别的实例正在写，不动
+/// 临时文件在此时长内被视为其他实例正在写入
 const TEMP_GRACE: Duration = Duration::from_secs(60);
 
 /// 封面缓存目录
@@ -25,7 +25,7 @@ fn cache_dir() -> PathBuf {
         .join("covers")
 }
 
-/// 清掉进程被强杀时留在缓存目录里的临时文件
+/// 清理进程异常退出后残留在缓存目录里的临时文件
 pub async fn sweep_temp_files() {
     let Ok(mut entries) = tokio::fs::read_dir(cache_dir()).await else {
         return;
@@ -87,8 +87,8 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
                 aspect,
             });
         }
-        // 探不出宽高说明文件损坏
-        // 也可能是因为实际为 image crate default-formats 不包括的格式，但反正不认识，和损坏没两样
+        // 读不到宽高说明缓存文件已损坏，需要重新下载。
+        // 也可能是 image crate default-formats 未包含的格式，但同样无法处理，因此视作损坏。
         None if cache_path.exists() => {
             tracing::debug!("cover cache {cache_path:?} is unreadable, downloading again");
             let _ = tokio::fs::remove_file(&cache_path).await;
@@ -148,7 +148,7 @@ fn write_cache_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         })
 }
 
-/// 读图片文件头取像素宽高比，错误返回 None
+/// 读取图片文件头取像素宽高比，失败返回 None
 fn probe_aspect_blocking(path: &std::path::Path) -> Option<f32> {
     let (width, height) = image::ImageReader::open(path)
         .ok()?
@@ -208,7 +208,7 @@ mod tests {
 
     use super::{probe_aspect_blocking, write_cache_file};
 
-    /// 建一个空的临时目录，返回路径
+    /// 创建一个空的临时目录，返回路径
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("voicefox-cache-{name}"));
         let _ = std::fs::remove_dir_all(&path);
@@ -216,7 +216,7 @@ mod tests {
         path
     }
 
-    /// 目录里的文件名，排过序
+    /// 目录里的文件名，已排序
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -232,7 +232,7 @@ mod tests {
         let target = dir.join("cover.jpg");
         std::fs::write(&target, b"old").unwrap();
 
-        // 先攥住旧文件的句柄，rename 换掉的只是目录项
+        // 先持有旧文件的句柄，rename 替换的只是目录项
         let mut old_handle = std::fs::File::open(&target).unwrap();
         write_cache_file(&target, b"new").unwrap();
 
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn a_failed_cache_write_leaves_no_temp_file() {
         let dir = temp_dir("failed");
-        // 目标是个目录，rename 过不去
+        // 目标是目录，rename 无法完成
         let target = dir.join("cover.jpg");
         std::fs::create_dir(&target).unwrap();
 

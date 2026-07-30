@@ -346,7 +346,7 @@ fn open_external_url(url: &str) {
     }
 }
 
-/// 两次自动重传封面之间的最小间隔。启用 focus-events 时不止 detach/attach 会发来事件，需要防抖
+/// 两次自动重传封面之间的最小间隔，client-attached hook 可能连续触发，需要防抖
 const COVER_REDRAW_THROTTLE: Duration = Duration::from_secs(2);
 
 #[allow(unused_assignments)]
@@ -438,7 +438,7 @@ fn run_app(
     let mut last_notification_cleanup = Instant::now();
     let mut last_playback_session_save = Instant::now();
     let mut mouse_capture_enabled = ctx.config.read().unwrap().ui.enable_mouse;
-    // 装 tmux 的 client-attached hook，析构时自己摘掉
+    // 安装 tmux 的 client-attached hook，析构时自动卸载
     let attach_watcher = tmux::AttachWatcher::install();
     let mut last_cover_redraw = Instant::now() - COVER_REDRAW_THROTTLE;
     #[cfg(target_os = "linux")]
@@ -985,7 +985,7 @@ fn run_app(
             last_periodic_render = Instant::now();
         }
 
-        // 封面的解码和编码在后台线程上跑，算完了才有东西可画
+        // 封面的解码与编码在后台线程进行，完成后才有内容可以绘制
         needs_render |= main_page.poll_cover();
 
         // 在读取下一个事件前先补画上一轮状态。这样即使 key repeat 每轮都
@@ -3043,7 +3043,7 @@ fn should_retransmit_cover(since_last_redraw: Duration) -> bool {
     since_last_redraw >= COVER_REDRAW_THROTTLE
 }
 
-/// 把封面重新传给终端，并强制下一帧全量重绘
+/// 把封面重新传输给终端，并强制下一帧全量重绘
 fn retransmit_cover(
     terminal: &mut DefaultTerminal,
     main_page: &mut pages::main_page::MainPage,
@@ -3051,9 +3051,9 @@ fn retransmit_cover(
     main_page.force_cover_reload();
     // detach 期间照常渲染，缓冲区内容不变，不清屏则不会重发任何序列
     //
-    // 这里不能用 Terminal::clear，它会先发 ESC[6n 读回光标位置。ratatui-image
-    // 的启动探测把 ESC[5n 包在 tmux passthrough 里发给外层终端，外层终端不应答时
-    // 它那个读 stdin 的线程会一直留着，抢走后续所有终端应答
+    // 此处不能用 Terminal::clear，它会先发 ESC[6n 读回光标位置。ratatui-image
+    // 的启动探测把 ESC[5n 包在 tmux passthrough 里发给外层终端，外层终端不应答时，
+    // 它读 stdin 的线程会一直留存，抢走后续所有终端应答
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))?;
     Ok(())

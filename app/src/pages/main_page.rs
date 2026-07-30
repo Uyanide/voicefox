@@ -54,22 +54,22 @@ impl MainPage {
         }
     }
 
-    /// 放掉解码好的封面
+    /// 释放已解码的封面
     pub fn release_cover_image(&mut self) {
         self.cover.sync(None);
     }
 
-    /// 收取封面后台线程算完的解码/编码结果，返回是否需要重画
+    /// 收取封面后台线程返回的解码与编码结果，返回是否需要重绘
     pub fn poll_cover(&mut self) -> bool {
         self.cover.poll()
     }
 
-    /// 终端尺寸变化后重新读单元格像素尺寸
+    /// 终端尺寸变化后重新读取单元格的像素尺寸
     pub fn refresh_cover_font_size(&mut self) {
         self.cover.refresh_font_size();
     }
 
-    /// 强制把封面重新传给终端，用于终端已经不认识之前那张图的场合
+    /// 强制把封面重新传输给终端，用于终端已丢弃此前图片的场合
     pub fn force_cover_reload(&mut self) {
         self.cover.force_reload();
     }
@@ -229,8 +229,8 @@ impl MainPage {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
                 .split(area);
-            // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_LYRIC_HEIGHT。
-            // 关掉封面时左栏整个归歌词
+            // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_HEIGHT。
+            // 关闭封面时左栏全部用于歌词
             let geometry = ctx.config.read().unwrap().ui.show_cover.then(|| {
                 CoverGeometry::from_font_size(
                     self.cover.font_size(),
@@ -450,7 +450,7 @@ fn queue_area(area: Rect) -> Rect {
 }
 
 impl MainPage {
-    /// 画封面框，失败退回文字占位。
+    /// 绘制封面框，无法绘制封面时退回文字占位
     fn render_cover(
         &mut self,
         area: Rect,

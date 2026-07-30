@@ -55,7 +55,7 @@ impl CoverService {
         *self.state.write().unwrap() = CoverState::Empty;
     }
 
-    /// 当前封面的本地路径，供渲染层解码
+    /// 当前封面的本地路径
     pub fn image_path(&self) -> Option<String> {
         self.image
             .read()
@@ -77,7 +77,7 @@ impl CoverService {
         self.state.read().unwrap().clone()
     }
 
-    /// 仅缓存封面，不修改当前显示的封面。
+    /// 把封面下载到本地缓存，不改变当前显示的封面
     pub async fn cache_path(&self, url: Option<String>) -> Result<Option<String>, String> {
         let Some(url) = url
             .map(|url| source::normalize_url(&url))

@@ -13,25 +13,25 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
 use ratatui_image::{FilterType, FontSize, Resize, ResizeEncodeRender};
 
-/// 用 Scale 而不是 Fit：Fit 内部是 min(area, image)，只缩不放
+/// 封面缩放到封面框的尺寸，放大与缩小都按 Triangle 采样
 const RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
 
 /// 解码后的最长边上限
 const MAX_DECODED_EDGE: u32 = 1024;
 
-/// 等终端回答能力查询的上限
+/// 等待终端应答能力查询的超时上限
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 主线程 → 解码线程
+/// 主线程发给解码线程的请求
 struct DecodeJob {
     path: String,
-    /// 建 protocol 用，字号变了这里跟着变
+    /// 构造 protocol 用的 Picker，携带当前的终端字号
     picker: Picker,
     /// 请求序号
     id: u64,
 }
 
-/// 后台线程 → 主线程
+/// 后台线程返回给主线程的结果
 enum Done {
     Loaded {
         id: u64,
@@ -43,13 +43,13 @@ enum Done {
 pub struct CoverRenderer {
     picker: Picker,
     enabled: bool,
-    /// 解码请求
+    /// 解码请求的发送端
     decode_tx: Sender<DecodeJob>,
-    /// 后台线程的结果
+    /// 后台线程结果的接收端
     done_rx: Receiver<Done>,
-    /// 图片状态。内部为空表示后台正在算
+    /// 封面的图形协议状态，内部为空表示后台线程尚未返回结果
     protocol: ThreadProtocol,
-    /// 当前是否有封面要显示
+    /// 当前是否有封面可以显示
     has_image: bool,
     /// 已经开始解码的路径
     loaded: Option<String>,
@@ -62,7 +62,7 @@ pub struct CoverRenderer {
 impl CoverRenderer {
     /// 探测终端图形能力并返回实例
     ///
-    /// 会向终端发查询序列并直接读 stdin，只能在事件循环起来之前调用一次。
+    /// 会向终端发送查询序列并直接读取 stdin，只能在事件循环启动前调用一次。
     pub fn detect(cover_protocol: &str) -> Self {
         let options = QueryStdioOptions {
             timeout: QUERY_TIMEOUT,
@@ -77,7 +77,7 @@ impl CoverRenderer {
         }
 
         let mut renderer = Self::spawn(picker);
-        // 记下 ioctl 的基准读数
+        // 记录 ioctl 的基准读数
         renderer.refresh_font_size();
         tracing::info!(
             "cover protocol {:?}, font size {:?}",
@@ -106,12 +106,12 @@ impl CoverRenderer {
         }
     }
 
-    /// 终端单元格的像素尺寸，供 [`super::CoverGeometry`] 排版
+    /// 终端单元格的像素尺寸
     pub fn font_size(&self) -> FontSize {
         self.picker.font_size()
     }
 
-    /// 把渲染器同步到给定封面路径。只有路径变化时才派活给后台线程
+    /// 把渲染器同步到给定的封面路径，路径变化时才向后台线程发起解码
     pub fn sync(&mut self, path: Option<&str>) {
         if !self.enabled {
             return;
@@ -136,7 +136,7 @@ impl CoverRenderer {
         }
     }
 
-    /// 派一次解码，旧图立刻撤下
+    /// 发起一次解码，同时清空当前的封面
     fn dispatch_decode(&mut self, path: String) {
         self.request_id += 1;
         self.protocol.empty_protocol();
@@ -150,7 +150,7 @@ impl CoverRenderer {
             .is_ok();
     }
 
-    /// 强制重新传一遍当前封面
+    /// 强制重新传输当前封面
     pub fn force_reload(&mut self) {
         if !self.enabled || self.picker.protocol_type() == ProtocolType::Halfblocks {
             return;
@@ -160,7 +160,7 @@ impl CoverRenderer {
         }
     }
 
-    /// 重新读终端的单元格像素尺寸，变了就按新尺寸重新解码当前封面
+    /// 重新读取终端的单元格像素尺寸，尺寸变化时按新尺寸重新解码当前封面
     pub fn refresh_font_size(&mut self) {
         if !self.enabled {
             return;
@@ -169,20 +169,20 @@ impl CoverRenderer {
             return;
         };
         match self.probed.replace(font_size) {
-            // 读数没变
+            // 单元格尺寸与上次读到的一致
             Some(previous)
                 if previous.width == font_size.width && previous.height == font_size.height =>
             {
                 return;
             }
-            // 第一次读。保留 Picker 查询的字号(若有)
-            // 依赖 capabilities 非空 => 字号非 arbitrary，无文档
+            // 第一次读取时保留 Picker 查询到的字号
+            // capabilities 非空说明字号来自终端应答，ratatui-image 未文档化此关系
             None if !self.picker.capabilities().is_empty() => return,
             _ => {}
         }
         tracing::debug!("cell size is now {font_size:?}");
 
-        // Picker 没有单独改字号的接口，重建一个，把探测到的协议带过去
+        // Picker 没有单独设置字号的接口，重建一个并沿用探测到的协议
         #[allow(deprecated)]
         let mut picker = Picker::from_fontsize(font_size);
         picker.set_protocol_type(self.picker.protocol_type());
@@ -193,13 +193,13 @@ impl CoverRenderer {
         }
     }
 
-    /// 收取后台线程算完的结果，返回是否需要重画
+    /// 收取后台线程返回的结果，返回是否需要重绘
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         loop {
             match self.done_rx.try_recv() {
                 Ok(Done::Loaded { id, protocol }) => {
-                    // 对不上说明封面换过了
+                    // id 与当前请求不一致说明封面已经更换
                     if id != self.request_id {
                         continue;
                     }
@@ -213,7 +213,7 @@ impl CoverRenderer {
                     changed = true;
                 }
                 Ok(Done::Resized(result)) => match *result {
-                    // 过期的结果会被 ThreadProtocol 按 id 丢掉
+                    // 过期的结果由 ThreadProtocol 按 id 丢弃
                     Ok(response) => changed |= self.protocol.update_resized_protocol(response),
                     Err(error) => {
                         tracing::debug!("cover encode failed: {error}");
@@ -228,7 +228,7 @@ impl CoverRenderer {
         changed
     }
 
-    /// 画封面，返回 false 表示没画
+    /// 绘制封面，返回 false 表示未绘制
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) -> bool {
         if !self.has_image || area.width == 0 || area.height == 0 {
             return false;
@@ -241,7 +241,7 @@ impl CoverRenderer {
     }
 }
 
-/// 起解码线程和编码线程
+/// 启动解码线程与编码线程，返回两个线程是否都启动成功
 fn spawn_workers(
     decode_rx: Receiver<DecodeJob>,
     encode_rx: Receiver<ResizeRequest>,
@@ -322,7 +322,7 @@ fn shrink(image: image::DynamicImage) -> image::DynamicImage {
     image.resize(MAX_DECODED_EDGE, MAX_DECODED_EDGE, FilterType::Triangle)
 }
 
-/// 解析配置里的 ui.cover_protocol，None 表示交给探测
+/// 解析配置里的 ui.cover_protocol，None 表示由终端探测决定
 fn parse_protocol(value: &str) -> Option<ProtocolType> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "auto" => None,
@@ -360,7 +360,7 @@ mod tests {
         CoverRenderer::spawn(Picker::halfblocks())
     }
 
-    /// 走真正会往终端传图的协议的渲染器
+    /// 采用会向终端传输图片的协议的渲染器
     fn kitty_renderer() -> CoverRenderer {
         #[allow(deprecated)]
         let mut picker = Picker::from_fontsize(FontSize::new(8, 16));
@@ -368,12 +368,12 @@ mod tests {
         CoverRenderer::spawn(picker)
     }
 
-    /// 存一张 16x16 的纯色 PNG，返回路径
+    /// 写入一张 16x16 的纯色 PNG，返回路径
     fn write_image(name: &str, color: [u8; 3]) -> String {
         write_sized_image(name, 16, 16, color)
     }
 
-    /// 存一张指定尺寸的纯色 PNG，返回路径
+    /// 写入一张指定尺寸的纯色 PNG，返回路径
     fn write_sized_image(name: &str, width: u32, height: u32, color: [u8; 3]) -> String {
         let path = std::env::temp_dir().join(format!("voicefox-cover-{name}.png"));
         let pixel = image::Rgb(color);
@@ -383,7 +383,7 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
-    /// 一直转到后台把解码和编码都干完，返回画出来的 buffer
+    /// 轮询至后台完成解码与编码，返回绘制出的 buffer
     fn settle(renderer: &mut CoverRenderer) -> Buffer {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -409,12 +409,12 @@ mod tests {
         let red = write_image("red", [255, 0, 0]);
         let mut renderer = renderer();
 
-        // 还没有封面
+        // 尚无封面
         let mut buf = Buffer::empty(AREA);
         assert!(!renderer.render(AREA, &mut buf));
 
         renderer.sync(Some(&red));
-        // 后台还在解码：框仍然归渲染器管，但这一帧留白
+        // 后台仍在解码：封面框由渲染器绘制，这一帧留白
         let mut buf = Buffer::empty(AREA);
         assert!(renderer.render(AREA, &mut buf));
         assert_eq!(buf, Buffer::empty(AREA));
@@ -429,7 +429,7 @@ mod tests {
         let green = write_image("fresh", [0, 255, 0]);
         let mut renderer = renderer();
 
-        // 中间不 poll，红色那次的结果回来时序号已经过期，必须被丢掉
+        // 两次 sync 之间不 poll，红色的结果返回时序号已经过期，必须被丢弃
         renderer.sync(Some(&red));
         renderer.sync(Some(&green));
 
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(parse_protocol("SIXEL"), Some(ProtocolType::Sixel));
         assert_eq!(parse_protocol("iterm"), Some(ProtocolType::Iterm2));
         assert_eq!(parse_protocol("halfblocks"), Some(ProtocolType::Halfblocks));
-        // 非致命错误
+        // 拼写错误退回 auto
         assert_eq!(parse_protocol("kity"), None);
     }
 }

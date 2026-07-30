@@ -3,10 +3,10 @@
 use ratatui::layout::Rect;
 use ratatui_image::FontSize;
 
-/// 封面宽高比的合理范围
+// 封面宽高比的合理范围
 const MIN_IMAGE_ASPECT: f32 = 0.2;
 const MAX_IMAGE_ASPECT: f32 = 5.0;
-/// 回退方图
+/// 封面宽高比的回退值，1.0 为方图
 pub const DEFAULT_IMAGE_ASPECT: f32 = 1.0;
 
 /// 终端单元格的高宽比回退值
@@ -22,7 +22,7 @@ pub struct CoverGeometry {
 }
 
 impl CoverGeometry {
-    /// 拒绝 NaN、无穷、非正数等极端值
+    /// 把数值夹进 [min, max]，非有限值与非正数取 fallback
     fn sanitize(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
         if value.is_finite() && value > 0.0 {
             value.clamp(min, max)
@@ -43,7 +43,7 @@ impl CoverGeometry {
         }
     }
 
-    /// 用 Picker 探测到的字体像素尺寸构造，探测不出来时回退到 2:1 的单元格
+    /// 用终端字体的像素尺寸构造，宽或高为 0 时单元格按 2:1 计算
     pub fn from_font_size(font_size: FontSize, image_aspect: f32) -> Self {
         let FontSize { width, height } = font_size;
         let cell_aspect = if width == 0 || height == 0 {
@@ -68,7 +68,7 @@ impl CoverGeometry {
             .clamp(1.0, f32::from(u16::MAX)) as u16
     }
 
-    /// 封面框应有的高度（含边框），返回 0 表示放不下
+    /// 封面框应有的高度（含边框），返回 0 表示可用空间不足
     pub fn box_height(self, box_width: u16, max_height: u16) -> u16 {
         let inner_width = box_width.saturating_sub(2);
         if inner_width == 0 || max_height < 3 {
@@ -77,19 +77,18 @@ impl CoverGeometry {
         self.rows_for(inner_width).saturating_add(2).min(max_height)
     }
 
-    /// 封面图片在框内 inner 区域中的实际位置。
-    /// - 高度充足时按宽度铺满、垂直居中
-    /// - 高度不够时压缩高度、水平居中、两侧留边
-    /// - 返回的矩形永远落在 inner 之内
+    /// 封面图片在框内 inner 区域中的实际位置，返回的矩形不会超出 inner
     pub fn image_rect(self, inner: Rect) -> Rect {
         if inner.width == 0 || inner.height == 0 {
             return Rect::ZERO;
         }
+        // 高度充足时按宽度铺满，垂直居中
         let fit_height = self.rows_for(inner.width);
         if fit_height <= inner.height {
             let y = inner.y + (inner.height - fit_height) / 2;
             return Rect::new(inner.x, y, inner.width, fit_height);
         }
+        // 高度不足时按高度反推宽度，水平居中
         let fit_width = self.columns_for(inner.height).min(inner.width);
         let x = inner.x + (inner.width - fit_width) / 2;
         Rect::new(x, inner.y, fit_width, inner.height)
@@ -112,9 +111,9 @@ mod tests {
     fn box_height_follows_the_cell_aspect() {
         // inner 宽 41 → 41/2 ≈ 21 行内容，加上下边框 = 23
         assert_eq!(square().box_height(43, 24), 23);
-        // 高度不够时被 max_height 压住
+        // 超出 max_height 时取 max_height
         assert_eq!(square().box_height(43, 8), 8);
-        // 连一行内容都放不下就整个不画
+        // 内容区不足一行时返回 0
         assert_eq!(square().box_height(43, 2), 0);
         assert_eq!(square().box_height(2, 24), 0);
     }
@@ -152,7 +151,7 @@ mod tests {
 
     #[test]
     fn geometry_falls_back_on_degenerate_ratios() {
-        // 错误回退
+        // NaN 回退到默认宽高比
         assert_eq!(
             CoverGeometry::new(0.0, f32::NAN),
             CoverGeometry::new(0.0, super::DEFAULT_IMAGE_ASPECT)
@@ -179,7 +178,7 @@ mod tests {
             CoverGeometry::from_font_size(FontSize::new(10, 20), 1.0),
             CoverGeometry::new(2.0, 1.0)
         );
-        // 探测失败（0）时回退
+        // 字号为 0 时回退到默认单元格比例
         assert_eq!(
             CoverGeometry::from_font_size(FontSize::new(0, 0), 1.0),
             CoverGeometry::new(super::DEFAULT_CELL_ASPECT, 1.0)
