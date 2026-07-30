@@ -9,6 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use unicode_width::UnicodeWidthStr;
 
 use crate::context::AppContext;
 
@@ -800,18 +801,17 @@ impl SettingsPage {
                 muted,
             ),
             setting_line("MPRIS", config.integration.mpris, "i", accent, muted),
-            Line::from(vec![
-                Span::styled(" [o/O] ", Style::new().fg(muted)),
-                Span::raw("TUI 通知   "),
-                Span::styled(
-                    format!(
-                        "{} · {} 秒",
-                        enabled(config.notification.in_app),
-                        config.notification.in_app_timeout.clamp(1, 60)
-                    ),
-                    Style::new().fg(accent),
+            setting_value_line(
+                "TUI 通知",
+                &format!(
+                    "{} · {} 秒",
+                    enabled(config.notification.in_app),
+                    config.notification.in_app_timeout.clamp(1, 60)
                 ),
-            ]),
+                "o/O",
+                accent,
+                muted,
+            ),
             setting_line("桌面通知", config.notification.enable, "x", accent, muted),
             setting_line(
                 "通知封面",
@@ -827,30 +827,28 @@ impl SettingsPage {
                 accent,
                 muted,
             ),
-            Line::from(vec![
-                Span::styled(" [p] ", Style::new().fg(muted)),
-                Span::raw(format!("主题强调色  {}", config.theme.accent)),
-            ]),
+            setting_value_line("主题强调色", &config.theme.accent, "p", accent, muted),
             setting_value_line("扫描深度", &scan_depth_label, "D", accent, muted),
-            Line::from(vec![
-                Span::styled(" [b] ", Style::new().fg(muted)),
-                Span::raw("哔哩哔哩    "),
-                Span::styled(
-                    if ctx.bili_source.is_logged_in() {
-                        ctx.bili_source
-                            .user()
-                            .map(|user| user.name)
-                            .unwrap_or_else(|| "已登录".to_string())
-                    } else {
-                        "未登录".to_string()
-                    },
-                    Style::new().fg(if ctx.bili_source.is_logged_in() {
-                        accent
-                    } else {
-                        muted
-                    }),
-                ),
-            ]),
+            {
+                let logged_in = ctx.bili_source.is_logged_in();
+                let account = if logged_in {
+                    ctx.bili_source
+                        .user()
+                        .map(|user| user.name)
+                        .unwrap_or_else(|| "已登录".to_string())
+                } else {
+                    "未登录".to_string()
+                };
+                setting_row(
+                    "哔哩哔哩",
+                    Span::styled(
+                        account,
+                        Style::new().fg(if logged_in { accent } else { muted }),
+                    ),
+                    "b",
+                    muted,
+                )
+            },
         ];
         render_setting_options(options, options_inner, buf);
 
@@ -1109,41 +1107,9 @@ impl SettingsPage {
             MouseEventKind::Down(MouseButton::Left) => {
                 let options_inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
                 if options_inner.contains((event.column, event.row).into()) {
-                    let key = match setting_option_index(
-                        options_inner,
-                        Position::new(event.column, event.row),
-                    ) {
-                        0 => Some('t'),
-                        1 => Some('g'),
-                        2 => Some('w'),
-                        3 => Some('c'),
-                        4 => Some('e'),
-                        5 => Some('q'),
-                        6 => Some('m'),
-                        7 => Some('H'),
-                        8 => Some('j'),
-                        9 => Some('u'),
-                        10 => Some('K'),
-                        11 => Some('T'),
-                        12 => Some('Y'),
-                        13 => Some(']'),
-                        14 => Some('n'),
-                        15 => Some('N'),
-                        16 => Some('P'),
-                        17 => Some('f'),
-                        18 => Some('z'),
-                        19 => Some('i'),
-                        20 => Some('o'),
-                        21 => Some('O'),
-                        22 => Some('x'),
-                        23 => Some('X'),
-                        24 => Some('R'),
-                        25 => Some('p'),
-                        26 => Some('D'),
-                        27 => Some('b'),
-                        _ => None,
-                    };
-                    if let Some(key) = key {
+                    let index =
+                        setting_option_index(options_inner, Position::new(event.column, event.row));
+                    if let Some(&key) = SETTING_OPTION_KEYS.get(index as usize) {
                         return self.handle_input(
                             KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
                             ctx,
@@ -1187,15 +1153,42 @@ fn enabled(value: bool) -> &'static str {
     if value { "开启" } else { "关闭" }
 }
 
-fn setting_line(label: &str, value: bool, key: &str, accent: Color, muted: Color) -> Line<'static> {
+/// 在更新配置项后更新这些常量!
+///
+/// 最长按键提示的显示宽度 (当前为 [./.] [[/]])
+const KEY_COLUMN_WIDTH: usize = 5;
+/// 最长标签的显示宽度 (当前为 保留播放状态)
+const LABEL_COLUMN_WIDTH: usize = 12;
+
+/// 在右侧补空格至指定显示宽度，宽字符按两列计算
+fn pad_display(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+    format!("{}{}", value, " ".repeat(padding))
+}
+
+/// 组装一行设置项：按键提示、标签与取值分别占固定宽度的列
+fn setting_row(label: &str, value: Span<'static>, key: &str, muted: Color) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!(" [{key}] "), Style::new().fg(muted)),
-        Span::raw(format!("{label:<10} ")),
+        Span::styled(
+            format!(" {} ", pad_display(&format!("[{key}]"), KEY_COLUMN_WIDTH)),
+            Style::new().fg(muted),
+        ),
+        Span::raw(pad_display(label, LABEL_COLUMN_WIDTH)),
+        Span::raw(" "),
+        value,
+    ])
+}
+
+fn setting_line(label: &str, value: bool, key: &str, accent: Color, muted: Color) -> Line<'static> {
+    setting_row(
+        label,
         Span::styled(
             if value { "[x]" } else { "[ ]" },
             Style::new().fg(if value { accent } else { muted }),
         ),
-    ])
+        key,
+        muted,
+    )
 }
 
 fn setting_value_line(
@@ -1205,11 +1198,12 @@ fn setting_value_line(
     accent: Color,
     muted: Color,
 ) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" [{key}] "), Style::new().fg(muted)),
-        Span::raw(format!("{label:<10} ")),
+    setting_row(
+        label,
         Span::styled(value.to_string(), Style::new().fg(accent)),
-    ])
+        key,
+        muted,
+    )
 }
 
 fn save_status(result: anyhow::Result<()>) -> Option<String> {
@@ -1296,7 +1290,14 @@ fn next_scan_depth(depth: u32) -> u32 {
     }
 }
 
-const SETTINGS_OPTION_COUNT: u16 = 28;
+/// 在更新配置项后更新这些常量!
+///
+/// 鼠标点击时触发的按键，顺序必须与 render 中的选项列表一致
+const SETTING_OPTION_KEYS: [char; 27] = [
+    't', 'g', 'w', 'c', 'e', 'q', 'm', 'H', 'j', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z',
+    'i', 'o', 'x', 'X', 'R', 'p', 'D', 'b',
+];
+const SETTINGS_OPTION_COUNT: u16 = SETTING_OPTION_KEYS.len() as u16;
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
@@ -1380,9 +1381,17 @@ fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
 #[cfg(test)]
 mod tests {
     use ratatui::layout::{Position, Rect};
+    use ratatui::style::Color;
     use ratatui::widgets::{Block, Borders};
+    use unicode_width::UnicodeWidthStr;
 
-    use super::{setting_option_index, settings_chunks, shorten_source};
+    use super::{
+        KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, setting_line, setting_option_index,
+        setting_value_line, settings_chunks, shorten_source,
+    };
+
+    /// 各设置项取值统一起始的列号
+    const VALUE_COLUMN: usize = 1 + KEY_COLUMN_WIDTH + 1 + LABEL_COLUMN_WIDTH + 1;
 
     #[test]
     fn shortens_unicode_source_path_on_character_boundaries() {
@@ -1391,6 +1400,28 @@ mod tests {
 
         assert_eq!(shortened.chars().count(), 24);
         assert!(shortened.ends_with("..."));
+    }
+
+    #[test]
+    fn setting_rows_align_values_on_a_shared_column() {
+        let accent = Color::Reset;
+        let muted = Color::Reset;
+        let rows = [
+            setting_line("MPRIS", true, "i", accent, muted),
+            setting_line("保留播放状态", false, "e", accent, muted),
+            setting_value_line("最大 FPS", "30", "f", accent, muted),
+            setting_value_line("歌词偏移", "+0 ms", "[/]", accent, muted),
+            setting_value_line("音源开关", "kw 开启", "k/K", accent, muted),
+        ];
+
+        for row in rows {
+            let prefix: String = row.spans[..row.spans.len() - 1]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+
+            assert_eq!(UnicodeWidthStr::width(prefix.as_str()), VALUE_COLUMN);
+        }
     }
 
     #[test]
