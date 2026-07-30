@@ -2744,7 +2744,7 @@ fn execute_action(
                 };
                 let mut settings = settings.lock().unwrap();
                 if errors.is_empty() {
-                    settings.status_msg = Some(format!("扫描完成，共 {} 首", count));
+                    settings.status_msg = Some(format!("本地音乐扫描完成，共 {} 首", count));
                     let _ = tx.send(AppAction::ShowNotification(Notification::success(format!(
                         "本地音乐扫描完成，共 {} 首",
                         count
