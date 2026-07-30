@@ -25,6 +25,17 @@ const SEARCH_SCOPES: &[(Option<SourceId>, &str)] = &[
     (Some(SourceId::Local), "本地 local"),
 ];
 
+/// Deferred multi-part selection. It owns the original result list so confirming a part can
+/// replace only the selected video while preserving the surrounding playback queue.
+struct BiliPartPicker {
+    video_title: String,
+    songs: Vec<SongInfo>,
+    replacement_index: usize,
+    parts: Vec<SongInfo>,
+    selected: usize,
+    scroll_offset: usize,
+}
+
 pub struct SearchPage {
     pub input: String,
     pub results: Vec<SongInfo>,
@@ -44,6 +55,9 @@ pub struct SearchPage {
     pub variant_indices: Vec<usize>,
     pub variant_selected: usize,
     search_scopes: Vec<(Option<SourceId>, &'static str)>,
+    part_picker: Option<BiliPartPicker>,
+    bili_parts_loading: Option<u64>,
+    next_bili_parts_request_id: u64,
     wrap_navigation: bool,
     scroll_amount: usize,
 }
@@ -80,14 +94,26 @@ impl SearchPage {
             variant_indices: Vec::new(),
             variant_selected: 0,
             search_scopes,
+            part_picker: None,
+            bili_parts_loading: None,
+            next_bili_parts_request_id: 0,
             wrap_navigation,
             scroll_amount: scroll_amount.max(1),
         }
     }
 
     pub fn handle_input(&mut self, key: KeyEvent, resolver: &KeybindingResolver) -> AppAction {
-        if !self.variant_indices.is_empty() {
-            return self.handle_variant_input(key);
+        if self.part_picker.is_some() {
+            return self.handle_bili_part_input(key);
+        }
+        if self.bili_parts_loading.is_some() {
+            if matches!(
+                (key.modifiers, key.code),
+                (KeyModifiers::NONE, KeyCode::Esc)
+            ) {
+                self.bili_parts_loading = None;
+            }
+            return AppAction::None;
         }
 
         if self.input_mode {
@@ -154,9 +180,7 @@ impl SearchPage {
                         return AppAction::None;
                     }
                     if self.result_keyword == keyword && !self.results.is_empty() {
-                        let songs = self.results.clone();
-                        let index = self.selected;
-                        return AppAction::PlaySong { songs, index };
+                        return self.activate_selected_result();
                     }
                     self.last_input_time = std::time::Instant::now();
                     self.last_searched_input = keyword.clone();
@@ -186,10 +210,7 @@ impl SearchPage {
                 }
                 Action::ListActivate => {
                     if !self.results.is_empty() {
-                        return AppAction::PlaySong {
-                            songs: self.results.clone(),
-                            index: self.selected,
-                        };
+                        return self.activate_selected_result();
                     }
                 }
                 Action::ListSelectUp => {
@@ -283,10 +304,7 @@ impl SearchPage {
             }
             (KeyModifiers::NONE, KeyCode::Char('l')) => {
                 if !self.results.is_empty() {
-                    return AppAction::PlaySong {
-                        songs: self.results.clone(),
-                        index: self.selected,
-                    };
+                    return self.activate_selected_result();
                 }
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
@@ -298,10 +316,7 @@ impl SearchPage {
                     return AppAction::None;
                 }
                 if self.result_keyword == keyword && !self.results.is_empty() {
-                    // 选中歌曲 → 播放
-                    let songs = self.results.clone();
-                    let index = self.selected;
-                    return AppAction::PlaySong { songs, index };
+                    return self.activate_selected_result();
                 }
                 self.last_input_time = std::time::Instant::now();
                 self.last_searched_input = keyword.clone();
@@ -380,6 +395,25 @@ impl SearchPage {
             && self.current_page > 0
     }
 
+    fn activate_selected_result(&mut self) -> AppAction {
+        let songs = self.results.clone();
+        let index = self.selected;
+        let Some(song) = songs.get(index) else {
+            return AppAction::None;
+        };
+        if needs_bili_part_selection(song) {
+            self.next_bili_parts_request_id += 1;
+            let request_id = self.next_bili_parts_request_id;
+            self.bili_parts_loading = Some(request_id);
+            return AppAction::ResolveBiliParts {
+                songs,
+                index,
+                request_id,
+            };
+        }
+        AppAction::PlaySong { songs, index }
+    }
+
     fn cycle_source(&mut self, direction: isize) -> AppAction {
         let current = self
             .search_scopes
@@ -402,6 +436,7 @@ impl SearchPage {
         self.error_message = None;
         self.close_variants();
 
+        self.close_bili_part_overlay();
         let keyword = self.input.trim().to_string();
         if keyword.is_empty() {
             AppAction::None
@@ -467,6 +502,7 @@ impl SearchPage {
         self.last_searched_input = keyword.to_string();
         self.error_message = None;
         self.close_variants();
+        self.close_bili_part_overlay();
         if !append {
             self.current_page = 0;
         }
@@ -510,6 +546,7 @@ impl SearchPage {
         self.is_searching = false;
         self.error_message = Some(message);
         self.close_variants();
+        self.close_bili_part_overlay();
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -661,6 +698,7 @@ impl SearchPage {
         }
 
         self.render_variant_picker(area, buf, ctx);
+        self.render_bili_part_overlay(area, buf, ctx);
     }
 
     fn render_source_tabs(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -701,6 +739,12 @@ impl SearchPage {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect, activate: bool) -> AppAction {
+        if self.part_picker.is_some() {
+            return self.handle_bili_part_mouse(event, area, activate);
+        }
+        if self.bili_parts_loading.is_some() {
+            return AppAction::None;
+        }
         if !self.variant_indices.is_empty() {
             return self.handle_variant_mouse(event, area, activate);
         }
@@ -753,10 +797,7 @@ impl SearchPage {
                         self.input_mode = false;
                         self.selected = index;
                         if activate {
-                            return AppAction::PlaySong {
-                                songs: self.results.clone(),
-                                index,
-                            };
+                            return self.activate_selected_result();
                         }
                     }
                 }
@@ -771,7 +812,10 @@ impl SearchPage {
         event: MouseEvent,
         area: Rect,
     ) -> Option<(Vec<SongInfo>, usize)> {
-        if !self.variant_indices.is_empty() {
+        if self.part_picker.is_some()
+            || self.bili_parts_loading.is_some()
+            || !self.variant_indices.is_empty()
+        {
             return None;
         }
         let chunks = Layout::default()
@@ -808,6 +852,182 @@ impl SearchPage {
     fn close_variants(&mut self) {
         self.variant_indices.clear();
         self.variant_selected = 0;
+    }
+
+    fn close_bili_part_overlay(&mut self) {
+        self.part_picker = None;
+        self.bili_parts_loading = None;
+    }
+
+    /// Applies a response only when it belongs to the active request. Single-part videos bypass
+    /// the picker; multi-part videos retain the original list until the user confirms a part.
+    pub fn complete_bili_part_request(
+        &mut self,
+        request_id: u64,
+        songs: Vec<SongInfo>,
+        index: usize,
+        parts: Vec<SongInfo>,
+    ) -> Option<AppAction> {
+        if self.bili_parts_loading != Some(request_id) {
+            return None;
+        }
+        self.bili_parts_loading = None;
+        if parts.len() == 1 {
+            let mut songs = songs;
+            songs.splice(index..=index, parts);
+            return Some(AppAction::PlaySong { songs, index });
+        }
+        let video_title = songs
+            .get(index)
+            .map(|song| song.name.clone())
+            .unwrap_or_else(|| "哔哩哔哩视频".to_string());
+        self.part_picker = Some(BiliPartPicker {
+            video_title,
+            songs,
+            replacement_index: index,
+            parts,
+            selected: 0,
+            scroll_offset: 0,
+        });
+        None
+    }
+
+    pub fn fail_bili_part_request(&mut self, request_id: u64) -> bool {
+        if self.bili_parts_loading != Some(request_id) {
+            return false;
+        }
+        self.bili_parts_loading = None;
+        true
+    }
+
+    fn handle_bili_part_input(&mut self, key: KeyEvent) -> AppAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => self.part_picker = None,
+            (KeyModifiers::NONE, KeyCode::Up | KeyCode::Char('k')) => {
+                if let Some(picker) = self.part_picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Down | KeyCode::Char('j')) => {
+                if let Some(picker) = self.part_picker.as_mut() {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.parts.len().saturating_sub(1));
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Home) | (KeyModifiers::NONE, KeyCode::Char('g')) => {
+                if let Some(picker) = self.part_picker.as_mut() {
+                    picker.selected = 0;
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::End)
+            | (KeyModifiers::NONE, KeyCode::Char('G'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
+                if let Some(picker) = self.part_picker.as_mut() {
+                    picker.selected = picker.parts.len().saturating_sub(1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('a')) => {
+                if let Some(song) = self
+                    .part_picker
+                    .as_ref()
+                    .and_then(|picker| picker.parts.get(picker.selected))
+                    .cloned()
+                {
+                    return AppAction::AddToQueue {
+                        song: Box::new(song),
+                        position: InsertPosition::End,
+                    };
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('A'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('A')) => {
+                if let Some(song) = self
+                    .part_picker
+                    .as_ref()
+                    .and_then(|picker| picker.parts.get(picker.selected))
+                    .cloned()
+                {
+                    return AppAction::AddToQueue {
+                        song: Box::new(song),
+                        position: InsertPosition::Next,
+                    };
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) | (KeyModifiers::NONE, KeyCode::Char('l')) => {
+                return self.confirm_bili_part();
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    /// Replace the selected video with all of its parts and begin at the part chosen in the popup.
+    fn confirm_bili_part(&mut self) -> AppAction {
+        let Some(picker) = self.part_picker.take() else {
+            return AppAction::None;
+        };
+        let selected = picker.selected.min(picker.parts.len().saturating_sub(1));
+        let mut songs = picker.songs;
+        songs.splice(
+            picker.replacement_index..=picker.replacement_index,
+            picker.parts,
+        );
+        AppAction::PlaySong {
+            songs,
+            index: picker.replacement_index + selected,
+        }
+    }
+
+    fn handle_bili_part_mouse(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+        activate: bool,
+    ) -> AppAction {
+        let popup = bili_part_popup(
+            area,
+            self.part_picker
+                .as_ref()
+                .map_or(0, |picker| picker.parts.len()),
+        );
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                if let Some(picker) = self.part_picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(picker) = self.part_picker.as_mut() {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.parts.len().saturating_sub(1));
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !popup.contains((event.column, event.row).into()) {
+                    self.part_picker = None;
+                    return AppAction::None;
+                }
+                let inner = Block::default().borders(Borders::ALL).inner(popup);
+                let list_y = inner.y.saturating_add(1);
+                let footer_y = inner.bottom().saturating_sub(1);
+                let mut confirm = false;
+                if event.row >= list_y && event.row < footer_y {
+                    if let Some(picker) = self.part_picker.as_mut() {
+                        let index =
+                            picker.scroll_offset + event.row.saturating_sub(list_y) as usize;
+                        if index < picker.parts.len() {
+                            picker.selected = index;
+                            confirm = activate;
+                        }
+                    }
+                }
+                if confirm {
+                    return self.confirm_bili_part();
+                }
+            }
+            _ => {}
+        }
+        AppAction::None
     }
 
     fn handle_variant_input(&mut self, key: KeyEvent) -> AppAction {
@@ -968,6 +1188,80 @@ impl SearchPage {
             );
         }
     }
+    fn render_bili_part_overlay(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if self.bili_parts_loading.is_some() {
+            let popup = bili_part_popup(area, 0);
+            Clear.render(popup, buf);
+            Paragraph::new("正在读取分 P…  Esc 取消")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(crate::theme::accent(ctx)))
+                        .title(" 选择分 P "),
+                )
+                .alignment(ratatui::layout::Alignment::Center)
+                .render(popup, buf);
+            return;
+        }
+
+        let Some(picker) = self.part_picker.as_mut() else {
+            return;
+        };
+        let popup = bili_part_popup(area, picker.parts.len());
+        if popup.width == 0 || popup.height == 0 {
+            return;
+        }
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(crate::theme::accent(ctx)))
+            .title(format!(" 选择分 P · {} ", picker.video_title));
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+        let visible_rows = inner.height.saturating_sub(2) as usize;
+        if visible_rows == 0 {
+            return;
+        }
+        if picker.selected < picker.scroll_offset {
+            picker.scroll_offset = picker.selected;
+        } else if picker.selected >= picker.scroll_offset + visible_rows {
+            picker.scroll_offset = picker.selected + 1 - visible_rows;
+        }
+        picker.scroll_offset = picker
+            .scroll_offset
+            .min(picker.parts.len().saturating_sub(visible_rows));
+
+        Paragraph::new(Line::from(Span::styled(
+            " P      时长       标题",
+            Style::new()
+                .fg(crate::theme::muted(ctx))
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
+
+        let end = (picker.scroll_offset + visible_rows).min(picker.parts.len());
+        for (row, part_index) in (picker.scroll_offset..end).enumerate() {
+            let part = &picker.parts[part_index];
+            let style = if part_index == picker.selected {
+                Style::new()
+                    .fg(crate::theme::selection_fg(ctx))
+                    .bg(crate::theme::accent(ctx))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(crate::theme::text(ctx))
+            };
+            Paragraph::new(Line::from(Span::styled(bili_part_row(part), style))).render(
+                Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
+                buf,
+            );
+        }
+        Paragraph::new(" ↑↓/j k 选择 · Enter 播放 · Esc 取消")
+            .style(Style::new().fg(crate::theme::muted(ctx)))
+            .render(
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+                buf,
+            );
+    }
 }
 
 fn source_tab_areas(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
@@ -1005,6 +1299,39 @@ fn variant_popup(area: Rect, count: usize) -> Rect {
         area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
+    )
+}
+
+fn bili_part_popup(area: Rect, count: usize) -> Rect {
+    let width = area.width.saturating_sub(4).min(92);
+    let height = (count as u16 + 4)
+        .min(area.height.saturating_sub(2))
+        .max(5.min(area.height));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn needs_bili_part_selection(song: &SongInfo) -> bool {
+    song.source == SourceId::Bili && !song.extra.contains_key("page")
+}
+
+fn bili_part_row(song: &SongInfo) -> String {
+    let page = song.extra.get("page").map(String::as_str).unwrap_or("?");
+    let title = song
+        .extra
+        .get("bili_part_title")
+        .filter(|title| !title.is_empty())
+        .map(String::as_str)
+        .unwrap_or(&song.name);
+    let duration = song.duration.as_secs();
+    format!(
+        " P{page:<4} {:02}:{:02}      {title}",
+        duration / 60,
+        duration % 60
     )
 }
 
@@ -1093,6 +1420,92 @@ mod tests {
         );
 
         assert!(matches!(action, AppAction::PlaySong { index: 0, .. }));
+    }
+
+    #[test]
+    fn selecting_bili_video_opens_part_picker_and_plays_selected_part() {
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut video = song("BV1xx411c7mD", SourceId::Bili, "测试视频", "UP主");
+        video
+            .extra
+            .insert("bvid".to_string(), "BV1xx411c7mD".to_string());
+        page.results = vec![video];
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+
+        let (songs, index, request_id) = match page.handle_input(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &resolver,
+        ) {
+            AppAction::ResolveBiliParts {
+                songs,
+                index,
+                request_id,
+            } => (songs, index, request_id),
+            action => panic!("expected Bili part resolution, got {action:?}"),
+        };
+
+        let mut first = song(
+            "BV1xx411c7mD-p1",
+            SourceId::Bili,
+            "测试视频 · P1 第一段",
+            "UP主",
+        );
+        first.extra.insert("page".to_string(), "1".to_string());
+        first
+            .extra
+            .insert("bili_part_title".to_string(), "第一段".to_string());
+        let mut second = song(
+            "BV1xx411c7mD-p2",
+            SourceId::Bili,
+            "测试视频 · P2 第二段",
+            "UP主",
+        );
+        second.extra.insert("page".to_string(), "2".to_string());
+        second
+            .extra
+            .insert("bili_part_title".to_string(), "第二段".to_string());
+
+        assert!(
+            page.complete_bili_part_request(request_id, songs, index, vec![first, second])
+                .is_none()
+        );
+        assert!(matches!(
+            page.handle_bili_part_input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            AppAction::None
+        ));
+
+        let action = page.handle_bili_part_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let AppAction::PlaySong { songs, index } = action else {
+            panic!("expected selected part playback");
+        };
+        assert_eq!(index, 1);
+        assert_eq!(songs[index].extra["bili_part_title"], "第二段");
+    }
+
+    #[test]
+    fn single_bili_part_starts_without_opening_picker() {
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        page.bili_parts_loading = Some(7);
+        let mut part = song("BV1xx411c7mD", SourceId::Bili, "测试视频", "UP主");
+        part.extra.insert("page".to_string(), "1".to_string());
+
+        let action = page
+            .complete_bili_part_request(
+                7,
+                vec![song("video", SourceId::Bili, "测试视频", "UP主")],
+                0,
+                vec![part],
+            )
+            .expect("single part should start playback");
+
+        let AppAction::PlaySong { songs, index } = action else {
+            panic!("expected single part playback");
+        };
+        assert_eq!(index, 0);
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].extra["page"], "1");
+        assert!(page.part_picker.is_none());
     }
 
     #[test]
