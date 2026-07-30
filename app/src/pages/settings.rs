@@ -64,6 +64,30 @@ impl SettingsPage {
         self.input_mode || self.local_path_mode || self.proxy_input_mode
     }
 
+    /// 判断按键是否由设置页独占。设置页把整个字母表当作选项开关，
+    /// 与用户可自定义的全局快捷键必然重叠，因此这些键不再交给全局分发。
+    /// 带 Ctrl/Alt 的组合键以及 Space、Tab、Esc 仍归全局。
+    pub fn consumes_key(key: &KeyEvent, resolver: &KeybindingResolver) -> bool {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        // 列表导航键可被用户重绑，按当前配置解析而不是写死 j/k
+        if matches!(
+            resolver.resolve_page("settings", key),
+            Some(Action::ListSelectUp | Action::ListSelectDown)
+        ) {
+            return true;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Down => true,
+            KeyCode::Char(character) => SETTINGS_PAGE_CHAR_KEYS.contains(&character),
+            _ => false,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             input_url: String::new(),
@@ -218,7 +242,8 @@ impl SettingsPage {
                             Some(format!("播放状态设置已更新，但会话保存失败: {error}"));
                     }
                 }
-                (KeyModifiers::NONE, KeyCode::Char('q')) => {
+                (KeyModifiers::SHIFT, KeyCode::Char('Q' | 'q'))
+                | (KeyModifiers::NONE, KeyCode::Char('Q')) => {
                     self.update_config(ctx, |config| {
                         config.player.quality = next_quality(config.player.quality);
                     });
@@ -239,7 +264,7 @@ impl SettingsPage {
                     };
                     ctx.storage.trim_history(limit);
                 }
-                (KeyModifiers::NONE, KeyCode::Char('j')) => {
+                (KeyModifiers::NONE, KeyCode::Char('v')) => {
                     self.cycle_default_source(ctx);
                 }
                 (KeyModifiers::NONE, KeyCode::Char('u')) => {
@@ -247,7 +272,7 @@ impl SettingsPage {
                         config.source.auto_toggle = !config.source.auto_toggle;
                     });
                 }
-                (KeyModifiers::NONE, KeyCode::Char('k')) => {
+                (KeyModifiers::NONE, KeyCode::Char('y')) => {
                     self.enabled_source_index =
                         (self.enabled_source_index + 1) % SourceId::all_online().len();
                 }
@@ -727,7 +752,7 @@ impl SettingsPage {
             setting_value_line(
                 "播放音质",
                 quality_label(config.player.quality),
-                "q",
+                "Q",
                 accent,
                 muted,
             ),
@@ -742,7 +767,7 @@ impl SettingsPage {
             setting_value_line(
                 "默认音源",
                 config.source.default.as_str(),
-                "j",
+                "v",
                 accent,
                 muted,
             ),
@@ -757,7 +782,7 @@ impl SettingsPage {
                         source.as_str(),
                         enabled(config.source.enabled.contains(&source))
                     ),
-                    "k/K",
+                    "y/K",
                     accent,
                     muted,
                 )
@@ -1294,11 +1319,19 @@ fn next_scan_depth(depth: u32) -> u32 {
 ///
 /// 鼠标点击时触发的按键，顺序必须与 render 中的选项列表一致
 const SETTING_OPTION_KEYS: [char; 27] = [
-    't', 'g', 'w', 'c', 'e', 'q', 'm', 'H', 'j', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z',
+    't', 'g', 'w', 'c', 'e', 'Q', 'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z',
     'i', 'o', 'x', 'X', 'R', 'p', 'D', 'b',
 ];
 const SETTINGS_OPTION_COUNT: u16 = SETTING_OPTION_KEYS.len() as u16;
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
+
+/// 设置页在非输入模式下响应的字符键：选项键之外还有列表操作键
+/// （a 添加 / d 删除 / s 切换焦点 / r 扫描 / y 与 [ 见 `handle_input`）。
+/// 列表导航键来自页面级绑定，由 `consumes_key` 查表解析，不列在这里。
+const SETTINGS_PAGE_CHAR_KEYS: &[char] = &[
+    'a', 'd', 'r', 's', 'y', '[', 'm', 'Q', 'v', 'p', 'b', 'n', 'o', 'c', 'e', 'f', 'g', 'i', 't',
+    'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']',
+];
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
     if !setting_options_use_two_columns(area) {
@@ -1385,9 +1418,12 @@ mod tests {
     use ratatui::widgets::{Block, Borders};
     use unicode_width::UnicodeWidthStr;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use lx_core::keybinding::{Action, KeybindingConfig, KeybindingResolver};
+
     use super::{
-        KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, setting_line, setting_option_index,
-        setting_value_line, settings_chunks, shorten_source,
+        KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, SETTING_OPTION_KEYS, SettingsPage, setting_line,
+        setting_option_index, setting_value_line, settings_chunks, shorten_source,
     };
 
     /// 各设置项取值统一起始的列号
@@ -1421,6 +1457,60 @@ mod tests {
                 .collect();
 
             assert_eq!(UnicodeWidthStr::width(prefix.as_str()), VALUE_COLUMN);
+        }
+    }
+
+    #[test]
+    fn settings_page_owns_every_option_key() {
+        let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+
+        for key in SETTING_OPTION_KEYS {
+            let event = KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE);
+
+            assert!(
+                SettingsPage::consumes_key(&event, &resolver),
+                "选项键 {key} 不应被全局快捷键抢先处理"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_page_owns_the_configured_list_navigation_keys() {
+        let mut config = KeybindingConfig::default();
+        config
+            .pages
+            .get_mut("settings")
+            .unwrap()
+            .insert(Action::ListSelectUp, "h".to_string());
+        let resolver = KeybindingResolver::from_config(&config);
+
+        let rebound = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        let released = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+
+        assert!(SettingsPage::consumes_key(&rebound, &resolver));
+        // 'k' 不再是导航键，也不是选项键，应交还给全局
+        assert!(!SettingsPage::consumes_key(&released, &resolver));
+    }
+
+    #[test]
+    fn settings_page_leaves_playback_and_navigation_keys_global() {
+        let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+        let global = [
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE),
+        ];
+
+        for event in global {
+            assert!(
+                !SettingsPage::consumes_key(&event, &resolver),
+                "{:?} 不应被设置页独占",
+                event.code
+            );
         }
     }
 
