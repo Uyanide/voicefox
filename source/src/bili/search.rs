@@ -199,7 +199,6 @@ fn parse_video_result(
         .as_str()
         .filter(|value| !value.is_empty())
         .unwrap_or("哔哩哔哩用户");
-    let album_id = value_string(&data["owner"]["mid"]);
     let cover_url = normalize_cover(data["pic"].as_str());
     let raw_pages = data["pages"].as_array();
     let multiple_pages = raw_pages.is_some_and(|pages| pages.len() > 1);
@@ -217,12 +216,14 @@ fn parse_video_result(
                 return None;
             }
             let part = page["part"].as_str().unwrap_or_default().trim();
+            let part_title = if part.is_empty() {
+                format!("P{page_number}")
+            } else {
+                part.to_string()
+            };
+            // A Bilibili video groups all of its pages; each page is an individual playable song.
             let name = if multiple_pages {
-                if part.is_empty() || part == title {
-                    format!("{title} · P{page_number}")
-                } else {
-                    format!("{title} · P{page_number} {part}")
-                }
+                part_title.clone()
             } else {
                 title.to_string()
             };
@@ -233,7 +234,7 @@ fn parse_video_result(
             };
             let mut song = SongInfo::new(id, SourceId::Bili, name, singer.to_string());
             song.album_name = title.to_string();
-            song.album_id = album_id.clone();
+            song.album_id = bvid.to_string();
             song.duration = Duration::from_secs(page["duration"].as_u64().unwrap_or_default());
             song.cover_url = cover_url.clone();
             song.qualities.extend([Quality::Low128, Quality::High320]);
@@ -241,8 +242,7 @@ fn parse_video_result(
             song.extra.insert("cid".to_string(), cid);
             song.extra
                 .insert("page".to_string(), page_number.to_string());
-            song.extra
-                .insert("bili_part_title".to_string(), part.to_string());
+            song.extra.insert("bili_part_title".to_string(), part_title);
             if !aid.is_empty() {
                 song.extra.insert("aid".to_string(), aid.clone());
             }
@@ -260,7 +260,7 @@ fn parse_video_result(
                 singer.to_string(),
             );
             song.album_name = title.to_string();
-            song.album_id = album_id;
+            song.album_id = bvid.to_string();
             song.duration = Duration::from_secs(data["duration"].as_u64().unwrap_or_default());
             song.cover_url = cover_url;
             song.qualities.extend([Quality::Low128, Quality::High320]);
@@ -323,11 +323,7 @@ fn parse_song(item: &Value) -> Option<SongInfo> {
             .to_string(),
     );
     song.album_name = title;
-    song.album_id = item["mid"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| item["mid"].as_u64().map(|value| value.to_string()))
-        .unwrap_or_default();
+    song.album_id = bvid.to_string();
     song.duration = parse_duration(item["duration"].as_str().unwrap_or_default());
     song.cover_url = item["pic"]
         .as_str()
@@ -433,6 +429,30 @@ mod tests {
     }
 
     #[test]
+    fn search_result_uses_the_video_as_its_album() {
+        let json = json!({
+            "data": {
+                "result": [{
+                    "bvid": "BV1xx411c7mD",
+                    "title": "测试<em>视频</em>",
+                    "author": "UP主",
+                    "mid": 42,
+                    "duration": "03:00"
+                }],
+                "numResults": 1,
+                "pagesize": 20
+            }
+        });
+
+        let song = parse_search_result(&json, 1).unwrap().items.remove(0);
+
+        assert_eq!(song.name, "测试视频");
+        assert_eq!(song.album_name, "测试视频");
+        assert_eq!(song.album_id, "BV1xx411c7mD");
+        assert_eq!(song.singer, "UP主");
+    }
+
+    #[test]
     fn parses_plain_bvid_and_long_video_url() {
         assert_eq!(
             parse_video_reference("BV1xx411c7mD"),
@@ -492,9 +512,11 @@ mod tests {
 
         assert_eq!(result.total, 2);
         assert!(!result.has_more);
-        assert_eq!(result.items[0].name, "测试视频 · P1 第一段");
+        assert_eq!(result.items[0].name, "第一段");
         assert_eq!(result.items[1].extra["cid"], "1002");
         assert_eq!(result.items[1].extra["bili_part_title"], "第二段");
+        assert_eq!(result.items[0].album_name, "测试视频");
+        assert_eq!(result.items[0].album_id, "BV1xx411c7mD");
         assert_eq!(
             result.items[0].cover_url.as_deref(),
             Some("https://example.com/cover.jpg")
@@ -521,5 +543,26 @@ mod tests {
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].id, "BV1xx411c7mD-p2");
         assert_eq!(result.items[0].duration, Duration::from_secs(90));
+        assert_eq!(result.items[0].name, "第二段");
+        assert_eq!(result.items[0].album_name, "测试视频");
+    }
+
+    #[test]
+    fn single_part_video_uses_the_video_title_as_its_song_name() {
+        let json = json!({
+            "data": {
+                "bvid": "BV1xx411c7mD",
+                "title": "测试视频",
+                "owner": {"name": "UP主"},
+                "pages": [{"cid": 1001, "page": 1, "part": "第一段", "duration": 60}]
+            }
+        });
+
+        let song = parse_video_result(&json, None).unwrap().items.remove(0);
+
+        assert_eq!(song.name, "测试视频");
+        assert_eq!(song.album_name, "测试视频");
+        assert_eq!(song.album_id, "BV1xx411c7mD");
+        assert_eq!(song.extra["bili_part_title"], "第一段");
     }
 }
