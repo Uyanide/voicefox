@@ -250,11 +250,7 @@ async fn load_source_with_policy(
             let engine = tokio::task::spawn_blocking(move || JsEngine::new(&path_string))
                 .await
                 .map_err(|error| format!("启动 JS 引擎任务失败: {error}"))??;
-            let name = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("js-source")
-                .to_string();
+            let name = source_display_name(&path, url);
             Ok::<_, String>(JsSource::new(name, engine, default_source.to_string()))
         }
         .await;
@@ -290,10 +286,83 @@ async fn load_source_with_policy(
     Err(format!("JS 音源加载失败（已重试 3 次）: {last_error}"))
 }
 
+fn source_display_name(path: &std::path::Path, origin: &str) -> String {
+    if let Ok(code) = std::fs::read_to_string(path)
+        && let Some(name) = metadata_value(&code, "name")
+    {
+        return name;
+    }
+
+    let clean_origin = origin.split(['?', '#']).next().unwrap_or(origin);
+    let segments = clean_origin
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let file_name = segments
+        .last()
+        .copied()
+        .unwrap_or("JS 音源")
+        .strip_suffix(".js")
+        .unwrap_or_else(|| segments.last().copied().unwrap_or("JS 音源"));
+    if file_name == "latest" {
+        return segments
+            .iter()
+            .rev()
+            .nth(1)
+            .copied()
+            .unwrap_or("JS 音源")
+            .to_string();
+    }
+    (!file_name.is_empty())
+        .then(|| file_name.to_string())
+        .unwrap_or_else(|| "JS 音源".to_string())
+}
+
+fn metadata_value(code: &str, key: &str) -> Option<String> {
+    code.lines().find_map(|line| {
+        let line = line
+            .trim()
+            .trim_start_matches("/*")
+            .trim_start_matches('*')
+            .trim_start_matches("//")
+            .trim();
+        let value = line.strip_prefix(&format!("@{key}"))?;
+        if !value.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_cache;
+    use super::{metadata_value, source_display_name, write_cache};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reads_lx_music_script_name_metadata() {
+        let code = "/*\n * @name\t聚合测试音源\n * @version 1.0.0\n */";
+        assert_eq!(
+            metadata_value(code, "name").as_deref(),
+            Some("聚合测试音源")
+        );
+    }
+
+    #[test]
+    fn source_name_falls_back_to_origin_filename() {
+        let name = source_display_name(
+            std::path::Path::new("/tmp/voicefox-missing-source.js"),
+            "https://example.com/custom-source.js?raw=1",
+        );
+        assert_eq!(name, "custom-source");
+
+        let latest = source_display_name(
+            std::path::Path::new("/tmp/voicefox-missing-source.js"),
+            "https://example.com/juhe/latest.js",
+        );
+        assert_eq!(latest, "juhe");
+    }
 
     #[test]
     fn cache_write_replaces_existing_file() {

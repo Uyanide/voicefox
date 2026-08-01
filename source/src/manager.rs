@@ -22,7 +22,12 @@ use crate::wy::WySource;
 
 struct JsSourceState {
     generation: u64,
-    sources: Vec<Arc<dyn MusicSource>>,
+    sources: Vec<JsSourceEntry>,
+}
+
+struct JsSourceEntry {
+    origin: String,
+    source: Arc<dyn MusicSource>,
 }
 
 /// 音源管理器
@@ -93,11 +98,28 @@ impl SourceManager {
         generation: u64,
         sources: Vec<Arc<dyn MusicSource>>,
     ) -> bool {
+        self.set_named_js_sources_if_current(
+            generation,
+            sources
+                .into_iter()
+                .map(|source| (String::new(), source))
+                .collect(),
+        )
+    }
+
+    pub fn set_named_js_sources_if_current(
+        &self,
+        generation: u64,
+        sources: Vec<(String, Arc<dyn MusicSource>)>,
+    ) -> bool {
         let mut state = self.js_sources.write().unwrap();
         if state.generation != generation {
             return false;
         }
-        state.sources = sources;
+        state.sources = sources
+            .into_iter()
+            .map(|(origin, source)| JsSourceEntry { origin, source })
+            .collect();
         true
     }
 
@@ -110,7 +132,13 @@ impl SourceManager {
         if state.generation != generation {
             return false;
         }
-        state.sources.insert(0, source);
+        state.sources.insert(
+            0,
+            JsSourceEntry {
+                origin: String::new(),
+                source,
+            },
+        );
         true
     }
 
@@ -133,7 +161,42 @@ impl SourceManager {
     }
 
     fn js_sources(&self) -> Vec<Arc<dyn MusicSource>> {
-        self.js_sources.read().unwrap().sources.clone()
+        self.js_sources
+            .read()
+            .unwrap()
+            .sources
+            .iter()
+            .map(|entry| Arc::clone(&entry.source))
+            .collect()
+    }
+
+    pub fn js_source_names(&self) -> Vec<String> {
+        self.js_sources
+            .read()
+            .unwrap()
+            .sources
+            .iter()
+            .map(|entry| entry.source.name().to_string())
+            .collect()
+    }
+
+    pub fn js_source_name(&self, index: usize) -> Option<String> {
+        self.js_sources
+            .read()
+            .unwrap()
+            .sources
+            .get(index)
+            .map(|entry| entry.source.name().to_string())
+    }
+
+    pub fn js_source_name_for_origin(&self, origin: &str) -> Option<String> {
+        self.js_sources
+            .read()
+            .unwrap()
+            .sources
+            .iter()
+            .find(|entry| entry.origin == origin)
+            .map(|entry| entry.source.name().to_string())
     }
 
     pub fn update_source_preferences(&self, default: SourceId, enabled: &[SourceId]) {
@@ -398,10 +461,28 @@ impl SourceManager {
         song: &SongInfo,
         quality: Quality,
     ) -> Result<SongUrl, FetchError> {
+        self.get_song_url_from_js_index(song, quality, 0)
+            .await
+            .map(|(url, _)| url)
+    }
+
+    /// 从指定 JS 音源索引开始解析播放地址。
+    ///
+    /// 返回成功提供地址的 JS 音源索引；`None` 表示使用了本地、B 站或内置音源。
+    /// mpv 实际播放失败后可从下一个索引继续，避免重复使用同一个失效链接。
+    pub async fn get_song_url_from_js_index(
+        &self,
+        song: &SongInfo,
+        quality: Quality,
+        js_start_index: usize,
+    ) -> Result<(SongUrl, Option<usize>), FetchError> {
         // 本地歌曲走本地音源
         if song.source == SourceId::Local {
             if let Some(local_src) = self.sources.get(&SourceId::Local) {
-                return local_src.get_song_url(song, quality).await;
+                return local_src
+                    .get_song_url(song, quality)
+                    .await
+                    .map(|url| (url, None));
             }
             return Err(FetchError::Other("本地音源不可用".to_string()));
         }
@@ -411,13 +492,19 @@ impl SourceManager {
                 .get(&SourceId::Bili)
                 .ok_or_else(|| FetchError::Other("哔哩哔哩音源不可用".to_string()))?
                 .get_song_url(song, quality)
-                .await;
+                .await
+                .map(|url| (url, None));
         }
         // 在线歌曲优先使用 JS 音源。
         let mut js_errors = Vec::new();
-        for js_source in self.js_sources() {
+        for (index, js_source) in self
+            .js_sources()
+            .into_iter()
+            .enumerate()
+            .skip(js_start_index)
+        {
             match js_source.get_song_url(song, quality).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => return Ok((result, Some(index))),
                 Err(error) => js_errors.push(error.to_string()),
             }
         }
@@ -428,7 +515,7 @@ impl SourceManager {
             .map(Arc::clone)
             .ok_or_else(|| FetchError::Other("歌曲来源不可用".to_string()))?;
         match source.get_song_url(song, quality).await {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok((result, None)),
             Err(builtin_error) => {
                 if !js_errors.is_empty() {
                     Err(FetchError::Other(format!(
@@ -622,9 +709,70 @@ fn match_score(s: &SongInfo, t_name: &str, t_singer: &str, t_intv: i64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{SourceManager, lyric_has_content};
+    use async_trait::async_trait;
     use lx_core::model::lyric::LyricData;
-    use lx_core::model::source::SourceId;
-    use std::sync::Arc;
+    use lx_core::model::song::SongInfo;
+    use lx_core::model::source::{Quality, SourceId};
+    use lx_core::traits::source::{FetchError, MusicSource, SearchError, SearchResult, SongUrl};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct StubJsSource {
+        name: &'static str,
+        succeeds: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl MusicSource for StubJsSource {
+        fn id(&self) -> SourceId {
+            SourceId::Kw
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn search(
+            &self,
+            _keyword: &str,
+            _page: u32,
+            _limit: u32,
+        ) -> Result<SearchResult, SearchError> {
+            Err(SearchError::Other("unused".to_string()))
+        }
+
+        async fn get_song_url(
+            &self,
+            _song: &SongInfo,
+            quality: Quality,
+        ) -> Result<SongUrl, FetchError> {
+            self.calls.lock().unwrap().push(self.name);
+            if !self.succeeds {
+                return Err(FetchError::NotFound);
+            }
+            Ok(SongUrl {
+                url: format!("https://example.com/{}.mp3", self.name),
+                quality,
+                duration: Duration::from_secs(180),
+                cover_url: None,
+                qualities: vec![quality],
+                headers: vec![],
+            })
+        }
+
+        async fn get_lyric(&self, _song: &SongInfo) -> Result<LyricData, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        async fn get_cover_url(&self, _song: &SongInfo) -> Result<String, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        fn supported_qualities(&self) -> Vec<Quality> {
+            vec![Quality::High320]
+        }
+    }
 
     #[test]
     fn translated_lyrics_count_as_content() {
@@ -652,5 +800,109 @@ mod tests {
             Arc::new(crate::local::LocalSource::new()),
         ));
         assert!(manager.has_js_source());
+    }
+
+    #[tokio::test]
+    async fn song_url_uses_js_sources_in_order_until_one_succeeds() {
+        let manager = SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let generation = manager.begin_js_source_request(true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = |name, succeeds| {
+            Arc::new(StubJsSource {
+                name,
+                succeeds,
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn MusicSource>
+        };
+        assert!(manager.set_js_sources_if_current(
+            generation,
+            vec![
+                source("juhe", false),
+                source("grass", true),
+                source("unused", true),
+            ],
+        ));
+        let song = SongInfo::new(
+            "song-id".to_string(),
+            SourceId::Kw,
+            "song".to_string(),
+            "artist".to_string(),
+        );
+
+        let result = manager
+            .get_song_url(&song, Quality::High320)
+            .await
+            .expect("the second JS source should resolve the song");
+
+        assert_eq!(result.url, "https://example.com/grass.mp3");
+        assert_eq!(*calls.lock().unwrap(), vec!["juhe", "grass"]);
+    }
+
+    #[tokio::test]
+    async fn song_url_can_resume_from_the_next_js_source() {
+        let manager = SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let generation = manager.begin_js_source_request(true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = |name| {
+            Arc::new(StubJsSource {
+                name,
+                succeeds: true,
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn MusicSource>
+        };
+        assert!(
+            manager.set_js_sources_if_current(generation, vec![source("juhe"), source("grass")],)
+        );
+        let song = SongInfo::new(
+            "song-id".to_string(),
+            SourceId::Kw,
+            "song".to_string(),
+            "artist".to_string(),
+        );
+
+        let (first, first_index) = manager
+            .get_song_url_from_js_index(&song, Quality::High320, 0)
+            .await
+            .unwrap();
+        let (second, second_index) = manager
+            .get_song_url_from_js_index(&song, Quality::High320, first_index.unwrap() + 1)
+            .await
+            .unwrap();
+
+        assert_eq!(first.url, "https://example.com/juhe.mp3");
+        assert_eq!(second.url, "https://example.com/grass.mp3");
+        assert_eq!(second_index, Some(1));
+        assert_eq!(*calls.lock().unwrap(), vec!["juhe", "grass"]);
+    }
+
+    #[test]
+    fn named_js_sources_keep_their_origin_and_display_names() {
+        let manager = SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let generation = manager.begin_js_source_request(true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = |name| {
+            Arc::new(StubJsSource {
+                name,
+                succeeds: true,
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn MusicSource>
+        };
+
+        assert!(manager.set_named_js_sources_if_current(
+            generation,
+            vec![
+                ("https://example.com/juhe.js".to_string(), source("聚合")),
+                ("https://example.com/grass.js".to_string(), source("草原")),
+            ],
+        ));
+
+        assert_eq!(
+            manager.js_source_names(),
+            vec!["聚合".to_string(), "草原".to_string()]
+        );
+        assert_eq!(
+            manager.js_source_name_for_origin("https://example.com/grass.js"),
+            Some("草原".to_string())
+        );
     }
 }

@@ -570,7 +570,7 @@ fn run_app(
                     if let Err(error) = ctx.persist_playback_session() {
                         tracing::warn!("save playback session failed: {error}");
                     }
-                    ctx.player.stop();
+                    ctx.stop_player();
                     return Ok(());
                 }
                 needs_render = true;
@@ -729,20 +729,22 @@ fn run_app(
         if let Some(rx) = player_event_rx.as_mut() {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    PlayerEvent::Ended => {
+                    PlayerEvent::Playing { generation }
+                        if generation == ctx.active_player_generation.load(Ordering::SeqCst) =>
+                    {
+                        ctx.playlist.mark_playback_started();
+                    }
+                    PlayerEvent::Ended { generation }
+                        if generation == ctx.active_player_generation.load(Ordering::SeqCst) =>
+                    {
                         if let Some((songs, index)) = ctx.playlist.next_entry() {
-                            execute_action(
-                                AppAction::PlaySong { songs, index },
-                                &ctx,
-                                rt,
-                                &action_tx,
-                                &search_page,
-                                &settings_page,
-                                &search_seq,
-                            );
+                            let _ = action_tx.send(AppAction::PlaySong { songs, index });
                         }
                     }
-                    PlayerEvent::Error(error) => {
+                    PlayerEvent::Error {
+                        generation,
+                        message: error,
+                    } if generation == ctx.active_player_generation.load(Ordering::SeqCst) => {
                         let retry_song = ctx.current_song.read().unwrap().clone();
                         let auto_toggle = ctx.config.read().unwrap().source.auto_toggle;
                         if auto_toggle
@@ -760,10 +762,21 @@ fn run_app(
                                 });
                             }
                         } else {
-                            ctx.notify(Notification::error(format!("播放器错误: {}", error)));
+                            let _ = action_tx.send(AppAction::PlaybackFailed {
+                                request_id: ctx.play_request_id.load(Ordering::SeqCst),
+                                error: format!("播放器错误: {error}"),
+                            });
                         }
                     }
-                    PlayerEvent::Buffering(_) => {}
+                    PlayerEvent::Buffering {
+                        generation,
+                        percent,
+                    } if generation == ctx.active_player_generation.load(Ordering::SeqCst) => {
+                        tracing::trace!("mpv buffering: {:.0}%", percent * 100.0);
+                    }
+                    stale_event => {
+                        tracing::debug!("ignoring stale player event: {stale_event:?}");
+                    }
                 }
                 needs_render = true;
             }
@@ -1172,7 +1185,10 @@ fn run_app(
             // 设置页的选项键覆盖了大半个字母表，与全局键位必然冲突，交由页面独占
             let settings_owns_key = active_tab == NavTab::Settings
                 && !text_input_active
-                && pages::settings::SettingsPage::consumes_key(&key, &kb_resolver);
+                && settings_page
+                    .lock()
+                    .unwrap()
+                    .consumes_key(&key, &kb_resolver);
             if !settings_owns_key && let Some(action) = kb_resolver.resolve_global(&key) {
                 match action {
                     Action::GlobalQuit if !text_input_active => {
@@ -1180,7 +1196,7 @@ fn run_app(
                         if let Err(error) = ctx.persist_playback_session() {
                             tracing::warn!("save playback session failed: {error}");
                         }
-                        ctx.player.stop();
+                        ctx.stop_player();
                         return Ok(());
                     }
                     Action::GlobalPlayPause if !text_input_active => {
@@ -1888,12 +1904,12 @@ fn run_app(
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             {
                 let duration = *ctx.duration.borrow();
-                if !duration.is_zero() && ui_areas.progress.width > 0 {
-                    let offset = mouse.column.saturating_sub(ui_areas.progress.x);
-                    let ratio = f64::from(offset) / f64::from(ui_areas.progress.width);
-                    ctx.seek(Duration::from_secs_f64(
-                        duration.as_secs_f64() * ratio.clamp(0.0, 1.0),
-                    ));
+                if let Some(position) = components::progress_bar::seek_position(
+                    ui_areas.progress,
+                    mouse.column,
+                    duration,
+                ) {
+                    ctx.seek(position);
                 }
             } else if ui_areas.content.contains(position) {
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
@@ -2408,7 +2424,7 @@ fn execute_mpris_command(
         MprisCommand::Play => ctx.player.resume(),
         MprisCommand::Pause => ctx.player.pause(),
         MprisCommand::Toggle => ctx.player.toggle(),
-        MprisCommand::Stop => ctx.player.stop(),
+        MprisCommand::Stop => ctx.stop_player(),
         MprisCommand::Next => play_entry(ctx.playlist.next_manual_entry()),
         MprisCommand::Previous => play_entry(ctx.playlist.prev_manual_entry()),
         MprisCommand::SeekBy(offset) => {
@@ -2560,69 +2576,10 @@ fn execute_action(
             });
         }
         AppAction::PlaySong { songs, index } => {
-            if let Some(song) = songs.get(index).cloned() {
-                if should_expand_bili_parts(&song) {
-                    let request_id = ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1;
-                    let _ = ctx.player.prepare();
-                    *ctx.current_song.write().unwrap() = Some(song.clone());
-                    ctx.notify(
-                        Notification::info(format!("正在解析分 P: {}", song.name)).tui_only(),
-                    );
-                    let bili_source = Arc::clone(&ctx.bili_source);
-                    let play_request_id = Arc::clone(&ctx.play_request_id);
-                    let tx = action_tx.clone();
-                    rt.spawn(async move {
-                        let result = tokio::time::timeout(
-                            Duration::from_secs(15),
-                            bili_source.video_parts(&song),
-                        )
-                        .await;
-                        if play_request_id.load(Ordering::SeqCst) != request_id {
-                            return;
-                        }
-
-                        let mut songs = songs;
-                        let next_index = match result {
-                            Ok(Ok(parts)) if !parts.is_empty() => {
-                                let part_count = parts.len();
-                                songs.splice(index..=index, parts);
-                                let _ = tx.send(AppAction::ShowNotification(
-                                    Notification::success(format!("已展开 {} 个分 P", part_count))
-                                        .tui_only(),
-                                ));
-                                index
-                            }
-                            Ok(Ok(_)) => {
-                                mark_bili_parts_checked(&mut songs[index]);
-                                index
-                            }
-                            Ok(Err(error)) => {
-                                mark_bili_parts_checked(&mut songs[index]);
-                                let _ =
-                                    tx.send(AppAction::ShowNotification(Notification::warning(
-                                        format!("分 P 解析失败，将播放默认分 P: {error}"),
-                                    )));
-                                index
-                            }
-                            Err(_) => {
-                                mark_bili_parts_checked(&mut songs[index]);
-                                let _ = tx.send(AppAction::ShowNotification(
-                                    Notification::warning("分 P 解析超时，将播放默认分 P"),
-                                ));
-                                index
-                            }
-                        };
-                        let _ = tx.send(AppAction::PlaySong {
-                            songs,
-                            index: next_index,
-                        });
-                    });
-                    return;
-                }
-                ctx.playlist.set_playlist(songs, index);
-                ctx.play_attempted_sources.lock().unwrap().clear();
-                start_song_playback(song, true, None, ctx, rt, action_tx);
-            }
+            begin_song_from_list(songs, index, false, ctx, rt, action_tx);
+        }
+        AppAction::PlaySongAfterFailure { songs, index } => {
+            begin_song_from_list(songs, index, true, ctx, rt, action_tx);
         }
         AppAction::RestorePlayback {
             songs,
@@ -2634,10 +2591,11 @@ fn execute_action(
             if let Some(song) = songs.get(index).cloned() {
                 ctx.playlist.set_playlist(songs, index);
                 ctx.play_attempted_sources.lock().unwrap().clear();
+                *ctx.play_js_source_index.lock().unwrap() = None;
                 if start_playback {
                     start_song_playback(song, false, Some((position, paused)), ctx, rt, action_tx);
                 } else {
-                    ctx.player.stop();
+                    ctx.stop_player();
                     *ctx.current_song.write().unwrap() = Some(song);
                 }
             }
@@ -2657,6 +2615,27 @@ fn execute_action(
         }
         AppAction::RetrySong { song } => {
             start_song_playback(*song, false, None, ctx, rt, action_tx);
+        }
+        AppAction::PlaybackFailed { request_id, error } => {
+            if ctx.play_request_id.load(Ordering::SeqCst) != request_id {
+                return;
+            }
+            ctx.stop_player();
+            if let Some((songs, index)) = ctx.playlist.next_after_failure() {
+                let failed = ctx
+                    .current_song
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|song| format!("{} - {}", song.name, song.singer))
+                    .unwrap_or_else(|| "当前歌曲".to_string());
+                ctx.notify(Notification::warning(format!("{error}；已跳过 {failed}")).tui_only());
+                begin_song_from_list(songs, index, true, ctx, rt, action_tx);
+            } else {
+                ctx.notify(Notification::error(format!(
+                    "{error}；队列中没有更多可播放歌曲"
+                )));
+            }
         }
         AppAction::ShowNotification(n) => {
             ctx.notify(n);
@@ -2831,6 +2810,87 @@ fn execute_action(
     }
 }
 
+fn begin_song_from_list(
+    songs: Vec<SongInfo>,
+    index: usize,
+    after_failure: bool,
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+) {
+    let Some(song) = songs.get(index).cloned() else {
+        return;
+    };
+    if should_expand_bili_parts(&song) {
+        let request_id = ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = prepare_player(ctx);
+        *ctx.current_song.write().unwrap() = Some(song.clone());
+        ctx.notify(Notification::info(format!("正在解析分 P: {}", song.name)).tui_only());
+        let bili_source = Arc::clone(&ctx.bili_source);
+        let play_request_id = Arc::clone(&ctx.play_request_id);
+        let tx = action_tx.clone();
+        rt.spawn(async move {
+            let result =
+                tokio::time::timeout(Duration::from_secs(15), bili_source.video_parts(&song)).await;
+            if play_request_id.load(Ordering::SeqCst) != request_id {
+                return;
+            }
+
+            let mut songs = songs;
+            let next_index = match result {
+                Ok(Ok(parts)) if !parts.is_empty() => {
+                    let part_count = parts.len();
+                    songs.splice(index..=index, parts);
+                    let _ = tx.send(AppAction::ShowNotification(
+                        Notification::success(format!("已展开 {} 个分 P", part_count)).tui_only(),
+                    ));
+                    index
+                }
+                Ok(Ok(_)) => {
+                    mark_bili_parts_checked(&mut songs[index]);
+                    index
+                }
+                Ok(Err(error)) => {
+                    mark_bili_parts_checked(&mut songs[index]);
+                    let _ = tx.send(AppAction::ShowNotification(Notification::warning(format!(
+                        "分 P 解析失败，将播放默认分 P: {error}"
+                    ))));
+                    index
+                }
+                Err(_) => {
+                    mark_bili_parts_checked(&mut songs[index]);
+                    let _ = tx.send(AppAction::ShowNotification(Notification::warning(
+                        "分 P 解析超时，将播放默认分 P",
+                    )));
+                    index
+                }
+            };
+            let action = if after_failure {
+                AppAction::PlaySongAfterFailure {
+                    songs,
+                    index: next_index,
+                }
+            } else {
+                AppAction::PlaySong {
+                    songs,
+                    index: next_index,
+                }
+            };
+            let _ = tx.send(action);
+        });
+        return;
+    }
+
+    if after_failure {
+        ctx.playlist.set_playlist_after_failure(songs, index);
+    } else {
+        ctx.playlist.set_playlist(songs, index);
+    }
+    ctx.play_attempted_sources.lock().unwrap().clear();
+    *ctx.play_js_source_index.lock().unwrap() = None;
+    start_song_playback(song, true, None, ctx, rt, action_tx);
+}
+
 fn start_song_playback(
     song: SongInfo,
     add_history: bool,
@@ -2840,7 +2900,7 @@ fn start_song_playback(
     action_tx: &mpsc::UnboundedSender<AppAction>,
 ) {
     let request_id = ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1;
-    let player_generation = ctx.player.prepare();
+    let player_generation = prepare_player(ctx);
     let lyric_generation = ctx.lyric_service.prepare();
     let (show_cover, album_cover_notification, track_change_notification) = {
         let config = ctx.config.read().unwrap();
@@ -2904,6 +2964,7 @@ fn start_song_playback(
     let current_song = Arc::clone(&ctx.current_song);
     let play_request_id = Arc::clone(&ctx.play_request_id);
     let attempted_sources = Arc::clone(&ctx.play_attempted_sources);
+    let js_source_index = Arc::clone(&ctx.play_js_source_index);
     let (quality, auto_toggle) = {
         let config = ctx.config.read().unwrap();
         (config.player.quality, config.source.auto_toggle)
@@ -2920,6 +2981,7 @@ fn start_song_playback(
                 auto_toggle,
                 Arc::clone(&play_request_id),
                 Arc::clone(&attempted_sources),
+                Arc::clone(&js_source_index),
                 request_id,
             ),
         )
@@ -2934,20 +2996,24 @@ fn start_song_playback(
             Ok(Ok(None)) => return,
             Ok(Err(error)) => {
                 player.stop();
-                let _ = tx.send(AppAction::ShowNotification(Notification::error(error)));
+                let _ = tx.send(AppAction::PlaybackFailed { request_id, error });
                 return;
             }
             Err(_) => {
                 player.stop();
-                let _ = tx.send(AppAction::ShowNotification(Notification::error(
-                    "获取播放地址超时，请稍后重试",
-                )));
+                let _ = tx.send(AppAction::PlaybackFailed {
+                    request_id,
+                    error: "获取播放地址超时，请稍后重试".to_string(),
+                });
                 return;
             }
         };
 
         let url = song_url.url;
         let headers = song_url.headers;
+        // mpv 可能在 loadfile 返回后立刻报错，先保存实际匹配到的歌曲，
+        // 让错误处理继续重试正确的候选音源。
+        *current_song.write().unwrap() = Some(resolved_song.clone());
         let player_for_start = Arc::clone(&player);
         let request_guard = Arc::clone(&play_request_id);
         let accepted = tokio::task::spawn_blocking(move || {
@@ -3051,16 +3117,36 @@ async fn resolve_playable_song(
     auto_toggle: bool,
     play_request_id: Arc<AtomicU64>,
     attempted_sources: Arc<std::sync::Mutex<std::collections::HashSet<SourceId>>>,
+    js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
     request_id: u64,
 ) -> Result<Option<(SongInfo, SongUrl)>, String> {
-    let direct_error = if mark_source_attempted(&attempted_sources, song.source) {
-        match source_manager.get_song_url(&song, quality).await {
-            Ok(url) => return Ok(Some((song, url))),
-            Err(error) => error.to_string(),
-        }
-    } else {
-        format!("音源 {} 已尝试", song.source.as_str())
-    };
+    let next_js_source_index = js_source_index
+        .lock()
+        .unwrap()
+        .and_then(|index| index.checked_add(1));
+    let retrying_next_js_source = next_js_source_index.is_some();
+    let direct_error =
+        if retrying_next_js_source || mark_source_attempted(&attempted_sources, song.source) {
+            match resolve_song_url(
+                Arc::clone(&source_manager),
+                &song,
+                quality,
+                next_js_source_index.unwrap_or(0),
+            )
+            .await
+            {
+                Ok((url, resolved_js_source_index)) => {
+                    if play_request_id.load(Ordering::SeqCst) != request_id {
+                        return Ok(None);
+                    }
+                    *js_source_index.lock().unwrap() = resolved_js_source_index;
+                    return Ok(Some((song, url)));
+                }
+                Err(error) => error,
+            }
+        } else {
+            format!("音源 {} 已尝试", song.source.as_str())
+        };
 
     if play_request_id.load(Ordering::SeqCst) != request_id {
         return Ok(None);
@@ -3078,8 +3164,14 @@ async fn resolve_playable_song(
         if !mark_source_attempted(&attempted_sources, candidate.source) {
             continue;
         }
-        match source_manager.get_song_url(&candidate, quality).await {
-            Ok(url) => return Ok(Some((candidate, url))),
+        match resolve_song_url(Arc::clone(&source_manager), &candidate, quality, 0).await {
+            Ok((url, resolved_js_source_index)) => {
+                if play_request_id.load(Ordering::SeqCst) != request_id {
+                    return Ok(None);
+                }
+                *js_source_index.lock().unwrap() = resolved_js_source_index;
+                return Ok(Some((candidate, url)));
+            }
             Err(error) => {
                 tracing::debug!(
                     "toggle source failed for {} [{}]: {}",
@@ -3100,11 +3192,30 @@ async fn resolve_playable_song(
     ))
 }
 
+async fn resolve_song_url(
+    source_manager: Arc<lx_source::manager::SourceManager>,
+    song: &SongInfo,
+    quality: Quality,
+    js_start_index: usize,
+) -> Result<(SongUrl, Option<usize>), String> {
+    source_manager
+        .get_song_url_from_js_index(song, quality, js_start_index)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 fn mark_source_attempted(
     attempted_sources: &std::sync::Mutex<std::collections::HashSet<SourceId>>,
     source: SourceId,
 ) -> bool {
     attempted_sources.lock().unwrap().insert(source)
+}
+
+fn prepare_player(ctx: &AppContext) -> u64 {
+    let generation = ctx.player.prepare();
+    ctx.active_player_generation
+        .store(generation, Ordering::SeqCst);
+    generation
 }
 
 fn spawn_js_source_loader(
@@ -3126,12 +3237,13 @@ fn spawn_js_source_loader(
 
     rt.spawn(async move {
         let total = urls.len();
-        let mut loaded = Vec::<Arc<dyn lx_core::traits::source::MusicSource>>::with_capacity(total);
+        let mut loaded =
+            Vec::<(String, Arc<dyn lx_core::traits::source::MusicSource>)>::with_capacity(total);
         let mut errors = Vec::new();
         for url in urls {
             match lx_source::js::loader::load_source(&url, &default_source).await {
                 Ok(source) => {
-                    loaded.push(Arc::new(source));
+                    loaded.push((url.clone(), Arc::new(source)));
                 }
                 Err(error) => {
                     if !source_manager.is_js_source_request_current(generation) {
@@ -3144,7 +3256,7 @@ fn spawn_js_source_loader(
         }
 
         let loaded_count = loaded.len();
-        if !source_manager.set_js_sources_if_current(generation, loaded) {
+        if !source_manager.set_named_js_sources_if_current(generation, loaded) {
             return;
         }
         if loaded_count == 0 {

@@ -138,22 +138,29 @@ impl Player for MpvEngine {
                                         PlayerState::Playing
                                     };
                                     let _ = state_tx.send(state);
+                                    let _ = event_tx.send(PlayerEvent::Playing { generation });
                                 }
                                 MpvEvent::Buffering(percent) => {
                                     if percent < 1.0 && !paused.load(Ordering::SeqCst) {
                                         let _ = state_tx.send(PlayerState::Loading);
                                     }
-                                    let _ = event_tx.send(PlayerEvent::Buffering(percent));
+                                    let _ = event_tx.send(PlayerEvent::Buffering {
+                                        generation,
+                                        percent,
+                                    });
                                 }
                                 MpvEvent::EndFile => {
                                     polling.store(false, Ordering::SeqCst);
-                                    let _ = event_tx.send(PlayerEvent::Ended);
                                     let _ = state_tx.send(PlayerState::Stopped);
+                                    let _ = event_tx.send(PlayerEvent::Ended { generation });
                                 }
                                 MpvEvent::Error(error) => {
                                     polling.store(false, Ordering::SeqCst);
-                                    let _ = event_tx.send(PlayerEvent::Error(error));
                                     let _ = state_tx.send(PlayerState::Stopped);
+                                    let _ = event_tx.send(PlayerEvent::Error {
+                                        generation,
+                                        message: error,
+                                    });
                                 }
                             }
                         }
@@ -227,7 +234,10 @@ impl Player for MpvEngine {
                         polling.store(false, Ordering::SeqCst);
                         ipc.stop();
                         let _ = self.state_tx.send(PlayerState::Stopped);
-                        let _ = self.event_tx.send(PlayerEvent::Error(error.to_string()));
+                        let _ = self.event_tx.send(PlayerEvent::Error {
+                            generation,
+                            message: error.to_string(),
+                        });
                         return false;
                     }
                 }
@@ -239,7 +249,10 @@ impl Player for MpvEngine {
                     polling.store(false, Ordering::SeqCst);
                     ipc.stop();
                     let _ = self.state_tx.send(PlayerState::Stopped);
-                    let _ = self.event_tx.send(PlayerEvent::Error(error.to_string()));
+                    let _ = self.event_tx.send(PlayerEvent::Error {
+                        generation,
+                        message: error.to_string(),
+                    });
                     return false;
                 }
                 // 存入 ipc；播放状态由 mpv 的 playback-restart 事件确认。
@@ -249,7 +262,10 @@ impl Player for MpvEngine {
             Err(e) => {
                 if self.generation.load(Ordering::SeqCst) == generation {
                     let _ = self.state_tx.send(PlayerState::Stopped);
-                    let _ = self.event_tx.send(PlayerEvent::Error(e.to_string()));
+                    let _ = self.event_tx.send(PlayerEvent::Error {
+                        generation,
+                        message: e.to_string(),
+                    });
                 }
                 false
             }

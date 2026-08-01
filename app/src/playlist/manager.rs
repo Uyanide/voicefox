@@ -14,6 +14,8 @@ pub struct PlaylistManager {
     current_index: Mutex<usize>,
     /// 播放模式（默认列表循环）
     play_mode: Mutex<crate::playlist::mode::PlayMode>,
+    /// 从上一次成功开始播放后累计的连续失败次数。
+    consecutive_failures: Mutex<usize>,
 }
 
 impl PlaylistManager {
@@ -22,15 +24,28 @@ impl PlaylistManager {
             current_list: Mutex::new(vec![]),
             current_index: Mutex::new(0),
             play_mode: Mutex::new(play_mode),
+            consecutive_failures: Mutex::new(0),
         }
     }
 
     /// 设置播放列表
     pub fn set_playlist(&self, songs: Vec<SongInfo>, index: usize) {
+        self.set_playlist_inner(songs, index, true);
+    }
+
+    /// 自动跳过失败歌曲时更新列表，但保留连续失败计数。
+    pub fn set_playlist_after_failure(&self, songs: Vec<SongInfo>, index: usize) {
+        self.set_playlist_inner(songs, index, false);
+    }
+
+    fn set_playlist_inner(&self, songs: Vec<SongInfo>, index: usize, reset_failures: bool) {
         let mut list = self.current_list.lock().unwrap();
         *list = songs;
         let mut idx = self.current_index.lock().unwrap();
         *idx = index.min(list.len().saturating_sub(1));
+        if reset_failures {
+            *self.consecutive_failures.lock().unwrap() = 0;
+        }
     }
 
     pub fn snapshot(&self) -> (Vec<SongInfo>, usize) {
@@ -97,6 +112,7 @@ impl PlaylistManager {
     pub fn clear(&self) {
         self.current_list.lock().unwrap().clear();
         *self.current_index.lock().unwrap() = 0;
+        *self.consecutive_failures.lock().unwrap() = 0;
     }
 
     pub fn next_entry(&self) -> Option<(Vec<SongInfo>, usize)> {
@@ -121,6 +137,34 @@ impl PlaylistManager {
         let next = mode.manual_next_index(*index, list.len())?;
         *index = next;
         Some((list.clone(), next))
+    }
+
+    /// 当前歌曲所有可用解析方式都失败后选择下一首。
+    ///
+    /// 单曲循环在失败时也会前进；列表循环最多尝试一轮，避免所有歌曲
+    /// 都不可播放时无限循环。
+    pub fn next_after_failure(&self) -> Option<(Vec<SongInfo>, usize)> {
+        let list = self.current_list.lock().unwrap();
+        if list.is_empty() {
+            return None;
+        }
+
+        let mut failures = self.consecutive_failures.lock().unwrap();
+        *failures = failures.saturating_add(1);
+        if *failures >= list.len() {
+            return None;
+        }
+
+        let mut index = self.current_index.lock().unwrap();
+        let mode = *self.play_mode.lock().unwrap();
+        let next = mode.manual_next_index(*index, list.len())?;
+        *index = next;
+        Some((list.clone(), next))
+    }
+
+    /// mpv 已确认开始播放，新的连续失败计数从零开始。
+    pub fn mark_playback_started(&self) {
+        *self.consecutive_failures.lock().unwrap() = 0;
     }
 
     pub fn prev_manual_entry(&self) -> Option<(Vec<SongInfo>, usize)> {
@@ -298,5 +342,54 @@ mod tests {
 
         assert_eq!(index, 1);
         assert_eq!(songs[index].id, "video-p2");
+    }
+
+    #[test]
+    fn natural_end_respects_list_modes() {
+        let list_loop = PlaylistManager::new(PlayMode::ListLoop);
+        list_loop.set_playlist(vec![song("a"), song("b")], 1);
+        assert_eq!(list_loop.next_entry().unwrap().1, 0);
+
+        let list = PlaylistManager::new(PlayMode::List);
+        list.set_playlist(vec![song("a"), song("b")], 0);
+        assert_eq!(list.next_entry().unwrap().1, 1);
+        assert!(list.next_entry().is_none());
+
+        let stopped = PlaylistManager::new(PlayMode::None);
+        stopped.set_playlist(vec![song("a"), song("b")], 0);
+        assert!(stopped.next_entry().is_none());
+    }
+
+    #[test]
+    fn playback_failure_skips_single_loop_song() {
+        let playlist = PlaylistManager::new(PlayMode::SingleLoop);
+        playlist.set_playlist(vec![song("a"), song("b"), song("c")], 0);
+
+        let (songs, index) = playlist
+            .next_after_failure()
+            .expect("another song should be attempted");
+
+        assert_eq!(index, 1);
+        assert_eq!(songs[index].id, "b");
+    }
+
+    #[test]
+    fn playback_failures_stop_after_one_list_loop_pass() {
+        let playlist = PlaylistManager::new(PlayMode::ListLoop);
+        playlist.set_playlist(vec![song("a"), song("b"), song("c")], 1);
+
+        assert_eq!(playlist.next_after_failure().unwrap().1, 2);
+        assert_eq!(playlist.next_after_failure().unwrap().1, 0);
+        assert!(playlist.next_after_failure().is_none());
+    }
+
+    #[test]
+    fn successful_playback_resets_failure_limit() {
+        let playlist = PlaylistManager::new(PlayMode::ListLoop);
+        playlist.set_playlist(vec![song("a"), song("b")], 0);
+
+        assert_eq!(playlist.next_after_failure().unwrap().1, 1);
+        playlist.mark_playback_started();
+        assert_eq!(playlist.next_after_failure().unwrap().1, 0);
     }
 }

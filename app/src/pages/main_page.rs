@@ -104,7 +104,7 @@ impl MainPage {
                 QueueEditCommand::RemoveSelected => self.remove_at(self.selected, ctx),
                 QueueEditCommand::Clear => {
                     ctx.playlist.clear();
-                    ctx.player.stop();
+                    ctx.stop_player();
                     ctx.cover_service.clear();
                     ctx.lyric_service.clear();
                     *ctx.current_song.write().unwrap() = None;
@@ -342,7 +342,7 @@ impl MainPage {
             return AppAction::None;
         }
         if remaining.is_empty() {
-            ctx.player.stop();
+            ctx.stop_player();
             ctx.cover_service.clear();
             ctx.lyric_service.clear();
             *ctx.current_song.write().unwrap() = None;

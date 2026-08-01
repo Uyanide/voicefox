@@ -318,11 +318,8 @@ impl FavoritesPage {
         let show_search = self.filter.is_active() || !self.filter.query().is_empty();
         let mut cursor_y = inner.y;
         if show_search {
-            self.filter.render(
-                Rect::new(inner.x, cursor_y, inner.width, 1),
-                buf,
-                ctx,
-            );
+            self.filter
+                .render(Rect::new(inner.x, cursor_y, inner.width, 1), buf, ctx);
             cursor_y = cursor_y.saturating_add(1);
         }
 
@@ -451,8 +448,7 @@ impl FavoritesPage {
         let favorites = ctx.storage.load_favorites();
         let filtered = self.filtered_song_indices(&favorites);
         let inner = Block::default().borders(Borders::ALL).inner(area);
-        let search_height =
-            u16::from(self.filter.is_active() || !self.filter.query().is_empty());
+        let search_height = u16::from(self.filter.is_active() || !self.filter.query().is_empty());
         let list_y = inner.y.saturating_add(search_height).saturating_add(1);
         if event.row < list_y || event.row >= inner.bottom() {
             return None;

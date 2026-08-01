@@ -1,9 +1,67 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::source::{Quality, SourceId};
 use crate::keybinding::KeybindingConfig;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 5;
+pub const CURRENT_CONFIG_VERSION: u32 = 6;
+
+/// 可显示在底部状态栏中的内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusBarItem {
+    State,
+    Source,
+    Sort,
+    Song,
+    Time,
+    Volume,
+    PlayMode,
+    Quality,
+    Queue,
+    JsSourceState,
+}
+
+impl StatusBarItem {
+    pub const ALL: [Self; 10] = [
+        Self::State,
+        Self::Source,
+        Self::Sort,
+        Self::Song,
+        Self::Time,
+        Self::Volume,
+        Self::PlayMode,
+        Self::Quality,
+        Self::Queue,
+        Self::JsSourceState,
+    ];
+}
+
+fn default_status_bar_items() -> Vec<StatusBarItem> {
+    StatusBarItem::ALL.to_vec()
+}
+
+fn deserialize_status_bar_items<'de, D>(deserializer: D) -> Result<Vec<StatusBarItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    let mut items = values
+        .into_iter()
+        .filter_map(|value| {
+            serde_json::from_value::<StatusBarItem>(serde_json::Value::String(value)).ok()
+        })
+        .collect();
+    sanitize_status_bar_items(&mut items);
+    Ok(items)
+}
+
+/// 去除状态栏配置中的重复字段，同时保留用户指定的顺序。
+pub fn sanitize_status_bar_items(items: &mut Vec<StatusBarItem>) -> bool {
+    let original_len = items.len();
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|item| seen.insert(*item));
+    items.len() != original_len
+}
 
 /// 播放器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +242,12 @@ pub struct UiConfig {
     #[serde(default, skip_serializing)]
     pub notification_timeout: Option<u64>,
     pub max_fps: u32,
+    /// 底部状态栏中启用的字段，数组顺序即显示顺序。
+    #[serde(
+        default = "default_status_bar_items",
+        deserialize_with = "deserialize_status_bar_items"
+    )]
+    pub status_bar_items: Vec<StatusBarItem>,
 }
 
 impl Default for UiConfig {
@@ -198,6 +262,7 @@ impl Default for UiConfig {
             show_notifications: None,
             notification_timeout: None,
             max_fps: 20,
+            status_bar_items: default_status_bar_items(),
         }
     }
 }
@@ -318,7 +383,7 @@ fn legacy_config_version() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::LocalMusicConfig;
+    use super::{LocalMusicConfig, StatusBarItem, UiConfig};
 
     #[test]
     fn legacy_local_music_config_remains_enabled() {
@@ -342,5 +407,41 @@ mod tests {
         .unwrap();
 
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn status_bar_items_ignore_unknown_values_and_duplicates() {
+        let config: UiConfig = serde_json::from_value(serde_json::json!({
+            "status_bar_items": ["source", "unknown", "song", "source"]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.status_bar_items,
+            vec![StatusBarItem::Source, StatusBarItem::Song]
+        );
+    }
+
+    #[test]
+    fn status_bar_items_preserve_an_explicit_empty_list() {
+        let config: UiConfig = serde_json::from_value(serde_json::json!({
+            "status_bar_items": []
+        }))
+        .unwrap();
+
+        assert!(config.status_bar_items.is_empty());
+    }
+
+    #[test]
+    fn status_bar_items_use_documented_config_names() {
+        let mut config = UiConfig::default();
+        config.status_bar_items = vec![StatusBarItem::PlayMode, StatusBarItem::JsSourceState];
+
+        let value = serde_json::to_value(config).unwrap();
+
+        assert_eq!(
+            value["status_bar_items"],
+            serde_json::json!(["play-mode", "js-source-state"])
+        );
     }
 }

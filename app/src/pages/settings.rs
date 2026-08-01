@@ -3,13 +3,14 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
 use lx_core::keybinding::{Action, KeybindingResolver};
+use lx_core::model::config::StatusBarItem;
 use lx_core::model::source::{Quality, SourceId};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::context::AppContext;
 
@@ -33,6 +34,46 @@ fn shorten_source(value: &str, max_chars: usize) -> String {
     )
 }
 
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    let width = UnicodeWidthStr::width(value);
+    if width <= max_chars {
+        return format!("{value}{}", " ".repeat(max_chars - width));
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let available = max_chars - 1;
+    let mut result = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > available {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push('…');
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsFocus {
+    JsSources,
+    LocalPaths,
+    StatusBar,
+}
+
+impl SettingsFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::JsSources => Self::LocalPaths,
+            Self::LocalPaths => Self::StatusBar,
+            Self::StatusBar => Self::JsSources,
+        }
+    }
+}
+
 pub struct SettingsPage {
     /// 输入中的 JS 源 URL 或本地路径
     pub input_url: String,
@@ -54,8 +95,12 @@ pub struct SettingsPage {
     pub proxy_input_mode: bool,
     /// 内置音源开关当前指向的音源
     pub enabled_source_index: usize,
-    /// 当前聚焦区域: "js" 或 "local"
-    pub focus: String,
+    /// 状态栏字段列表的选中索引
+    pub selected_status_item: usize,
+    /// 状态栏字段列表的滚动位置
+    status_item_scroll: usize,
+    /// 当前聚焦区域
+    focus: SettingsFocus,
 }
 
 impl SettingsPage {
@@ -67,7 +112,7 @@ impl SettingsPage {
     /// 判断按键是否由设置页独占。设置页把整个字母表当作选项开关，
     /// 与用户可自定义的全局快捷键必然重叠，因此这些键不再交给全局分发。
     /// 带 Ctrl/Alt 的组合键以及 Space、Tab、Esc 仍归全局。
-    pub fn consumes_key(key: &KeyEvent, resolver: &KeybindingResolver) -> bool {
+    pub fn consumes_key(&self, key: &KeyEvent, resolver: &KeybindingResolver) -> bool {
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -79,6 +124,17 @@ impl SettingsPage {
             resolver.resolve_page("settings", key),
             Some(Action::ListSelectUp | Action::ListSelectDown)
         ) {
+            return true;
+        }
+        if self.focus == SettingsFocus::StatusBar
+            && (matches!(
+                (key.modifiers, key.code),
+                (KeyModifiers::NONE, KeyCode::Enter | KeyCode::Char(' '))
+            ) || matches!(
+                (key.modifiers, key.code),
+                (KeyModifiers::SHIFT, KeyCode::Left | KeyCode::Right)
+            ))
+        {
             return true;
         }
         match key.code {
@@ -100,7 +156,9 @@ impl SettingsPage {
             proxy_input: String::new(),
             proxy_input_mode: false,
             enabled_source_index: 0,
-            focus: "js".to_string(),
+            selected_status_item: 0,
+            status_item_scroll: 0,
+            focus: SettingsFocus::JsSources,
         }
     }
 
@@ -144,9 +202,22 @@ impl SettingsPage {
                 _ => {}
             }
         } else {
-            // 先判断焦点区域：local 区域的按键优先处理
-            if self.focus == "local"
+            if matches!(
+                (key.modifiers, key.code),
+                (KeyModifiers::NONE, KeyCode::Char('s'))
+            ) {
+                self.focus = self.focus.next();
+                return AppAction::None;
+            }
+
+            // 当前列表区域的按键优先处理。
+            if self.focus == SettingsFocus::LocalPaths
                 && let Some(action) = self.handle_local_keys(key, ctx, resolver)
+            {
+                return action;
+            }
+            if self.focus == SettingsFocus::StatusBar
+                && let Some(action) = self.handle_status_bar_keys(key, ctx, resolver)
             {
                 return action;
             }
@@ -423,9 +494,6 @@ impl SettingsPage {
                             next_scan_depth(config.local_music.max_depth);
                     });
                 }
-                (KeyModifiers::NONE, KeyCode::Char('s')) => {
-                    self.focus = if self.focus == "js" { "local" } else { "js" }.to_string();
-                }
                 (KeyModifiers::NONE, KeyCode::Char('b')) => {
                     if ctx.bili_source.is_logged_in() {
                         return AppAction::BiliLogout;
@@ -636,10 +704,6 @@ impl SettingsPage {
         }
 
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Char('s')) => {
-                self.focus = "js".to_string();
-                Some(AppAction::None)
-            }
             (KeyModifiers::NONE, KeyCode::Char('a')) => {
                 self.local_path_mode = true;
                 self.local_path_input.clear();
@@ -697,6 +761,119 @@ impl SettingsPage {
         }
     }
 
+    fn handle_status_bar_keys(
+        &mut self,
+        key: KeyEvent,
+        ctx: &AppContext,
+        resolver: &KeybindingResolver,
+    ) -> Option<AppAction> {
+        let item_count = StatusBarItem::ALL.len();
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Enter | KeyCode::Char(' ')) => {
+                self.toggle_status_bar_item(ctx);
+                return Some(AppAction::None);
+            }
+            (KeyModifiers::SHIFT, KeyCode::Left | KeyCode::Up) => {
+                self.move_status_bar_item(ctx, -1);
+                return Some(AppAction::None);
+            }
+            (KeyModifiers::SHIFT, KeyCode::Right | KeyCode::Down) => {
+                self.move_status_bar_item(ctx, 1);
+                return Some(AppAction::None);
+            }
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                self.selected_status_item = self.selected_status_item.saturating_sub(1);
+                return Some(AppAction::None);
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                self.selected_status_item =
+                    (self.selected_status_item + 1).min(item_count.saturating_sub(1));
+                return Some(AppAction::None);
+            }
+            (KeyModifiers::NONE, KeyCode::Char('a' | 'd' | 'r')) => {
+                return Some(AppAction::None);
+            }
+            _ => {}
+        }
+
+        if let Some(action) = resolver.resolve_page("settings", &key) {
+            match action {
+                Action::ListSelectUp => {
+                    self.selected_status_item = self.selected_status_item.saturating_sub(1);
+                    return Some(AppAction::None);
+                }
+                Action::ListSelectDown => {
+                    self.selected_status_item =
+                        (self.selected_status_item + 1).min(item_count.saturating_sub(1));
+                    return Some(AppAction::None);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn toggle_status_bar_item(&mut self, ctx: &AppContext) {
+        let item = StatusBarItem::ALL[self.selected_status_item % StatusBarItem::ALL.len()];
+        let (enabled, result) = {
+            let mut config = ctx.config.write().unwrap();
+            if config.ui.status_bar_items.contains(&item) {
+                config
+                    .ui
+                    .status_bar_items
+                    .retain(|candidate| *candidate != item);
+                let result = crate::config::loader::save(&config, &ctx.config_path);
+                (false, result)
+            } else {
+                config.ui.status_bar_items.push(item);
+                let result = crate::config::loader::save(&config, &ctx.config_path);
+                (true, result)
+            }
+        };
+        self.status_msg = Some(match result {
+            Ok(()) => format!(
+                "状态栏“{}”已{}",
+                status_bar_item_label(item),
+                if enabled { "显示" } else { "隐藏" }
+            ),
+            Err(error) => format!("状态栏已更新，但保存失败: {error}"),
+        });
+    }
+
+    fn move_status_bar_item(&mut self, ctx: &AppContext, direction: isize) {
+        let item = StatusBarItem::ALL[self.selected_status_item % StatusBarItem::ALL.len()];
+        let (position, result) = {
+            let mut config = ctx.config.write().unwrap();
+            let Some(index) = config
+                .ui
+                .status_bar_items
+                .iter()
+                .position(|candidate| *candidate == item)
+            else {
+                self.status_msg = Some("请先启用这个状态栏字段".to_string());
+                return;
+            };
+            let new_index = if direction < 0 {
+                index.saturating_sub(1)
+            } else {
+                (index + 1).min(config.ui.status_bar_items.len().saturating_sub(1))
+            };
+            if new_index == index {
+                return;
+            }
+            config.ui.status_bar_items.swap(index, new_index);
+            let result = crate::config::loader::save(&config, &ctx.config_path);
+            (new_index + 1, result)
+        };
+        self.status_msg = Some(match result {
+            Ok(()) => format!(
+                "状态栏“{}”已移到第 {position} 位",
+                status_bar_item_label(item)
+            ),
+            Err(error) => format!("状态栏顺序已更新，但保存失败: {error}"),
+        });
+    }
+
     fn update_config(
         &mut self,
         ctx: &AppContext,
@@ -719,7 +896,7 @@ impl SettingsPage {
         let local_paths = &config.local_music.paths;
         let accent = crate::theme::accent(ctx);
         let muted = crate::theme::muted(ctx);
-        let chunks = settings_chunks(area);
+        let chunks = settings_chunks(area, self.focus);
         let proxy_label = if config.network.proxy_url.is_empty() {
             "未设置".to_string()
         } else {
@@ -879,12 +1056,12 @@ impl SettingsPage {
 
         let source_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(if self.focus == "js" {
+            .border_style(Style::new().fg(if self.focus == SettingsFocus::JsSources {
                 accent
             } else {
                 crate::theme::border(ctx)
             }))
-            .title(" lx-music JS 音源 · a 添加 / d 删除 ");
+            .title(" JS 音源 [s/a/d] ");
         let source_inner = source_block.inner(chunks[1]);
         source_block.render(chunks[1], buf);
         if source_inner.height > 0 {
@@ -921,10 +1098,14 @@ impl SettingsPage {
             }
         } else {
             self.selected_source = self.selected_source.min(sources.len().saturating_sub(1));
-            let max_chars = source_inner.width.saturating_sub(14) as usize;
+            let max_url_chars = source_inner.width.saturating_sub(28) as usize;
             for (row, (index, url)) in sources.iter().enumerate().take(source_rows).enumerate() {
                 let cached = is_source_cached(url);
                 let status = if cached { "cached" } else { "download" };
+                let name = ctx
+                    .source_manager
+                    .js_source_name_for_origin(url)
+                    .unwrap_or_else(|| "未加载".to_string());
                 let style = if index == self.selected_source {
                     Style::new()
                         .fg(crate::theme::selection_fg(ctx))
@@ -933,7 +1114,12 @@ impl SettingsPage {
                 } else {
                     Style::new().fg(crate::theme::text(ctx))
                 };
-                let text = format!(" {:<8} {}", status, shorten_source(url, max_chars.max(8)));
+                let text = format!(
+                    " {:<8} {} {}",
+                    status,
+                    truncate_display(&name, 12),
+                    shorten_source(url, max_url_chars.max(8))
+                );
                 Paragraph::new(Line::from(Span::styled(text, style))).render(
                     Rect::new(
                         source_inner.x,
@@ -946,33 +1132,15 @@ impl SettingsPage {
             }
         }
 
-        if let Some(ref msg) = self.status_msg
-            && source_inner.height > 1
-        {
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {}", msg),
-                Style::new().fg(crate::theme::yellow(ctx)),
-            )))
-            .render(
-                Rect::new(
-                    source_inner.x,
-                    source_inner.bottom().saturating_sub(1),
-                    source_inner.width,
-                    1,
-                ),
-                buf,
-            );
-        }
-
         // ── 本地音乐目录列表 ──
         let local_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(if self.focus == "local" {
+            .border_style(Style::new().fg(if self.focus == SettingsFocus::LocalPaths {
                 accent
             } else {
                 crate::theme::border(ctx)
             }))
-            .title(" 本地音乐目录 · s 切换 / a 添加 / d 删除 / r 扫描 ");
+            .title(" 本地目录 [s/a/d/r] ");
         let local_inner = local_block.inner(chunks[2]);
         local_block.render(chunks[2], buf);
 
@@ -1027,6 +1195,94 @@ impl SettingsPage {
                     buf,
                 );
             }
+        }
+
+        // ── 状态栏字段 ──
+        let status_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(if self.focus == SettingsFocus::StatusBar {
+                accent
+            } else {
+                crate::theme::border(ctx)
+            }))
+            .title(" 状态栏 [s/Space/Shift+方向键] ");
+        let status_inner = status_block.inner(chunks[3]);
+        status_block.render(chunks[3], buf);
+        let status_rows = status_inner.height.saturating_sub(1) as usize;
+        self.selected_status_item = self
+            .selected_status_item
+            .min(StatusBarItem::ALL.len().saturating_sub(1));
+        if self.selected_status_item < self.status_item_scroll {
+            self.status_item_scroll = self.selected_status_item;
+        } else if status_rows > 0
+            && self.selected_status_item >= self.status_item_scroll + status_rows
+        {
+            self.status_item_scroll = self.selected_status_item + 1 - status_rows;
+        }
+        self.status_item_scroll = self
+            .status_item_scroll
+            .min(StatusBarItem::ALL.len().saturating_sub(status_rows.max(1)));
+
+        for (row, (index, item)) in StatusBarItem::ALL
+            .iter()
+            .enumerate()
+            .skip(self.status_item_scroll)
+            .take(status_rows)
+            .enumerate()
+        {
+            let order = config
+                .ui
+                .status_bar_items
+                .iter()
+                .position(|candidate| candidate == item)
+                .map(|position| position + 1);
+            let selected = index == self.selected_status_item;
+            let style = if selected {
+                Style::new()
+                    .fg(crate::theme::selection_fg(ctx))
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(crate::theme::text(ctx))
+            };
+            let text = format!(
+                " [{}] {:>2}  {}",
+                if order.is_some() { "x" } else { " " },
+                order.map_or_else(|| "-".to_string(), |value| value.to_string()),
+                status_bar_item_label(*item)
+            );
+            Paragraph::new(Line::from(Span::styled(text, style))).render(
+                Rect::new(
+                    status_inner.x,
+                    status_inner.y + row as u16,
+                    status_inner.width,
+                    1,
+                ),
+                buf,
+            );
+        }
+
+        let focused_inner = match self.focus {
+            SettingsFocus::JsSources => source_inner,
+            SettingsFocus::LocalPaths => local_inner,
+            SettingsFocus::StatusBar => status_inner,
+        };
+        if let Some(ref msg) = self.status_msg
+            && focused_inner.height > 1
+        {
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}", msg),
+                Style::new().fg(crate::theme::yellow(ctx)),
+            )))
+            .render(
+                Rect::new(
+                    focused_inner.x,
+                    focused_inner.bottom().saturating_sub(1),
+                    focused_inner.width,
+                    1,
+                ),
+                buf,
+            );
         }
 
         // ── 本地音乐路径输入弹窗 ──
@@ -1120,14 +1376,37 @@ impl SettingsPage {
         if self.input_mode {
             return AppAction::None;
         }
-        let chunks = settings_chunks(area);
+        let chunks = settings_chunks(area, self.focus);
         match event.kind {
             MouseEventKind::ScrollUp => {
-                self.selected_source = self.selected_source.saturating_sub(1);
+                let position = Position::new(event.column, event.row);
+                if chunks[3].contains(position) {
+                    self.selected_status_item = self.selected_status_item.saturating_sub(1);
+                    self.focus = SettingsFocus::StatusBar;
+                } else if chunks[2].contains(position) {
+                    self.selected_local_path = self.selected_local_path.saturating_sub(1);
+                    self.focus = SettingsFocus::LocalPaths;
+                } else if chunks[1].contains(position) {
+                    self.selected_source = self.selected_source.saturating_sub(1);
+                    self.focus = SettingsFocus::JsSources;
+                }
             }
             MouseEventKind::ScrollDown => {
-                let len = ctx.config.read().unwrap().source.js_sources.len();
-                self.selected_source = (self.selected_source + 1).min(len.saturating_sub(1));
+                let position = Position::new(event.column, event.row);
+                if chunks[3].contains(position) {
+                    self.selected_status_item = (self.selected_status_item + 1)
+                        .min(StatusBarItem::ALL.len().saturating_sub(1));
+                    self.focus = SettingsFocus::StatusBar;
+                } else if chunks[2].contains(position) {
+                    let len = ctx.config.read().unwrap().local_music.paths.len();
+                    self.selected_local_path =
+                        (self.selected_local_path + 1).min(len.saturating_sub(1));
+                    self.focus = SettingsFocus::LocalPaths;
+                } else if chunks[1].contains(position) {
+                    let len = ctx.config.read().unwrap().source.js_sources.len();
+                    self.selected_source = (self.selected_source + 1).min(len.saturating_sub(1));
+                    self.focus = SettingsFocus::JsSources;
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let options_inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
@@ -1151,7 +1430,7 @@ impl SettingsPage {
                     let len = ctx.config.read().unwrap().source.js_sources.len();
                     if index < len {
                         self.selected_source = index;
-                        self.focus = "js".to_string();
+                        self.focus = SettingsFocus::JsSources;
                     }
                 }
 
@@ -1164,7 +1443,22 @@ impl SettingsPage {
                     let len = ctx.config.read().unwrap().local_music.paths.len();
                     if index < len {
                         self.selected_local_path = index;
-                        self.focus = "local".to_string();
+                        self.focus = SettingsFocus::LocalPaths;
+                    }
+                }
+
+                let status_inner = Block::default().borders(Borders::ALL).inner(chunks[3]);
+                if status_inner.contains((event.column, event.row).into())
+                    && event.row < status_inner.bottom().saturating_sub(1)
+                {
+                    let index =
+                        self.status_item_scroll + event.row.saturating_sub(status_inner.y) as usize;
+                    if index < StatusBarItem::ALL.len() {
+                        self.selected_status_item = index;
+                        self.focus = SettingsFocus::StatusBar;
+                        if event.column < status_inner.x.saturating_add(5) {
+                            self.toggle_status_bar_item(ctx);
+                        }
                     }
                 }
             }
@@ -1176,6 +1470,21 @@ impl SettingsPage {
 
 fn enabled(value: bool) -> &'static str {
     if value { "开启" } else { "关闭" }
+}
+
+fn status_bar_item_label(item: StatusBarItem) -> &'static str {
+    match item {
+        StatusBarItem::State => "播放状态",
+        StatusBarItem::Source => "当前音源",
+        StatusBarItem::Sort => "页面排序",
+        StatusBarItem::Song => "歌曲名称",
+        StatusBarItem::Time => "播放时间",
+        StatusBarItem::Volume => "音量",
+        StatusBarItem::PlayMode => "播放模式",
+        StatusBarItem::Quality => "音质",
+        StatusBarItem::Queue => "队列位置",
+        StatusBarItem::JsSourceState => "JS 音源状态",
+    }
 }
 
 /// 在更新配置项后更新这些常量!
@@ -1384,30 +1693,38 @@ fn setting_options_height(panel_width: u16) -> u16 {
     rows.saturating_add(2)
 }
 
-fn settings_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
-    if area.width >= 72 {
-        // 宽屏：选项占满上排，JS 音源与本地目录共享下排。
-        let option_height = setting_options_height(area.width).min(area.height);
-        let vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(option_height), Constraint::Min(0)])
-            .split(area);
+fn settings_chunks(area: Rect, focus: SettingsFocus) -> [Rect; 4] {
+    let option_height = setting_options_height(area.width).min(area.height);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(option_height), Constraint::Min(0)])
+        .split(area);
+
+    if area.width >= 108 {
+        // 宽屏：选项占满上排，三个管理区域共享下排。
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(vertical[1]);
-        std::rc::Rc::new([vertical[0], bottom[0], bottom[1]])
-    } else {
-        // 三块垂直布局
-        let option_height = setting_options_height(area.width).min(area.height);
-        Layout::default()
-            .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(option_height),
-                Constraint::Ratio(1, 2),
-                Constraint::Ratio(1, 2),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
             ])
-            .split(area)
+            .split(vertical[1]);
+        [vertical[0], bottom[0], bottom[1], bottom[2]]
+    } else {
+        // 窄屏只显示当前管理区域，避免列表被分割到无法使用。
+        let mut chunks = [
+            vertical[0],
+            Rect::default(),
+            Rect::default(),
+            Rect::default(),
+        ];
+        chunks[match focus {
+            SettingsFocus::JsSources => 1,
+            SettingsFocus::LocalPaths => 2,
+            SettingsFocus::StatusBar => 3,
+        }] = vertical[1];
+        chunks
     }
 }
 
@@ -1422,8 +1739,8 @@ mod tests {
     use lx_core::keybinding::{Action, KeybindingConfig, KeybindingResolver};
 
     use super::{
-        KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, SETTING_OPTION_KEYS, SettingsPage, setting_line,
-        setting_option_index, setting_value_line, settings_chunks, shorten_source,
+        KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, SETTING_OPTION_KEYS, SettingsFocus, SettingsPage,
+        setting_line, setting_option_index, setting_value_line, settings_chunks, shorten_source,
     };
 
     /// 各设置项取值统一起始的列号
@@ -1463,12 +1780,13 @@ mod tests {
     #[test]
     fn settings_page_owns_every_option_key() {
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+        let page = SettingsPage::new();
 
         for key in SETTING_OPTION_KEYS {
             let event = KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE);
 
             assert!(
-                SettingsPage::consumes_key(&event, &resolver),
+                page.consumes_key(&event, &resolver),
                 "选项键 {key} 不应被全局快捷键抢先处理"
             );
         }
@@ -1483,18 +1801,20 @@ mod tests {
             .unwrap()
             .insert(Action::ListSelectUp, "h".to_string());
         let resolver = KeybindingResolver::from_config(&config);
+        let page = SettingsPage::new();
 
         let rebound = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
         let released = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
 
-        assert!(SettingsPage::consumes_key(&rebound, &resolver));
+        assert!(page.consumes_key(&rebound, &resolver));
         // 'k' 不再是导航键，也不是选项键，应交还给全局
-        assert!(!SettingsPage::consumes_key(&released, &resolver));
+        assert!(!page.consumes_key(&released, &resolver));
     }
 
     #[test]
     fn settings_page_leaves_playback_and_navigation_keys_global() {
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+        let page = SettingsPage::new();
         let global = [
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -1507,7 +1827,7 @@ mod tests {
 
         for event in global {
             assert!(
-                !SettingsPage::consumes_key(&event, &resolver),
+                !page.consumes_key(&event, &resolver),
                 "{:?} 不应被设置页独占",
                 event.code
             );
@@ -1515,28 +1835,43 @@ mod tests {
     }
 
     #[test]
-    fn narrow_settings_use_two_columns_when_the_width_allows_it() {
-        let chunks = settings_chunks(Rect::new(0, 0, 60, 24));
+    fn status_bar_focus_owns_toggle_and_reorder_keys() {
+        let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+        let mut page = SettingsPage::new();
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        let shift_left = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
 
-        assert_eq!(chunks[0].height, 16);
-        assert!(chunks[1].height > 0);
-        assert!(chunks[2].height > 0);
-        assert_eq!(chunks[2].bottom(), 24);
+        assert!(!page.consumes_key(&space, &resolver));
+        page.focus = SettingsFocus::StatusBar;
+        assert!(page.consumes_key(&space, &resolver));
+        assert!(page.consumes_key(&shift_left, &resolver));
     }
 
     #[test]
-    fn wide_settings_keep_both_source_lists_visible() {
-        let chunks = settings_chunks(Rect::new(0, 0, 120, 30));
+    fn narrow_settings_show_only_the_focused_management_panel() {
+        let chunks = settings_chunks(Rect::new(0, 0, 60, 24), SettingsFocus::StatusBar);
+
+        assert_eq!(chunks[0].height, 16);
+        assert_eq!(chunks[1], Rect::default());
+        assert_eq!(chunks[2], Rect::default());
+        assert!(chunks[3].height > 0);
+        assert_eq!(chunks[3].bottom(), 24);
+    }
+
+    #[test]
+    fn wide_settings_keep_all_management_panels_visible() {
+        let chunks = settings_chunks(Rect::new(0, 0, 120, 30), SettingsFocus::JsSources);
 
         assert_eq!(chunks[0].height, 16);
         assert_eq!(chunks[1].y, chunks[0].bottom());
         assert_eq!(chunks[2].y, chunks[0].bottom());
-        assert_eq!(chunks[1].width + chunks[2].width, 120);
+        assert_eq!(chunks[3].y, chunks[0].bottom());
+        assert_eq!(chunks[1].width + chunks[2].width + chunks[3].width, 120);
     }
 
     #[test]
     fn setting_mouse_rows_follow_the_two_column_layout() {
-        let panel = settings_chunks(Rect::new(0, 0, 60, 24))[0];
+        let panel = settings_chunks(Rect::new(0, 0, 60, 24), SettingsFocus::JsSources)[0];
         let inner = Block::default().borders(Borders::ALL).inner(panel);
         let right_column_x = inner.x + inner.width / 2 + 1;
 

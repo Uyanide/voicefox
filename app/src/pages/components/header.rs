@@ -86,8 +86,18 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
 
     let source = song
         .as_ref()
-        .map(|song| song.source.as_str())
-        .unwrap_or("-");
+        .map(|song| {
+            let js_index = *ctx.play_js_source_index.lock().unwrap();
+            js_index
+                .and_then(|index| ctx.source_manager.js_source_name(index))
+                .or_else(|| {
+                    ctx.source_manager
+                        .get(song.source)
+                        .map(|source| source.name().to_string())
+                })
+                .unwrap_or_else(|| song.source.as_str().to_string())
+        })
+        .unwrap_or_else(|| "-".to_string());
     Paragraph::new(vec![
         Line::from(Span::styled(
             format!("Volume: {:>3}%", ctx.player.volume()),

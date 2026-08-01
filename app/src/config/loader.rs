@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use lx_core::model::config::{CURRENT_CONFIG_VERSION, Config, ThemeConfig};
+use lx_core::model::config::{
+    CURRENT_CONFIG_VERSION, Config, ThemeConfig, sanitize_status_bar_items,
+};
 use lx_core::model::source::SourceId;
 
 const VERSION_1_DEFAULT_SOURCES: &[SourceId] = &[
@@ -40,6 +42,7 @@ pub fn load(custom_path: &str) -> anyhow::Result<(Config, PathBuf)> {
 
 fn migrate_legacy_config(config: &mut Config) -> bool {
     let mut changed = migrate_legacy_theme(config);
+    changed |= sanitize_status_bar_items(&mut config.ui.status_bar_items);
     if config.version < 1 {
         if config.source.enabled == [SourceId::Kw] {
             config.source.enabled = VERSION_1_DEFAULT_SOURCES.to_vec();
@@ -81,6 +84,10 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
     if config.version < 5 {
         config.player.history_limit = config.player.history_limit.max(1);
         config.version = 5;
+        changed = true;
+    }
+    if config.version < 6 {
+        config.version = 6;
         changed = true;
     }
     debug_assert!(config.version <= CURRENT_CONFIG_VERSION);
@@ -137,7 +144,7 @@ pub fn save(config: &Config, path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{load, migrate_legacy_config};
-    use lx_core::model::config::{CURRENT_CONFIG_VERSION, Config};
+    use lx_core::model::config::{CURRENT_CONFIG_VERSION, Config, StatusBarItem};
     use lx_core::model::source::SourceId;
 
     #[test]
@@ -239,6 +246,22 @@ mod tests {
         assert!(migrate_legacy_config(&mut config));
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert_eq!(config.player.history_limit, 1);
+    }
+
+    #[test]
+    fn migration_preserves_status_bar_order_and_removes_duplicates() {
+        let mut config = Config::default();
+        config.ui.status_bar_items = vec![
+            StatusBarItem::Source,
+            StatusBarItem::Song,
+            StatusBarItem::Source,
+        ];
+
+        assert!(migrate_legacy_config(&mut config));
+        assert_eq!(
+            config.ui.status_bar_items,
+            vec![StatusBarItem::Source, StatusBarItem::Song]
+        );
     }
 
     #[test]

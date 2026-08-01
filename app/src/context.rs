@@ -40,7 +40,9 @@ pub struct AppContext {
     pub playlist: Arc<PlaylistManager>,
     pub current_song: Arc<std::sync::RwLock<Option<SongInfo>>>,
     pub play_request_id: Arc<AtomicU64>,
+    pub active_player_generation: Arc<AtomicU64>,
     pub play_attempted_sources: Arc<std::sync::Mutex<HashSet<lx_core::model::source::SourceId>>>,
+    pub play_js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
     pub local_scan_request_id: Arc<AtomicU64>,
     /// 当前进度所属的连续时间线，跳转会递增
     position_epoch: AtomicU64,
@@ -105,7 +107,9 @@ impl AppContext {
             playlist,
             current_song: Arc::new(std::sync::RwLock::new(None)),
             play_request_id: Arc::new(AtomicU64::new(0)),
+            active_player_generation: Arc::new(AtomicU64::new(0)),
             play_attempted_sources: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            play_js_source_index: Arc::new(std::sync::Mutex::new(None)),
             local_scan_request_id: Arc::new(AtomicU64::new(0)),
             position_epoch: AtomicU64::new(0),
             config: std::sync::RwLock::new(config),
@@ -122,6 +126,11 @@ impl AppContext {
     pub fn seek(&self, position: Duration) {
         self.player.seek(position);
         self.position_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn stop_player(&self) {
+        self.active_player_generation.fetch_add(1, Ordering::SeqCst);
+        self.player.stop();
     }
 
     /// 当前进度纪元，变化即代表期间发生过跳转。

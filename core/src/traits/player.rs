@@ -7,9 +7,10 @@ use crate::model::source::PlayerState;
 /// 播放器离散事件
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
-    Ended,
-    Error(String),
-    Buffering(f64),
+    Playing { generation: u64 },
+    Ended { generation: u64 },
+    Error { generation: u64, message: String },
+    Buffering { generation: u64, percent: f64 },
 }
 
 /// 播放器统一接口

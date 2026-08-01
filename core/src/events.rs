@@ -32,6 +32,10 @@ pub enum AppAction {
         songs: Vec<SongInfo>,
         index: usize,
     },
+    PlaySongAfterFailure {
+        songs: Vec<SongInfo>,
+        index: usize,
+    },
     /// Resolve a search-result Bilibili video before playback; multi-part videos open a picker.
     ResolveBiliParts {
         songs: Vec<SongInfo>,
@@ -51,6 +55,10 @@ pub enum AppAction {
     },
     RetrySong {
         song: Box<SongInfo>,
+    },
+    PlaybackFailed {
+        request_id: u64,
+        error: String,
     },
     Search {
         keyword: String,

@@ -67,6 +67,20 @@ show_cover = true
 # auto/kitty/sixel/iterm2/halfblocks；手动指定可跳过终端协议探测
 cover_protocol = "auto"
 max_fps = 20
+# 底部状态栏内容；数组顺序即从左到右的显示顺序，删除某项可将其隐藏
+# 可选项: state/source/sort/song/time/volume/play-mode/quality/queue/js-source-state
+status_bar_items = [
+    "state",
+    "source",
+    "sort",
+    "song",
+    "time",
+    "volume",
+    "play-mode",
+    "quality",
+    "queue",
+    "js-source-state",
+]
 
 [local_music]
 enabled = true
