@@ -3,7 +3,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -26,10 +26,28 @@ pub struct PlaybackSession {
     pub state: SavedPlayerState,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomPlaylist {
+    pub id: String,
+    pub name: String,
+    pub songs: Vec<SongInfo>,
+    pub created_at_unix_nanos: u128,
+    pub updated_at_unix_nanos: u128,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomPlaylistSummary {
+    pub id: String,
+    pub name: String,
+    pub cover_url: Option<String>,
+    pub song_count: u32,
+}
+
 pub struct Storage {
     data_dir: PathBuf,
     favorites: RwLock<Vec<SongInfo>>,
     favorite_playlists: RwLock<Vec<Playlist>>,
+    custom_playlists: RwLock<Vec<CustomPlaylist>>,
     history: RwLock<Vec<SongInfo>>,
 }
 
@@ -42,11 +60,13 @@ impl Storage {
         fs::create_dir_all(&dir).ok();
         let favorites = Self::load_file(&dir.join("favorites.json"));
         let favorite_playlists = Self::load_file(&dir.join("favorite_playlists.json"));
+        let custom_playlists = Self::load_file(&dir.join("custom_playlists.json"));
         let history = Self::load_file(&dir.join("history.json"));
         Self {
             data_dir: dir,
             favorites: RwLock::new(favorites),
             favorite_playlists: RwLock::new(favorite_playlists),
+            custom_playlists: RwLock::new(custom_playlists),
             history: RwLock::new(history),
         }
     }
@@ -119,6 +139,158 @@ impl Storage {
 
     pub fn load_favorite_playlists(&self) -> Vec<Playlist> {
         self.favorite_playlists.read().unwrap().clone()
+    }
+
+    // ── 自定义歌单 ────────────────────────────────────
+
+    pub fn custom_playlist_summaries(&self) -> Vec<CustomPlaylistSummary> {
+        self.custom_playlists
+            .read()
+            .unwrap()
+            .iter()
+            .map(|playlist| CustomPlaylistSummary {
+                id: playlist.id.clone(),
+                name: playlist.name.clone(),
+                cover_url: playlist
+                    .songs
+                    .iter()
+                    .find_map(|song| song.cover_url.clone()),
+                song_count: u32::try_from(playlist.songs.len()).unwrap_or(u32::MAX),
+            })
+            .collect()
+    }
+
+    pub fn custom_playlist_choices(&self) -> Vec<(String, String)> {
+        self.custom_playlists
+            .read()
+            .unwrap()
+            .iter()
+            .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
+            .collect()
+    }
+
+    pub fn custom_playlist(&self, playlist_id: &str) -> Option<CustomPlaylist> {
+        self.custom_playlists
+            .read()
+            .unwrap()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .cloned()
+    }
+
+    pub fn create_custom_playlist(&self, name: &str) -> Result<CustomPlaylist, String> {
+        let name = validate_custom_playlist_name(name)?;
+        self.update_custom_playlists(|playlists| {
+            ensure_unique_custom_playlist_name(playlists, &name, None)?;
+            let now = unix_nanos();
+            let playlist = CustomPlaylist {
+                id: format!("custom-{now}-{}", std::process::id()),
+                name,
+                songs: Vec::new(),
+                created_at_unix_nanos: now,
+                updated_at_unix_nanos: now,
+            };
+            playlists.push(playlist.clone());
+            Ok(playlist)
+        })
+    }
+
+    pub fn rename_custom_playlist(&self, playlist_id: &str, name: &str) -> Result<(), String> {
+        let name = validate_custom_playlist_name(name)?;
+        self.update_custom_playlists(|playlists| {
+            ensure_unique_custom_playlist_name(playlists, &name, Some(playlist_id))?;
+            let playlist = playlists
+                .iter_mut()
+                .find(|playlist| playlist.id == playlist_id)
+                .ok_or_else(|| "自定义歌单不存在".to_string())?;
+            playlist.name = name;
+            playlist.updated_at_unix_nanos = unix_nanos();
+            Ok(())
+        })
+    }
+
+    pub fn delete_custom_playlist(&self, playlist_id: &str) -> Result<bool, String> {
+        self.update_custom_playlists(|playlists| {
+            let old_len = playlists.len();
+            playlists.retain(|playlist| playlist.id != playlist_id);
+            Ok(playlists.len() != old_len)
+        })
+    }
+
+    pub fn add_song_to_custom_playlist(
+        &self,
+        playlist_id: &str,
+        song: &SongInfo,
+    ) -> Result<bool, String> {
+        self.update_custom_playlists(|playlists| {
+            let playlist = playlists
+                .iter_mut()
+                .find(|playlist| playlist.id == playlist_id)
+                .ok_or_else(|| "自定义歌单不存在".to_string())?;
+            if playlist
+                .songs
+                .iter()
+                .any(|item| same_song_identity(item, song))
+            {
+                return Ok(false);
+            }
+            playlist.songs.push(song.clone());
+            playlist.updated_at_unix_nanos = unix_nanos();
+            Ok(true)
+        })
+    }
+
+    pub fn remove_song_from_custom_playlist(
+        &self,
+        playlist_id: &str,
+        song: &SongInfo,
+    ) -> Result<bool, String> {
+        self.update_custom_playlists(|playlists| {
+            let playlist = playlists
+                .iter_mut()
+                .find(|playlist| playlist.id == playlist_id)
+                .ok_or_else(|| "自定义歌单不存在".to_string())?;
+            let old_len = playlist.songs.len();
+            playlist
+                .songs
+                .retain(|item| !same_song_identity(item, song));
+            if playlist.songs.len() == old_len {
+                return Ok(false);
+            }
+            playlist.updated_at_unix_nanos = unix_nanos();
+            Ok(true)
+        })
+    }
+
+    pub fn remove_local_path_from_custom_playlists(&self, path: &Path) -> Result<usize, String> {
+        self.update_custom_playlists(|playlists| {
+            let mut removed = 0;
+            for playlist in playlists {
+                let old_len = playlist.songs.len();
+                playlist
+                    .songs
+                    .retain(|song| !local_song_matches_path(song, path));
+                let removed_from_playlist = old_len.saturating_sub(playlist.songs.len());
+                if removed_from_playlist > 0 {
+                    removed += removed_from_playlist;
+                    playlist.updated_at_unix_nanos = unix_nanos();
+                }
+            }
+            Ok(removed)
+        })
+    }
+
+    fn update_custom_playlists<T>(
+        &self,
+        update: impl FnOnce(&mut Vec<CustomPlaylist>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut current = self.custom_playlists.write().unwrap();
+        let mut updated = current.clone();
+        let result = update(&mut updated)?;
+        let json = serde_json::to_vec_pretty(&updated).map_err(|error| error.to_string())?;
+        save_atomic(&self.data_dir.join("custom_playlists.json"), &json)?;
+        *current = updated;
+        Ok(result)
     }
 
     // ── 播放历史 ──────────────────────────────────────
@@ -292,9 +464,58 @@ fn normalize_singer(value: &str) -> String {
     singers.join("|")
 }
 
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn validate_custom_playlist_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("歌单名称不能为空".to_string());
+    }
+    if name.chars().count() > 80 {
+        return Err("歌单名称不能超过 80 个字符".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn ensure_unique_custom_playlist_name(
+    playlists: &[CustomPlaylist],
+    name: &str,
+    except_id: Option<&str>,
+) -> Result<(), String> {
+    if playlists.iter().any(|playlist| {
+        Some(playlist.id.as_str()) != except_id && playlist.name.eq_ignore_ascii_case(name)
+    }) {
+        return Err("已经存在同名自定义歌单".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn same_song_identity(left: &SongInfo, right: &SongInfo) -> bool {
+    if left.source == right.source && !left.id.is_empty() && left.id == right.id {
+        return true;
+    }
+    left.source == lx_core::model::source::SourceId::Local
+        && right.source == lx_core::model::source::SourceId::Local
+        && left.file_path.is_some()
+        && left.file_path == right.file_path
+}
+
+pub(crate) fn local_song_matches_path(song: &SongInfo, path: &Path) -> bool {
+    song.source == lx_core::model::source::SourceId::Local
+        && (song.file_path.as_deref() == Some(path) || song.id == path.to_string_lossy())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PlaybackSession, SavedPlayerState, Storage, songs_equivalent};
+    use super::{
+        CustomPlaylist, PlaybackSession, SavedPlayerState, Storage, same_song_identity,
+        songs_equivalent,
+    };
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
     use std::sync::RwLock;
@@ -351,6 +572,7 @@ mod tests {
             data_dir: data_dir.clone(),
             favorites: RwLock::new(Vec::new()),
             favorite_playlists: RwLock::new(Vec::new()),
+            custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
         };
         let first = song("1", SourceId::Kw, "One", "Artist");
@@ -391,6 +613,7 @@ mod tests {
             data_dir: data_dir.clone(),
             favorites: RwLock::new(Vec::new()),
             favorite_playlists: RwLock::new(Vec::new()),
+            custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
         };
         let session = PlaybackSession {
@@ -408,6 +631,143 @@ mod tests {
         assert_eq!(restored.state, SavedPlayerState::Paused);
         storage.clear_playback_session().unwrap();
         assert!(storage.load_playback_session().is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn custom_playlists_store_network_and_local_songs_and_support_editing() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "voicefox-custom-playlist-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = Storage {
+            data_dir: data_dir.clone(),
+            favorites: RwLock::new(Vec::new()),
+            favorite_playlists: RwLock::new(Vec::new()),
+            custom_playlists: RwLock::new(Vec::new()),
+            history: RwLock::new(Vec::new()),
+        };
+        assert!(storage.create_custom_playlist("   ").is_err());
+        let playlist = storage.create_custom_playlist("通勤").unwrap();
+        assert!(storage.create_custom_playlist("通勤").is_err());
+        let network = song("network", SourceId::Wy, "Network", "Artist");
+        let mut local = song("local", SourceId::Local, "Local", "Artist");
+        local.file_path = Some(data_dir.join("local.flac"));
+
+        assert!(
+            storage
+                .add_song_to_custom_playlist(&playlist.id, &network)
+                .unwrap()
+        );
+        assert!(
+            storage
+                .add_song_to_custom_playlist(&playlist.id, &local)
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .add_song_to_custom_playlist(&playlist.id, &local)
+                .unwrap()
+        );
+        storage
+            .rename_custom_playlist(&playlist.id, "夜间通勤")
+            .unwrap();
+
+        let stored = storage.custom_playlist(&playlist.id).unwrap();
+        assert_eq!(stored.name, "夜间通勤");
+        assert_eq!(stored.songs.len(), 2);
+        assert_eq!(stored.songs[1].file_path, local.file_path);
+        let summaries = storage.custom_playlist_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].song_count, 2);
+        let persisted: Vec<CustomPlaylist> =
+            Storage::load_file(&data_dir.join("custom_playlists.json"));
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].name, "夜间通勤");
+        assert_eq!(persisted[0].songs.len(), 2);
+        assert!(
+            storage
+                .remove_song_from_custom_playlist(&playlist.id, &network)
+                .unwrap()
+        );
+        assert_eq!(
+            storage.custom_playlist(&playlist.id).unwrap().songs.len(),
+            1
+        );
+        assert!(storage.delete_custom_playlist(&playlist.id).unwrap());
+        assert!(storage.custom_playlist_summaries().is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn empty_song_ids_do_not_collapse_unrelated_tracks() {
+        let first = song("", SourceId::Kw, "First", "Artist");
+        let second = song("", SourceId::Kw, "Second", "Artist");
+
+        assert!(!same_song_identity(&first, &second));
+    }
+
+    #[test]
+    fn deleting_a_local_file_cleans_all_custom_playlists_and_persists() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "voicefox-custom-local-delete-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = Storage {
+            data_dir: data_dir.clone(),
+            favorites: RwLock::new(Vec::new()),
+            favorite_playlists: RwLock::new(Vec::new()),
+            custom_playlists: RwLock::new(Vec::new()),
+            history: RwLock::new(Vec::new()),
+        };
+        let first_playlist = storage.create_custom_playlist("通勤").unwrap();
+        let second_playlist = storage.create_custom_playlist("夜晚").unwrap();
+        let path = data_dir.join("local.flac");
+        let mut local = song(&path.to_string_lossy(), SourceId::Local, "Local", "Artist");
+        local.file_path = Some(path.clone());
+        let legacy_local = song(&path.to_string_lossy(), SourceId::Local, "Legacy", "Artist");
+        storage
+            .add_song_to_custom_playlist(&first_playlist.id, &local)
+            .unwrap();
+        storage
+            .add_song_to_custom_playlist(&second_playlist.id, &legacy_local)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .remove_local_path_from_custom_playlists(&path)
+                .unwrap(),
+            2
+        );
+        assert!(
+            storage
+                .custom_playlist(&first_playlist.id)
+                .unwrap()
+                .songs
+                .is_empty()
+        );
+        assert!(
+            storage
+                .custom_playlist(&second_playlist.id)
+                .unwrap()
+                .songs
+                .is_empty()
+        );
+        let persisted: Vec<CustomPlaylist> =
+            Storage::load_file(&data_dir.join("custom_playlists.json"));
+        assert!(persisted.iter().all(|playlist| playlist.songs.is_empty()));
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 }

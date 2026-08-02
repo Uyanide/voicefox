@@ -1,6 +1,7 @@
 //! 热门歌单与歌单收藏页面
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::{AppAction, InsertPosition, Notification};
@@ -12,9 +13,36 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use unicode_width::UnicodeWidthChar;
 
 use crate::context::AppContext;
+use crate::storage::{CustomPlaylistSummary, local_song_matches_path, same_song_identity};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistScope {
+    Custom,
+    Favorites,
+    Source(SourceId),
+}
+
+#[derive(Debug, Clone)]
+enum PlaylistNameInput {
+    Create,
+    Rename { playlist_id: String },
+}
+
+#[derive(Debug, Clone)]
+enum CustomDeleteTarget {
+    Playlist {
+        playlist_id: String,
+        name: String,
+    },
+    Song {
+        playlist_id: String,
+        song: Box<SongInfo>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaylistLoadRequest {
@@ -37,7 +65,7 @@ struct PlaylistListCache {
 }
 
 pub struct PlaylistsPage {
-    scopes: Vec<Option<SourceId>>,
+    scopes: Vec<PlaylistScope>,
     scope_index: usize,
     pub playlists: Vec<Playlist>,
     pub songs: Vec<SongInfo>,
@@ -54,12 +82,16 @@ pub struct PlaylistsPage {
     error_message: Option<String>,
     list_cache: HashMap<SourceId, PlaylistListCache>,
     song_cache: HashMap<(SourceId, String), Vec<SongInfo>>,
+    name_input: Option<PlaylistNameInput>,
+    name_input_value: String,
+    pending_delete: Option<CustomDeleteTarget>,
 }
 
 impl PlaylistsPage {
     pub fn new(sources: Vec<SourceId>) -> Self {
-        let scopes = std::iter::once(None)
-            .chain(sources.into_iter().map(Some))
+        let scopes = [PlaylistScope::Custom, PlaylistScope::Favorites]
+            .into_iter()
+            .chain(sources.into_iter().map(PlaylistScope::Source))
             .collect();
         Self {
             scopes,
@@ -79,11 +111,29 @@ impl PlaylistsPage {
             error_message: None,
             list_cache: HashMap::new(),
             song_cache: HashMap::new(),
+            name_input: None,
+            name_input_value: String::new(),
+            pending_delete: None,
         }
     }
 
     pub fn current_source(&self) -> Option<SourceId> {
-        self.scopes.get(self.scope_index).copied().flatten()
+        match self.scopes.get(self.scope_index).copied() {
+            Some(PlaylistScope::Source(source)) => Some(source),
+            _ => None,
+        }
+    }
+
+    fn current_scope(&self) -> Option<PlaylistScope> {
+        self.scopes.get(self.scope_index).copied()
+    }
+
+    fn is_custom_scope(&self) -> bool {
+        self.current_scope() == Some(PlaylistScope::Custom)
+    }
+
+    fn is_favorites_scope(&self) -> bool {
+        self.current_scope() == Some(PlaylistScope::Favorites)
     }
 
     pub fn current_playlist(&self) -> Option<&Playlist> {
@@ -91,11 +141,95 @@ impl PlaylistsPage {
             .and_then(|index| self.playlists.get(index))
     }
 
-    pub fn sync_favorites(&mut self, ctx: &AppContext) {
-        if self.current_source().is_some() || self.selected_playlist.is_some() {
+    fn current_playlist_mut(&mut self) -> Option<&mut Playlist> {
+        self.selected_playlist
+            .and_then(|index| self.playlists.get_mut(index))
+    }
+
+    pub fn current_custom_playlist_id(&self) -> Option<String> {
+        self.is_custom_scope()
+            .then(|| self.current_playlist().map(|playlist| playlist.id.clone()))
+            .flatten()
+    }
+
+    pub fn input_active(&self) -> bool {
+        self.name_input.is_some() || self.pending_delete.is_some()
+    }
+
+    pub fn apply_custom_song_addition(&mut self, playlist_id: &str, song: &SongInfo) {
+        if !self.is_custom_scope() {
             return;
         }
-        self.playlists = ctx.storage.load_favorite_playlists();
+        if let Some(playlist) = self
+            .playlists
+            .iter_mut()
+            .find(|playlist| playlist.id == playlist_id)
+        {
+            playlist.song_count = playlist.song_count.saturating_add(1);
+            if playlist.cover_url.is_none() {
+                playlist.cover_url = song.cover_url.clone();
+            }
+        }
+        if self.current_custom_playlist_id().as_deref() == Some(playlist_id)
+            && !self.songs.iter().any(|item| same_song_identity(item, song))
+        {
+            self.songs.push(song.clone());
+            self.songs_loaded = true;
+        }
+    }
+
+    pub fn apply_custom_song_removal(&mut self, playlist_id: &str, song: &SongInfo) {
+        if self.current_custom_playlist_id().as_deref() != Some(playlist_id) {
+            return;
+        }
+        self.songs.retain(|item| !same_song_identity(item, song));
+        let song_count = self.songs.len() as u32;
+        let cover_url = self.songs.iter().find_map(|item| item.cover_url.clone());
+        if let Some(playlist) = self.current_playlist_mut() {
+            playlist.song_count = song_count;
+            playlist.cover_url = cover_url;
+        }
+        self.selected = self.selected.min(self.songs.len().saturating_sub(1));
+        self.song_scroll_offset = self
+            .song_scroll_offset
+            .min(self.songs.len().saturating_sub(1));
+    }
+
+    pub fn apply_local_file_removal(&mut self, path: &Path, summaries: &[CustomPlaylistSummary]) {
+        if !self.is_custom_scope() {
+            return;
+        }
+        for playlist in &mut self.playlists {
+            if let Some(summary) = summaries.iter().find(|summary| summary.id == playlist.id) {
+                playlist.name = summary.name.clone();
+                playlist.cover_url = summary.cover_url.clone();
+                playlist.song_count = summary.song_count;
+            }
+        }
+        if self.selected_playlist.is_some() {
+            self.songs
+                .retain(|song| !local_song_matches_path(song, path));
+            self.selected = self.selected.min(self.songs.len().saturating_sub(1));
+            self.song_scroll_offset = self
+                .song_scroll_offset
+                .min(self.songs.len().saturating_sub(1));
+        }
+    }
+
+    pub fn sync_saved_playlists(&mut self, ctx: &AppContext) {
+        if self.selected_playlist.is_some() {
+            return;
+        }
+        self.playlists = match self.current_scope() {
+            Some(PlaylistScope::Custom) => ctx
+                .storage
+                .custom_playlist_summaries()
+                .iter()
+                .map(custom_playlist_metadata)
+                .collect(),
+            Some(PlaylistScope::Favorites) => ctx.storage.load_favorite_playlists(),
+            _ => return,
+        };
         self.list_loaded = true;
         self.list_loading = false;
         self.selected = self.selected.min(self.playlists.len().saturating_sub(1));
@@ -103,6 +237,9 @@ impl PlaylistsPage {
 
     pub fn next_load_request(&self) -> Option<PlaylistLoadRequest> {
         if let Some(playlist) = self.current_playlist() {
+            if self.is_custom_scope() {
+                return None;
+            }
             if !self.songs_loading && !self.songs_loaded {
                 return Some(PlaylistLoadRequest::Songs {
                     source: playlist.source,
@@ -263,6 +400,12 @@ impl PlaylistsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
+        if self.name_input.is_some() {
+            return self.handle_name_input(key, ctx);
+        }
+        if self.pending_delete.is_some() {
+            return self.handle_delete_confirmation(key, ctx);
+        }
         if let Some(action) = resolver.resolve_page("playlists", key) {
             match action {
                 Action::ListSelectUp => {
@@ -297,7 +440,7 @@ impl PlaylistsPage {
                             index: self.selected,
                         };
                     }
-                    self.enter_selected_playlist();
+                    self.enter_selected_playlist(ctx);
                     return AppAction::None;
                 }
                 Action::ListAddToQueue => {
@@ -323,10 +466,7 @@ impl PlaylistsPage {
                     return AppAction::None;
                 }
                 Action::ListGoBack => {
-                    if self.selected_playlist.is_some() {
-                        self.leave_playlist();
-                    }
-                    return AppAction::None;
+                    return self.go_back();
                 }
                 Action::SearchCycleSourcePrev => {
                     self.select_previous_scope(ctx);
@@ -381,7 +521,7 @@ impl PlaylistsPage {
                         index: self.selected,
                     };
                 }
-                self.enter_selected_playlist();
+                self.enter_selected_playlist(ctx);
             }
             (KeyModifiers::NONE, KeyCode::Char('a')) if self.selected_playlist.is_some() => {
                 if let Some(song) = self.songs.get(self.selected).cloned() {
@@ -402,18 +542,158 @@ impl PlaylistsPage {
                     };
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Char('h'))
-            | (KeyModifiers::NONE, KeyCode::Left)
-            | (KeyModifiers::NONE, KeyCode::Esc)
+            (KeyModifiers::NONE, KeyCode::Char('h')) | (KeyModifiers::NONE, KeyCode::Left)
                 if self.selected_playlist.is_some() =>
             {
                 self.leave_playlist();
             }
+            (KeyModifiers::NONE, KeyCode::Esc) => return self.go_back(),
             (KeyModifiers::NONE, KeyCode::Char('f'))
             | (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 return self.toggle_favorite(ctx);
             }
+            (KeyModifiers::NONE, KeyCode::Char('c'))
+                if self.is_custom_scope() && self.selected_playlist.is_none() =>
+            {
+                self.name_input = Some(PlaylistNameInput::Create);
+                self.name_input_value.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('e')) if self.is_custom_scope() => {
+                if let Some((playlist_id, playlist_name)) = self
+                    .current_playlist()
+                    .or_else(|| self.playlists.get(self.selected))
+                    .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
+                {
+                    self.name_input = Some(PlaylistNameInput::Rename { playlist_id });
+                    self.name_input_value = playlist_name;
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('d') | KeyCode::Delete)
+                if self.is_custom_scope() =>
+            {
+                self.begin_custom_delete();
+            }
             (KeyModifiers::NONE, KeyCode::Char('r')) => self.refresh_current(ctx),
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn handle_name_input(&mut self, key: &KeyEvent, ctx: &AppContext) -> AppAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.name_input = None;
+                self.name_input_value.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let mode = self.name_input.clone().expect("input mode checked above");
+                let name = self.name_input_value.trim().to_string();
+                let result = match mode {
+                    PlaylistNameInput::Create => {
+                        ctx.storage.create_custom_playlist(&name).map(|playlist| {
+                            self.sync_saved_playlists(ctx);
+                            self.selected = self
+                                .playlists
+                                .iter()
+                                .position(|item| item.id == playlist.id)
+                                .unwrap_or_default();
+                            format!("已创建歌单: {}", playlist.name)
+                        })
+                    }
+                    PlaylistNameInput::Rename { playlist_id } => ctx
+                        .storage
+                        .rename_custom_playlist(&playlist_id, &name)
+                        .map(|()| {
+                            for playlist in &mut self.playlists {
+                                if playlist.id == playlist_id {
+                                    playlist.name = name.clone();
+                                }
+                            }
+                            format!("已重命名为: {name}")
+                        }),
+                };
+                return match result {
+                    Ok(message) => {
+                        self.name_input = None;
+                        self.name_input_value.clear();
+                        AppAction::ShowNotification(Notification::success(message))
+                    }
+                    Err(error) => AppAction::ShowNotification(Notification::error(error)),
+                };
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.name_input_value.pop();
+            }
+            (modifiers, KeyCode::Char(character))
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.name_input_value.push(character);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn begin_custom_delete(&mut self) {
+        if let Some(playlist) = self.current_playlist() {
+            if let Some(song) = self.songs.get(self.selected).cloned() {
+                self.pending_delete = Some(CustomDeleteTarget::Song {
+                    playlist_id: playlist.id.clone(),
+                    song: Box::new(song),
+                });
+            }
+            return;
+        }
+        if let Some(playlist) = self.playlists.get(self.selected) {
+            self.pending_delete = Some(CustomDeleteTarget::Playlist {
+                playlist_id: playlist.id.clone(),
+                name: playlist.name.clone(),
+            });
+        }
+    }
+
+    fn handle_delete_confirmation(&mut self, key: &KeyEvent, ctx: &AppContext) -> AppAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('n' | 'N'))
+            | (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.pending_delete = None;
+            }
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('y' | 'Y')) => {
+                let target = self
+                    .pending_delete
+                    .take()
+                    .expect("delete target checked above");
+                let result = match target {
+                    CustomDeleteTarget::Playlist { playlist_id, name } => ctx
+                        .storage
+                        .delete_custom_playlist(&playlist_id)
+                        .map(|deleted| {
+                            if deleted {
+                                self.sync_saved_playlists(ctx);
+                                self.selected =
+                                    self.selected.min(self.playlists.len().saturating_sub(1));
+                                Notification::success(format!("已删除歌单: {name}"))
+                            } else {
+                                Notification::info("歌单已不存在")
+                            }
+                        }),
+                    CustomDeleteTarget::Song { playlist_id, song } => ctx
+                        .storage
+                        .remove_song_from_custom_playlist(&playlist_id, &song)
+                        .map(|removed| {
+                            if removed {
+                                self.apply_custom_song_removal(&playlist_id, &song);
+                                Notification::success(format!("已从歌单移除: {}", song.name))
+                            } else {
+                                Notification::info("歌曲已不在歌单中")
+                            }
+                        }),
+                };
+                return match result {
+                    Ok(notification) => AppAction::ShowNotification(notification),
+                    Err(error) => AppAction::ShowNotification(Notification::error(error)),
+                };
+            }
             _ => {}
         }
         AppAction::None
@@ -426,16 +706,33 @@ impl PlaylistsPage {
         activate: bool,
         ctx: &AppContext,
     ) -> AppAction {
+        if self.input_active() {
+            return AppAction::None;
+        }
         let page = page_chunks(area, self.playlists.len());
         let position = Position::new(event.column, event.row);
         let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
-                self.selected = self.selected.saturating_sub(scroll_amount);
+                let scroll_area = if self.selected_playlist.is_some() {
+                    page.songs
+                } else {
+                    page.playlists
+                };
+                if scroll_area.contains(position) {
+                    self.selected = self.selected.saturating_sub(scroll_amount);
+                }
             }
             MouseEventKind::ScrollDown => {
-                self.selected =
-                    (self.selected + scroll_amount).min(self.current_list_len().saturating_sub(1));
+                let scroll_area = if self.selected_playlist.is_some() {
+                    page.songs
+                } else {
+                    page.playlists
+                };
+                if scroll_area.contains(position) {
+                    self.selected = (self.selected + scroll_amount)
+                        .min(self.current_list_len().saturating_sub(1));
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 for (index, tab) in scope_tab_rects(page.scopes, self.scopes.len())
@@ -454,8 +751,11 @@ impl PlaylistsPage {
                         + event.row.saturating_sub(playlist_inner.y) as usize;
                     if index < self.playlists.len() {
                         if activate {
+                            if self.selected_playlist.is_some() {
+                                self.leave_playlist();
+                            }
                             self.selected = index;
-                            self.enter_selected_playlist();
+                            self.enter_selected_playlist(ctx);
                         } else if self.selected_playlist.is_none() {
                             self.selected = index;
                         }
@@ -524,11 +824,12 @@ impl PlaylistsPage {
         self.render_scopes(page.scopes, buf, ctx);
         self.render_playlists(page.playlists, buf, ctx);
         self.render_songs(page.songs, buf, ctx);
+        self.render_dialog(area, buf, ctx);
     }
 
     fn render_scopes(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         for (index, tab) in scope_tab_rects(area, self.scopes.len()).iter().enumerate() {
-            let label = scope_label(self.scopes[index], area.width >= 58);
+            let label = scope_label(self.scopes[index], area.width >= 66);
             let style = if index == self.scope_index {
                 Style::new()
                     .bg(crate::theme::accent(ctx))
@@ -545,7 +846,9 @@ impl PlaylistsPage {
     }
 
     fn render_playlists(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-        let title = if self.current_source().is_none() {
+        let title = if self.is_custom_scope() {
+            format!("自建歌单 ({}) [c/e/d]", self.playlists.len())
+        } else if self.is_favorites_scope() {
             format!("收藏歌单 ({})", self.playlists.len())
         } else if self.current_source() == Some(SourceId::Bili) {
             format!("我的收藏夹 ({})", self.playlists.len())
@@ -590,7 +893,9 @@ impl PlaylistsPage {
                 return;
             }
             if self.list_loaded && self.playlists.is_empty() {
-                let message = if self.current_source().is_none() {
+                let message = if self.is_custom_scope() {
+                    "暂无自建歌单，按 c 创建"
+                } else if self.is_favorites_scope() {
                     "暂无收藏歌单"
                 } else if self.current_source() == Some(SourceId::Bili) {
                     "暂无收藏夹，或尚未登录哔哩哔哩"
@@ -618,7 +923,7 @@ impl PlaylistsPage {
             ..(self.playlist_scroll_offset + visible_height).min(self.playlists.len())
         {
             let playlist = &self.playlists[index];
-            let favorite = ctx.storage.is_favorite_playlist(playlist);
+            let favorite = !self.is_custom_scope() && ctx.storage.is_favorite_playlist(playlist);
             let prefix = if favorite { "* " } else { "  " };
             let details = if playlist.song_count > 0 {
                 format!(" · {} 首", playlist.song_count)
@@ -656,7 +961,13 @@ impl PlaylistsPage {
     fn render_songs(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let title = self
             .current_playlist()
-            .map(|playlist| format!("{} · {}", source_name(playlist.source), playlist.name))
+            .map(|playlist| {
+                if self.is_custom_scope() {
+                    format!("自建 · {} · d 移除", playlist.name)
+                } else {
+                    format!("{} · {}", source_name(playlist.source), playlist.name)
+                }
+            })
             .unwrap_or_else(|| "歌曲列表".to_string());
         let block = Block::default()
             .borders(Borders::ALL)
@@ -680,7 +991,16 @@ impl PlaylistsPage {
             return;
         }
         if self.songs_loaded && self.songs.is_empty() {
-            render_muted("该歌单暂无歌曲", inner, buf, ctx);
+            render_muted(
+                if self.is_custom_scope() {
+                    "该自建歌单暂无歌曲，可在任意歌曲右键菜单中加入"
+                } else {
+                    "该歌单暂无歌曲"
+                },
+                inner,
+                buf,
+                ctx,
+            );
             return;
         }
         if self.songs.is_empty() || inner.height == 0 {
@@ -735,7 +1055,81 @@ impl PlaylistsPage {
         }
     }
 
+    fn render_dialog(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(mode) = &self.name_input {
+            let dialog = centered_dialog(area, 56, 3);
+            if dialog.width == 0 || dialog.height == 0 {
+                return;
+            }
+            Clear.render(dialog, buf);
+            let title = match mode {
+                PlaylistNameInput::Create => " 创建自建歌单 ",
+                PlaylistNameInput::Rename { .. } => " 重命名自建歌单 ",
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(crate::theme::accent(ctx)))
+                .style(
+                    Style::new()
+                        .bg(crate::theme::surface0(ctx))
+                        .fg(crate::theme::text(ctx)),
+                )
+                .title(title);
+            let inner = block.inner(dialog);
+            block.render(dialog, buf);
+            Paragraph::new(name_input_with_cursor(
+                &self.name_input_value,
+                inner.width as usize,
+            ))
+            .style(
+                Style::new()
+                    .bg(crate::theme::surface0(ctx))
+                    .fg(crate::theme::text(ctx)),
+            )
+            .render(inner, buf);
+            return;
+        }
+
+        let Some(target) = &self.pending_delete else {
+            return;
+        };
+        let message = match target {
+            CustomDeleteTarget::Playlist { name, .. } => {
+                format!("删除歌单“{name}”及其歌曲列表？ [y/n]")
+            }
+            CustomDeleteTarget::Song { song, .. } => {
+                format!("从当前歌单移除“{}”？ [y/n]", song.name)
+            }
+        };
+        let dialog = centered_dialog(area, 64, 3);
+        if dialog.width == 0 || dialog.height == 0 {
+            return;
+        }
+        Clear.render(dialog, buf);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(crate::theme::red(ctx)))
+            .style(
+                Style::new()
+                    .bg(crate::theme::surface0(ctx))
+                    .fg(crate::theme::text(ctx)),
+            )
+            .title(" 确认删除 ");
+        let inner = block.inner(dialog);
+        block.render(dialog, buf);
+        Paragraph::new(truncate_chars(&message, inner.width as usize))
+            .style(
+                Style::new()
+                    .bg(crate::theme::surface0(ctx))
+                    .fg(crate::theme::text(ctx)),
+            )
+            .render(inner, buf);
+    }
+
     fn toggle_favorite(&mut self, ctx: &AppContext) -> AppAction {
+        if self.is_custom_scope() {
+            return AppAction::ShowNotification(Notification::info("自建歌单无需收藏"));
+        }
         let Some(playlist) = self
             .current_playlist()
             .or_else(|| self.playlists.get(self.selected))
@@ -745,11 +1139,11 @@ impl PlaylistsPage {
         };
         if ctx.storage.is_favorite_playlist(&playlist) {
             ctx.storage.remove_favorite_playlist(&playlist);
-            if self.current_source().is_none() {
+            if self.is_favorites_scope() {
                 if self.selected_playlist.is_some() {
                     self.leave_playlist();
                 }
-                self.sync_favorites(ctx);
+                self.sync_saved_playlists(ctx);
             }
             AppAction::ShowNotification(Notification::success("已取消收藏歌单"))
         } else {
@@ -758,7 +1152,7 @@ impl PlaylistsPage {
         }
     }
 
-    fn enter_selected_playlist(&mut self) {
+    fn enter_selected_playlist(&mut self, ctx: &AppContext) {
         if self.selected_playlist.is_some() || self.selected >= self.playlists.len() {
             return;
         }
@@ -770,6 +1164,15 @@ impl PlaylistsPage {
         self.song_scroll_offset = 0;
         self.error_message = None;
         self.songs_loading = false;
+        if self.is_custom_scope() {
+            self.songs = ctx
+                .storage
+                .custom_playlist(&playlist.id)
+                .map(|custom| custom.songs)
+                .unwrap_or_default();
+            self.songs_loaded = true;
+            return;
+        }
         if let Some(songs) = self.song_cache.get(&cache_key) {
             self.songs = songs.clone();
             self.songs_loaded = true;
@@ -789,9 +1192,30 @@ impl PlaylistsPage {
         self.song_scroll_offset = 0;
     }
 
+    fn go_back(&mut self) -> AppAction {
+        if self.selected_playlist.is_some() {
+            self.leave_playlist();
+            AppAction::None
+        } else {
+            AppAction::GoBack
+        }
+    }
+
     fn refresh_current(&mut self, ctx: &AppContext) {
         self.error_message = None;
         if let Some(playlist) = self.current_playlist() {
+            if self.is_custom_scope() {
+                self.songs = ctx
+                    .storage
+                    .custom_playlist(&playlist.id)
+                    .map(|custom| custom.songs)
+                    .unwrap_or_default();
+                self.songs_loaded = true;
+                self.songs_loading = false;
+                self.selected = self.selected.min(self.songs.len().saturating_sub(1));
+                self.song_scroll_offset = 0;
+                return;
+            }
             self.song_cache
                 .remove(&(playlist.source, playlist.id.clone()));
             self.songs.clear();
@@ -809,7 +1233,7 @@ impl PlaylistsPage {
             self.selected = 0;
             self.playlist_scroll_offset = 0;
         } else {
-            self.sync_favorites(ctx);
+            self.sync_saved_playlists(ctx);
         }
     }
 
@@ -860,7 +1284,16 @@ impl PlaylistsPage {
                 self.list_has_more = false;
             }
         } else {
-            self.playlists = ctx.storage.load_favorite_playlists();
+            self.playlists = match self.current_scope() {
+                Some(PlaylistScope::Custom) => ctx
+                    .storage
+                    .custom_playlist_summaries()
+                    .iter()
+                    .map(custom_playlist_metadata)
+                    .collect(),
+                Some(PlaylistScope::Favorites) => ctx.storage.load_favorite_playlists(),
+                Some(PlaylistScope::Source(_)) | None => Vec::new(),
+            };
             self.list_loaded = true;
             self.list_loading = false;
             self.list_page = 0;
@@ -935,6 +1368,36 @@ fn page_chunks(area: Rect, playlist_count: usize) -> PageChunks {
     }
 }
 
+fn centered_dialog(area: Rect, max_width: u16, height: u16) -> Rect {
+    let width = area.width.saturating_sub(2).min(max_width);
+    let height = area.height.min(height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn name_input_with_cursor(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let available = width.saturating_sub(1);
+    let mut used = 0;
+    let mut visible = Vec::new();
+    for character in value.chars().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > available {
+            break;
+        }
+        used += character_width;
+        visible.push(character);
+    }
+    visible.reverse();
+    visible.into_iter().chain(std::iter::once('█')).collect()
+}
+
 fn scope_tab_rects(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
     if count == 0 {
         return std::rc::Rc::from([]);
@@ -976,17 +1439,30 @@ fn source_name(source: SourceId) -> &'static str {
     }
 }
 
-fn scope_label(source: Option<SourceId>, full: bool) -> &'static str {
-    match (source, full) {
-        (None, _) => "已收藏",
-        (Some(SourceId::Kw), true) => "酷我 kw",
-        (Some(SourceId::Kg), true) => "酷狗 kg",
-        (Some(SourceId::Tx), true) => "QQ tx",
-        (Some(SourceId::Wy), true) => "网易 wy",
-        (Some(SourceId::Mg), true) => "咪咕 mg",
-        (Some(SourceId::Bili), true) => "哔哩哔哩 bili",
-        (Some(SourceId::Local), true) => "本地 local",
-        (Some(source), false) => source.as_str(),
+fn scope_label(scope: PlaylistScope, full: bool) -> &'static str {
+    match (scope, full) {
+        (PlaylistScope::Custom, _) => "自建",
+        (PlaylistScope::Favorites, _) => "已收藏",
+        (PlaylistScope::Source(SourceId::Kw), true) => "酷我 kw",
+        (PlaylistScope::Source(SourceId::Kg), true) => "酷狗 kg",
+        (PlaylistScope::Source(SourceId::Tx), true) => "QQ tx",
+        (PlaylistScope::Source(SourceId::Wy), true) => "网易 wy",
+        (PlaylistScope::Source(SourceId::Mg), true) => "咪咕 mg",
+        (PlaylistScope::Source(SourceId::Bili), true) => "哔哩哔哩 bili",
+        (PlaylistScope::Source(SourceId::Local), true) => "本地 local",
+        (PlaylistScope::Source(source), false) => source.as_str(),
+    }
+}
+
+fn custom_playlist_metadata(playlist: &CustomPlaylistSummary) -> Playlist {
+    Playlist {
+        id: playlist.id.clone(),
+        name: playlist.name.clone(),
+        source: SourceId::Local,
+        cover_url: playlist.cover_url.clone(),
+        song_count: playlist.song_count,
+        description: Some("voicefox-custom-playlist".to_string()),
+        play_count: None,
     }
 }
 
@@ -1004,9 +1480,21 @@ fn truncate_chars(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlaylistLoadRequest, PlaylistsPage};
+    use super::{
+        CustomDeleteTarget, PlaylistLoadRequest, PlaylistNameInput, PlaylistScope, PlaylistsPage,
+    };
+    use lx_core::events::AppAction;
     use lx_core::model::playlist::Playlist;
+    use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
+
+    fn select_source_scope(page: &mut PlaylistsPage, source: SourceId) {
+        page.scope_index = page
+            .scopes
+            .iter()
+            .position(|scope| *scope == PlaylistScope::Source(source))
+            .unwrap();
+    }
 
     fn playlist(id: &str, source: SourceId) -> Playlist {
         Playlist {
@@ -1023,7 +1511,7 @@ mod tests {
     #[test]
     fn source_lists_are_cached_independently() {
         let mut page = PlaylistsPage::new(vec![SourceId::Kw, SourceId::Kg]);
-        page.scope_index = 1;
+        select_source_scope(&mut page, SourceId::Kw);
         page.list_loaded = false;
         assert_eq!(
             page.next_load_request(),
@@ -1034,7 +1522,7 @@ mod tests {
             })
         );
         page.update_playlists(SourceId::Kw, 1, false, vec![playlist("kw-1", SourceId::Kw)]);
-        page.scope_index = 2;
+        select_source_scope(&mut page, SourceId::Kg);
         page.list_loaded = false;
         assert_eq!(
             page.next_load_request(),
@@ -1049,7 +1537,7 @@ mod tests {
     #[test]
     fn reaching_the_end_requests_and_appends_the_next_page() {
         let mut page = PlaylistsPage::new(vec![SourceId::Kw]);
-        page.scope_index = 1;
+        select_source_scope(&mut page, SourceId::Kw);
         page.list_loaded = false;
         page.update_playlists(SourceId::Kw, 1, false, vec![playlist("kw-1", SourceId::Kw)]);
 
@@ -1078,11 +1566,160 @@ mod tests {
     #[test]
     fn duplicate_or_empty_pages_stop_pagination() {
         let mut page = PlaylistsPage::new(vec![SourceId::Kw]);
-        page.scope_index = 1;
+        select_source_scope(&mut page, SourceId::Kw);
         page.update_playlists(SourceId::Kw, 1, false, vec![playlist("kw-1", SourceId::Kw)]);
         page.update_playlists(SourceId::Kw, 2, true, vec![playlist("kw-1", SourceId::Kw)]);
 
         assert!(!page.list_has_more);
         assert_eq!(page.next_load_request(), None);
+    }
+
+    #[test]
+    fn custom_playlist_overlays_capture_global_keys() {
+        let mut page = PlaylistsPage::new(Vec::new());
+        page.name_input = Some(PlaylistNameInput::Create);
+        assert!(page.input_active());
+
+        page.name_input = None;
+        page.pending_delete = Some(CustomDeleteTarget::Playlist {
+            playlist_id: "custom-1".to_string(),
+            name: "通勤".to_string(),
+        });
+        assert!(page.input_active());
+    }
+
+    #[test]
+    fn external_custom_song_removal_updates_the_open_playlist() {
+        let mut page = PlaylistsPage::new(Vec::new());
+        page.playlists = vec![Playlist {
+            id: "custom-1".to_string(),
+            name: "通勤".to_string(),
+            source: SourceId::Local,
+            cover_url: Some("first-cover".to_string()),
+            song_count: 2,
+            description: None,
+            play_count: None,
+        }];
+        page.selected_playlist = Some(0);
+        let mut first = SongInfo::new(
+            "first".to_string(),
+            SourceId::Kw,
+            "First".to_string(),
+            "Artist".to_string(),
+        );
+        first.cover_url = Some("first-cover".to_string());
+        let mut second = SongInfo::new(
+            "second".to_string(),
+            SourceId::Wy,
+            "Second".to_string(),
+            "Artist".to_string(),
+        );
+        second.cover_url = Some("second-cover".to_string());
+        page.songs = vec![first.clone(), second.clone()];
+        page.selected = 1;
+
+        page.apply_custom_song_removal("custom-1", &first);
+
+        assert_eq!(page.songs.len(), 1);
+        assert_eq!(page.songs[0].id, second.id);
+        assert_eq!(page.playlists[0].song_count, 1);
+        assert_eq!(page.playlists[0].cover_url.as_deref(), Some("second-cover"));
+        assert_eq!(page.selected, 0);
+    }
+
+    #[test]
+    fn external_custom_song_addition_updates_metadata_and_the_open_playlist() {
+        let mut page = PlaylistsPage::new(Vec::new());
+        page.playlists = vec![Playlist {
+            id: "custom-1".to_string(),
+            name: "通勤".to_string(),
+            source: SourceId::Local,
+            cover_url: None,
+            song_count: 0,
+            description: None,
+            play_count: None,
+        }];
+        page.selected_playlist = Some(0);
+        let mut song = SongInfo::new(
+            "song".to_string(),
+            SourceId::Kw,
+            "Song".to_string(),
+            "Artist".to_string(),
+        );
+        song.cover_url = Some("cover".to_string());
+
+        page.apply_custom_song_addition("custom-1", &song);
+
+        assert_eq!(page.songs.len(), 1);
+        assert_eq!(page.songs[0].id, song.id);
+        assert_eq!(page.playlists[0].song_count, 1);
+        assert_eq!(page.playlists[0].cover_url.as_deref(), Some("cover"));
+    }
+
+    #[test]
+    fn playlist_go_back_leaves_the_open_playlist_then_returns_to_main() {
+        let mut page = PlaylistsPage::new(Vec::new());
+        page.playlists = vec![playlist("custom-1", SourceId::Local)];
+        page.selected_playlist = Some(0);
+
+        assert!(matches!(page.go_back(), AppAction::None));
+        assert!(page.selected_playlist.is_none());
+        assert!(matches!(page.go_back(), AppAction::GoBack));
+    }
+
+    #[test]
+    fn local_file_removal_updates_custom_playlist_metadata_and_open_songs() {
+        let mut page = PlaylistsPage::new(Vec::new());
+        page.playlists = vec![
+            playlist("custom-1", SourceId::Local),
+            playlist("custom-2", SourceId::Local),
+        ];
+        page.playlists[0].song_count = 2;
+        page.playlists[1].song_count = 1;
+        page.selected_playlist = Some(0);
+        let path = std::path::Path::new("/music/local.flac");
+        let mut local = SongInfo::new(
+            path.to_string_lossy().into_owned(),
+            SourceId::Local,
+            "Local".to_string(),
+            "Artist".to_string(),
+        );
+        local.file_path = Some(path.to_path_buf());
+        let network = SongInfo::new(
+            "network".to_string(),
+            SourceId::Wy,
+            "Network".to_string(),
+            "Artist".to_string(),
+        );
+        page.songs = vec![local, network.clone()];
+        let summaries = vec![
+            crate::storage::CustomPlaylistSummary {
+                id: "custom-1".to_string(),
+                name: "通勤".to_string(),
+                cover_url: None,
+                song_count: 1,
+            },
+            crate::storage::CustomPlaylistSummary {
+                id: "custom-2".to_string(),
+                name: "夜晚".to_string(),
+                cover_url: None,
+                song_count: 0,
+            },
+        ];
+
+        page.apply_local_file_removal(path, &summaries);
+
+        assert_eq!(page.songs.len(), 1);
+        assert_eq!(page.songs[0].id, network.id);
+        assert_eq!(page.playlists[0].name, "通勤");
+        assert_eq!(page.playlists[0].song_count, 1);
+        assert_eq!(page.playlists[1].song_count, 0);
+    }
+
+    #[test]
+    fn long_playlist_names_keep_the_cursor_visible() {
+        assert_eq!(super::name_input_with_cursor("abcdefgh", 7), "cdefgh█");
+        assert_eq!(super::name_input_with_cursor("一二三四五", 7), "三四五█");
+        assert_eq!(super::name_input_with_cursor("name", 0), "");
     }
 }

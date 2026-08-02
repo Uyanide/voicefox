@@ -42,7 +42,9 @@ use tokio::sync::mpsc;
 
 use context::AppContext;
 use pages::components;
-use pages::components::context_menu::{MenuOutcome, SongContextMenu, SongMenuAction, SongMenuKind};
+use pages::components::context_menu::{
+    MenuOutcome, SongContextMenu, SongContextMenuOptions, SongMenuAction, SongMenuKind,
+};
 use pages::sidebar::NavTab;
 use pages::sort::{SortMode, SortState, SortTarget};
 use storage::SavedPlayerState;
@@ -144,6 +146,20 @@ fn nav_page_scope(tab: NavTab) -> &'static str {
     }
 }
 
+fn should_go_to_main(
+    active_tab: NavTab,
+    page_input_active: bool,
+    playlist_open: bool,
+    leaderboard_open: bool,
+) -> bool {
+    !page_input_active
+        && active_tab != NavTab::Main
+        && active_tab != NavTab::Search
+        && active_tab != NavTab::Favorites
+        && !(active_tab == NavTab::Playlists && playlist_open)
+        && !(active_tab == NavTab::Leaderboard && leaderboard_open)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_song_menu_action(
     action: SongMenuAction,
@@ -156,6 +172,7 @@ fn execute_song_menu_action(
     settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
     search_seq: &Arc<AtomicU64>,
     favorites_page: &mut pages::favorites::FavoritesPage,
+    playlists_page: &mut pages::playlists::PlaylistsPage,
     history_state: &mut SortState,
     local_state: &mut SortState,
     confirm_delete: &mut Option<LocalDeleteConfirmation>,
@@ -173,6 +190,26 @@ fn execute_song_menu_action(
             song: Box::new(menu.song().clone()),
             position: InsertPosition::End,
         },
+        SongMenuAction::OpenCustomPlaylists => {
+            ctx.notify(Notification::info("请选择一个自建歌单"));
+            AppAction::None
+        }
+        SongMenuAction::AddToCustomPlaylist(playlist_id) => {
+            let song = menu.song();
+            match ctx.storage.add_song_to_custom_playlist(&playlist_id, song) {
+                Ok(true) => {
+                    playlists_page.apply_custom_song_addition(&playlist_id, song);
+                    ctx.notify(Notification::success("已加入自建歌单"));
+                }
+                Ok(false) => ctx.notify(Notification::info("歌曲已经在这个歌单中")),
+                Err(error) => ctx.notify(Notification::error(error)),
+            }
+            AppAction::None
+        }
+        SongMenuAction::NoCustomPlaylists => {
+            ctx.notify(Notification::info("暂无自建歌单，请先进入歌单页按 c 创建"));
+            AppAction::None
+        }
         SongMenuAction::ToggleFavorite => {
             let song = menu.song();
             let message = if ctx.storage.is_favorite(song) {
@@ -221,6 +258,21 @@ fn execute_song_menu_action(
                 });
             } else {
                 ctx.notify(Notification::error("无法删除：没有本地文件路径"));
+            }
+            AppAction::None
+        }
+        SongMenuAction::RemoveFromCustomPlaylist(playlist_id) => {
+            let song = menu.song();
+            match ctx
+                .storage
+                .remove_song_from_custom_playlist(&playlist_id, song)
+            {
+                Ok(true) => {
+                    playlists_page.apply_custom_song_removal(&playlist_id, song);
+                    ctx.notify(Notification::success("已从自建歌单移除"));
+                }
+                Ok(false) => ctx.notify(Notification::info("歌曲已经不在这个歌单中")),
+                Err(error) => ctx.notify(Notification::error(error)),
             }
             AppAction::None
         }
@@ -890,7 +942,7 @@ fn run_app(
             );
         }
         if active_tab == NavTab::Playlists {
-            playlists.sync_favorites(&ctx);
+            playlists.sync_saved_playlists(&ctx);
             maybe_spawn_playlist_load(
                 &mut playlists,
                 &mut playlist_request_id,
@@ -1010,7 +1062,8 @@ fn run_app(
             let input_active = active_tab == NavTab::Search
                 && search_page.lock().unwrap().input_mode
                 || active_tab == NavTab::Settings && settings_page.lock().unwrap().input_mode
-                || active_tab == NavTab::Favorites && favorites_page.input_mode();
+                || active_tab == NavTab::Favorites && favorites_page.input_mode()
+                || active_tab == NavTab::Playlists && playlists.input_active();
             let notification_active = !ctx.notifications.read().unwrap().is_empty();
             needs_render |= matches!(
                 state,
@@ -1067,11 +1120,13 @@ fn run_app(
                 active_tab == NavTab::Search && search_page.lock().unwrap().input_mode;
             let favorites_input_mode =
                 active_tab == NavTab::Favorites && favorites_page.input_mode();
+            let playlists_input_mode = active_tab == NavTab::Playlists && playlists.input_active();
             let local_input_mode = active_tab == NavTab::LocalMusic && local_filter.is_active();
             let history_input_mode = active_tab == NavTab::History && history_filter.is_active();
             let text_input_active = settings_input_mode
                 || search_input_mode
                 || favorites_input_mode
+                || playlists_input_mode
                 || local_input_mode
                 || history_input_mode;
 
@@ -1104,6 +1159,14 @@ fn run_app(
                             Ok(()) => {
                                 let local_source = ctx.source_manager.local_source();
                                 local_source.remove_by_path(&confirmation.path);
+                                let custom_playlist_cleanup = ctx
+                                    .storage
+                                    .remove_local_path_from_custom_playlists(&confirmation.path);
+                                if custom_playlist_cleanup.is_ok() {
+                                    let summaries = ctx.storage.custom_playlist_summaries();
+                                    playlists
+                                        .apply_local_file_removal(&confirmation.path, &summaries);
+                                }
                                 let remaining = local_source.all_songs().len();
                                 local_state.selected =
                                     local_state.selected.min(remaining.saturating_sub(1));
@@ -1114,6 +1177,11 @@ fn run_app(
                                     "已删除本地文件: {}",
                                     confirmation.name
                                 )));
+                                if let Err(error) = custom_playlist_cleanup {
+                                    ctx.notify(Notification::warning(format!(
+                                        "文件已删除，但清理自建歌单失败: {error}"
+                                    )));
+                                }
                                 let config = ctx.config.read().unwrap();
                                 let paths = config.local_music.paths.clone();
                                 let max_depth = config.local_music.max_depth;
@@ -1146,7 +1214,12 @@ fn run_app(
             }
 
             if let Some(menu) = song_menu.as_mut() {
-                let outcome = menu.handle_key(&key, &kb_resolver, nav_page_scope(active_tab));
+                let outcome = menu.handle_key(
+                    &key,
+                    &kb_resolver,
+                    nav_page_scope(active_tab),
+                    ui_areas.content,
+                );
                 match outcome {
                     MenuOutcome::None => {}
                     MenuOutcome::Close => {
@@ -1165,6 +1238,7 @@ fn run_app(
                             &settings_page,
                             &search_seq,
                             &mut favorites_page,
+                            &mut playlists,
                             &mut history_state,
                             &mut local_state,
                             &mut confirm_delete,
@@ -1315,14 +1389,12 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalGoToMain
-                        if !settings_input_mode
-                            && active_tab != NavTab::Main
-                            && active_tab != NavTab::Search
-                            && active_tab != NavTab::Favorites
-                            && !(active_tab == NavTab::Playlists
-                                && playlists.selected_playlist.is_some())
-                            && !(active_tab == NavTab::Leaderboard
-                                && leaderboard.selected_board.is_some()) =>
+                        if should_go_to_main(
+                            active_tab,
+                            text_input_active,
+                            playlists.selected_playlist.is_some(),
+                            leaderboard.selected_board.is_some(),
+                        ) =>
                     {
                         active_tab = NavTab::Main;
                         needs_render = true;
@@ -1478,6 +1550,11 @@ fn run_app(
                 }
                 NavTab::Playlists => {
                     let action = playlists.handle_input(&key, &ctx, &kb_resolver);
+                    if matches!(action, AppAction::GoBack) {
+                        active_tab = NavTab::Main;
+                        needs_render = true;
+                        continue;
+                    }
                     execute_action(
                         action,
                         &ctx,
@@ -1867,12 +1944,18 @@ fn run_app(
                             &settings_page,
                             &search_seq,
                             &mut favorites_page,
+                            &mut playlists,
                             &mut history_state,
                             &mut local_state,
                             &mut confirm_delete,
                         );
                     }
                 }
+                needs_render = true;
+                continue;
+            }
+
+            if active_tab == NavTab::Playlists && playlists.input_active() {
                 needs_render = true;
                 continue;
             }
@@ -1968,8 +2051,22 @@ fn run_app(
                     };
                     if let Some(((songs, index), kind, sort)) = target {
                         let is_favorite = ctx.storage.is_favorite(&songs[index]);
-                        song_menu =
-                            SongContextMenu::new(position, songs, index, kind, is_favorite, sort);
+                        let custom_playlists = ctx.storage.custom_playlist_choices();
+                        let current_custom_playlist = (active_tab == NavTab::Playlists)
+                            .then(|| playlists.current_custom_playlist_id())
+                            .flatten();
+                        song_menu = SongContextMenu::new(
+                            position,
+                            songs,
+                            index,
+                            kind,
+                            is_favorite,
+                            SongContextMenuOptions {
+                                sort,
+                                custom_playlists,
+                                current_custom_playlist,
+                            },
+                        );
                         needs_render = true;
                         continue;
                     }
@@ -2041,7 +2138,7 @@ fn run_app(
             );
         }
         if active_tab == NavTab::Playlists {
-            playlists.sync_favorites(&ctx);
+            playlists.sync_saved_playlists(&ctx);
             maybe_spawn_playlist_load(
                 &mut playlists,
                 &mut playlist_request_id,
@@ -3545,7 +3642,7 @@ mod tests {
 
     use super::{
         DeleteConfirmationAction, delete_confirmation_action, next_list_index,
-        playback_restore_flags, previous_list_index, should_expand_bili_parts,
+        playback_restore_flags, previous_list_index, should_expand_bili_parts, should_go_to_main,
         should_scan_local_music_on_entry,
     };
     use crate::pages::sidebar::NavTab;
@@ -3598,6 +3695,13 @@ mod tests {
                 DeleteConfirmationAction::Cancel
             );
         }
+    }
+
+    #[test]
+    fn playlist_overlays_and_open_lists_receive_escape_before_global_navigation() {
+        assert!(!should_go_to_main(NavTab::Playlists, true, false, false));
+        assert!(!should_go_to_main(NavTab::Playlists, false, true, false));
+        assert!(should_go_to_main(NavTab::Playlists, false, false, false));
     }
 
     #[test]
