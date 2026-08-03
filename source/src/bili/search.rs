@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use lx_core::model::song::SongInfo;
-use lx_core::model::source::{Quality, SourceId};
+use lx_core::model::source::SourceId;
 use lx_core::traits::source::{SearchError, SearchResult};
 use regex::Regex;
 use reqwest::Url;
@@ -237,7 +237,6 @@ fn parse_video_result(
             song.album_id = bvid.to_string();
             song.duration = Duration::from_secs(page["duration"].as_u64().unwrap_or_default());
             song.cover_url = cover_url.clone();
-            song.qualities.extend([Quality::Low128, Quality::High320]);
             song.extra.insert("bvid".to_string(), bvid.to_string());
             song.extra.insert("cid".to_string(), cid);
             song.extra
@@ -263,7 +262,6 @@ fn parse_video_result(
             song.album_id = bvid.to_string();
             song.duration = Duration::from_secs(data["duration"].as_u64().unwrap_or_default());
             song.cover_url = cover_url;
-            song.qualities.extend([Quality::Low128, Quality::High320]);
             song.extra.insert("bvid".to_string(), bvid.to_string());
             song.extra.insert("cid".to_string(), cid);
             song.extra.insert("page".to_string(), "1".to_string());
@@ -521,6 +519,25 @@ mod tests {
             result.items[0].cover_url.as_deref(),
             Some("https://example.com/cover.jpg")
         );
+    }
+
+    #[test]
+    fn expanded_parts_carry_no_quality_until_a_stream_is_chosen() {
+        let json = json!({
+            "code": 0,
+            "data": {
+                "bvid": "BV1xx411c7mD",
+                "title": "测试视频",
+                "owner": {"name": "UP主", "mid": 42},
+                "pages": [
+                    {"cid": 1001, "page": 1, "part": "第一段", "duration": 60}
+                ]
+            }
+        });
+
+        let result = parse_video_result(&json, None).unwrap();
+
+        assert!(result.items[0].qualities.is_empty());
     }
 
     #[test]
