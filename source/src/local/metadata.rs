@@ -3,10 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, Tag};
 
 use lx_core::model::song::SongInfo;
+use lx_core::model::source::{AudioProperties, Quality};
 
 static COVER_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 const COVER_TEMP_INFIX: &str = ".part.";
@@ -17,6 +18,14 @@ pub fn read_metadata(path: &Path) -> Result<SongInfo, String> {
 
     let properties = tagged.properties();
     let duration = properties.duration();
+    // lofty 未解析出的字段取值为 0
+    let audio = AudioProperties {
+        bitrate: properties.audio_bitrate().filter(|bitrate| *bitrate != 0),
+        sample_rate: properties.sample_rate().filter(|rate| *rate != 0),
+        bit_depth: properties.bit_depth().filter(|depth| *depth != 0),
+        // 位深字段的存在与否是 MP4 的编码判据，取值 0 同样代表存在
+        lossless: is_lossless(tagged.file_type(), properties.bit_depth()),
+    };
 
     // 提取主标签
     let (title, artist, album) = if let Some(tag) = tagged.first_tag() {
@@ -58,7 +67,8 @@ pub fn read_metadata(path: &Path) -> Result<SongInfo, String> {
         album_id: String::new(),
         duration,
         source: lx_core::model::source::SourceId::Local,
-        qualities: std::collections::BTreeSet::from([lx_core::model::source::Quality::High320]),
+        qualities: classify(&audio).into_iter().collect(),
+        audio: Some(audio),
         cover_url: cover_path,
         extra: std::collections::HashMap::new(),
         toggle_source: None,
@@ -67,6 +77,44 @@ pub fn read_metadata(path: &Path) -> Result<SongInfo, String> {
             .extension()
             .and_then(|e| e.to_str())
             .map(|s| s.to_string()),
+    })
+}
+
+/// 判断编码是否无损
+///
+/// 按容器判断的近似结果。WavPack 的 hybrid 模式、格式标记非 PCM 与 IEEE_FLOAT
+/// 的 WAV、带压缩类型的 AIFC 三者实为有损，此处判为无损。三者的准确标识在
+/// `FileProperties` 的转换过程被丢弃，取值需要按具体类型重新解析文件。但实
+/// 际应用场景极其有限因此不做处理。
+fn is_lossless(file_type: FileType, bit_depth: Option<u8>) -> bool {
+    match file_type {
+        FileType::Flac | FileType::Ape | FileType::WavPack | FileType::Wav | FileType::Aiff => true,
+        // AAC、ALAC 与 FLAC 共用 MP4 容器，lofty 只在后两者的解析分支写入位深
+        FileType::Mp4 => bit_depth.is_some(),
+        _ => false,
+    }
+}
+
+/// 将实际编码参数归入 `Quality` 档位
+///
+/// 无损文件的码率随音乐内容浮动，规格取决于位深与采样率。有损文件的码率即规格
+fn classify(audio: &AudioProperties) -> Option<Quality> {
+    if audio.lossless {
+        let hi_res = audio.bit_depth.is_some_and(|depth| depth > 16)
+            || audio.sample_rate.is_some_and(|rate| rate > 48_000);
+        return Some(if hi_res {
+            Quality::Flac24
+        } else {
+            Quality::Flac
+        });
+    }
+    // 码率缺失则无从判断档位
+    let bitrate = audio.bitrate?;
+    // 224 是 128 与 320 的中点
+    Some(if bitrate >= 224 {
+        Quality::High320
+    } else {
+        Quality::Low128
     })
 }
 
@@ -180,8 +228,135 @@ fn simple_hash(data: &[u8]) -> String {
 mod tests {
     use std::io::Cursor;
 
-    use super::{embedded_lyric_from_tag, validate_cover, write_cover_cache};
+    use super::{
+        classify, embedded_lyric_from_tag, is_lossless, validate_cover, write_cover_cache,
+    };
+    use lofty::file::FileType;
     use lofty::tag::{ItemKey, Tag, TagType};
+    use lx_core::model::song::SongInfo;
+    use lx_core::model::source::{AudioProperties, Quality};
+
+    fn audio(
+        lossless: bool,
+        bitrate: u32,
+        sample_rate: u32,
+        bit_depth: Option<u8>,
+    ) -> AudioProperties {
+        AudioProperties {
+            bitrate: Some(bitrate),
+            sample_rate: Some(sample_rate),
+            bit_depth,
+            lossless,
+        }
+    }
+
+    #[test]
+    fn mp4_is_lossless_only_when_a_bit_depth_was_parsed() {
+        assert!(is_lossless(FileType::Mp4, Some(24)));
+        assert!(is_lossless(FileType::Mp4, Some(0)));
+        assert!(!is_lossless(FileType::Mp4, None));
+    }
+
+    #[test]
+    fn container_decides_losslessness_outside_mp4() {
+        assert!(is_lossless(FileType::Flac, None));
+        assert!(is_lossless(FileType::Wav, Some(16)));
+        assert!(!is_lossless(FileType::Mpeg, Some(16)));
+        assert!(!is_lossless(FileType::Opus, None));
+    }
+
+    #[test]
+    fn lossless_files_are_classified_by_depth_and_sample_rate() {
+        let cases = [
+            (audio(true, 5475, 192_000, Some(24)), Quality::Flac24),
+            (audio(true, 900, 44_100, Some(24)), Quality::Flac24),
+            (audio(true, 3000, 96_000, Some(16)), Quality::Flac24),
+            (audio(true, 551, 44_100, Some(16)), Quality::Flac),
+        ];
+        for (audio, expected) in cases {
+            assert_eq!(classify(&audio), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_high_bitrate_lossless_file_never_lands_in_a_lossy_tier() {
+        let quality = classify(&audio(true, 5475, 192_000, Some(24)));
+        assert!(matches!(quality, Some(Quality::Flac | Quality::Flac24)));
+    }
+
+    #[test]
+    fn lossy_files_are_classified_by_a_midpoint_threshold() {
+        let cases = [
+            (audio(false, 321, 44_100, None), Quality::High320),
+            (audio(false, 224, 44_100, None), Quality::High320),
+            (audio(false, 223, 44_100, None), Quality::Low128),
+            (audio(false, 96, 44_100, None), Quality::Low128),
+        ];
+        for (audio, expected) in cases {
+            assert_eq!(classify(&audio), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_lossless_file_is_labelled_by_depth_and_sample_rate() {
+        let cases = [
+            (audio(true, 5475, 192_000, Some(24)), "24/192"),
+            (audio(true, 2478, 96_000, Some(24)), "24/96"),
+            (audio(true, 551, 44_100, Some(16)), "16/44.1"),
+            (audio(true, 4000, 176_400, Some(24)), "24/176.4"),
+        ];
+        for (audio, expected) in cases {
+            assert_eq!(audio.label().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_lossy_file_is_labelled_by_its_measured_bitrate() {
+        let cases = [
+            (audio(false, 321, 44_100, None), "321K"),
+            (audio(false, 320, 44_100, None), "320K"),
+            (audio(false, 220, 44_100, None), "220K"),
+            (audio(false, 107, 44_100, None), "107K"),
+        ];
+        for (audio, expected) in cases {
+            assert_eq!(audio.label().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_lossless_file_missing_a_bit_depth_falls_back_to_the_sample_rate() {
+        let no_depth = AudioProperties {
+            bitrate: Some(900),
+            sample_rate: Some(44_100),
+            bit_depth: None,
+            lossless: true,
+        };
+
+        assert_eq!(no_depth.label().as_deref(), Some("44.1kHz"));
+    }
+
+    #[test]
+    fn a_lossy_file_without_a_parsed_bitrate_gets_no_tier_at_all() {
+        let unknown = AudioProperties {
+            bitrate: None,
+            sample_rate: Some(44_100),
+            bit_depth: None,
+            lossless: false,
+        };
+
+        assert_eq!(classify(&unknown), None);
+
+        let mut song = SongInfo::new(
+            "1".to_string(),
+            lx_core::model::source::SourceId::Local,
+            "歌曲".to_string(),
+            "歌手".to_string(),
+        );
+        song.qualities = classify(&unknown).into_iter().collect();
+        song.audio = Some(unknown);
+
+        assert_eq!(song.quality_label(), "-");
+    }
 
     #[test]
     fn reads_and_trims_embedded_lyric() {

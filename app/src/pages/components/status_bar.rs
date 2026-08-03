@@ -1,7 +1,7 @@
 //! 底部状态栏
 
 use lx_core::model::config::StatusBarItem;
-use lx_core::model::source::{PlayerState, Quality};
+use lx_core::model::source::PlayerState;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -143,7 +143,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
                 Style::new().fg(crate::theme::lavender(ctx)).bg(background),
             )),
             StatusBarItem::Quality => Some((
-                quality_label(quality).to_string(),
+                quality.label().to_string(),
                 Style::new().fg(crate::theme::peach(ctx)).bg(background),
             )),
             StatusBarItem::Queue => Some((
@@ -245,15 +245,6 @@ fn truncate(value: &str, width: usize) -> String {
     }
     result.push('…');
     result
-}
-
-fn quality_label(quality: Quality) -> &'static str {
-    match quality {
-        Quality::Low128 => "128K",
-        Quality::High320 => "320K",
-        Quality::Flac => "FLAC",
-        Quality::Flac24 => "Hi-Res",
-    }
 }
 
 fn format_duration(duration: std::time::Duration) -> String {
