@@ -1058,7 +1058,8 @@ fn run_app(
         }
 
         if last_periodic_render.elapsed() >= render_interval {
-            ctx.lyric_service.update_position(*ctx.position.borrow());
+            ctx.lyric_service
+                .update_position(*ctx.lyric_position.borrow());
             let input_active = active_tab == NavTab::Search
                 && search_page.lock().unwrap().input_mode
                 || active_tab == NavTab::Settings && settings_page.lock().unwrap().input_mode
@@ -3040,23 +3041,8 @@ fn start_song_playback(
     let source_mgr = Arc::clone(&ctx.source_manager);
     let player = Arc::clone(&ctx.player);
     let lyric_service = Arc::clone(&ctx.lyric_service);
-    let lyric_song = song.clone();
-    let lyric_position = ctx.position.clone();
+    let lyric_position = ctx.lyric_position.clone();
     let lyric_tx = action_tx.clone();
-    rt.spawn(async move {
-        let result = tokio::time::timeout(
-            Duration::from_secs(15),
-            lyric_service.load(&lyric_song, lyric_generation),
-        )
-        .await;
-        match result {
-            Err(error) => tracing::warn!("load lyric timeout: {}", error),
-            Ok(Err(error)) => tracing::warn!("load lyric failed: {}", error),
-            Ok(Ok(())) => {}
-        }
-        lyric_service.update_position(*lyric_position.borrow());
-        let _ = lyric_tx.send(AppAction::None);
-    });
 
     let current_song = Arc::clone(&ctx.current_song);
     let play_request_id = Arc::clone(&ctx.play_request_id);
@@ -3130,6 +3116,23 @@ fn start_song_playback(
                 player.pause();
             }
         }
+
+        // 自动换源可能匹配到另一个版本，歌词必须跟随最终交给 mpv 的歌曲。
+        let lyric_song = resolved_song.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                lyric_service.load(&lyric_song, lyric_generation),
+            )
+            .await;
+            match result {
+                Err(error) => tracing::warn!("load lyric timeout: {}", error),
+                Ok(Err(error)) => tracing::warn!("load lyric failed: {}", error),
+                Ok(Ok(())) => {}
+            }
+            lyric_service.update_position(*lyric_position.borrow());
+            let _ = lyric_tx.send(AppAction::None);
+        });
 
         if resolved_song.cover_url.is_none() {
             resolved_song.cover_url = song_url.cover_url.clone();

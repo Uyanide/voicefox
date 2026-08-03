@@ -26,6 +26,7 @@ pub struct AppContext {
     pub player: Arc<dyn Player>,
     pub player_state: tokio::sync::watch::Receiver<PlayerState>,
     pub position: tokio::sync::watch::Receiver<std::time::Duration>,
+    pub lyric_position: tokio::sync::watch::Receiver<std::time::Duration>,
     pub duration: tokio::sync::watch::Receiver<std::time::Duration>,
 
     // --- 音源 ---
@@ -93,12 +94,14 @@ impl AppContext {
 
         let player_state = player.state_watcher();
         let position = player.position_watcher();
+        let lyric_position = player.audible_position_watcher();
         let duration = player.duration_watcher();
 
         Ok(Self {
             player,
             player_state,
             position,
+            lyric_position,
             duration,
             source_manager,
             bili_source,

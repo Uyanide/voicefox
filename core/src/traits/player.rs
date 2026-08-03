@@ -32,6 +32,10 @@ pub trait Player: Send + Sync {
     fn state_watcher(&self) -> watch::Receiver<PlayerState>;
     /// 进度观察者
     fn position_watcher(&self) -> watch::Receiver<Duration>;
+    /// 实际可听到的音频进度。默认与媒体进度一致，支持音频输出延迟的播放器可覆盖。
+    fn audible_position_watcher(&self) -> watch::Receiver<Duration> {
+        self.position_watcher()
+    }
     /// 总时长观察者
     fn duration_watcher(&self) -> watch::Receiver<Duration>;
 

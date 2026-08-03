@@ -19,6 +19,8 @@ pub struct MpvEngine {
     state_rx: watch::Receiver<PlayerState>,
     position_tx: watch::Sender<Duration>,
     position_rx: watch::Receiver<Duration>,
+    audible_position_tx: watch::Sender<Duration>,
+    audible_position_rx: watch::Receiver<Duration>,
     duration_tx: watch::Sender<Duration>,
     duration_rx: watch::Receiver<Duration>,
     event_tx: mpsc::UnboundedSender<PlayerEvent>,
@@ -33,6 +35,7 @@ impl MpvEngine {
     pub fn new() -> Self {
         let (state_tx, state_rx) = watch::channel(PlayerState::Idle);
         let (position_tx, position_rx) = watch::channel(Duration::ZERO);
+        let (audible_position_tx, audible_position_rx) = watch::channel(Duration::ZERO);
         let (duration_tx, duration_rx) = watch::channel(Duration::ZERO);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -43,6 +46,8 @@ impl MpvEngine {
             state_rx,
             position_tx,
             position_rx,
+            audible_position_tx,
+            audible_position_rx,
             duration_tx,
             duration_rx,
             event_tx,
@@ -71,12 +76,20 @@ fn duration_from_mpv_seconds(seconds: f64) -> Duration {
     Duration::from_secs_f64(seconds.max(0.0))
 }
 
+fn select_audible_position(
+    audio_position: Option<Duration>,
+    media_position: Option<Duration>,
+) -> Option<Duration> {
+    audio_position.or(media_position)
+}
+
 impl Player for MpvEngine {
     fn prepare(&self) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.paused.store(false, Ordering::SeqCst);
         let _ = self.state_tx.send(PlayerState::Loading);
         let _ = self.position_tx.send(Duration::ZERO);
+        let _ = self.audible_position_tx.send(Duration::ZERO);
         let _ = self.duration_tx.send(Duration::ZERO);
         generation
     }
@@ -170,6 +183,7 @@ impl Player for MpvEngine {
                 // 启动进度轮询任务
                 let ipc_clone = Arc::clone(&ipc);
                 let position_tx = self.position_tx.clone();
+                let audible_position_tx = self.audible_position_tx.clone();
                 let duration_tx = self.duration_tx.clone();
                 let active_generation = Arc::clone(&self.generation);
                 let polling_task = Arc::clone(&polling);
@@ -193,10 +207,29 @@ impl Player for MpvEngine {
                                 .ok()
                                 .and_then(Result::ok);
 
-                        if let Some(ref pos_str) = pos_res
-                            && let Some(secs) = parse_mpv_data(pos_str)
+                        let media_position = pos_res
+                            .as_deref()
+                            .and_then(parse_mpv_data)
+                            .map(duration_from_mpv_seconds);
+                        if let Some(position) = media_position {
+                            let _ = position_tx.send(position);
+                        }
+
+                        // audio-pts 会扣除音频输出缓冲，更接近用户实际听到的声音。
+                        let ipc = Arc::clone(&ipc_clone);
+                        let audio_res =
+                            tokio::task::spawn_blocking(move || ipc.get_property("audio-pts"))
+                                .await
+                                .ok()
+                                .and_then(Result::ok);
+                        let audio_position = audio_res
+                            .as_deref()
+                            .and_then(parse_mpv_data)
+                            .map(duration_from_mpv_seconds);
+                        if let Some(position) =
+                            select_audible_position(audio_position, media_position)
                         {
-                            let _ = position_tx.send(duration_from_mpv_seconds(secs));
+                            let _ = audible_position_tx.send(position);
                         }
 
                         // 总时长变化频率很低，每秒查询一次即可。
@@ -319,6 +352,7 @@ impl Player for MpvEngine {
         }
         let _ = self.state_tx.send(PlayerState::Stopped);
         let _ = self.position_tx.send(Duration::ZERO);
+        let _ = self.audible_position_tx.send(Duration::ZERO);
         let _ = self.duration_tx.send(Duration::ZERO);
     }
 
@@ -340,6 +374,7 @@ impl Player for MpvEngine {
         };
         // 先更新本地观察值，让进度条和歌词立即响应，再通知 mpv。
         let _ = self.position_tx.send(position);
+        let _ = self.audible_position_tx.send(position);
         let cmd = format!(
             "{{\"command\": [\"set_property\", \"time-pos\", {}]}}",
             position.as_secs_f64()
@@ -360,6 +395,10 @@ impl Player for MpvEngine {
 
     fn position_watcher(&self) -> watch::Receiver<Duration> {
         self.position_rx.clone()
+    }
+
+    fn audible_position_watcher(&self) -> watch::Receiver<Duration> {
+        self.audible_position_rx.clone()
     }
 
     fn duration_watcher(&self) -> watch::Receiver<Duration> {
@@ -410,7 +449,7 @@ impl Drop for MpvEngine {
 mod tests {
     use std::time::Duration;
 
-    use super::duration_from_mpv_seconds;
+    use super::{duration_from_mpv_seconds, select_audible_position};
 
     #[test]
     fn negative_mpv_times_are_clamped_to_zero() {
@@ -424,5 +463,17 @@ mod tests {
             duration_from_mpv_seconds(1.25),
             Duration::from_millis(1_250)
         );
+    }
+
+    #[test]
+    fn audible_position_prefers_audio_pts_and_falls_back_to_media_time() {
+        let media = Duration::from_millis(1_500);
+        let audio = Duration::from_millis(1_350);
+
+        assert_eq!(
+            select_audible_position(Some(audio), Some(media)),
+            Some(audio)
+        );
+        assert_eq!(select_audible_position(None, Some(media)), Some(media));
     }
 }

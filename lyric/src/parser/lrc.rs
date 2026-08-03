@@ -9,7 +9,13 @@ use regex::Regex;
 
 /// 解析 LRC 文本为 LyricLine 数组（按时间升序排列）
 pub fn parse(content: &str) -> Vec<LyricLine> {
-    let re = Regex::new(r"\[(\d{2}):(\d{2})\.(\d{2,3})\]").unwrap();
+    let re = Regex::new(r"\[(\d{1,3}):(\d{2})(?:[.:,](\d{1,3}))?\]").unwrap();
+    let offset_re = Regex::new(r"(?i)\[offset:\s*([+-]?\d+)\s*\]").unwrap();
+    let offset_ms = offset_re
+        .captures_iter(content)
+        .filter_map(|captures| captures.get(1)?.as_str().parse::<i64>().ok())
+        .last()
+        .unwrap_or_default();
     let mut lines: Vec<LyricLine> = Vec::new();
 
     for raw_line in content.lines() {
@@ -25,16 +31,17 @@ pub fn parse(content: &str) -> Vec<LyricLine> {
             if let Some(m) = cap.get(0) {
                 let min: u64 = cap[1].parse().unwrap_or(0);
                 let sec: u64 = cap[2].parse().unwrap_or(0);
-                let ms: u64 = {
-                    let ms_str = &cap[3];
+                let ms: u64 = cap.get(3).map_or(0, |fraction| {
+                    let ms_str = fraction.as_str();
                     let val: u64 = ms_str.parse().unwrap_or(0);
-                    if ms_str.len() == 2 {
-                        val * 10 // 2 位 ms → 补到 3 位精度
-                    } else {
-                        val
+                    match ms_str.len() {
+                        1 => val * 100,
+                        2 => val * 10,
+                        _ => val,
                     }
-                };
-                timestamps.push(min * 60_000 + sec * 1000 + ms);
+                });
+                let timestamp = min * 60_000 + sec * 1000 + ms;
+                timestamps.push(apply_offset(timestamp, offset_ms));
                 last_end = m.end();
             }
         }
@@ -70,6 +77,14 @@ pub fn parse(content: &str) -> Vec<LyricLine> {
     }
 
     lines
+}
+
+fn apply_offset(timestamp: u64, offset_ms: i64) -> u64 {
+    if offset_ms >= 0 {
+        timestamp.saturating_add(offset_ms as u64)
+    } else {
+        timestamp.saturating_sub(offset_ms.unsigned_abs())
+    }
 }
 
 #[cfg(test)]
@@ -112,5 +127,17 @@ mod tests {
         assert_eq!(result[1].timestamp, 2000);
         assert_eq!(result[0].text, "重复歌词");
         assert_eq!(result[1].text, "重复歌词");
+    }
+
+    #[test]
+    fn applies_lrc_offset_to_every_timestamp() {
+        let result = parse("[offset:+500]\n[00:01.00]第一行\n[00:02.00]第二行");
+
+        assert_eq!(result[0].timestamp, 1_500);
+        assert_eq!(result[1].timestamp, 2_500);
+
+        let result = parse("[offset:-1500]\n[00:01]第一行\n[0:02,5]第二行");
+        assert_eq!(result[0].timestamp, 0);
+        assert_eq!(result[1].timestamp, 1_000);
     }
 }
