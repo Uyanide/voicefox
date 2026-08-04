@@ -14,7 +14,7 @@ jobs:
   build-linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libmpv-dev
@@ -26,7 +26,7 @@ jobs:
         run: cargo test --release --verbose
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: voicefox-linux-x86_64
           path: target/release/voicefox
@@ -35,7 +35,7 @@ jobs:
   build-windows:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install MinGW toolchain
         uses: msys2/setup-msys2@v2
@@ -50,11 +50,24 @@ jobs:
           rustup target add x86_64-pc-windows-gnu
           "C:\msys64\mingw64\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          Invoke-WebRequest `
-            -Uri "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z" `
-            -OutFile mpv-dev.7z
+          $libmpvUrl = "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z"
+          curl.exe --location --fail --retry 3 --retry-delay 2 `
+            --output mpv-dev.7z $libmpvUrl
+          if ($LASTEXITCODE -ne 0) {
+            throw "Downloading libmpv failed with exit code $LASTEXITCODE"
+          }
+          if ((Get-Item mpv-dev.7z).Length -lt 1MB) {
+            throw "Downloaded libmpv archive is unexpectedly small"
+          }
+          7z t mpv-dev.7z | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "Downloaded libmpv archive is invalid"
+          }
           New-Item -ItemType Directory -Force -Path mpv-source/64 | Out-Null
           7z x mpv-dev.7z "-ompv-source/64" | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "Extracting libmpv failed with exit code $LASTEXITCODE"
+          }
           "MPV_SOURCE=$((Get-Location).Path)\mpv-source" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -70,7 +83,7 @@ jobs:
           7z a dist/voicefox-windows-x86_64.zip dist/voicefox.exe dist/libmpv-2.dll | Out-Host
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: voicefox-windows-x86_64
           path: dist/voicefox-windows-x86_64.zip
@@ -79,18 +92,20 @@ jobs:
   build-macos:
     runs-on: macos-15-intel
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
-        run: brew install mpv
+        run: |
+          brew install mpv
+          echo "RUSTFLAGS=-Lnative=$(brew --prefix mpv)/lib" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --verbose
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: voicefox-macos-x86_64
           path: target/release/voicefox
