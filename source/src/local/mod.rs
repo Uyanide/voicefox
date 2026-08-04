@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
-use lx_core::model::source::{Quality, SourceId};
+use lx_core::model::source::{QUALITY_ORDER, Quality, SourceId};
 use lx_core::traits::source::{FetchError, MusicSource, SearchError, SearchResult, SongUrl};
 
 /// 扫描到的本地歌曲（含文件路径）
@@ -217,12 +217,14 @@ impl MusicSource for LocalSource {
             }
         };
 
+        let qualities: Vec<Quality> = song.qualities.iter().copied().collect();
+
         Ok(SongUrl {
             url: path.to_string_lossy().to_string(),
-            quality: Quality::High320,
+            quality: qualities.last().copied().unwrap_or(Quality::High320),
             duration: song.duration,
             cover_url: song.cover_url.clone(),
-            qualities: vec![Quality::High320],
+            qualities,
             headers: vec![],
         })
     }
@@ -254,8 +256,9 @@ impl MusicSource for LocalSource {
         Err(FetchError::NotFound)
     }
 
+    /// 本地文件的规格由文件本身决定，四个档位都可能出现
     fn supported_qualities(&self) -> Vec<Quality> {
-        vec![Quality::High320]
+        QUALITY_ORDER.to_vec()
     }
 }
 

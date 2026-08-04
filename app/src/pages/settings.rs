@@ -928,7 +928,7 @@ impl SettingsPage {
             ),
             setting_value_line(
                 "播放音质",
-                quality_label(config.player.quality),
+                config.player.quality.label(),
                 "Q",
                 accent,
                 muted,
@@ -1553,15 +1553,6 @@ fn next_quality(quality: Quality) -> Quality {
         Quality::High320 => Quality::Flac,
         Quality::Flac => Quality::Flac24,
         Quality::Flac24 => Quality::Low128,
-    }
-}
-
-fn quality_label(quality: Quality) -> &'static str {
-    match quality {
-        Quality::Low128 => "128k",
-        Quality::High320 => "320k",
-        Quality::Flac => "FLAC",
-        Quality::Flac24 => "Hi-Res",
     }
 }
 

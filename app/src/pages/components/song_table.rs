@@ -1,5 +1,4 @@
 use lx_core::model::song::SongInfo;
-use lx_core::model::source::Quality;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn header(width: u16) -> String {
@@ -18,12 +17,7 @@ pub fn header(width: u16) -> String {
 pub fn row(song: &SongInfo, index: usize, width: u16) -> String {
     let index = (index + 1).to_string();
     let duration = format_duration(song.duration);
-    let quality = song
-        .qualities
-        .iter()
-        .next_back()
-        .map(|quality| quality_label(*quality))
-        .unwrap_or("-");
+    let quality = song.quality_label();
 
     format_columns(
         width as usize,
@@ -32,7 +26,7 @@ pub fn row(song: &SongInfo, index: usize, width: u16) -> String {
         &song.singer,
         &song.album_name,
         &duration,
-        quality,
+        &quality,
         song.source.as_str(),
     )
 }
@@ -49,7 +43,7 @@ fn format_columns(
     source: &str,
 ) -> String {
     if width >= 96 {
-        let fixed = 4 + 20 + 7 + 8 + 7;
+        let fixed = 4 + 20 + 7 + 9 + 7;
         let flexible = width.saturating_sub(fixed);
         let name_width = flexible.div_ceil(2);
         let album_width = flexible.saturating_sub(name_width);
@@ -59,7 +53,7 @@ fn format_columns(
             cell(singer, 20),
             cell(album, album_width),
             cell(duration, 7),
-            cell(quality, 8),
+            cell(quality, 9),
             cell(source, 7),
         ]
         .concat();
@@ -127,15 +121,6 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
     let total = duration.as_secs();
     format!("{:02}:{:02}", total / 60, total % 60)
-}
-
-fn quality_label(quality: Quality) -> &'static str {
-    match quality {
-        Quality::Low128 => "128K",
-        Quality::High320 => "320K",
-        Quality::Flac => "FLAC",
-        Quality::Flac24 => "Hi-Res",
-    }
 }
 
 #[cfg(test)]
