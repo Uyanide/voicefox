@@ -3,20 +3,14 @@ name = "lx-player"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+build_libmpv = ["libmpv2/build_libmpv"]
+
 [dependencies]
 lx-core = { path = "../core" }
 
 tokio.workspace = true
-serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-thiserror.workspace = true
-interprocess.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
+libmpv2.workspace = true

@@ -13,16 +13,11 @@ use lx_source::wy::WySource;
 async fn main() {
     println!("=== lx-tui 音源验证 ===\n");
 
-    // 1. 测试 mpv
-    print!("[1/7] mpv 可用性 ... ");
-    match std::process::Command::new("mpv")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(s) if s.success() => println!("✅ mpv 已安装"),
-        _ => println!("❌ mpv 未安装 - 播放功能无法使用"),
+    // 1. 测试 libmpv
+    print!("[1/7] libmpv 可用性 ... ");
+    match lx_player::engine::MpvEngine::new() {
+        Ok(_) => println!("✅ libmpv 初始化成功"),
+        Err(error) => println!("❌ libmpv 初始化失败 - {error}"),
     }
 
     // 2. 测试 kw

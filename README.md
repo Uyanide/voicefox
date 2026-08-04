@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/emoeem/voicefox/actions/workflows/ci.yml/badge.svg)](https://github.com/emoeem/voicefox/actions/workflows/ci.yml)
 
-voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，基于 ratatui 构建界面，通过 mpv 播放音频。支持多音源搜索、在线播放、歌词显示、收藏管理等功能。
+voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，基于 ratatui 构建界面，通过 libmpv 播放音频。支持多音源搜索、在线播放、歌词显示、收藏管理等功能。
 
 无需离开终端，也能享受完整的音乐体验。
 
@@ -35,7 +35,7 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 
 ### ✅ 已实现
 - **多音源搜索**：网易云音乐、酷狗音乐、酷我音乐、QQ 音乐、咪咕音乐、哔哩哔哩
-- **在线播放**：通过 mpv 播放高品质音乐
+- **在线播放**：通过进程内 libmpv 播放高品质音乐
 - **本地音乐**：扫描本地音乐目录，支持 MP3/FLAC/M4A/OGG/WAV，自动读取封面、同名 LRC 和音频内嵌歌词，并可确认后删除本地文件
 - **封面显示**：按终端能力自动选择 Kitty / Sixel / iTerm2 图片协议，都不支持时用 Unicode 半格块渲染
 - **tmux 封面**：在 tmux 中通过 passthrough 传递图形协议序列，封面照常显示；detach 后再 attach 自动重传，关掉终端、SSH 断线、换机器 attach 都能恢复，前提是这些终端支持同一种图形协议
@@ -49,7 +49,7 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - **排行榜**：按音源切换榜单目录，查看各音源实时热门歌曲
 - **热门歌单**：按音源切换并分页浏览酷我、酷狗、QQ、网易云、咪咕的实时歌单
 - **换源与失败跳过**：获取地址或实际播放失败时依次尝试其他解析器和音源，全部失败后自动播放下一首
-- **JS 自定义音源**：同时加载多个社区音源脚本，按配置顺序解析播放地址、歌词和封面；mpv 拒绝失效链接时可从下一个脚本继续
+- **JS 自定义音源**：同时加载多个社区音源脚本，按配置顺序解析播放地址、歌词和封面；libmpv 拒绝失效链接时可从下一个脚本继续
 - **主题配置**：可自定义颜色主题
 - **鼠标支持**：支持点击、滚轮、队列拖拽和歌曲右键操作菜单
 - **TUI 通知**：支持信息、成功、警告、错误四级浮动通知，可配置开关和停留时间
@@ -58,6 +58,12 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - **键盘快捷键**：完整的键盘操作
 
 ## 最近更新
+
+### 2026-08-04：播放器迁移到 libmpv2
+
+- 播放器改为通过 `libmpv2 6.0.0` 在 voicefox 进程内控制 libmpv，不再启动 `mpv` 命令行程序或使用 JSON IPC。
+- 播放进度、`audio-pts`、时长、暂停和缓冲状态改为由 libmpv 属性事件直接推送；歌词继续优先跟随实际可听音频进度。
+- Windows CI 和发布制品改用 MinGW 构建，并将 `libmpv-2.dll` 与 `voicefox.exe` 一起打包。
 
 ### 2026-08-01：播放模式、进度条与音源识别修复
 
@@ -152,7 +158,7 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 - [x] **哔哩哔哩音频**：支持搜索、BV/av 号、视频长链接、`b23.tv` 短链、分 P 直达、热门推荐、收藏夹、视频音频流和扫码登录；推荐接口异常时自动降级到全网热门
 - [ ] **听书模式**：支持有声书、播客内容
 - [x] **自动补全歌词**：播放时自动从多个源匹配歌词
-- [ ] **歌单管理**：创建和编辑自定义歌单
+- [x] **歌单管理**：创建、重命名和编辑自定义歌单
 - [x] **非原生图片终端兼容**：Kitty、Sixel、iTerm2 三种图片协议自动探测，都不支持时退回 Unicode 半格块渲染
 - [ ] **跨平台包管理**：支持更多 Linux 发行版、macOS
 - [ ] **更多音源插件**：兼容更多 lx-music 社区音源
@@ -162,10 +168,10 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 
 ### 前置依赖
 
-- **mpv**（必需）：音频播放引擎
-  - Linux：`sudo pacman -S mpv`（Arch） / `sudo apt install mpv`（Debian/Ubuntu）
+- **libmpv**（必需）：音频播放引擎，无需安装或调用 `mpv` 命令行程序
+  - Linux：`sudo pacman -S mpv`（Arch） / `sudo apt install libmpv-dev`（Debian/Ubuntu）
   - macOS：`brew install mpv`
-  - Windows：从 https://mpv.io/ 下载安装
+  - Windows：GitHub Actions 制品已包含 `libmpv-2.dll`
 
 ### tmux 中显示封面
 
@@ -263,14 +269,14 @@ install -Dm644 icons/512.png \
 install -Dm644 assets/voicefox.desktop \
   ~/.local/share/applications/voicefox.desktop
 
-# Arch Linux 安装依赖
+# Arch Linux 安装 libmpv
 sudo pacman -S mpv
 
-# Debian/Ubuntu 安装依赖
-sudo apt install mpv
+# Debian/Ubuntu 安装 libmpv 开发包
+sudo apt install libmpv-dev
 
-# Fedora 安装依赖
-sudo dnf install mpv
+# Fedora 安装 libmpv 开发包
+sudo dnf install mpv-libs-devel
 ```
 
 ### macOS
@@ -294,9 +300,9 @@ cp target/release/voicefox /usr/local/bin/
 
 1. 前往 [Actions](https://github.com/emoeem/voicefox/actions) 页面
 2. 选择最新的 CI 构建
-3. 下载 `voicefox-windows-x86_64.exe` 制品
-4. 安装 [mpv](https://mpv.io/installation/) 并加入 PATH
-5. 运行 `voicefox.exe`
+3. 下载 `voicefox-windows-x86_64` 制品
+4. 解压 `voicefox-windows-x86_64.zip`
+5. 保持 `voicefox.exe` 和 `libmpv-2.dll` 在同一目录并运行
 
 #### 方法二：从 Linux 交叉编译
 
@@ -304,22 +310,31 @@ cp target/release/voicefox /usr/local/bin/
 # 在 Linux 上交叉编译 Windows 版本
 sudo apt install gcc-mingw-w64-x86-64
 rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
+
+# 下载 Windows libmpv 开发包，将 libmpv.dll.a 和 libmpv-2.dll
+# 解压到 .deps/mpv/64 后编译
+MPV_SOURCE="$PWD/.deps/mpv" cargo build --release \
+  --target x86_64-pc-windows-gnu \
+  --features lx-player/build_libmpv
 
 # 输出文件
 # ./target/x86_64-pc-windows-gnu/release/voicefox.exe
+# 将 .deps/mpv/64/libmpv-2.dll 复制到 exe 同一目录
 ```
 
 #### 方法三：在 Windows 上本地编译
 
 ```powershell
-# 安装 Rust（从 https://rustup.rs 下载）
-# 安装 mpv（从 https://mpv.io/installation/ 下载并加入 PATH）
+# 安装 Rust 和 MinGW-w64
+# 下载 Windows libmpv 开发包，将其解压到 .deps/mpv/64
 
 git clone https://github.com/emoeem/voicefox.git
 cd voicefox
-cargo build --release
-# 输出在 target/release/voicefox.exe
+rustup target add x86_64-pc-windows-gnu
+$env:MPV_SOURCE = "$PWD\.deps\mpv"
+cargo build --release --target x86_64-pc-windows-gnu --features lx-player/build_libmpv
+# 输出在 target/x86_64-pc-windows-gnu/release/voicefox.exe
+# 将 .deps/mpv/64/libmpv-2.dll 复制到 exe 同一目录
 ```
 
 ## 快速开始
@@ -715,7 +730,7 @@ voicefox 内置以下音源模块：
 | 咪咕音乐 | mg | 移动旗下，版权较多 |
 | 哔哩哔哩 | bili | 支持搜索、BV/av 号、视频链接、短链和多 P 音频解析 |
 
-**JS 自定义音源**：支持同时加载多个社区维护的 lx-music 兼容音源脚本。脚本按 `js_sources` 数组顺序参与播放地址、歌词和封面解析，并共同参与聚合搜索；前一个脚本返回错误时会继续尝试后续脚本。若某个脚本成功返回 URL，但 mpv 实际无法播放，开启自动换源后会记住该脚本并从下一个脚本继续，而不会重复请求同一个失效链接。
+**JS 自定义音源**：支持同时加载多个社区维护的 lx-music 兼容音源脚本。脚本按 `js_sources` 数组顺序参与播放地址、歌词和封面解析，并共同参与聚合搜索；前一个脚本返回错误时会继续尝试后续脚本。若某个脚本成功返回 URL，但 libmpv 实际无法播放，开启自动换源后会记住该脚本并从下一个脚本继续，而不会重复请求同一个失效链接。
 
 通过设置页添加脚本时，新添加的 URL 会放到列表最前面，因此最后添加的脚本优先级最高。需要固定顺序时可直接编辑 `config.toml` 中的 `js_sources`。
 
@@ -738,7 +753,7 @@ voicefox/
 │   └── src/
 │       ├── wy/ kw/ kg/ tx/ mg/ bili/ local/  # 各音源实现
 │       └── js/                  # JS 自定义音源引擎
-├── player/       # 播放器引擎（mpv IPC）
+├── player/       # 播放器引擎（libmpv2）
 └── lyric/        # 歌词解析库（LRC/KRC/QRC/YRC）
 ```
 
@@ -748,11 +763,17 @@ voicefox/
 - **TUI 框架**：[ratatui](https://github.com/ratatui/ratatui) 0.30
 - **终端事件**：[crossterm](https://github.com/crossterm-rs/crossterm) 0.29
 - **异步运行时**：[tokio](https://github.com/tokio-rs/tokio)
-- **音频播放**：[mpv](https://mpv.io/)（通过 IPC 控制）
+- **音频播放**：[libmpv2](https://docs.rs/libmpv2/)（进程内控制 libmpv）
 - **HTTP 客户端**：[reqwest](https://github.com/seanmonstar/reqwest)
 - **歌词解析**：LRC/KRC/QRC/YRC 自实现解析器
 
 ## 更新日志
+
+### 2026-08-04
+
+- 使用 `libmpv2 6.0.0` 替换外部 mpv 子进程和 JSON IPC。
+- 使用 libmpv 属性事件更新媒体进度、实际音频进度、时长、暂停和缓冲状态。
+- Windows 构建和发布制品包含 `libmpv-2.dll`。
 
 ### 2026-07-31
 

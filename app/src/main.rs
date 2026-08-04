@@ -309,20 +309,6 @@ fn main() -> anyhow::Result<()> {
     // 初始化 AppContext
     let ctx = rt.block_on(AppContext::new(cfg, config_path))?;
 
-    // 验证 mpv 是否可用
-    let mut mpv_check = std::process::Command::new("mpv");
-    configure_background_command(&mut mpv_check);
-    if mpv_check
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
-        eprintln!("⚠ 警告: 未找到 mpv，音频播放功能不可用");
-        eprintln!("请安装 mpv: sudo apt install mpv (或 brew install mpv)");
-    }
-
     // 启动 TUI
     let mut terminal = ratatui::init();
     let mouse_enabled = ctx.config.read().unwrap().ui.enable_mouse;
@@ -824,7 +810,7 @@ fn run_app(
                         generation,
                         percent,
                     } if generation == ctx.active_player_generation.load(Ordering::SeqCst) => {
-                        tracing::trace!("mpv buffering: {:.0}%", percent * 100.0);
+                        tracing::trace!("libmpv buffering: {:.0}%", percent * 100.0);
                     }
                     stale_event => {
                         tracing::debug!("ignoring stale player event: {stale_event:?}");
@@ -3094,7 +3080,7 @@ fn start_song_playback(
 
         let url = song_url.url;
         let headers = song_url.headers;
-        // mpv 可能在 loadfile 返回后立刻报错，先保存实际匹配到的歌曲，
+        // libmpv 可能在 loadfile 返回后立刻报错，先保存实际匹配到的歌曲，
         // 让错误处理继续重试正确的候选音源。
         *current_song.write().unwrap() = Some(resolved_song.clone());
         let player_for_start = Arc::clone(&player);
@@ -3117,7 +3103,7 @@ fn start_song_playback(
             }
         }
 
-        // 自动换源可能匹配到另一个版本，歌词必须跟随最终交给 mpv 的歌曲。
+        // 自动换源可能匹配到另一个版本，歌词必须跟随最终交给 libmpv 的歌曲。
         let lyric_song = resolved_song.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -3660,7 +3646,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_sessions_restore_the_queue_without_starting_mpv() {
+    fn stopped_sessions_restore_the_queue_without_loading_libmpv_media() {
         assert_eq!(
             playback_restore_flags(SavedPlayerState::Playing),
             (true, false)

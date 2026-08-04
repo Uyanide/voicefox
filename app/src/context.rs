@@ -67,7 +67,7 @@ impl AppContext {
             anyhow::bail!("不支持的播放器引擎: {}", config.player.engine);
         }
         lx_source::configure_network(&config.network.proxy_url, config.network.timeout);
-        let player: Arc<dyn Player> = Arc::new(lx_player::engine::MpvEngine::new());
+        let player: Arc<dyn Player> = Arc::new(lx_player::engine::MpvEngine::new()?);
         player.set_volume(config.player.volume);
 
         // 创建音源管理器（JS 音源在 TUI 启动后异步加载）
