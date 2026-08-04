@@ -11,6 +11,10 @@ pub struct Cli {
     /// 日志级别
     #[arg(short, long, default_value = "info")]
     pub log_level: String,
+
+    /// 检查 libmpv 运行时是否可以初始化后退出
+    #[arg(long)]
+    pub check_libmpv: bool,
 }
 
 impl Cli {

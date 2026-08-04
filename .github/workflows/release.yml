@@ -98,6 +98,10 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-gnu'
         run: cargo build --locked --release --package voicefox-app --target "${{ matrix.target }}" --features lx-player/build_libmpv
 
+      - name: Validate non-Windows libmpv runtime
+        if: matrix.target != 'x86_64-pc-windows-gnu'
+        run: '"${{ matrix.binary_path }}" --check-libmpv'
+
       - name: Build non-Windows release asset
         if: matrix.target != 'x86_64-pc-windows-gnu'
         shell: bash
@@ -105,14 +109,26 @@ jobs:
           mkdir -p dist
           cp "${{ matrix.binary_path }}" "dist/${{ matrix.asset_name }}"
 
-      - name: Build Windows release asset
+      - name: Validate and build Windows release asset
         if: matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "${{ matrix.binary_path }}" dist/voicefox.exe
           Copy-Item mpv-source/64/libmpv-2.dll dist/libmpv-2.dll
-          7z a "dist/${{ matrix.asset_name }}" dist/voicefox.exe dist/libmpv-2.dll | Out-Host
+          Push-Location dist
+          try {
+            .\voicefox.exe --check-libmpv
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bundled libmpv runtime check failed with exit code $LASTEXITCODE"
+            }
+            7z a "${{ matrix.asset_name }}" voicefox.exe libmpv-2.dll | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaging Windows release failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Pop-Location
+          }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7

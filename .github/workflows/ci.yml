@@ -72,15 +72,27 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-gnu --features lx-player/build_libmpv 2>&1
+        run: cargo build --locked --release --package voicefox-app --target x86_64-pc-windows-gnu --features lx-player/build_libmpv 2>&1
 
-      - name: Package binary and libmpv
+      - name: Validate and package binary with libmpv
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/x86_64-pc-windows-gnu/release/voicefox.exe dist/voicefox.exe
           Copy-Item mpv-source/64/libmpv-2.dll dist/libmpv-2.dll
-          7z a dist/voicefox-windows-x86_64.zip dist/voicefox.exe dist/libmpv-2.dll | Out-Host
+          Push-Location dist
+          try {
+            .\voicefox.exe --check-libmpv
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bundled libmpv runtime check failed with exit code $LASTEXITCODE"
+            }
+            7z a voicefox-windows-x86_64.zip voicefox.exe libmpv-2.dll | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaging Windows artifact failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Pop-Location
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -90,9 +102,24 @@ jobs:
 
   # ── macOS 构建 ──
   build-macos:
-    runs-on: macos-15-intel
+    name: build-macos-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+            runner_arch: x86_64
+            target: x86_64-apple-darwin
+            artifact: voicefox-macos-x86_64
+          - arch: arm64
+            runner: macos-15
+            runner_arch: arm64
+            target: aarch64-apple-darwin
+            artifact: voicefox-macos-aarch64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -102,10 +129,13 @@ jobs:
           echo "RUSTFLAGS=-Lnative=$(brew --prefix mpv)/lib" >> "$GITHUB_ENV"
 
       - name: Build
-        run: cargo build --release --verbose
+        run: cargo build --locked --release --package voicefox-app --target "${{ matrix.target }}" --verbose
+
+      - name: Validate libmpv runtime
+        run: "target/${{ matrix.target }}/release/voicefox --check-libmpv"
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: voicefox-macos-x86_64
-          path: target/release/voicefox
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/voicefox

@@ -23,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -293,6 +294,14 @@ fn main() -> anyhow::Result<()> {
 
     // 解析 CLI
     let cli = cli::Cli::parse();
+
+    if cli.check_libmpv {
+        let player = lx_player::engine::MpvEngine::new()
+            .context("libmpv 运行时自检失败，请确认程序与动态库来自同一个发布包")?;
+        drop(player);
+        println!("libmpv runtime check passed");
+        return Ok(());
+    }
 
     // 加载配置
     let (cfg, config_path) = config::loader::load(&cli.config)?;
