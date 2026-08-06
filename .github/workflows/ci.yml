@@ -82,13 +82,27 @@ jobs:
           Copy-Item mpv-source/64/libmpv-2.dll dist/libmpv-2.dll
           Push-Location dist
           try {
-            $imports = (& "C:\msys64\mingw64\bin\objdump.exe" -p voicefox.exe | Out-String)
-            $imports | Select-String "DLL Name:|mpv_client_api_version"
-            if ($imports -notmatch "DLL Name:\s+libmpv-2\.dll") {
-              throw "voicefox.exe does not import the bundled libmpv-2.dll"
+            $objdump = Get-Command objdump.exe -ErrorAction SilentlyContinue
+            if ($null -eq $objdump) {
+              $objdumpPath = @(
+                "C:\msys64\mingw64\bin\objdump.exe",
+                "C:\msys64\usr\bin\objdump.exe"
+              ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+              if ($null -ne $objdumpPath) {
+                $objdump = Get-Item $objdumpPath
+              }
             }
-            if ($imports -notmatch "mpv_client_api_version") {
-              throw "voicefox.exe does not import mpv_client_api_version"
+            if ($null -eq $objdump) {
+              Write-Warning "objdump.exe was not found; skipping import-table diagnostics"
+            } else {
+              $imports = (& $objdump.Path -p voicefox.exe | Out-String)
+              $imports | Select-String "DLL Name:|mpv_client_api_version"
+              if ($imports -notmatch "DLL Name:\s+libmpv-2\.dll") {
+                throw "voicefox.exe does not import the bundled libmpv-2.dll"
+              }
+              if ($imports -notmatch "mpv_client_api_version") {
+                throw "voicefox.exe does not import mpv_client_api_version"
+              }
             }
             .\voicefox.exe --check-libmpv
             if ($LASTEXITCODE -ne 0) {

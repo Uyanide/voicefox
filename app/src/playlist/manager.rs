@@ -55,6 +55,7 @@ impl PlaylistManager {
         )
     }
 
+    #[cfg(target_os = "linux")]
     pub fn len(&self) -> usize {
         self.current_list.lock().unwrap().len()
     }

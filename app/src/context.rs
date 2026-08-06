@@ -137,6 +137,7 @@ impl AppContext {
     }
 
     /// 当前进度纪元，变化即代表期间发生过跳转。
+    #[cfg(target_os = "linux")]
     pub fn position_epoch(&self) -> u64 {
         self.position_epoch.load(Ordering::Relaxed)
     }
