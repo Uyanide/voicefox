@@ -65,26 +65,17 @@ impl MpvEngine {
         mpv.set_property("volume", 80.0_f64)
             .context("设置 libmpv 初始音量失败")?;
 
-        let event_client = mpv
-            .create_client(Some("voicefox_events"))
-            .context("创建 libmpv 事件客户端失败")?;
-        event_client
-            .disable_deprecated_events()
+        mpv.disable_deprecated_events()
             .context("配置 libmpv 事件失败")?;
-        event_client
-            .observe_property("time-pos", Format::Double, TIME_POS_OBSERVER)
+        mpv.observe_property("time-pos", Format::Double, TIME_POS_OBSERVER)
             .context("监听 libmpv 播放进度失败")?;
-        event_client
-            .observe_property("audio-pts", Format::Double, AUDIO_PTS_OBSERVER)
+        mpv.observe_property("audio-pts", Format::Double, AUDIO_PTS_OBSERVER)
             .context("监听 libmpv 音频进度失败")?;
-        event_client
-            .observe_property("duration", Format::Double, DURATION_OBSERVER)
+        mpv.observe_property("duration", Format::Double, DURATION_OBSERVER)
             .context("监听 libmpv 音频时长失败")?;
-        event_client
-            .observe_property("pause", Format::Flag, PAUSE_OBSERVER)
+        mpv.observe_property("pause", Format::Flag, PAUSE_OBSERVER)
             .context("监听 libmpv 暂停状态失败")?;
-        event_client
-            .observe_property("cache-buffering-state", Format::Double, BUFFERING_OBSERVER)
+        mpv.observe_property("cache-buffering-state", Format::Double, BUFFERING_OBSERVER)
             .context("监听 libmpv 缓冲状态失败")?;
 
         let (state_tx, state_rx) = watch::channel(PlayerState::Idle);
@@ -108,9 +99,10 @@ impl MpvEngine {
             pending_seek: Arc::clone(&pending_seek),
             shutdown: Arc::clone(&shutdown),
         };
+        let event_mpv = Arc::clone(&mpv);
         let event_thread = thread::Builder::new()
             .name("voicefox-libmpv-events".to_string())
-            .spawn(move || run_event_loop(event_client, event_context))
+            .spawn(move || run_event_loop(event_mpv, event_context))
             .context("启动 libmpv 事件线程失败")?;
 
         Ok(Self {
@@ -163,7 +155,7 @@ impl MpvEngine {
     }
 }
 
-fn run_event_loop(event_client: Mpv, context: EventLoopContext) {
+fn run_event_loop(event_client: Arc<Mpv>, context: EventLoopContext) {
     let mut current_file_generation = None;
     let mut last_media_position = None;
     let mut has_audio_position = false;

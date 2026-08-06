@@ -102,6 +102,14 @@ jobs:
         if: matrix.target != 'x86_64-pc-windows-gnu'
         run: '"${{ matrix.binary_path }}" --check-libmpv'
 
+      - name: Inspect macOS libmpv linkage
+        if: startsWith(matrix.runner, 'macos')
+        run: |
+          mpv_lib="$(brew --prefix mpv)/lib/libmpv.dylib"
+          file "$mpv_lib"
+          file "${{ matrix.binary_path }}"
+          otool -L "${{ matrix.binary_path }}"
+
       - name: Build non-Windows release asset
         if: matrix.target != 'x86_64-pc-windows-gnu'
         shell: bash
@@ -118,6 +126,14 @@ jobs:
           Copy-Item mpv-source/64/libmpv-2.dll dist/libmpv-2.dll
           Push-Location dist
           try {
+            $imports = (& "C:\msys64\mingw64\bin\objdump.exe" -p voicefox.exe | Out-String)
+            $imports | Select-String "DLL Name:|mpv_client_api_version"
+            if ($imports -notmatch "DLL Name:\s+libmpv-2\.dll") {
+              throw "voicefox.exe does not import the bundled libmpv-2.dll"
+            }
+            if ($imports -notmatch "mpv_client_api_version") {
+              throw "voicefox.exe does not import mpv_client_api_version"
+            }
             .\voicefox.exe --check-libmpv
             if ($LASTEXITCODE -ne 0) {
               throw "Bundled libmpv runtime check failed with exit code $LASTEXITCODE"

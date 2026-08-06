@@ -82,6 +82,14 @@ jobs:
           Copy-Item mpv-source/64/libmpv-2.dll dist/libmpv-2.dll
           Push-Location dist
           try {
+            $imports = (& "C:\msys64\mingw64\bin\objdump.exe" -p voicefox.exe | Out-String)
+            $imports | Select-String "DLL Name:|mpv_client_api_version"
+            if ($imports -notmatch "DLL Name:\s+libmpv-2\.dll") {
+              throw "voicefox.exe does not import the bundled libmpv-2.dll"
+            }
+            if ($imports -notmatch "mpv_client_api_version") {
+              throw "voicefox.exe does not import mpv_client_api_version"
+            }
             .\voicefox.exe --check-libmpv
             if ($LASTEXITCODE -ne 0) {
               throw "Bundled libmpv runtime check failed with exit code $LASTEXITCODE"
@@ -119,7 +127,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: voicefox-macos-aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         env:
@@ -130,6 +138,15 @@ jobs:
 
       - name: Build
         run: cargo build --locked --release --package voicefox-app --target "${{ matrix.target }}" --verbose
+
+      - name: Inspect libmpv linkage
+        run: |
+          mpv_lib="$(brew --prefix mpv)/lib/libmpv.dylib"
+          binary="target/${{ matrix.target }}/release/voicefox"
+          file "$mpv_lib"
+          file "$binary"
+          file "$binary" | grep -q "${{ matrix.runner_arch }}"
+          otool -L "$binary"
 
       - name: Validate libmpv runtime
         run: "target/${{ matrix.target }}/release/voicefox --check-libmpv"
