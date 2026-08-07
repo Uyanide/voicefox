@@ -1,7 +1,7 @@
+pub mod bili;
 pub mod js;
 pub mod local;
 pub mod manager;
-pub mod bili;
 
 // 音源模块
 pub mod kg;

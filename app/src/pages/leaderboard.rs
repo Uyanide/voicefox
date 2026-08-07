@@ -350,14 +350,7 @@ impl LeaderboardPage {
                 if board_inner.contains(position) {
                     let index =
                         self.board_scroll_offset + event.row.saturating_sub(board_inner.y) as usize;
-                    if index < self.boards.len() {
-                        if activate {
-                            self.selected = index;
-                            self.enter_selected_board();
-                        } else if self.selected_board.is_none() {
-                            self.selected = index;
-                        }
-                    }
+                    self.handle_board_click(index, activate);
                     return AppAction::None;
                 }
 
@@ -635,6 +628,21 @@ impl LeaderboardPage {
         }
     }
 
+    fn handle_board_click(&mut self, index: usize, activate: bool) {
+        if index >= self.boards.len() {
+            return;
+        }
+        if activate {
+            if self.selected_board.is_some() {
+                self.leave_board();
+            }
+            self.selected = index;
+            self.enter_selected_board();
+        } else if self.selected_board.is_none() {
+            self.selected = index;
+        }
+    }
+
     fn enter_selected_board(&mut self) {
         if self.selected_board.is_some() || self.selected >= self.boards.len() {
             return;
@@ -878,6 +886,26 @@ mod tests {
             page.next_load_request(),
             Some(LeaderboardLoadRequest::Boards {
                 source: SourceId::Kw
+            })
+        );
+    }
+    #[test]
+    fn activating_another_board_does_not_require_leaving_first() {
+        let mut page = LeaderboardPage::new(vec![SourceId::Kw]);
+        let first = LeaderboardInfo::new("first".to_string(), "第一榜".to_string(), SourceId::Kw);
+        let second = LeaderboardInfo::new("second".to_string(), "第二榜".to_string(), SourceId::Kw);
+        page.update_boards(SourceId::Kw, vec![first, second]);
+
+        page.handle_board_click(0, true);
+        assert_eq!(page.selected_board, Some(0));
+
+        page.handle_board_click(1, true);
+        assert_eq!(page.selected_board, Some(1));
+        assert_eq!(
+            page.next_load_request(),
+            Some(LeaderboardLoadRequest::Songs {
+                source: SourceId::Kw,
+                board_id: "second".to_string(),
             })
         );
     }
