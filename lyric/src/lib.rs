@@ -2,6 +2,6 @@
 //!
 //! 对标 go-musicfox internal/lyric/
 
-pub mod service;
-pub mod parser;
 pub mod fetcher;
+pub mod parser;
+pub mod service;
