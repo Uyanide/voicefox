@@ -4,7 +4,7 @@ use super::source::{Quality, SourceId};
 use crate::keybinding::KeybindingConfig;
 use crate::traits::player::EqualizerBand;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 8;
+pub const CURRENT_CONFIG_VERSION: u32 = 9;
 
 /// 可显示在底部状态栏中的内容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

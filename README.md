@@ -59,6 +59,13 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 
 ## 最近更新
 
+### 2026-08-08：设置页键位与鼠标交互修复（v0.3.1）
+
+- 数字键 `1` 到 `8` 始终用于切换标签页；新增播放和数据操作改用 `F1` 到 `F10` 及 `Shift+F1` 到 `Shift+F8`。
+- 旧配置中的冲突键位会在启动时迁移，`Ctrl+数字` 等不冲突的自定义组合键保持不变。
+- 设置项支持鼠标点击；底部 JS 音源、本地目录和状态栏面板支持点击选择、滚轮移动、右键操作与状态栏拖动排序。
+- 补全音频设备和外部歌单路径输入弹窗，鼠标触发与键盘快捷键使用相同处理流程。
+
 ### 2026-08-08：完整播放控制、增量本地库与数据迁移（v0.3.0）
 
 - 播放器增加播放速度、音频输出设备、ReplayGain、均衡器、声道模式、左右平衡、A-B 循环、无缝播放和淡入淡出控制。
@@ -701,25 +708,25 @@ voicefox 支持通过配置文件自定义快捷键，无需修改代码。配�
 
 **设置页面的播放与数据动作**：
 
-这些动作默认使用数字键和大写字母；可以在 `[keybindings.pages.settings]` 中逐项重绑。设置页会显示重绑后的按键，鼠标点击对应行与按键执行相同动作。
+这些动作默认使用功能键和 `Shift+功能键`；数字键 `1` 到 `8` 保留给侧边栏标签页。可以在 `[keybindings.pages.settings]` 中逐项重绑。设置页会显示重绑后的按键，鼠标点击对应行与按键执行相同动作。
 
 | 配置项 | 默认值 | 功能 |
 |--------|--------|------|
-| `settings_cycle_playback_speed` | `"1"` | 循环播放速度 |
-| `settings_edit_audio_device` | `"2"` | 编辑 libmpv 音频设备名 |
-| `settings_cycle_replay_gain_mode` | `"3"` | 切换 ReplayGain 模式 |
-| `settings_cycle_channel_mode` | `"4"` | 切换自动 / 立体声 / 单声道 / 左 / 右 |
-| `settings_cycle_replay_gain_preamp` | `"5"` | 调整 ReplayGain 预放大 |
-| `settings_cycle_balance` | `"6"` | 调整左右平衡 |
-| `settings_toggle_replay_gain_clip` | `"7"` | 切换削波保护 |
-| `settings_cycle_fade_in_duration` | `"8"` | 循环淡入时长 |
-| `settings_cycle_fade_out_duration` | `"9"` | 循环淡出时长 |
-| `settings_cycle_equalizer_preset` | `"0"` | 循环均衡器预设 |
-| `settings_run_fade_in` / `settings_run_fade_out` | `"F"` / `"G"` | 立即淡入 / 淡出当前歌曲 |
-| `settings_set_ab_loop_start` / `settings_set_ab_loop_end` | `"L"` / `"U"` | 设置 A / B 点 |
-| `settings_clear_ab_loop` | `"C"` | 清除 A-B 循环 |
-| `settings_export_data` / `settings_import_data` | `"E"` / `"I"` | 导出 / 导入版本化数据备份 |
-| `settings_import_playlist` | `"J"` | 输入路径并导入 M3U、LX Music 或网易云歌单 |
+| `settings_cycle_playback_speed` | `"F1"` | 循环播放速度 |
+| `settings_edit_audio_device` | `"F2"` | 编辑 libmpv 音频设备名 |
+| `settings_cycle_replay_gain_mode` | `"F3"` | 切换 ReplayGain 模式 |
+| `settings_cycle_channel_mode` | `"F4"` | 切换自动 / 立体声 / 单声道 / 左 / 右 |
+| `settings_cycle_replay_gain_preamp` | `"F5"` | 调整 ReplayGain 预放大 |
+| `settings_cycle_balance` | `"F6"` | 调整左右平衡 |
+| `settings_toggle_replay_gain_clip` | `"F7"` | 切换削波保护 |
+| `settings_cycle_fade_in_duration` | `"F8"` | 循环淡入时长 |
+| `settings_cycle_fade_out_duration` | `"F9"` | 循环淡出时长 |
+| `settings_cycle_equalizer_preset` | `"F10"` | 循环均衡器预设 |
+| `settings_run_fade_in` / `settings_run_fade_out` | `"Shift+F1"` / `"Shift+F2"` | 立即淡入 / 淡出当前歌曲 |
+| `settings_set_ab_loop_start` / `settings_set_ab_loop_end` | `"Shift+F3"` / `"Shift+F4"` | 设置 A / B 点 |
+| `settings_clear_ab_loop` | `"Shift+F5"` | 清除 A-B 循环 |
+| `settings_export_data` / `settings_import_data` | `"Shift+F6"` / `"Shift+F7"` | 导出 / 导入版本化数据备份 |
+| `settings_import_playlist` | `"Shift+F8"` | 输入路径并导入 M3U、LX Music 或网易云歌单 |
 
 ### 配置示例
 
@@ -734,8 +741,8 @@ list_select_up = "e"
 list_select_down = "n"
 
 [keybindings.pages.settings]
-settings_cycle_playback_speed = "Ctrl+1"
-settings_cycle_equalizer_preset = "Ctrl+0"
+settings_cycle_playback_speed = "Alt+s"
+settings_cycle_equalizer_preset = "Alt+e"
 ```
 
 ### 页面名列表
@@ -802,6 +809,11 @@ voicefox/
 - **歌词解析**：LRC/KRC/QRC/YRC 自实现解析器
 
 ## 更新日志
+
+### 2026-08-08（v0.3.1）
+
+- 设置页播放与数据操作改用功能键，数字键 `1` 到 `8` 保留给标签页并自动迁移旧配置。
+- 设置项和底部三个管理面板补全鼠标点击、滚轮、右键及拖动操作。
 
 ### 2026-08-04
 

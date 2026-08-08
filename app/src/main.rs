@@ -1179,7 +1179,8 @@ fn run_app(
                 .update_position(*ctx.lyric_position.borrow());
             let input_active = active_tab == NavTab::Search
                 && search_page.lock().unwrap().input_mode
-                || active_tab == NavTab::Settings && settings_page.lock().unwrap().input_mode
+                || active_tab == NavTab::Settings
+                    && settings_page.lock().unwrap().any_input_active()
                 || active_tab == NavTab::Favorites && favorites_page.input_mode()
                 || active_tab == NavTab::Playlists && playlists.input_active();
             let notification_active = !ctx.notifications.read().unwrap().is_empty();
@@ -1232,7 +1233,7 @@ fn run_app(
             && key.kind == KeyEventKind::Press
         {
             let key = *key;
-            // 1a. 侧边栏全局快捷键 (/, 1-5) — 输入模式下跳过
+            // 1a. 侧边栏全局快捷键（1-8）—— 输入模式下跳过
             let settings_input_mode =
                 active_tab == NavTab::Settings && settings_page.lock().unwrap().any_input_active();
             let search_input_mode =
@@ -1368,9 +1369,8 @@ fn run_app(
                 continue;
             }
 
-            // Settings owns its option keys (including numeric playback
-            // controls); resolve that ownership before the global sidebar
-            // shortcuts so `1`-`6` do not unexpectedly switch tabs.
+            // 设置页独占自己的选项键；数字键 1-8 则始终留给侧边栏。
+            // 先判断页面归属，再分发全局快捷键。
             let settings_owns_key = active_tab == NavTab::Settings
                 && !text_input_active
                 && settings_page

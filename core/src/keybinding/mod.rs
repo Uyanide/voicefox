@@ -184,6 +184,54 @@ impl Default for KeybindingConfig {
     }
 }
 
+/// 将旧版设置页快捷键迁移到不占用标签页数字键的默认绑定。
+///
+/// 裸数字键在设置页始终保留给侧边栏；带 Ctrl/Alt/Shift 的用户绑定不受影响。
+pub fn migrate_legacy_settings_bindings(config: &mut KeybindingConfig) -> bool {
+    let Some(settings) = config.pages.get_mut("settings") else {
+        return false;
+    };
+    let defaults = default_page_bindings()
+        .remove("settings")
+        .expect("default settings bindings must exist");
+    let legacy_defaults = [
+        (Action::SettingsCyclePlaybackSpeed, "1"),
+        (Action::SettingsEditAudioDevice, "2"),
+        (Action::SettingsCycleReplayGainMode, "3"),
+        (Action::SettingsCycleChannelMode, "4"),
+        (Action::SettingsCycleReplayGainPreamp, "5"),
+        (Action::SettingsCycleBalance, "6"),
+        (Action::SettingsToggleReplayGainClip, "7"),
+        (Action::SettingsCycleFadeInDuration, "8"),
+        (Action::SettingsCycleFadeOutDuration, "9"),
+        (Action::SettingsCycleEqualizerPreset, "0"),
+        (Action::SettingsRunFadeIn, "F"),
+        (Action::SettingsRunFadeOut, "G"),
+        (Action::SettingsSetAbLoopStart, "L"),
+        (Action::SettingsSetAbLoopEnd, "U"),
+        (Action::SettingsClearAbLoop, "C"),
+        (Action::SettingsExportData, "E"),
+        (Action::SettingsImportData, "I"),
+        (Action::SettingsImportPlaylist, "J"),
+    ];
+
+    let mut changed = false;
+    for (action, binding) in settings.iter_mut() {
+        let is_bare_digit = binding.len() == 1 && binding.as_bytes()[0].is_ascii_digit();
+        let is_legacy_default = legacy_defaults
+            .iter()
+            .any(|(legacy_action, legacy_key)| action == legacy_action && binding == legacy_key);
+        if (is_bare_digit || is_legacy_default)
+            && let Some(default) = defaults.get(action)
+            && binding != default
+        {
+            binding.clone_from(default);
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct PartialKeybindingConfig {
@@ -346,24 +394,25 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     settings.insert(Action::ListSelectUp, "k".to_string());
     settings.insert(Action::ListSelectDown, "j".to_string());
     settings.insert(Action::ListGoBack, "Esc".to_string());
-    settings.insert(Action::SettingsCyclePlaybackSpeed, "1".to_string());
-    settings.insert(Action::SettingsEditAudioDevice, "2".to_string());
-    settings.insert(Action::SettingsCycleReplayGainMode, "3".to_string());
-    settings.insert(Action::SettingsCycleChannelMode, "4".to_string());
-    settings.insert(Action::SettingsCycleReplayGainPreamp, "5".to_string());
-    settings.insert(Action::SettingsCycleBalance, "6".to_string());
-    settings.insert(Action::SettingsToggleReplayGainClip, "7".to_string());
-    settings.insert(Action::SettingsCycleFadeInDuration, "8".to_string());
-    settings.insert(Action::SettingsCycleFadeOutDuration, "9".to_string());
-    settings.insert(Action::SettingsCycleEqualizerPreset, "0".to_string());
-    settings.insert(Action::SettingsRunFadeIn, "F".to_string());
-    settings.insert(Action::SettingsRunFadeOut, "G".to_string());
-    settings.insert(Action::SettingsSetAbLoopStart, "L".to_string());
-    settings.insert(Action::SettingsSetAbLoopEnd, "U".to_string());
-    settings.insert(Action::SettingsClearAbLoop, "C".to_string());
-    settings.insert(Action::SettingsExportData, "E".to_string());
-    settings.insert(Action::SettingsImportData, "I".to_string());
-    settings.insert(Action::SettingsImportPlaylist, "J".to_string());
+    // 数字键留给侧边栏的 1-8 标签页快捷键；设置动作统一使用功能键。
+    settings.insert(Action::SettingsCyclePlaybackSpeed, "F1".to_string());
+    settings.insert(Action::SettingsEditAudioDevice, "F2".to_string());
+    settings.insert(Action::SettingsCycleReplayGainMode, "F3".to_string());
+    settings.insert(Action::SettingsCycleChannelMode, "F4".to_string());
+    settings.insert(Action::SettingsCycleReplayGainPreamp, "F5".to_string());
+    settings.insert(Action::SettingsCycleBalance, "F6".to_string());
+    settings.insert(Action::SettingsToggleReplayGainClip, "F7".to_string());
+    settings.insert(Action::SettingsCycleFadeInDuration, "F8".to_string());
+    settings.insert(Action::SettingsCycleFadeOutDuration, "F9".to_string());
+    settings.insert(Action::SettingsCycleEqualizerPreset, "F10".to_string());
+    settings.insert(Action::SettingsRunFadeIn, "Shift+F1".to_string());
+    settings.insert(Action::SettingsRunFadeOut, "Shift+F2".to_string());
+    settings.insert(Action::SettingsSetAbLoopStart, "Shift+F3".to_string());
+    settings.insert(Action::SettingsSetAbLoopEnd, "Shift+F4".to_string());
+    settings.insert(Action::SettingsClearAbLoop, "Shift+F5".to_string());
+    settings.insert(Action::SettingsExportData, "Shift+F6".to_string());
+    settings.insert(Action::SettingsImportData, "Shift+F7".to_string());
+    settings.insert(Action::SettingsImportPlaylist, "Shift+F8".to_string());
     pages.insert("settings".to_string(), settings);
 
     // --- B站登录 ---
@@ -693,29 +742,63 @@ mod tests {
         let config = KeybindingConfig::default();
         let settings = config.pages.get("settings").unwrap();
         let expected = [
-            (Action::SettingsCyclePlaybackSpeed, "1"),
-            (Action::SettingsEditAudioDevice, "2"),
-            (Action::SettingsCycleReplayGainMode, "3"),
-            (Action::SettingsCycleChannelMode, "4"),
-            (Action::SettingsCycleReplayGainPreamp, "5"),
-            (Action::SettingsCycleBalance, "6"),
-            (Action::SettingsToggleReplayGainClip, "7"),
-            (Action::SettingsCycleFadeInDuration, "8"),
-            (Action::SettingsCycleFadeOutDuration, "9"),
-            (Action::SettingsCycleEqualizerPreset, "0"),
-            (Action::SettingsRunFadeIn, "F"),
-            (Action::SettingsRunFadeOut, "G"),
-            (Action::SettingsSetAbLoopStart, "L"),
-            (Action::SettingsSetAbLoopEnd, "U"),
-            (Action::SettingsClearAbLoop, "C"),
-            (Action::SettingsExportData, "E"),
-            (Action::SettingsImportData, "I"),
-            (Action::SettingsImportPlaylist, "J"),
+            (Action::SettingsCyclePlaybackSpeed, "F1"),
+            (Action::SettingsEditAudioDevice, "F2"),
+            (Action::SettingsCycleReplayGainMode, "F3"),
+            (Action::SettingsCycleChannelMode, "F4"),
+            (Action::SettingsCycleReplayGainPreamp, "F5"),
+            (Action::SettingsCycleBalance, "F6"),
+            (Action::SettingsToggleReplayGainClip, "F7"),
+            (Action::SettingsCycleFadeInDuration, "F8"),
+            (Action::SettingsCycleFadeOutDuration, "F9"),
+            (Action::SettingsCycleEqualizerPreset, "F10"),
+            (Action::SettingsRunFadeIn, "Shift+F1"),
+            (Action::SettingsRunFadeOut, "Shift+F2"),
+            (Action::SettingsSetAbLoopStart, "Shift+F3"),
+            (Action::SettingsSetAbLoopEnd, "Shift+F4"),
+            (Action::SettingsClearAbLoop, "Shift+F5"),
+            (Action::SettingsExportData, "Shift+F6"),
+            (Action::SettingsImportData, "Shift+F7"),
+            (Action::SettingsImportPlaylist, "Shift+F8"),
         ];
 
         for (action, key) in expected {
             assert_eq!(settings.get(&action).map(String::as_str), Some(key));
         }
+    }
+
+    #[test]
+    fn migrates_legacy_settings_keys_without_overwriting_modified_combinations() {
+        let mut config = KeybindingConfig::default();
+        let settings = config.pages.get_mut("settings").unwrap();
+        settings.insert(Action::SettingsCyclePlaybackSpeed, "1".to_string());
+        settings.insert(Action::SettingsRunFadeIn, "F".to_string());
+        settings.insert(Action::SettingsImportData, "Ctrl+7".to_string());
+        settings.insert(Action::ListSelectUp, "8".to_string());
+
+        assert!(migrate_legacy_settings_bindings(&mut config));
+        let settings = config.pages.get("settings").unwrap();
+        assert_eq!(
+            settings
+                .get(&Action::SettingsCyclePlaybackSpeed)
+                .map(String::as_str),
+            Some("F1")
+        );
+        assert_eq!(
+            settings.get(&Action::SettingsRunFadeIn).map(String::as_str),
+            Some("Shift+F1")
+        );
+        assert_eq!(
+            settings
+                .get(&Action::SettingsImportData)
+                .map(String::as_str),
+            Some("Ctrl+7")
+        );
+        assert_eq!(
+            settings.get(&Action::ListSelectUp).map(String::as_str),
+            Some("k")
+        );
+        assert!(!migrate_legacy_settings_bindings(&mut config));
     }
 
     #[test]

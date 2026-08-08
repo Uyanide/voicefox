@@ -105,6 +105,8 @@ pub struct SettingsPage {
     pub selected_status_item: usize,
     /// 状态栏字段列表的滚动位置
     status_item_scroll: usize,
+    /// 状态栏拖拽当前所在的字段行，避免同一行重复触发重排。
+    status_drag_target: Option<usize>,
     /// 当前聚焦区域
     focus: SettingsFocus,
 }
@@ -123,6 +125,12 @@ impl SettingsPage {
     /// 与用户可自定义的全局快捷键必然重叠，因此这些键不再交给全局分发。
     /// 未被 settings 页面级动作绑定的 Ctrl/Alt 组合键仍归全局。
     pub fn consumes_key(&self, key: &KeyEvent, resolver: &KeybindingResolver) -> bool {
+        // Bare number keys are reserved for navigation (1-8 select sidebar
+        // tabs). Even a stale or intentionally custom settings binding must
+        // not make tab switching stop while the settings page is open.
+        if key.modifiers == KeyModifiers::NONE && matches!(key.code, KeyCode::Char('0'..='9')) {
+            return false;
+        }
         if resolver
             .resolve_page("settings", key)
             .is_some_and(settings_action_is_page_owned)
@@ -171,6 +179,7 @@ impl SettingsPage {
             enabled_source_index: 0,
             selected_status_item: 0,
             status_item_scroll: 0,
+            status_drag_target: None,
             focus: SettingsFocus::JsSources,
         }
     }
@@ -1052,6 +1061,39 @@ impl SettingsPage {
         });
     }
 
+    fn move_status_bar_item_to(&mut self, ctx: &AppContext, target_index: usize) {
+        let item = StatusBarItem::ALL[self.selected_status_item % StatusBarItem::ALL.len()];
+        let Some(&target) = StatusBarItem::ALL.get(target_index) else {
+            return;
+        };
+        if item == target {
+            return;
+        }
+
+        let (position, result) = {
+            let mut config = ctx.config.write().unwrap();
+            if !config.ui.status_bar_items.contains(&item) {
+                self.status_msg = Some("请先启用这个状态栏字段".to_string());
+                return;
+            }
+            let Some(position) =
+                reorder_status_bar_items(&mut config.ui.status_bar_items, item, target)
+            else {
+                // Disabled fields have no display-order position to drop on.
+                return;
+            };
+            let result = crate::config::loader::save(&config, &ctx.config_path);
+            (position + 1, result)
+        };
+        self.status_msg = Some(match result {
+            Ok(()) => format!(
+                "状态栏“{}”已移到第 {position} 位",
+                status_bar_item_label(item)
+            ),
+            Err(error) => format!("状态栏顺序已更新，但保存失败: {error}"),
+        });
+    }
+
     fn update_config(
         &mut self,
         ctx: &AppContext,
@@ -1085,25 +1127,13 @@ impl SettingsPage {
         } else {
             config.local_music.max_depth.to_string()
         };
-        let replaygain_keys = format!(
-            "{}/{}",
-            settings_binding(
-                &config.keybindings,
-                Action::SettingsCycleReplayGainMode,
-                "3"
-            ),
-            settings_binding(
-                &config.keybindings,
-                Action::SettingsCycleReplayGainPreamp,
-                "5"
-            )
-        );
-        let ab_loop_keys = format!(
-            "{}/{}/{}",
-            settings_binding(&config.keybindings, Action::SettingsSetAbLoopStart, "L"),
-            settings_binding(&config.keybindings, Action::SettingsSetAbLoopEnd, "U"),
-            settings_binding(&config.keybindings, Action::SettingsClearAbLoop, "C")
-        );
+        let ab_loop = ctx.player.ab_loop();
+        let ab_start_label = ab_loop
+            .map(|points| format_duration(points.start))
+            .unwrap_or_else(|| "未设置".to_string());
+        let ab_end_label = ab_loop
+            .map(|points| format_duration(points.end))
+            .unwrap_or_else(|| "未设置".to_string());
 
         let options_block = Block::default()
             .borders(Borders::ALL)
@@ -1133,38 +1163,54 @@ impl SettingsPage {
             setting_value_line(
                 "播放速度",
                 &format!("{:.2}x", config.player.playback_speed),
-                settings_binding(&config.keybindings, Action::SettingsCyclePlaybackSpeed, "1"),
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsCyclePlaybackSpeed,
+                    "F1",
+                ),
                 accent,
                 muted,
             ),
             setting_value_line(
                 "音频设备",
                 &config.player.audio_device,
-                settings_binding(&config.keybindings, Action::SettingsEditAudioDevice, "2"),
+                settings_binding(&config.keybindings, Action::SettingsEditAudioDevice, "F2"),
                 accent,
                 muted,
             ),
             setting_value_line(
                 "ReplayGain",
-                &format!(
-                    "{} ({:+.1} dB)",
-                    config.player.replaygain_mode, config.player.replaygain_preamp
+                &config.player.replaygain_mode,
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsCycleReplayGainMode,
+                    "F3",
                 ),
-                &replaygain_keys,
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "RG 预放大",
+                &format!("{:+.1} dB", config.player.replaygain_preamp),
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsCycleReplayGainPreamp,
+                    "F5",
+                ),
                 accent,
                 muted,
             ),
             setting_value_line(
                 "声道模式",
                 &config.player.channel_mode,
-                settings_binding(&config.keybindings, Action::SettingsCycleChannelMode, "4"),
+                settings_binding(&config.keybindings, Action::SettingsCycleChannelMode, "F4"),
                 accent,
                 muted,
             ),
             setting_value_line(
                 "左右平衡",
                 &format!("{:+.2}", config.player.balance),
-                settings_binding(&config.keybindings, Action::SettingsCycleBalance, "6"),
+                settings_binding(&config.keybindings, Action::SettingsCycleBalance, "F6"),
                 accent,
                 muted,
             ),
@@ -1174,7 +1220,7 @@ impl SettingsPage {
                 settings_binding(
                     &config.keybindings,
                     Action::SettingsToggleReplayGainClip,
-                    "7",
+                    "F7",
                 ),
                 accent,
                 muted,
@@ -1185,7 +1231,7 @@ impl SettingsPage {
                 settings_binding(
                     &config.keybindings,
                     Action::SettingsCycleFadeInDuration,
-                    "8",
+                    "F8",
                 ),
                 accent,
                 muted,
@@ -1196,7 +1242,7 @@ impl SettingsPage {
                 settings_binding(
                     &config.keybindings,
                     Action::SettingsCycleFadeOutDuration,
-                    "9",
+                    "F9",
                 ),
                 accent,
                 muted,
@@ -1207,7 +1253,7 @@ impl SettingsPage {
                 settings_binding(
                     &config.keybindings,
                     Action::SettingsCycleEqualizerPreset,
-                    "0",
+                    "F10",
                 ),
                 accent,
                 muted,
@@ -1215,21 +1261,47 @@ impl SettingsPage {
             setting_value_line(
                 "淡入当前歌曲",
                 "执行",
-                settings_binding(&config.keybindings, Action::SettingsRunFadeIn, "F"),
+                settings_binding(&config.keybindings, Action::SettingsRunFadeIn, "Shift+F1"),
                 accent,
                 muted,
             ),
             setting_value_line(
                 "淡出当前歌曲",
                 "执行",
-                settings_binding(&config.keybindings, Action::SettingsRunFadeOut, "G"),
+                settings_binding(&config.keybindings, Action::SettingsRunFadeOut, "Shift+F2"),
                 accent,
                 muted,
             ),
             setting_value_line(
-                "A-B 循环",
-                &ab_loop_label(ctx.player.ab_loop()),
-                &ab_loop_keys,
+                "A-B 循环起点",
+                &ab_start_label,
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsSetAbLoopStart,
+                    "Shift+F3",
+                ),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "A-B 循环终点",
+                &ab_end_label,
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsSetAbLoopEnd,
+                    "Shift+F4",
+                ),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "清除 A-B",
+                if ab_loop.is_some() {
+                    "执行"
+                } else {
+                    "未设置"
+                },
+                settings_binding(&config.keybindings, Action::SettingsClearAbLoop, "Shift+F5"),
                 accent,
                 muted,
             ),
@@ -1334,21 +1406,25 @@ impl SettingsPage {
             setting_value_line(
                 "导出数据",
                 "voicefox-export.json",
-                settings_binding(&config.keybindings, Action::SettingsExportData, "E"),
+                settings_binding(&config.keybindings, Action::SettingsExportData, "Shift+F6"),
                 accent,
                 muted,
             ),
             setting_value_line(
                 "导入数据",
                 "voicefox-export.json",
-                settings_binding(&config.keybindings, Action::SettingsImportData, "I"),
+                settings_binding(&config.keybindings, Action::SettingsImportData, "Shift+F7"),
                 accent,
                 muted,
             ),
             setting_value_line(
                 "导入外部歌单",
                 "M3U/JSON",
-                settings_binding(&config.keybindings, Action::SettingsImportPlaylist, "J"),
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsImportPlaylist,
+                    "Shift+F8",
+                ),
                 accent,
                 muted,
             ),
@@ -1397,19 +1473,23 @@ impl SettingsPage {
             } else {
                 ("加载中或加载失败".to_string(), crate::theme::yellow(ctx))
             };
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {}", source_state.0),
-                Style::new().fg(source_state.1),
-            )))
+            // Keep command labels at a stable left-hand position so the
+            // mouse hit targets match what is rendered even when the source
+            // status text changes length.
+            Paragraph::new(Line::from(vec![
+                Span::styled(" [a] 添加  [d] 删除  ", Style::new().fg(muted)),
+                Span::styled(source_state.0, Style::new().fg(source_state.1)),
+            ]))
             .render(
                 Rect::new(source_inner.x, source_inner.y, source_inner.width, 1),
                 buf,
             );
         }
 
-        let source_rows = source_inner.height.saturating_sub(2) as usize;
+        // Reserve one row for the command hint and one for the status message.
+        let source_rows = source_inner.height.saturating_sub(3) as usize;
         if sources.is_empty() {
-            if source_inner.height > 2 {
+            if source_inner.height > 3 {
                 Paragraph::new(" (无)")
                     .style(Style::new().fg(muted))
                     .render(
@@ -1419,8 +1499,15 @@ impl SettingsPage {
             }
         } else {
             self.selected_source = self.selected_source.min(sources.len().saturating_sub(1));
+            let source_start = list_window_start(self.selected_source, sources.len(), source_rows);
             let max_url_chars = source_inner.width.saturating_sub(28) as usize;
-            for (row, (index, url)) in sources.iter().enumerate().take(source_rows).enumerate() {
+            for (row, (index, url)) in sources
+                .iter()
+                .enumerate()
+                .skip(source_start)
+                .take(source_rows)
+                .enumerate()
+            {
                 let cached = is_source_cached(url);
                 let status = if cached { "cached" } else { "download" };
                 let name = ctx
@@ -1465,10 +1552,23 @@ impl SettingsPage {
         let local_inner = local_block.inner(chunks[2]);
         local_block.render(chunks[2], buf);
 
+        if local_inner.height > 1 {
+            Paragraph::new(Line::from(Span::styled(
+                " [a] 添加目录  [d] 移除  [r] 重新扫描",
+                Style::new().fg(muted),
+            )))
+            .render(
+                Rect::new(local_inner.x, local_inner.y, local_inner.width, 1),
+                buf,
+            );
+        }
+
         let local_songs = ctx.source_manager.local_source().all_songs();
-        let local_rows = local_inner.height.saturating_sub(2) as usize;
+        // Reserve one row for commands and the final row for the status/count
+        // footer so list entries are never overwritten by those lines.
+        let local_rows = local_inner.height.saturating_sub(3) as usize;
         if local_paths.is_empty() {
-            if local_inner.height > 2 {
+            if local_inner.height > 3 {
                 Paragraph::new(Line::from(Span::styled(
                     " (无，按 a 添加音乐目录)",
                     Style::new().fg(crate::theme::yellow(ctx)),
@@ -1482,7 +1582,14 @@ impl SettingsPage {
             self.selected_local_path = self
                 .selected_local_path
                 .min(local_paths.len().saturating_sub(1));
-            for (row, (index, path)) in local_paths.iter().enumerate().take(local_rows).enumerate()
+            let local_start =
+                list_window_start(self.selected_local_path, local_paths.len(), local_rows);
+            for (row, (index, path)) in local_paths
+                .iter()
+                .enumerate()
+                .skip(local_start)
+                .take(local_rows)
+                .enumerate()
             {
                 let style = if index == self.selected_local_path {
                     Style::new()
@@ -1685,6 +1792,42 @@ impl SettingsPage {
             input_block.render(input_area, buf);
             Paragraph::new(Line::from(self.proxy_input.as_str())).render(inner, buf);
         }
+
+        if self.audio_device_input_mode {
+            let width = area.width.saturating_sub(4).min(74);
+            let input_area = Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(3) / 2,
+                width,
+                3.min(area.height),
+            );
+            Clear.render(input_area, buf);
+            let input_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(crate::theme::green(ctx)))
+                .title("输入 libmpv 音频设备名，Enter 保存");
+            let inner = input_block.inner(input_area);
+            input_block.render(input_area, buf);
+            Paragraph::new(Line::from(self.audio_device_input.as_str())).render(inner, buf);
+        }
+
+        if self.playlist_import_mode {
+            let width = area.width.saturating_sub(4).min(74);
+            let input_area = Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(3) / 2,
+                width,
+                3.min(area.height),
+            );
+            Clear.render(input_area, buf);
+            let input_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(crate::theme::green(ctx)))
+                .title("输入 M3U/LX Music/网易云歌单路径，Enter 导入");
+            let inner = input_block.inner(input_area);
+            input_block.render(input_area, buf);
+            Paragraph::new(Line::from(self.playlist_import_input.as_str())).render(inner, buf);
+        }
     }
 
     pub fn handle_mouse(
@@ -1694,13 +1837,13 @@ impl SettingsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
-        if self.input_mode {
+        if self.any_input_active() {
             return AppAction::None;
         }
         let chunks = settings_chunks(area, self.focus);
+        let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::ScrollUp => {
-                let position = Position::new(event.column, event.row);
                 if chunks[3].contains(position) {
                     self.selected_status_item = self.selected_status_item.saturating_sub(1);
                     self.focus = SettingsFocus::StatusBar;
@@ -1713,7 +1856,6 @@ impl SettingsPage {
                 }
             }
             MouseEventKind::ScrollDown => {
-                let position = Position::new(event.column, event.row);
                 if chunks[3].contains(position) {
                     self.selected_status_item = (self.selected_status_item + 1)
                         .min(StatusBarItem::ALL.len().saturating_sub(1));
@@ -1729,69 +1871,209 @@ impl SettingsPage {
                     self.focus = SettingsFocus::JsSources;
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let options_inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
-                if options_inner.contains((event.column, event.row).into()) {
-                    let index =
-                        setting_option_index(options_inner, Position::new(event.column, event.row));
-                    if let Some(Some(action)) = SETTING_OPTION_ACTIONS.get(index as usize)
-                        && let Some(result) = self.handle_bound_action(*action, ctx)
-                    {
-                        return result;
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let status_inner = Block::default().borders(Borders::ALL).inner(chunks[3]);
+                if let Some(index) = status_item_at(status_inner, position, self.status_item_scroll)
+                {
+                    self.focus = SettingsFocus::StatusBar;
+                    if self.status_drag_target.is_some() && self.status_drag_target != Some(index) {
+                        self.move_status_bar_item_to(ctx, index);
+                        self.status_drag_target = Some(index);
                     }
-                    if let Some(&key) = SETTING_OPTION_KEYS.get(index as usize) {
-                        return self.handle_input(
-                            KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
-                            ctx,
-                            resolver,
-                        );
+                }
+            }
+            MouseEventKind::Down(button)
+                if matches!(button, MouseButton::Left | MouseButton::Right) =>
+            {
+                let right_click = button == MouseButton::Right;
+                self.status_drag_target = None;
+                if !right_click && area.width < ALL_MANAGEMENT_PANELS_MIN_WIDTH {
+                    let focused_panel = chunks[match self.focus {
+                        SettingsFocus::JsSources => 1,
+                        SettingsFocus::LocalPaths => 2,
+                        SettingsFocus::StatusBar => 3,
+                    }];
+                    // Narrow layouts show only one management panel. Its
+                    // title already advertises `[s]`; clicking that title
+                    // provides the equivalent mouse-only way to cycle panels.
+                    if focused_panel.contains(position) && position.y == focused_panel.y {
+                        self.focus = self.focus.next();
+                        return AppAction::None;
+                    }
+                }
+                if !right_click {
+                    let options_inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
+                    if options_inner.contains(position) {
+                        let index = setting_option_index(options_inner, position);
+                        if let Some(Some(action)) = SETTING_OPTION_ACTIONS.get(index as usize)
+                            && let Some(result) = self.handle_bound_action(*action, ctx)
+                        {
+                            return result;
+                        }
+                        if let Some(&key) = SETTING_OPTION_KEYS.get(index as usize)
+                            && key != '\0'
+                        {
+                            return self.handle_input(
+                                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                                ctx,
+                                resolver,
+                            );
+                        }
                     }
                 }
 
                 let source_inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
-                if source_inner.contains((event.column, event.row).into())
-                    && event.row >= source_inner.y.saturating_add(2)
-                {
-                    let index = event.row.saturating_sub(source_inner.y + 2) as usize;
-                    let len = ctx.config.read().unwrap().source.js_sources.len();
-                    if index < len {
-                        self.selected_source = index;
-                        self.focus = SettingsFocus::JsSources;
+                if chunks[1].contains(position) {
+                    self.focus = SettingsFocus::JsSources;
+                    let command_y = source_inner.y;
+                    if event.row == command_y {
+                        let key = command_key_at(
+                            source_inner,
+                            position,
+                            &[("[a] 添加", 'a'), ("[d] 删除", 'd')],
+                        );
+                        if let Some(key) = key {
+                            return self.handle_input(
+                                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                                ctx,
+                                resolver,
+                            );
+                        }
                     }
+                    let rows = source_inner.height.saturating_sub(3) as usize;
+                    if let Some(row) = list_row_at(source_inner, position, rows) {
+                        let len = ctx.config.read().unwrap().source.js_sources.len();
+                        let start = list_window_start(self.selected_source, len, rows);
+                        let index = start + row;
+                        if index < len {
+                            self.selected_source = index;
+                            if right_click {
+                                return self.handle_input(
+                                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                                    ctx,
+                                    resolver,
+                                );
+                            }
+                        }
+                    }
+                    return AppAction::None;
                 }
 
-                // 本地音乐目录列表点击
                 let local_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
-                if local_inner.contains((event.column, event.row).into())
-                    && event.row >= local_inner.y.saturating_add(2)
-                {
-                    let index = event.row.saturating_sub(local_inner.y + 2) as usize;
-                    let len = ctx.config.read().unwrap().local_music.paths.len();
-                    if index < len {
-                        self.selected_local_path = index;
-                        self.focus = SettingsFocus::LocalPaths;
+                if chunks[2].contains(position) {
+                    self.focus = SettingsFocus::LocalPaths;
+                    let command_y = local_inner.y;
+                    if event.row == command_y {
+                        let key = command_key_at(
+                            local_inner,
+                            position,
+                            &[
+                                ("[a] 添加目录", 'a'),
+                                ("[d] 移除", 'd'),
+                                ("[r] 重新扫描", 'r'),
+                            ],
+                        );
+                        if let Some(key) = key {
+                            return self.handle_input(
+                                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                                ctx,
+                                resolver,
+                            );
+                        }
                     }
+                    let rows = local_inner.height.saturating_sub(3) as usize;
+                    if let Some(row) = list_row_at(local_inner, position, rows) {
+                        let len = ctx.config.read().unwrap().local_music.paths.len();
+                        let start = list_window_start(self.selected_local_path, len, rows);
+                        let index = start + row;
+                        if index < len {
+                            self.selected_local_path = index;
+                            if right_click {
+                                return self.handle_input(
+                                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                                    ctx,
+                                    resolver,
+                                );
+                            }
+                        }
+                    }
+                    return AppAction::None;
                 }
 
                 let status_inner = Block::default().borders(Borders::ALL).inner(chunks[3]);
-                if status_inner.contains((event.column, event.row).into())
-                    && event.row < status_inner.bottom().saturating_sub(1)
+                if let Some(index) = status_item_at(status_inner, position, self.status_item_scroll)
                 {
-                    let index =
-                        self.status_item_scroll + event.row.saturating_sub(status_inner.y) as usize;
-                    if index < StatusBarItem::ALL.len() {
-                        self.selected_status_item = index;
-                        self.focus = SettingsFocus::StatusBar;
-                        if event.column < status_inner.x.saturating_add(5) {
-                            self.toggle_status_bar_item(ctx);
-                        }
+                    self.selected_status_item = index;
+                    self.focus = SettingsFocus::StatusBar;
+                    let checkbox = event.column < status_inner.x.saturating_add(5);
+                    if !right_click && !checkbox {
+                        self.status_drag_target = Some(index);
+                    }
+                    if right_click || checkbox {
+                        self.toggle_status_bar_item(ctx);
                     }
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.status_drag_target = None;
             }
             _ => {}
         }
         AppAction::None
     }
+}
+
+fn list_window_start(selected: usize, len: usize, rows: usize) -> usize {
+    if len == 0 || rows == 0 {
+        0
+    } else {
+        selected.min(len - 1).saturating_sub(rows.saturating_sub(1))
+    }
+}
+
+/// Return the command key under a mouse position on a panel's command row.
+///
+/// The labels are rendered from the panel's left edge with two spaces between
+/// commands. Keeping this calculation in one place prevents the hit regions
+/// from drifting when labels are changed or localized.
+fn command_key_at(area: Rect, position: Position, commands: &[(&str, char)]) -> Option<char> {
+    if position.y != area.y || position.x < area.x || position.x >= area.right() {
+        return None;
+    }
+
+    let mut x = area.x;
+    // The rendered line starts with one leading space before the first label.
+    x = x.saturating_add(1);
+    for (label, key) in commands {
+        let width = UnicodeWidthStr::width(*label) as u16;
+        if position.x >= x && position.x < x.saturating_add(width) {
+            return Some(*key);
+        }
+        x = x.saturating_add(width).saturating_add(2);
+    }
+    None
+}
+
+/// Return the zero-based visible row for a source/directory list item.
+/// The first two inner rows are reserved for the panel title/commands and the
+/// final row is reserved for the status/count footer.
+fn list_row_at(area: Rect, position: Position, rows: usize) -> Option<usize> {
+    if rows == 0
+        || !area.contains(position)
+        || position.y < area.y.saturating_add(2)
+        || position.y >= area.y.saturating_add(2 + rows as u16)
+    {
+        return None;
+    }
+    Some(position.y.saturating_sub(area.y + 2) as usize)
+}
+
+fn status_item_at(area: Rect, position: Position, scroll: usize) -> Option<usize> {
+    if !area.contains(position) || position.y >= area.bottom().saturating_sub(1) {
+        return None;
+    }
+    let index = scroll + position.y.saturating_sub(area.y) as usize;
+    (index < StatusBarItem::ALL.len()).then_some(index)
 }
 
 fn enabled(value: bool) -> &'static str {
@@ -1852,10 +2134,26 @@ fn status_bar_item_label(item: StatusBarItem) -> &'static str {
     }
 }
 
+fn reorder_status_bar_items(
+    items: &mut Vec<StatusBarItem>,
+    item: StatusBarItem,
+    target: StatusBarItem,
+) -> Option<usize> {
+    let item_position = items.iter().position(|candidate| *candidate == item)?;
+    let target_position = items.iter().position(|candidate| *candidate == target)?;
+    if item_position == target_position {
+        return Some(item_position);
+    }
+    items.remove(item_position);
+    let insertion = target_position.min(items.len());
+    items.insert(insertion, item);
+    Some(insertion)
+}
+
 /// 在更新配置项后更新这些常量!
 ///
-/// 最长按键提示的显示宽度 (当前为 [./.] [[/]])
-const KEY_COLUMN_WIDTH: usize = 5;
+/// 最长按键提示的显示宽度 (组合键在界面中使用 C/S/A 缩写)
+const KEY_COLUMN_WIDTH: usize = 7;
 /// 最长标签的显示宽度 (当前为 保留播放状态)
 const LABEL_COLUMN_WIDTH: usize = 12;
 
@@ -1869,13 +2167,22 @@ fn pad_display(value: &str, width: usize) -> String {
 fn setting_row(label: &str, value: Span<'static>, key: &str, muted: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!(" {} ", pad_display(&format!("[{key}]"), KEY_COLUMN_WIDTH)),
+            format!(
+                " {} ",
+                pad_display(&format!("[{}]", compact_key_label(key)), KEY_COLUMN_WIDTH)
+            ),
             Style::new().fg(muted),
         ),
         Span::raw(pad_display(label, LABEL_COLUMN_WIDTH)),
         Span::raw(" "),
         value,
     ])
+}
+
+fn compact_key_label(key: &str) -> String {
+    key.replace("Ctrl+", "C+")
+        .replace("Shift+", "S+")
+        .replace("Alt+", "A+")
 }
 
 fn setting_line(label: &str, value: bool, key: &str, accent: Color, muted: Color) -> Line<'static> {
@@ -2000,18 +2307,6 @@ fn fade_label(value: u64) -> String {
     }
 }
 
-fn ab_loop_label(loop_points: Option<lx_core::traits::player::AbLoop>) -> String {
-    loop_points
-        .map(|points| {
-            format!(
-                "{} - {}",
-                format_duration(points.start),
-                format_duration(points.end)
-            )
-        })
-        .unwrap_or_else(|| "未设置".to_string())
-}
-
 fn format_duration(value: std::time::Duration) -> String {
     let total = value.as_secs();
     format!("{:02}:{:02}", total / 60, total % 60)
@@ -2021,9 +2316,9 @@ fn format_duration(value: std::time::Duration) -> String {
 ///
 /// 鼠标点击时触发的按键，顺序必须与 render 中的选项列表一致
 const SETTING_OPTION_KEYS: [char; 43] = [
-    't', 'g', 'w', 'c', 'e', 'Q', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'F', 'G', 'L',
-    'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z', 'i', 'o', 'x', 'X', 'R', 'p',
-    'D', 'E', 'I', 'J', 'b',
+    't', 'g', 'w', 'c', 'e', 'Q', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0',
+    '\0', '\0', 'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z', 'i', 'o', 'x',
+    'X', 'R', 'p', 'D', '\0', '\0', '\0', 'b',
 ];
 const SETTING_OPTION_ACTIONS: [Option<Action>; 43] = [
     None,
@@ -2073,6 +2368,7 @@ const SETTING_OPTION_ACTIONS: [Option<Action>; 43] = [
 const SETTINGS_OPTION_COUNT: u16 = SETTING_OPTION_KEYS.len() as u16;
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 const THREE_COLUMN_OPTIONS_MIN_WIDTH: u16 = 72;
+const ALL_MANAGEMENT_PANELS_MIN_WIDTH: u16 = 108;
 
 /// 设置页在非输入模式下响应的字符键：选项键之外还有列表操作键
 /// （a 添加 / d 删除 / s 切换焦点 / r 扫描 / y 与 [ 见 `handle_input`）。
@@ -2146,7 +2442,7 @@ fn settings_chunks(area: Rect, focus: SettingsFocus) -> [Rect; 4] {
         .constraints([Constraint::Length(option_height), Constraint::Min(0)])
         .split(area);
 
-    if area.width >= 108 {
+    if area.width >= ALL_MANAGEMENT_PANELS_MIN_WIDTH {
         // 宽屏：选项占满上排，三个管理区域共享下排。
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
@@ -2183,10 +2479,12 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use lx_core::keybinding::{Action, KeybindingConfig, KeybindingResolver};
+    use lx_core::model::config::StatusBarItem;
 
     use super::{
-        KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, SETTING_OPTION_KEYS, SettingsFocus, SettingsPage,
-        setting_line, setting_option_index, setting_value_line, settings_chunks, shorten_source,
+        KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, SETTING_OPTION_ACTIONS, SETTING_OPTION_KEYS,
+        SettingsFocus, SettingsPage, command_key_at, reorder_status_bar_items, setting_line,
+        setting_option_index, setting_value_line, settings_chunks, shorten_source,
     };
 
     /// 各设置项取值统一起始的列号
@@ -2228,13 +2526,50 @@ mod tests {
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
         let page = SettingsPage::new();
 
-        for key in SETTING_OPTION_KEYS {
+        for (index, key) in SETTING_OPTION_KEYS.into_iter().enumerate() {
+            // 新播放/数据动作由页面级 Action 处理，不能再把它们的旧数字
+            // 占位键视为设置页快捷键，否则会遮挡侧边栏的 1-8 切换。
+            if SETTING_OPTION_ACTIONS[index].is_some() {
+                continue;
+            }
             let event = KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE);
 
             assert!(
                 page.consumes_key(&event, &resolver),
                 "选项键 {key} 不应被全局快捷键抢先处理"
             );
+        }
+    }
+
+    #[test]
+    fn tab_number_keys_remain_available_on_the_settings_page() {
+        let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+        let page = SettingsPage::new();
+
+        for key in '0'..='9' {
+            assert!(!page.consumes_key(
+                &KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &resolver
+            ));
+        }
+    }
+
+    #[test]
+    fn tab_number_keys_remain_reserved_with_custom_settings_bindings() {
+        let mut config = KeybindingConfig::default();
+        config
+            .pages
+            .get_mut("settings")
+            .unwrap()
+            .insert(Action::SettingsCyclePlaybackSpeed, "1".to_string());
+        let resolver = KeybindingResolver::from_config(&config);
+        let page = SettingsPage::new();
+
+        for key in '1'..='8' {
+            assert!(!page.consumes_key(
+                &KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &resolver
+            ));
         }
     }
 
@@ -2367,5 +2702,61 @@ mod tests {
             setting_option_index(inner, Position::new(third_column_x, inner.y + 5)),
             17
         );
+    }
+
+    #[test]
+    fn bottom_panel_command_hit_targets_match_rendered_labels() {
+        let area = Rect::new(10, 20, 50, 8);
+        let source_commands = [("[a] 添加", 'a'), ("[d] 删除", 'd')];
+        // One leading space is part of the rendered command row.
+        assert_eq!(
+            command_key_at(area, Position::new(area.x + 2, area.y), &source_commands),
+            Some('a')
+        );
+        assert_eq!(
+            command_key_at(area, Position::new(area.x + 12, area.y), &source_commands),
+            Some('d')
+        );
+        assert_eq!(
+            command_key_at(area, Position::new(area.x, area.y), &source_commands),
+            None
+        );
+        assert_eq!(
+            command_key_at(
+                area,
+                Position::new(area.x + 1, area.y + 1),
+                &source_commands
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn status_bar_drag_reorders_once_at_the_target_position() {
+        let mut items = vec![
+            StatusBarItem::State,
+            StatusBarItem::Source,
+            StatusBarItem::Sort,
+            StatusBarItem::Song,
+        ];
+
+        assert_eq!(
+            reorder_status_bar_items(&mut items, StatusBarItem::State, StatusBarItem::Sort),
+            Some(2)
+        );
+        assert_eq!(
+            items,
+            vec![
+                StatusBarItem::Source,
+                StatusBarItem::Sort,
+                StatusBarItem::State,
+                StatusBarItem::Song,
+            ]
+        );
+        assert_eq!(
+            reorder_status_bar_items(&mut items, StatusBarItem::Song, StatusBarItem::Source),
+            Some(0)
+        );
+        assert_eq!(items[0], StatusBarItem::Song);
     }
 }

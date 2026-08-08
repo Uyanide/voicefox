@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use lx_core::keybinding::migrate_legacy_settings_bindings;
 use lx_core::model::config::{
     CURRENT_CONFIG_VERSION, Config, ThemeConfig, sanitize_status_bar_items,
 };
@@ -101,6 +102,11 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
         config.version = 8;
         changed = true;
     }
+    if config.version < 9 {
+        migrate_legacy_settings_bindings(&mut config.keybindings);
+        config.version = 9;
+        changed = true;
+    }
     debug_assert!(config.version <= CURRENT_CONFIG_VERSION);
     changed
 }
@@ -155,6 +161,7 @@ pub fn save(config: &Config, path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{load, migrate_legacy_config};
+    use lx_core::keybinding::Action;
     use lx_core::model::config::{CURRENT_CONFIG_VERSION, Config, StatusBarItem};
     use lx_core::model::source::SourceId;
 
@@ -257,6 +264,33 @@ mod tests {
         assert!(migrate_legacy_config(&mut config));
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert_eq!(config.player.history_limit, 1);
+    }
+
+    #[test]
+    fn migrates_version_eight_settings_shortcuts_away_from_tab_numbers() {
+        let mut config = Config {
+            version: 8,
+            ..Config::default()
+        };
+        let settings = config.keybindings.pages.get_mut("settings").unwrap();
+        settings.insert(Action::SettingsCyclePlaybackSpeed, "1".to_string());
+        settings.insert(Action::SettingsCycleBalance, "6".to_string());
+
+        assert!(migrate_legacy_config(&mut config));
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        let settings = config.keybindings.pages.get("settings").unwrap();
+        assert_eq!(
+            settings
+                .get(&Action::SettingsCyclePlaybackSpeed)
+                .map(String::as_str),
+            Some("F1")
+        );
+        assert_eq!(
+            settings
+                .get(&Action::SettingsCycleBalance)
+                .map(String::as_str),
+            Some("F6")
+        );
     }
 
     #[test]
