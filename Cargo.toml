@@ -3,7 +3,7 @@ members = ["core", "source", "player", "lyric", "app", "test"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/emoeem/voicefox"
@@ -71,6 +71,9 @@ regex = "1"
 # Local music
 lofty = "0.22"
 walkdir = "2"
+notify = "8.2"
+# Pure-Rust CUE sheet reader/writer (MIT/Apache-2.0).
+cue-rw = "0.2.1"
 
 # Playback
 libmpv2 = { version = "6.0.0", default-features = false }

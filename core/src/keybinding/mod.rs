@@ -109,6 +109,42 @@ pub enum Action {
     // --- 设置页面专用 ---
     /// 切换设置项的值
     SettingsToggle,
+    /// 循环切换播放速度
+    SettingsCyclePlaybackSpeed,
+    /// 编辑音频输出设备
+    SettingsEditAudioDevice,
+    /// 循环切换 ReplayGain 模式
+    SettingsCycleReplayGainMode,
+    /// 循环切换 ReplayGain 预放大
+    SettingsCycleReplayGainPreamp,
+    /// 循环切换声道模式
+    SettingsCycleChannelMode,
+    /// 循环调整左右平衡
+    SettingsCycleBalance,
+    /// 切换 ReplayGain 削波保护
+    SettingsToggleReplayGainClip,
+    /// 循环切换自动淡入时长
+    SettingsCycleFadeInDuration,
+    /// 循环切换自动淡出时长
+    SettingsCycleFadeOutDuration,
+    /// 循环切换均衡器预设
+    SettingsCycleEqualizerPreset,
+    /// 对当前歌曲执行淡入
+    SettingsRunFadeIn,
+    /// 对当前歌曲执行淡出
+    SettingsRunFadeOut,
+    /// 把当前位置设为 A-B 循环起点
+    SettingsSetAbLoopStart,
+    /// 把当前位置设为 A-B 循环终点
+    SettingsSetAbLoopEnd,
+    /// 清除 A-B 循环
+    SettingsClearAbLoop,
+    /// 导出用户数据
+    SettingsExportData,
+    /// 导入用户数据
+    SettingsImportData,
+    /// 导入外部歌单
+    SettingsImportPlaylist,
 }
 
 // =============================================================================
@@ -310,6 +346,24 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     settings.insert(Action::ListSelectUp, "k".to_string());
     settings.insert(Action::ListSelectDown, "j".to_string());
     settings.insert(Action::ListGoBack, "Esc".to_string());
+    settings.insert(Action::SettingsCyclePlaybackSpeed, "1".to_string());
+    settings.insert(Action::SettingsEditAudioDevice, "2".to_string());
+    settings.insert(Action::SettingsCycleReplayGainMode, "3".to_string());
+    settings.insert(Action::SettingsCycleChannelMode, "4".to_string());
+    settings.insert(Action::SettingsCycleReplayGainPreamp, "5".to_string());
+    settings.insert(Action::SettingsCycleBalance, "6".to_string());
+    settings.insert(Action::SettingsToggleReplayGainClip, "7".to_string());
+    settings.insert(Action::SettingsCycleFadeInDuration, "8".to_string());
+    settings.insert(Action::SettingsCycleFadeOutDuration, "9".to_string());
+    settings.insert(Action::SettingsCycleEqualizerPreset, "0".to_string());
+    settings.insert(Action::SettingsRunFadeIn, "F".to_string());
+    settings.insert(Action::SettingsRunFadeOut, "G".to_string());
+    settings.insert(Action::SettingsSetAbLoopStart, "L".to_string());
+    settings.insert(Action::SettingsSetAbLoopEnd, "U".to_string());
+    settings.insert(Action::SettingsClearAbLoop, "C".to_string());
+    settings.insert(Action::SettingsExportData, "E".to_string());
+    settings.insert(Action::SettingsImportData, "I".to_string());
+    settings.insert(Action::SettingsImportPlaylist, "J".to_string());
     pages.insert("settings".to_string(), settings);
 
     // --- B站登录 ---
@@ -631,6 +685,36 @@ mod tests {
                     .and_then(|bindings| bindings.get(&Action::ListCycleSort)),
                 Some(&"s".to_string())
             );
+        }
+    }
+
+    #[test]
+    fn settings_defaults_cover_extended_playback_and_data_actions() {
+        let config = KeybindingConfig::default();
+        let settings = config.pages.get("settings").unwrap();
+        let expected = [
+            (Action::SettingsCyclePlaybackSpeed, "1"),
+            (Action::SettingsEditAudioDevice, "2"),
+            (Action::SettingsCycleReplayGainMode, "3"),
+            (Action::SettingsCycleChannelMode, "4"),
+            (Action::SettingsCycleReplayGainPreamp, "5"),
+            (Action::SettingsCycleBalance, "6"),
+            (Action::SettingsToggleReplayGainClip, "7"),
+            (Action::SettingsCycleFadeInDuration, "8"),
+            (Action::SettingsCycleFadeOutDuration, "9"),
+            (Action::SettingsCycleEqualizerPreset, "0"),
+            (Action::SettingsRunFadeIn, "F"),
+            (Action::SettingsRunFadeOut, "G"),
+            (Action::SettingsSetAbLoopStart, "L"),
+            (Action::SettingsSetAbLoopEnd, "U"),
+            (Action::SettingsClearAbLoop, "C"),
+            (Action::SettingsExportData, "E"),
+            (Action::SettingsImportData, "I"),
+            (Action::SettingsImportPlaylist, "J"),
+        ];
+
+        for (action, key) in expected {
+            assert_eq!(settings.get(&action).map(String::as_str), Some(key));
         }
     }
 

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -7,7 +7,9 @@ use anyhow::Context;
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Format, Mpv, mpv_end_file_reason};
 use lx_core::model::source::PlayerState;
-use lx_core::traits::player::{Player, PlayerEvent};
+use lx_core::traits::player::{
+    AbLoop, ChannelMode, EqualizerBand, Player, PlayerEvent, ReplayGainMode,
+};
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
@@ -16,6 +18,20 @@ const AUDIO_PTS_OBSERVER: u64 = 2;
 const DURATION_OBSERVER: u64 = 3;
 const PAUSE_OBSERVER: u64 = 4;
 const BUFFERING_OBSERVER: u64 = 5;
+
+const DEFAULT_PLAYBACK_SPEED: f64 = 1.0;
+const MIN_PLAYBACK_SPEED: f64 = 0.01;
+const MAX_PLAYBACK_SPEED: f64 = 100.0;
+const DEFAULT_AUDIO_DEVICE: &str = "auto";
+const DEFAULT_REPLAYGAIN_PREAMP: f64 = 0.0;
+const MIN_REPLAYGAIN_PREAMP: f64 = -150.0;
+const MAX_REPLAYGAIN_PREAMP: f64 = 150.0;
+const EQ_MIN_FREQUENCY_HZ: f64 = 1.0;
+const EQ_MAX_FREQUENCY_HZ: f64 = 96_000.0;
+const EQ_MIN_GAIN_DB: f64 = -150.0;
+const EQ_MAX_GAIN_DB: f64 = 150.0;
+const EQ_FILTER_LABEL: &str = "@voicefox-eq";
+const BALANCE_FILTER_LABEL: &str = "@voicefox-balance";
 
 struct EventLoopContext {
     state_tx: watch::Sender<PlayerState>,
@@ -44,6 +60,16 @@ pub struct MpvEngine {
     event_tx: mpsc::UnboundedSender<PlayerEvent>,
     event_rx: Mutex<Option<mpsc::UnboundedReceiver<PlayerEvent>>>,
     volume: AtomicU32,
+    playback_speed: AtomicU64,
+    audio_device: Mutex<String>,
+    replaygain_mode: AtomicU8,
+    replaygain_preamp: AtomicU64,
+    replaygain_clip: AtomicBool,
+    channel_mode: AtomicU8,
+    balance: AtomicU64,
+    ab_loop: Mutex<Option<AbLoop>>,
+    equalizer_bands: Mutex<Vec<EqualizerBand>>,
+    fade_generation: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     pending_seek: Arc<Mutex<Option<(u64, Duration)>>>,
@@ -58,12 +84,42 @@ impl MpvEngine {
                 init.set_option("vo", "null")?;
                 init.set_option("cache", "yes")?;
                 init.set_option("audio-client-name", "voicefox")?;
+                // Keep the audio output alive across compatible file changes so
+                // consecutive tracks can start without an avoidable gap.
+                if let Err(error) = init.set_option("gapless-audio", "yes") {
+                    warn!("libmpv gapless-audio option unavailable: {error}");
+                }
                 Ok(())
             })
             .context("初始化 libmpv 失败")?,
         );
         mpv.set_property("volume", 80.0_f64)
             .context("设置 libmpv 初始音量失败")?;
+
+        // These controls are available as regular mpv properties. Keep startup
+        // resilient when a system ships an older libmpv with a missing optional
+        // property; subsequent user changes still report a useful warning.
+        if let Err(error) = mpv.set_property("speed", DEFAULT_PLAYBACK_SPEED) {
+            warn!("libmpv speed property unavailable: {error}");
+        }
+        if let Err(error) = mpv.set_property("audio-device", DEFAULT_AUDIO_DEVICE) {
+            warn!("libmpv audio-device property unavailable: {error}");
+        }
+        if let Err(error) =
+            mpv.set_property("replaygain", replaygain_mpv_value(ReplayGainMode::Off))
+        {
+            warn!("libmpv replaygain property unavailable: {error}");
+        }
+        if let Err(error) = mpv.set_property("replaygain-preamp", DEFAULT_REPLAYGAIN_PREAMP) {
+            warn!("libmpv replaygain-preamp property unavailable: {error}");
+        }
+        if let Err(error) = mpv.set_property("replaygain-clip", false) {
+            warn!("libmpv replaygain-clip property unavailable: {error}");
+        }
+        if let Err(error) = mpv.set_property("audio-channels", channel_mpv_value(ChannelMode::Auto))
+        {
+            warn!("libmpv audio-channels property unavailable: {error}");
+        }
 
         mpv.disable_deprecated_events()
             .context("配置 libmpv 事件失败")?;
@@ -87,6 +143,7 @@ impl MpvEngine {
         let paused = Arc::new(AtomicBool::new(false));
         let pending_seek = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let fade_generation = Arc::new(AtomicU64::new(0));
 
         let event_context = EventLoopContext {
             state_tx: state_tx.clone(),
@@ -119,6 +176,16 @@ impl MpvEngine {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             volume: AtomicU32::new(80),
+            playback_speed: AtomicU64::new(DEFAULT_PLAYBACK_SPEED.to_bits()),
+            audio_device: Mutex::new(DEFAULT_AUDIO_DEVICE.to_string()),
+            replaygain_mode: AtomicU8::new(replaygain_mode_code(ReplayGainMode::Off)),
+            replaygain_preamp: AtomicU64::new(DEFAULT_REPLAYGAIN_PREAMP.to_bits()),
+            replaygain_clip: AtomicBool::new(false),
+            channel_mode: AtomicU8::new(channel_mode_code(ChannelMode::Auto)),
+            balance: AtomicU64::new(0.0_f64.to_bits()),
+            ab_loop: Mutex::new(None),
+            equalizer_bands: Mutex::new(Vec::new()),
+            fade_generation,
             generation,
             paused,
             pending_seek,
@@ -152,6 +219,56 @@ impl MpvEngine {
         }
 
         true
+    }
+
+    fn clear_ab_loop_locked(&self) {
+        let result = self
+            .mpv
+            .set_property("ab-loop-a", "no")
+            .and_then(|()| self.mpv.set_property("ab-loop-b", "no"));
+        if let Err(error) = result {
+            warn!("libmpv clear A-B loop failed: {error}");
+        }
+        *self.ab_loop.lock().unwrap() = None;
+    }
+
+    fn cancel_fade_internal(&self) {
+        self.fade_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn fade_to(&self, from: f64, to: f64, duration: Duration) {
+        let token = self.fade_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let mpv = Arc::clone(&self.mpv);
+        let fade_generation = Arc::clone(&self.fade_generation);
+        let shutdown = Arc::clone(&self.shutdown);
+        let duration = duration.min(Duration::from_secs(60));
+        let _ = thread::Builder::new()
+            .name("voicefox-volume-fade".to_string())
+            .spawn(move || {
+                if duration.is_zero() {
+                    if !shutdown.load(Ordering::Acquire)
+                        && fade_generation.load(Ordering::Acquire) == token
+                    {
+                        let _ = mpv.set_property("volume", to);
+                    }
+                    return;
+                }
+                let step = Duration::from_millis(20);
+                let steps = (duration.as_millis() / step.as_millis()).max(1) as u32;
+                for index in 0..=steps {
+                    if shutdown.load(Ordering::Acquire)
+                        || fade_generation.load(Ordering::Acquire) != token
+                    {
+                        return;
+                    }
+                    let progress = f64::from(index) / f64::from(steps);
+                    let value = from + (to - from) * progress;
+                    let _ = mpv.set_property("volume", value.clamp(0.0, 100.0));
+                    if index != steps {
+                        thread::sleep(step);
+                    }
+                }
+            });
     }
 }
 
@@ -376,11 +493,133 @@ fn format_http_header_fields(headers: &[(String, String)]) -> String {
         .join(",")
 }
 
+fn clamp_playback_speed(speed: f64) -> Option<f64> {
+    speed
+        .is_finite()
+        .then(|| speed.clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED))
+}
+
+fn clamp_replaygain_preamp(db: f64) -> Option<f64> {
+    db.is_finite()
+        .then(|| db.clamp(MIN_REPLAYGAIN_PREAMP, MAX_REPLAYGAIN_PREAMP))
+}
+
+fn clamp_balance(balance: f64) -> Option<f64> {
+    balance.is_finite().then(|| balance.clamp(-1.0, 1.0))
+}
+
+fn replaygain_mode_code(mode: ReplayGainMode) -> u8 {
+    match mode {
+        ReplayGainMode::Off => 0,
+        ReplayGainMode::Track => 1,
+        ReplayGainMode::Album => 2,
+    }
+}
+
+fn replaygain_mode_from_code(code: u8) -> ReplayGainMode {
+    match code {
+        1 => ReplayGainMode::Track,
+        2 => ReplayGainMode::Album,
+        _ => ReplayGainMode::Off,
+    }
+}
+
+fn replaygain_mpv_value(mode: ReplayGainMode) -> &'static str {
+    match mode {
+        ReplayGainMode::Off => "no",
+        ReplayGainMode::Track => "track",
+        ReplayGainMode::Album => "album",
+    }
+}
+
+fn channel_mode_code(mode: ChannelMode) -> u8 {
+    match mode {
+        ChannelMode::Auto => 0,
+        ChannelMode::Stereo => 1,
+        ChannelMode::Mono => 2,
+        ChannelMode::Left => 3,
+        ChannelMode::Right => 4,
+    }
+}
+
+fn channel_mode_from_code(code: u8) -> ChannelMode {
+    match code {
+        1 => ChannelMode::Stereo,
+        2 => ChannelMode::Mono,
+        3 => ChannelMode::Left,
+        4 => ChannelMode::Right,
+        _ => ChannelMode::Auto,
+    }
+}
+
+fn channel_mpv_value(mode: ChannelMode) -> &'static str {
+    match mode {
+        ChannelMode::Auto => "auto-safe",
+        ChannelMode::Stereo => "stereo",
+        ChannelMode::Mono => "mono",
+        // A one-speaker layout is the most direct way to select one side and
+        // lets mpv perform the required conversion for the current source.
+        ChannelMode::Left => "fl",
+        ChannelMode::Right => "fr",
+    }
+}
+
+fn valid_equalizer_band(band: EqualizerBand) -> bool {
+    band.frequency_hz.is_finite()
+        && band.gain_db.is_finite()
+        && (EQ_MIN_FREQUENCY_HZ..=EQ_MAX_FREQUENCY_HZ).contains(&band.frequency_hz)
+        && (EQ_MIN_GAIN_DB..=EQ_MAX_GAIN_DB).contains(&band.gain_db)
+}
+
+/// Build a labelled lavfi graph for Voicefox's equalizer settings.
+///
+/// The label lets us replace/remove only our own filter and preserve filters
+/// configured by the caller or inserted automatically by mpv.
+fn format_equalizer_filter(bands: &[EqualizerBand]) -> Option<String> {
+    let valid_bands = bands
+        .iter()
+        .copied()
+        .filter(|band| valid_equalizer_band(*band))
+        .collect::<Vec<_>>();
+    if valid_bands.is_empty() {
+        return None;
+    }
+
+    let graph = valid_bands
+        .iter()
+        .map(|band| format!("equalizer=f={:.3}:g={:.3}", band.frequency_hz, band.gain_db))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("{EQ_FILTER_LABEL}:lavfi=[{graph}]"))
+}
+
+fn format_balance_filter(balance: f64) -> Option<String> {
+    let balance = clamp_balance(balance)?;
+    if balance.abs() < f64::EPSILON {
+        return None;
+    }
+
+    // Keep the selected side at unity gain and attenuate only the opposite
+    // side, which matches the usual balance control semantics.
+    let left_gain = if balance > 0.0 { 1.0 - balance } else { 1.0 };
+    let right_gain = if balance < 0.0 { 1.0 + balance } else { 1.0 };
+    Some(format!(
+        "{BALANCE_FILTER_LABEL}:lavfi=[pan=stereo|c0={left_gain:.6}*c0|c1={right_gain:.6}*c1]"
+    ))
+}
+
+fn normalize_ab_loop(loop_points: AbLoop) -> Option<AbLoop> {
+    AbLoop::new(loop_points.start, loop_points.end)
+}
+
 impl Player for MpvEngine {
     fn prepare(&self) -> u64 {
+        let _play_guard = self.play_lock.lock().unwrap();
+        self.cancel_fade_internal();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.paused.store(false, Ordering::SeqCst);
         *self.pending_seek.lock().unwrap() = None;
+        self.clear_ab_loop_locked();
         let _ = self.state_tx.send(PlayerState::Loading);
         let _ = self.position_tx.send(Duration::ZERO);
         let _ = self.audible_position_tx.send(Duration::ZERO);
@@ -425,9 +664,11 @@ impl Player for MpvEngine {
 
     fn stop(&self) {
         let _play_guard = self.play_lock.lock().unwrap();
+        self.cancel_fade_internal();
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
         *self.pending_seek.lock().unwrap() = None;
+        self.clear_ab_loop_locked();
         if let Err(error) = self.mpv.command("stop", &[]) {
             warn!("libmpv stop failed: {error}");
         }
@@ -489,6 +730,7 @@ impl Player for MpvEngine {
     }
 
     fn set_volume(&self, volume: u32) {
+        self.cancel_fade_internal();
         let volume = volume.clamp(0, 100);
         if let Err(error) = self.mpv.set_property("volume", f64::from(volume)) {
             warn!("libmpv set_volume failed: {error}");
@@ -504,11 +746,212 @@ impl Player for MpvEngine {
     fn volume_down(&self, delta: u32) {
         self.set_volume(self.volume().saturating_sub(delta));
     }
+
+    fn playback_speed(&self) -> f64 {
+        f64::from_bits(self.playback_speed.load(Ordering::Relaxed))
+    }
+
+    fn set_playback_speed(&self, speed: f64) {
+        let Some(speed) = clamp_playback_speed(speed) else {
+            warn!("ignoring invalid libmpv playback speed: {speed}");
+            return;
+        };
+        if let Err(error) = self.mpv.set_property("speed", speed) {
+            warn!("libmpv set_playback_speed failed: {error}");
+            return;
+        }
+        self.playback_speed
+            .store(speed.to_bits(), Ordering::Relaxed);
+    }
+
+    fn audio_output_device(&self) -> String {
+        self.audio_device.lock().unwrap().clone()
+    }
+
+    fn set_audio_output_device(&self, device: &str) {
+        // libmpv's CString conversion rejects NUL bytes. Reject them here so
+        // a malformed value cannot leave our cached state out of sync; an empty
+        // value is treated as the portable default device.
+        if device.contains('\0') {
+            warn!("ignoring invalid libmpv audio device name");
+            return;
+        }
+        let device = if device.is_empty() {
+            DEFAULT_AUDIO_DEVICE
+        } else {
+            device
+        };
+        let _play_guard = self.play_lock.lock().unwrap();
+        if let Err(error) = self.mpv.set_property("audio-device", device) {
+            warn!("libmpv set_audio_output_device failed: {error}");
+            return;
+        }
+        *self.audio_device.lock().unwrap() = device.to_string();
+    }
+
+    fn replaygain_mode(&self) -> ReplayGainMode {
+        replaygain_mode_from_code(self.replaygain_mode.load(Ordering::Relaxed))
+    }
+
+    fn set_replaygain_mode(&self, mode: ReplayGainMode) {
+        if let Err(error) = self
+            .mpv
+            .set_property("replaygain", replaygain_mpv_value(mode))
+        {
+            warn!("libmpv set_replaygain_mode failed: {error}");
+            return;
+        }
+        self.replaygain_mode
+            .store(replaygain_mode_code(mode), Ordering::Relaxed);
+    }
+
+    fn replaygain_preamp(&self) -> f64 {
+        f64::from_bits(self.replaygain_preamp.load(Ordering::Relaxed))
+    }
+
+    fn set_replaygain_preamp(&self, db: f64) {
+        let Some(db) = clamp_replaygain_preamp(db) else {
+            warn!("ignoring invalid ReplayGain preamp: {db}");
+            return;
+        };
+        if let Err(error) = self.mpv.set_property("replaygain-preamp", db) {
+            warn!("libmpv set_replaygain_preamp failed: {error}");
+            return;
+        }
+        self.replaygain_preamp
+            .store(db.to_bits(), Ordering::Relaxed);
+    }
+
+    fn replaygain_clip(&self) -> bool {
+        self.replaygain_clip.load(Ordering::Relaxed)
+    }
+
+    fn set_replaygain_clip(&self, clip: bool) {
+        if let Err(error) = self.mpv.set_property("replaygain-clip", clip) {
+            warn!("libmpv set_replaygain_clip failed: {error}");
+            return;
+        }
+        self.replaygain_clip.store(clip, Ordering::Relaxed);
+    }
+
+    fn channel_mode(&self) -> ChannelMode {
+        channel_mode_from_code(self.channel_mode.load(Ordering::Relaxed))
+    }
+
+    fn set_channel_mode(&self, mode: ChannelMode) {
+        if let Err(error) = self
+            .mpv
+            .set_property("audio-channels", channel_mpv_value(mode))
+        {
+            warn!("libmpv set_channel_mode failed: {error}");
+            return;
+        }
+        self.channel_mode
+            .store(channel_mode_code(mode), Ordering::Relaxed);
+    }
+
+    fn balance(&self) -> f64 {
+        f64::from_bits(self.balance.load(Ordering::Relaxed))
+    }
+
+    fn set_balance(&self, balance: f64) {
+        let Some(balance) = clamp_balance(balance) else {
+            warn!("ignoring invalid channel balance: {balance}");
+            return;
+        };
+
+        let _play_guard = self.play_lock.lock().unwrap();
+        // Adding an existing label replaces that filter atomically. Clearing
+        // removes only Voicefox's filter and leaves other filters untouched.
+        let result = match format_balance_filter(balance) {
+            Some(filter) => self.mpv.command("af", &["add", &filter]),
+            None => self.mpv.command("af", &["remove", BALANCE_FILTER_LABEL]),
+        };
+        if let Err(error) = result {
+            warn!("libmpv set_balance failed: {error}");
+            return;
+        }
+        self.balance.store(balance.to_bits(), Ordering::Relaxed);
+    }
+
+    fn ab_loop(&self) -> Option<AbLoop> {
+        *self.ab_loop.lock().unwrap()
+    }
+
+    fn set_ab_loop(&self, loop_points: Option<AbLoop>) {
+        let loop_points = match loop_points {
+            Some(points) => {
+                let Some(points) = normalize_ab_loop(points) else {
+                    warn!("ignoring invalid A-B loop range");
+                    return;
+                };
+                Some(points)
+            }
+            None => None,
+        };
+
+        let _play_guard = self.play_lock.lock().unwrap();
+        let result = match loop_points {
+            Some(points) => self
+                .mpv
+                .set_property("ab-loop-a", points.start.as_secs_f64())
+                .and_then(|()| self.mpv.set_property("ab-loop-b", points.end.as_secs_f64())),
+            None => self
+                .mpv
+                .set_property("ab-loop-a", "no")
+                .and_then(|()| self.mpv.set_property("ab-loop-b", "no")),
+        };
+
+        if let Err(error) = result {
+            warn!("libmpv set_ab_loop failed: {error}");
+            return;
+        }
+        *self.ab_loop.lock().unwrap() = loop_points;
+    }
+
+    fn equalizer_bands(&self) -> Vec<EqualizerBand> {
+        self.equalizer_bands.lock().unwrap().clone()
+    }
+
+    fn set_equalizer_bands(&self, bands: &[EqualizerBand]) {
+        if bands.iter().any(|band| !valid_equalizer_band(*band)) {
+            warn!("ignoring invalid equalizer band");
+            return;
+        }
+
+        let _play_guard = self.play_lock.lock().unwrap();
+        // Adding an existing label replaces that filter atomically in mpv.
+        // Clearing removes only our label and leaves caller/automatic filters.
+        let result = match format_equalizer_filter(bands) {
+            Some(filter) => self.mpv.command("af", &["add", &filter]),
+            None => self.mpv.command("af", &["remove", EQ_FILTER_LABEL]),
+        };
+        if let Err(error) = result {
+            warn!("libmpv set_equalizer_bands failed: {error}");
+            return;
+        }
+        *self.equalizer_bands.lock().unwrap() = bands.to_vec();
+    }
+
+    fn fade_in(&self, duration: Duration) {
+        let target = self.volume() as f64;
+        self.fade_to(0.0, target, duration);
+    }
+
+    fn fade_out(&self, duration: Duration) {
+        let from = self.volume() as f64;
+        self.fade_to(from, 0.0, duration);
+    }
+
+    fn cancel_fade(&self) {
+        self.cancel_fade_internal();
+    }
 }
 
 impl Drop for MpvEngine {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.cancel_fade_internal();
         let _ = self.mpv.command("stop", &[]);
         if let Some(event_thread) = self.event_thread.lock().unwrap().take()
             && event_thread.join().is_err()
@@ -527,8 +970,11 @@ mod tests {
     use lx_core::model::source::PlayerState;
 
     use super::{
-        duration_from_mpv_seconds, format_http_header_fields, loading_state, take_pending_seek,
+        channel_mpv_value, clamp_balance, clamp_playback_speed, clamp_replaygain_preamp,
+        duration_from_mpv_seconds, format_balance_filter, format_equalizer_filter,
+        format_http_header_fields, loading_state, replaygain_mpv_value, take_pending_seek,
     };
+    use lx_core::traits::player::{ChannelMode, EqualizerBand, ReplayGainMode};
 
     #[test]
     fn invalid_mpv_times_are_handled_safely() {
@@ -591,5 +1037,63 @@ mod tests {
 
         assert_eq!(take_pending_seek(&pending, 5), None);
         assert!(pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn playback_speed_is_clamped_to_mpv_range() {
+        assert_eq!(clamp_playback_speed(f64::NAN), None);
+        assert_eq!(clamp_playback_speed(-1.0), Some(0.01));
+        assert_eq!(clamp_playback_speed(1.25), Some(1.25));
+        assert_eq!(clamp_playback_speed(101.0), Some(100.0));
+    }
+
+    #[test]
+    fn replaygain_and_channel_modes_map_to_mpv_values() {
+        assert_eq!(replaygain_mpv_value(ReplayGainMode::Off), "no");
+        assert_eq!(replaygain_mpv_value(ReplayGainMode::Track), "track");
+        assert_eq!(replaygain_mpv_value(ReplayGainMode::Album), "album");
+        assert_eq!(channel_mpv_value(ChannelMode::Auto), "auto-safe");
+        assert_eq!(channel_mpv_value(ChannelMode::Stereo), "stereo");
+        assert_eq!(channel_mpv_value(ChannelMode::Mono), "mono");
+        assert_eq!(channel_mpv_value(ChannelMode::Left), "fl");
+        assert_eq!(channel_mpv_value(ChannelMode::Right), "fr");
+    }
+
+    #[test]
+    fn equalizer_filter_is_labelled_and_rejects_invalid_bands() {
+        let bands = [
+            EqualizerBand::new(100.0, 3.0),
+            EqualizerBand::new(1_000.0, -2.5),
+        ];
+        assert_eq!(
+            format_equalizer_filter(&bands).as_deref(),
+            Some("@voicefox-eq:lavfi=[equalizer=f=100.000:g=3.000,equalizer=f=1000.000:g=-2.500]")
+        );
+        assert!(format_equalizer_filter(&[EqualizerBand::new(0.0, 1.0)]).is_none());
+        assert!(format_equalizer_filter(&[EqualizerBand::new(100.0, f64::NAN)]).is_none());
+    }
+
+    #[test]
+    fn replaygain_preamp_is_clamped_and_rejects_non_finite_values() {
+        assert_eq!(clamp_replaygain_preamp(f64::NAN), None);
+        assert_eq!(clamp_replaygain_preamp(-200.0), Some(-150.0));
+        assert_eq!(clamp_replaygain_preamp(2.5), Some(2.5));
+        assert_eq!(clamp_replaygain_preamp(200.0), Some(150.0));
+    }
+
+    #[test]
+    fn balance_is_clamped_and_only_attenuates_the_opposite_side() {
+        assert_eq!(clamp_balance(f64::NAN), None);
+        assert_eq!(clamp_balance(-2.0), Some(-1.0));
+        assert_eq!(clamp_balance(0.25), Some(0.25));
+        assert_eq!(format_balance_filter(0.0), None);
+        assert_eq!(
+            format_balance_filter(0.5).as_deref(),
+            Some("@voicefox-balance:lavfi=[pan=stereo|c0=0.500000*c0|c1=1.000000*c1]")
+        );
+        assert_eq!(
+            format_balance_filter(-1.0).as_deref(),
+            Some("@voicefox-balance:lavfi=[pan=stereo|c0=1.000000*c0|c1=0.000000*c1]")
+        );
     }
 }

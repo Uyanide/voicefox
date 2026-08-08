@@ -2,8 +2,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::source::{Quality, SourceId};
 use crate::keybinding::KeybindingConfig;
+use crate::traits::player::EqualizerBand;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 6;
+pub const CURRENT_CONFIG_VERSION: u32 = 8;
 
 /// 可显示在底部状态栏中的内容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +71,27 @@ pub struct PlayerConfig {
     pub engine: String,
     pub quality: Quality,
     pub volume: u32,
+    /// 播放速度倍率，正常速度为 1.0。
+    pub playback_speed: f64,
+    /// libmpv 音频输出设备，`auto` 使用系统默认设备。
+    pub audio_device: String,
+    /// ReplayGain 模式：off、track 或 album。
+    pub replaygain_mode: String,
+    /// ReplayGain 预放大（分贝）。
+    pub replaygain_preamp: f64,
+    /// 声道模式：auto、stereo、mono、left 或 right。
+    pub channel_mode: String,
+    /// 左右声道平衡，-1 为全左，1 为全右。
+    pub balance: f64,
+    /// 是否在 ReplayGain 预放大后限制削波。
+    pub replaygain_clip: bool,
+    /// 持久化的均衡器频段；空数组表示关闭均衡器。
+    #[serde(default)]
+    pub equalizer_bands: Vec<EqualizerBand>,
+    /// 新曲目开始时的淡入时长（毫秒），0 表示关闭。
+    pub fade_in_ms: u64,
+    /// 曲目结束前的淡出时长（毫秒），0 表示关闭。
+    pub fade_out_ms: u64,
     pub play_mode: String,
     pub remember_playback_state: bool,
     pub history_limit: usize,
@@ -81,6 +103,16 @@ impl Default for PlayerConfig {
             engine: "mpv".to_string(),
             quality: Quality::High320,
             volume: 80,
+            playback_speed: 1.0,
+            audio_device: "auto".to_string(),
+            replaygain_mode: "off".to_string(),
+            replaygain_preamp: 0.0,
+            channel_mode: "auto".to_string(),
+            balance: 0.0,
+            replaygain_clip: false,
+            equalizer_bands: Vec::new(),
+            fade_in_ms: 0,
+            fade_out_ms: 0,
             play_mode: "list-loop".to_string(),
             remember_playback_state: true,
             history_limit: 100,
@@ -434,8 +466,10 @@ mod tests {
 
     #[test]
     fn status_bar_items_use_documented_config_names() {
-        let mut config = UiConfig::default();
-        config.status_bar_items = vec![StatusBarItem::PlayMode, StatusBarItem::JsSourceState];
+        let config = UiConfig {
+            status_bar_items: vec![StatusBarItem::PlayMode, StatusBarItem::JsSourceState],
+            ..UiConfig::default()
+        };
 
         let value = serde_json::to_value(config).unwrap();
 

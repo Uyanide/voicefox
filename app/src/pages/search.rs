@@ -1011,14 +1011,14 @@ impl SearchPage {
                 let list_y = inner.y.saturating_add(1);
                 let footer_y = inner.bottom().saturating_sub(1);
                 let mut confirm = false;
-                if event.row >= list_y && event.row < footer_y {
-                    if let Some(picker) = self.part_picker.as_mut() {
-                        let index =
-                            picker.scroll_offset + event.row.saturating_sub(list_y) as usize;
-                        if index < picker.parts.len() {
-                            picker.selected = index;
-                            confirm = activate;
-                        }
+                if event.row >= list_y
+                    && event.row < footer_y
+                    && let Some(picker) = self.part_picker.as_mut()
+                {
+                    let index = picker.scroll_offset + event.row.saturating_sub(list_y) as usize;
+                    if index < picker.parts.len() {
+                        picker.selected = index;
+                        confirm = activate;
                     }
                 }
                 if confirm {

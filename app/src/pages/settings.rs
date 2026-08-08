@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
-use lx_core::keybinding::{Action, KeybindingResolver};
+use lx_core::keybinding::{Action, KeybindingConfig, KeybindingResolver};
 use lx_core::model::config::StatusBarItem;
 use lx_core::model::source::{Quality, SourceId};
 use ratatui::buffer::Buffer;
@@ -93,6 +93,12 @@ pub struct SettingsPage {
     pub proxy_input: String,
     /// 代理地址输入模式
     pub proxy_input_mode: bool,
+    /// 音频输出设备输入模式
+    pub audio_device_input: String,
+    pub audio_device_input_mode: bool,
+    /// 外部歌单文件输入模式。
+    pub playlist_import_input: String,
+    pub playlist_import_mode: bool,
     /// 内置音源开关当前指向的音源
     pub enabled_source_index: usize,
     /// 状态栏字段列表的选中索引
@@ -106,25 +112,28 @@ pub struct SettingsPage {
 impl SettingsPage {
     /// 检查是否有任何输入模式激活（JS 源输入或本地路径输入）
     pub fn any_input_active(&self) -> bool {
-        self.input_mode || self.local_path_mode || self.proxy_input_mode
+        self.input_mode
+            || self.local_path_mode
+            || self.proxy_input_mode
+            || self.audio_device_input_mode
+            || self.playlist_import_mode
     }
 
     /// 判断按键是否由设置页独占。设置页把整个字母表当作选项开关，
     /// 与用户可自定义的全局快捷键必然重叠，因此这些键不再交给全局分发。
-    /// 带 Ctrl/Alt 的组合键以及 Space、Tab、Esc 仍归全局。
+    /// 未被 settings 页面级动作绑定的 Ctrl/Alt 组合键仍归全局。
     pub fn consumes_key(&self, key: &KeyEvent, resolver: &KeybindingResolver) -> bool {
+        if resolver
+            .resolve_page("settings", key)
+            .is_some_and(settings_action_is_page_owned)
+        {
+            return true;
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             return false;
-        }
-        // 列表导航键可被用户重绑，按当前配置解析而不是写死 j/k
-        if matches!(
-            resolver.resolve_page("settings", key),
-            Some(Action::ListSelectUp | Action::ListSelectDown)
-        ) {
-            return true;
         }
         if self.focus == SettingsFocus::StatusBar
             && (matches!(
@@ -155,6 +164,10 @@ impl SettingsPage {
             selected_local_path: 0,
             proxy_input: String::new(),
             proxy_input_mode: false,
+            audio_device_input: String::new(),
+            audio_device_input_mode: false,
+            playlist_import_input: String::new(),
+            playlist_import_mode: false,
             enabled_source_index: 0,
             selected_status_item: 0,
             status_item_scroll: 0,
@@ -170,6 +183,12 @@ impl SettingsPage {
     ) -> AppAction {
         if self.proxy_input_mode {
             return self.handle_proxy_input(key, ctx);
+        }
+        if self.audio_device_input_mode {
+            return self.handle_audio_device_input(key, ctx);
+        }
+        if self.playlist_import_mode {
+            return self.handle_playlist_import_input(key, ctx);
         }
         if self.local_path_mode {
             return self.handle_local_path_input(key, ctx);
@@ -202,6 +221,12 @@ impl SettingsPage {
                 _ => {}
             }
         } else {
+            if let Some(action) = resolver.resolve_page("settings", &key)
+                && let Some(result) = self.handle_bound_action(action, ctx)
+            {
+                return result;
+            }
+
             if matches!(
                 (key.modifiers, key.code),
                 (KeyModifiers::NONE, KeyCode::Char('s'))
@@ -507,6 +532,95 @@ impl SettingsPage {
         AppAction::None
     }
 
+    /// 执行通过 settings 页面级键位映射解析出的播放与数据动作。
+    /// 返回 `None` 表示该动作由其他设置页逻辑处理。
+    fn handle_bound_action(&mut self, action: Action, ctx: &AppContext) -> Option<AppAction> {
+        match action {
+            Action::SettingsCyclePlaybackSpeed => {
+                self.status_msg = Some(ctx.cycle_playback_speed());
+            }
+            Action::SettingsEditAudioDevice => {
+                self.audio_device_input = ctx.config.read().unwrap().player.audio_device.clone();
+                self.audio_device_input_mode = true;
+                self.status_msg = Some("输入 libmpv 音频设备名，Enter 保存".to_string());
+            }
+            Action::SettingsCycleReplayGainMode => {
+                self.status_msg = Some(ctx.cycle_replaygain_mode());
+            }
+            Action::SettingsCycleReplayGainPreamp => {
+                self.status_msg = Some(ctx.cycle_replaygain_preamp());
+            }
+            Action::SettingsCycleChannelMode => {
+                self.status_msg = Some(ctx.cycle_channel_mode());
+            }
+            Action::SettingsCycleBalance => {
+                self.status_msg = Some(ctx.cycle_balance());
+            }
+            Action::SettingsToggleReplayGainClip => {
+                self.status_msg = Some(ctx.toggle_replaygain_clip());
+            }
+            Action::SettingsCycleFadeInDuration => {
+                let duration = {
+                    let mut config = ctx.config.write().unwrap();
+                    config.player.fade_in_ms = next_fade_duration(config.player.fade_in_ms);
+                    let value = config.player.fade_in_ms;
+                    self.status_msg =
+                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    value
+                };
+                self.status_msg = Some(format!("淡入: {}", fade_label(duration)));
+            }
+            Action::SettingsCycleFadeOutDuration => {
+                let duration = {
+                    let mut config = ctx.config.write().unwrap();
+                    config.player.fade_out_ms = next_fade_duration(config.player.fade_out_ms);
+                    let value = config.player.fade_out_ms;
+                    self.status_msg =
+                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    value
+                };
+                self.status_msg = Some(format!("淡出: {}", fade_label(duration)));
+            }
+            Action::SettingsCycleEqualizerPreset => {
+                self.status_msg = Some(ctx.cycle_equalizer_preset());
+            }
+            Action::SettingsRunFadeIn => {
+                self.status_msg = Some(ctx.fade_in_now());
+            }
+            Action::SettingsRunFadeOut => {
+                self.status_msg = Some(ctx.fade_out_now());
+            }
+            Action::SettingsSetAbLoopStart => {
+                self.status_msg = Some(ctx.set_ab_loop_start_now());
+            }
+            Action::SettingsSetAbLoopEnd => {
+                self.status_msg = Some(ctx.set_ab_loop_end_now());
+            }
+            Action::SettingsClearAbLoop => {
+                self.status_msg = Some(ctx.clear_ab_loop());
+            }
+            Action::SettingsExportData => {
+                self.status_msg = Some(match ctx.storage.export_default() {
+                    Ok(path) => format!("数据已导出: {}", path.display()),
+                    Err(error) => format!("数据导出失败: {error}"),
+                });
+            }
+            Action::SettingsImportData => {
+                self.status_msg = Some(match ctx.storage.import_default() {
+                    Ok(path) => format!("数据已导入，原数据备份于: {}", path.display()),
+                    Err(error) => format!("数据导入失败: {error}"),
+                });
+            }
+            Action::SettingsImportPlaylist => {
+                self.playlist_import_input.clear();
+                self.playlist_import_mode = true;
+                self.status_msg = Some("输入 M3U/LX Music/网易云歌单路径，Enter 导入".to_string());
+            }
+            _ => return None,
+        }
+        Some(AppAction::None)
+    }
+
     fn handle_proxy_input(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -534,6 +648,70 @@ impl SettingsPage {
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.proxy_input.push(c);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn handle_audio_device_input(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.audio_device_input_mode = false;
+                self.audio_device_input.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let device = self.audio_device_input.trim().to_string();
+                if !device.is_empty() {
+                    self.status_msg = Some(ctx.set_audio_output_device(&device));
+                }
+                self.audio_device_input_mode = false;
+                self.audio_device_input.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.audio_device_input.pop();
+            }
+            (modifiers, KeyCode::Char(c))
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && c != '\0' =>
+            {
+                self.audio_device_input.push(c);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    fn handle_playlist_import_input(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.playlist_import_mode = false;
+                self.playlist_import_input.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let path = self.playlist_import_input.trim().to_string();
+                if !path.is_empty() {
+                    self.status_msg = match ctx
+                        .storage
+                        .import_external_playlist(std::path::Path::new(&path))
+                    {
+                        Ok(report) => Some(format!(
+                            "已导入歌单 {}：{} 首，跳过 {} 首",
+                            report.playlist_name, report.imported, report.skipped
+                        )),
+                        Err(error) => Some(format!("歌单导入失败: {error}")),
+                    };
+                }
+                self.playlist_import_mode = false;
+                self.playlist_import_input.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.playlist_import_input.pop();
+            }
+            (modifiers, KeyCode::Char(c))
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.playlist_import_input.push(c);
             }
             _ => {}
         }
@@ -907,6 +1085,25 @@ impl SettingsPage {
         } else {
             config.local_music.max_depth.to_string()
         };
+        let replaygain_keys = format!(
+            "{}/{}",
+            settings_binding(
+                &config.keybindings,
+                Action::SettingsCycleReplayGainMode,
+                "3"
+            ),
+            settings_binding(
+                &config.keybindings,
+                Action::SettingsCycleReplayGainPreamp,
+                "5"
+            )
+        );
+        let ab_loop_keys = format!(
+            "{}/{}/{}",
+            settings_binding(&config.keybindings, Action::SettingsSetAbLoopStart, "L"),
+            settings_binding(&config.keybindings, Action::SettingsSetAbLoopEnd, "U"),
+            settings_binding(&config.keybindings, Action::SettingsClearAbLoop, "C")
+        );
 
         let options_block = Block::default()
             .borders(Borders::ALL)
@@ -930,6 +1127,109 @@ impl SettingsPage {
                 "播放音质",
                 config.player.quality.label(),
                 "Q",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "播放速度",
+                &format!("{:.2}x", config.player.playback_speed),
+                settings_binding(&config.keybindings, Action::SettingsCyclePlaybackSpeed, "1"),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "音频设备",
+                &config.player.audio_device,
+                settings_binding(&config.keybindings, Action::SettingsEditAudioDevice, "2"),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "ReplayGain",
+                &format!(
+                    "{} ({:+.1} dB)",
+                    config.player.replaygain_mode, config.player.replaygain_preamp
+                ),
+                &replaygain_keys,
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "声道模式",
+                &config.player.channel_mode,
+                settings_binding(&config.keybindings, Action::SettingsCycleChannelMode, "4"),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "左右平衡",
+                &format!("{:+.2}", config.player.balance),
+                settings_binding(&config.keybindings, Action::SettingsCycleBalance, "6"),
+                accent,
+                muted,
+            ),
+            setting_line(
+                "ReplayGain 削波保护",
+                config.player.replaygain_clip,
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsToggleReplayGainClip,
+                    "7",
+                ),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "淡入时长",
+                &fade_label(config.player.fade_in_ms),
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsCycleFadeInDuration,
+                    "8",
+                ),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "淡出时长",
+                &fade_label(config.player.fade_out_ms),
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsCycleFadeOutDuration,
+                    "9",
+                ),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "均衡器",
+                crate::context::equalizer_label(&config.player.equalizer_bands),
+                settings_binding(
+                    &config.keybindings,
+                    Action::SettingsCycleEqualizerPreset,
+                    "0",
+                ),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "淡入当前歌曲",
+                "执行",
+                settings_binding(&config.keybindings, Action::SettingsRunFadeIn, "F"),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "淡出当前歌曲",
+                "执行",
+                settings_binding(&config.keybindings, Action::SettingsRunFadeOut, "G"),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "A-B 循环",
+                &ab_loop_label(ctx.player.ab_loop()),
+                &ab_loop_keys,
                 accent,
                 muted,
             ),
@@ -1031,6 +1331,27 @@ impl SettingsPage {
             ),
             setting_value_line("主题强调色", &config.theme.accent, "p", accent, muted),
             setting_value_line("扫描深度", &scan_depth_label, "D", accent, muted),
+            setting_value_line(
+                "导出数据",
+                "voicefox-export.json",
+                settings_binding(&config.keybindings, Action::SettingsExportData, "E"),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "导入数据",
+                "voicefox-export.json",
+                settings_binding(&config.keybindings, Action::SettingsImportData, "I"),
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "导入外部歌单",
+                "M3U/JSON",
+                settings_binding(&config.keybindings, Action::SettingsImportPlaylist, "J"),
+                accent,
+                muted,
+            ),
             {
                 let logged_in = ctx.bili_source.is_logged_in();
                 let account = if logged_in {
@@ -1413,6 +1734,11 @@ impl SettingsPage {
                 if options_inner.contains((event.column, event.row).into()) {
                     let index =
                         setting_option_index(options_inner, Position::new(event.column, event.row));
+                    if let Some(Some(action)) = SETTING_OPTION_ACTIONS.get(index as usize)
+                        && let Some(result) = self.handle_bound_action(*action, ctx)
+                    {
+                        return result;
+                    }
                     if let Some(&key) = SETTING_OPTION_KEYS.get(index as usize) {
                         return self.handle_input(
                             KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
@@ -1470,6 +1796,45 @@ impl SettingsPage {
 
 fn enabled(value: bool) -> &'static str {
     if value { "开启" } else { "关闭" }
+}
+
+fn settings_binding<'a>(
+    config: &'a KeybindingConfig,
+    action: Action,
+    fallback: &'a str,
+) -> &'a str {
+    config
+        .pages
+        .get("settings")
+        .and_then(|bindings| bindings.get(&action))
+        .map(String::as_str)
+        .unwrap_or(fallback)
+}
+
+fn settings_action_is_page_owned(action: Action) -> bool {
+    matches!(
+        action,
+        Action::ListSelectUp
+            | Action::ListSelectDown
+            | Action::SettingsCyclePlaybackSpeed
+            | Action::SettingsEditAudioDevice
+            | Action::SettingsCycleReplayGainMode
+            | Action::SettingsCycleReplayGainPreamp
+            | Action::SettingsCycleChannelMode
+            | Action::SettingsCycleBalance
+            | Action::SettingsToggleReplayGainClip
+            | Action::SettingsCycleFadeInDuration
+            | Action::SettingsCycleFadeOutDuration
+            | Action::SettingsCycleEqualizerPreset
+            | Action::SettingsRunFadeIn
+            | Action::SettingsRunFadeOut
+            | Action::SettingsSetAbLoopStart
+            | Action::SettingsSetAbLoopEnd
+            | Action::SettingsClearAbLoop
+            | Action::SettingsExportData
+            | Action::SettingsImportData
+            | Action::SettingsImportPlaylist
+    )
 }
 
 fn status_bar_item_label(item: StatusBarItem) -> &'static str {
@@ -1615,15 +1980,99 @@ fn next_scan_depth(depth: u32) -> u32 {
     }
 }
 
+fn next_fade_duration(value: u64) -> u64 {
+    match value {
+        0 => 250,
+        1..=250 => 500,
+        251..=500 => 1_000,
+        501..=1_000 => 2_000,
+        _ => 0,
+    }
+}
+
+fn fade_label(value: u64) -> String {
+    if value == 0 {
+        "关闭".to_string()
+    } else if value.is_multiple_of(1_000) {
+        format!("{} 秒", value / 1_000)
+    } else {
+        format!("{} ms", value)
+    }
+}
+
+fn ab_loop_label(loop_points: Option<lx_core::traits::player::AbLoop>) -> String {
+    loop_points
+        .map(|points| {
+            format!(
+                "{} - {}",
+                format_duration(points.start),
+                format_duration(points.end)
+            )
+        })
+        .unwrap_or_else(|| "未设置".to_string())
+}
+
+fn format_duration(value: std::time::Duration) -> String {
+    let total = value.as_secs();
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
 /// 在更新配置项后更新这些常量!
 ///
 /// 鼠标点击时触发的按键，顺序必须与 render 中的选项列表一致
-const SETTING_OPTION_KEYS: [char; 27] = [
-    't', 'g', 'w', 'c', 'e', 'Q', 'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z',
-    'i', 'o', 'x', 'X', 'R', 'p', 'D', 'b',
+const SETTING_OPTION_KEYS: [char; 43] = [
+    't', 'g', 'w', 'c', 'e', 'Q', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'F', 'G', 'L',
+    'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z', 'i', 'o', 'x', 'X', 'R', 'p',
+    'D', 'E', 'I', 'J', 'b',
+];
+const SETTING_OPTION_ACTIONS: [Option<Action>; 43] = [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(Action::SettingsCyclePlaybackSpeed),
+    Some(Action::SettingsEditAudioDevice),
+    Some(Action::SettingsCycleReplayGainMode),
+    Some(Action::SettingsCycleChannelMode),
+    Some(Action::SettingsCycleReplayGainPreamp),
+    Some(Action::SettingsCycleBalance),
+    Some(Action::SettingsToggleReplayGainClip),
+    Some(Action::SettingsCycleFadeInDuration),
+    Some(Action::SettingsCycleFadeOutDuration),
+    Some(Action::SettingsCycleEqualizerPreset),
+    Some(Action::SettingsRunFadeIn),
+    Some(Action::SettingsRunFadeOut),
+    Some(Action::SettingsSetAbLoopStart),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(Action::SettingsExportData),
+    Some(Action::SettingsImportData),
+    Some(Action::SettingsImportPlaylist),
+    None,
 ];
 const SETTINGS_OPTION_COUNT: u16 = SETTING_OPTION_KEYS.len() as u16;
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
+const THREE_COLUMN_OPTIONS_MIN_WIDTH: u16 = 72;
 
 /// 设置页在非输入模式下响应的字符键：选项键之外还有列表操作键
 /// （a 添加 / d 删除 / s 切换焦点 / r 扫描 / y 与 [ 见 `handle_input`）。
@@ -1634,53 +2083,59 @@ const SETTINGS_PAGE_CHAR_KEYS: &[char] = &[
 ];
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
-    if !setting_options_use_two_columns(area) {
+    let column_count = setting_option_column_count(area.width);
+    if column_count == 1 {
         Paragraph::new(options).render(area, buf);
         return;
     }
 
     let columns = setting_option_columns(area);
-    let mut left = Vec::new();
-    let mut right = Vec::new();
+    let mut lines = (0..column_count).map(|_| Vec::new()).collect::<Vec<_>>();
     for (index, line) in options.into_iter().enumerate() {
-        if index.is_multiple_of(2) {
-            left.push(line);
-        } else {
-            right.push(line);
-        }
+        lines[index % column_count].push(line);
     }
-    Paragraph::new(left).render(columns[0], buf);
-    Paragraph::new(right).render(columns[1], buf);
+    for (column, lines) in columns.iter().zip(lines) {
+        Paragraph::new(lines).render(*column, buf);
+    }
 }
 
 fn setting_option_index(area: Rect, position: Position) -> u16 {
     let row = position.y.saturating_sub(area.y);
-    if !setting_options_use_two_columns(area) {
+    let column_count = setting_option_column_count(area.width);
+    if column_count == 1 {
         return row;
     }
     let columns = setting_option_columns(area);
-    let column = u16::from(columns[1].contains(position));
-    row.saturating_mul(2).saturating_add(column)
+    let column = columns
+        .iter()
+        .position(|column| column.contains(position))
+        .unwrap_or(0) as u16;
+    row.saturating_mul(column_count as u16)
+        .saturating_add(column)
 }
 
-fn setting_options_use_two_columns(area: Rect) -> bool {
-    area.width >= TWO_COLUMN_OPTIONS_MIN_WIDTH
+fn setting_option_column_count(width: u16) -> usize {
+    if width >= THREE_COLUMN_OPTIONS_MIN_WIDTH {
+        3
+    } else if width >= TWO_COLUMN_OPTIONS_MIN_WIDTH {
+        2
+    } else {
+        1
+    }
 }
 
 fn setting_option_columns(area: Rect) -> std::rc::Rc<[Rect]> {
+    let count = setting_option_column_count(area.width);
     Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints((0..count).map(|_| Constraint::Ratio(1, count as u32)))
         .split(area)
 }
 
 fn setting_options_height(panel_width: u16) -> u16 {
     let inner_width = panel_width.saturating_sub(2);
-    let rows = if inner_width >= TWO_COLUMN_OPTIONS_MIN_WIDTH {
-        SETTINGS_OPTION_COUNT.div_ceil(2)
-    } else {
-        SETTINGS_OPTION_COUNT
-    };
+    let columns = setting_option_column_count(inner_width) as u16;
+    let rows = SETTINGS_OPTION_COUNT.div_ceil(columns);
     rows.saturating_add(2)
 }
 
@@ -1803,6 +2258,24 @@ mod tests {
     }
 
     #[test]
+    fn settings_page_owns_rebound_playback_action_even_with_ctrl() {
+        let mut config = KeybindingConfig::default();
+        config
+            .pages
+            .get_mut("settings")
+            .unwrap()
+            .insert(Action::SettingsCyclePlaybackSpeed, "Ctrl+1".to_string());
+        let resolver = KeybindingResolver::from_config(&config);
+        let page = SettingsPage::new();
+
+        let rebound = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL);
+        let released = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+
+        assert!(page.consumes_key(&rebound, &resolver));
+        assert!(!page.consumes_key(&released, &resolver));
+    }
+
+    #[test]
     fn settings_page_leaves_playback_and_navigation_keys_global() {
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
         let page = SettingsPage::new();
@@ -1840,9 +2313,9 @@ mod tests {
 
     #[test]
     fn narrow_settings_show_only_the_focused_management_panel() {
-        let chunks = settings_chunks(Rect::new(0, 0, 60, 24), SettingsFocus::StatusBar);
+        let chunks = settings_chunks(Rect::new(0, 0, 80, 24), SettingsFocus::StatusBar);
 
-        assert_eq!(chunks[0].height, 16);
+        assert_eq!(chunks[0].height, 17);
         assert_eq!(chunks[1], Rect::default());
         assert_eq!(chunks[2], Rect::default());
         assert!(chunks[3].height > 0);
@@ -1853,7 +2326,7 @@ mod tests {
     fn wide_settings_keep_all_management_panels_visible() {
         let chunks = settings_chunks(Rect::new(0, 0, 120, 30), SettingsFocus::JsSources);
 
-        assert_eq!(chunks[0].height, 16);
+        assert_eq!(chunks[0].height, 17);
         assert_eq!(chunks[1].y, chunks[0].bottom());
         assert_eq!(chunks[2].y, chunks[0].bottom());
         assert_eq!(chunks[3].y, chunks[0].bottom());
@@ -1877,6 +2350,22 @@ mod tests {
         assert_eq!(
             setting_option_index(inner, Position::new(right_column_x, inner.y + 5)),
             11
+        );
+    }
+
+    #[test]
+    fn setting_mouse_rows_follow_the_three_column_layout() {
+        let panel = settings_chunks(Rect::new(0, 0, 80, 24), SettingsFocus::JsSources)[0];
+        let inner = Block::default().borders(Borders::ALL).inner(panel);
+        let third_column_x = inner.x + inner.width * 5 / 6;
+
+        assert_eq!(
+            setting_option_index(inner, Position::new(third_column_x, inner.y)),
+            2
+        );
+        assert_eq!(
+            setting_option_index(inner, Position::new(third_column_x, inner.y + 5)),
+            17
         );
     }
 }

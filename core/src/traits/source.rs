@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::model::leaderboard::LeaderboardInfo;
 use crate::model::lyric::LyricData;
-use crate::model::playlist::{Playlist, Tag};
+use crate::model::playlist::{Album, Artist, Playlist, Tag};
 use crate::model::song::SongInfo;
 use crate::model::source::{Quality, SourceId};
 
@@ -65,6 +65,96 @@ pub trait MusicSource: Send + Sync {
     ) -> Result<Vec<SongInfo>, FetchError> {
         Ok(vec![])
     }
+    /// 获取歌手歌曲。未实现专用接口的音源会回退到搜索并按歌手过滤。
+    async fn get_artist_songs(
+        &self,
+        artist: &Artist,
+        page: u32,
+        limit: u32,
+    ) -> Result<SearchResult, SearchError> {
+        let result = self.search(&artist.name, page, limit).await?;
+        let artist_name = normalize_artist_name(&artist.name);
+        let items = result
+            .items
+            .into_iter()
+            .filter(|song| {
+                normalize_artist_name(&song.singer).contains(&artist_name)
+                    || artist_name.contains(&normalize_artist_name(&song.singer))
+            })
+            .collect::<Vec<_>>();
+        Ok(SearchResult {
+            total: items.len() as u32,
+            has_more: result.has_more,
+            items,
+        })
+    }
+    /// 获取歌手专辑。默认从歌手歌曲结果中按专辑去重。
+    async fn get_artist_albums(
+        &self,
+        artist: &Artist,
+        page: u32,
+        limit: u32,
+    ) -> Result<Vec<Album>, SearchError> {
+        let result = self.get_artist_songs(artist, page, limit.max(100)).await?;
+        let mut albums = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for song in result.items {
+            if song.album_name.trim().is_empty() {
+                continue;
+            }
+            let key = if song.album_id.trim().is_empty() {
+                format!("name:{}", song.album_name.trim().to_lowercase())
+            } else {
+                format!("id:{}", song.album_id)
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            albums.push(Album {
+                id: if song.album_id.trim().is_empty() {
+                    song.album_name.clone()
+                } else {
+                    song.album_id.clone()
+                },
+                name: song.album_name,
+                source: song.source,
+                cover_url: song.cover_url,
+                artist: artist.name.clone(),
+            });
+        }
+        Ok(albums)
+    }
+    /// 获取专辑曲目。默认搜索歌手和专辑名，再按专辑标识或名称过滤。
+    async fn get_album_songs(
+        &self,
+        album: &Album,
+        page: u32,
+        limit: u32,
+    ) -> Result<SearchResult, SearchError> {
+        let keyword = format!("{} {}", album.artist, album.name);
+        let result = self.search(&keyword, page, limit).await?;
+        let artist_name = normalize_artist_name(&album.artist);
+        let album_name = album.name.trim().to_lowercase();
+        let items = result
+            .items
+            .into_iter()
+            .filter(|song| {
+                let artist_matches = artist_name.is_empty()
+                    || normalize_artist_name(&song.singer).contains(&artist_name);
+                let album_matches = (!album.id.trim().is_empty()
+                    && !song.album_id.trim().is_empty()
+                    && song.album_id == album.id)
+                    || (!album_name.is_empty()
+                        && song.album_name.trim().to_lowercase() == album_name);
+                artist_matches && album_matches
+            })
+            .collect::<Vec<_>>();
+        Ok(SearchResult {
+            total: items.len() as u32,
+            has_more: result.has_more,
+            items,
+        })
+    }
     async fn get_leaderboard_boards(&self) -> Result<Vec<LeaderboardInfo>, SearchError> {
         Err(SearchError::Other("该音源不支持排行榜".to_string()))
     }
@@ -76,6 +166,16 @@ pub trait MusicSource: Send + Sync {
     ) -> Result<SearchResult, SearchError> {
         Err(SearchError::Other("该音源不支持排行榜".to_string()))
     }
+}
+
+fn normalize_artist_name(value: &str) -> String {
+    value
+        .split(['、', ',', '&', '/', '|'])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// 搜索错误

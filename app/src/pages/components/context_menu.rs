@@ -26,6 +26,8 @@ pub enum SongMenuAction {
     PlayNext,
     AddToQueue,
     OpenCustomPlaylists,
+    OpenPlaybackControls,
+    Playback(PlaybackMenuAction),
     AddToCustomPlaylist(String),
     NoCustomPlaylists,
     ToggleFavorite,
@@ -35,6 +37,23 @@ pub enum SongMenuAction {
     ClearHistory,
     DeleteLocal,
     RemoveFromCustomPlaylist(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackMenuAction {
+    CycleSpeed,
+    UseDefaultAudioDevice,
+    CycleReplayGainMode,
+    CycleReplayGainPreamp,
+    ToggleReplayGainClip,
+    CycleEqualizer,
+    CycleChannelMode,
+    CycleBalance,
+    FadeIn,
+    FadeOut,
+    SetAbLoopStart,
+    SetAbLoopEnd,
+    ClearAbLoop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +68,20 @@ pub struct SongContextMenuOptions {
     pub sort: Option<(SortTarget, SortMode)>,
     pub custom_playlists: Vec<(String, String)>,
     pub current_custom_playlist: Option<String>,
+    pub playback: Option<PlaybackMenuState>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlaybackMenuState {
+    pub speed: f64,
+    pub audio_device: String,
+    pub replaygain_mode: String,
+    pub replaygain_preamp: f64,
+    pub replaygain_clip: bool,
+    pub equalizer: String,
+    pub channel_mode: String,
+    pub balance: f64,
+    pub ab_loop: String,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +94,7 @@ struct MenuItem {
 enum MenuLevel {
     Root,
     CustomPlaylists,
+    PlaybackControls,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +107,7 @@ pub struct SongContextMenu {
     level: MenuLevel,
     root_items: Vec<MenuItem>,
     custom_playlist_items: Vec<MenuItem>,
+    playback_control_items: Vec<MenuItem>,
 }
 
 impl SongContextMenu {
@@ -89,6 +124,7 @@ impl SongContextMenu {
             sort,
             custom_playlists,
             current_custom_playlist,
+            playback,
         } = options;
         let mut root_items = vec![MenuItem {
             label: "播放".to_string(),
@@ -124,6 +160,12 @@ impl SongContextMenu {
             },
             action: SongMenuAction::ToggleFavorite,
         });
+        if playback.is_some() {
+            root_items.push(MenuItem {
+                label: "播放控制...".to_string(),
+                action: SongMenuAction::OpenPlaybackControls,
+            });
+        }
         if let Some((target, mode)) = sort {
             root_items.push(MenuItem {
                 label: format!("排序：{}（切换）", mode.label(target)),
@@ -165,6 +207,9 @@ impl SongContextMenu {
                 })
                 .collect()
         };
+        let playback_control_items = playback
+            .map(build_playback_control_items)
+            .unwrap_or_default();
 
         Some(Self {
             origin,
@@ -175,6 +220,7 @@ impl SongContextMenu {
             level: MenuLevel::Root,
             root_items,
             custom_playlist_items,
+            playback_control_items,
         })
     }
 
@@ -273,6 +319,7 @@ impl SongContextMenu {
             .title(match self.level {
                 MenuLevel::Root => " 歌曲操作 ",
                 MenuLevel::CustomPlaylists => " 选择自建歌单 ",
+                MenuLevel::PlaybackControls => " 播放控制 ",
             });
         let inner = block.inner(area);
         block.render(area, buf);
@@ -348,6 +395,12 @@ impl SongContextMenu {
                 self.scroll_offset = 0;
                 MenuOutcome::None
             }
+            Some(SongMenuAction::OpenPlaybackControls) => {
+                self.level = MenuLevel::PlaybackControls;
+                self.selected = 0;
+                self.scroll_offset = 0;
+                MenuOutcome::None
+            }
             Some(action) => MenuOutcome::Action(action),
             None => MenuOutcome::Close,
         }
@@ -357,6 +410,7 @@ impl SongContextMenu {
         match self.level {
             MenuLevel::Root => &self.root_items,
             MenuLevel::CustomPlaylists => &self.custom_playlist_items,
+            MenuLevel::PlaybackControls => &self.playback_control_items,
         }
     }
 
@@ -374,7 +428,7 @@ fn menu_area(bounds: Rect, origin: Position, item_count: usize) -> Rect {
     if bounds.width == 0 || bounds.height == 0 {
         return Rect::default();
     }
-    let width = 30.min(bounds.width);
+    let width = 38.min(bounds.width);
     let height = (item_count as u16 + 2).min(bounds.height);
     let max_x = bounds.right().saturating_sub(width);
     let max_y = bounds.bottom().saturating_sub(height);
@@ -384,6 +438,63 @@ fn menu_area(bounds: Rect, origin: Position, item_count: usize) -> Rect {
         width,
         height,
     )
+}
+
+fn build_playback_control_items(state: PlaybackMenuState) -> Vec<MenuItem> {
+    use PlaybackMenuAction as Action;
+
+    vec![
+        playback_item(
+            format!("播放速度: {:.2}x（切换）", state.speed),
+            Action::CycleSpeed,
+        ),
+        playback_item(
+            format!("音频设备: {}（恢复默认）", state.audio_device),
+            Action::UseDefaultAudioDevice,
+        ),
+        playback_item(
+            format!("ReplayGain: {}（切换）", state.replaygain_mode),
+            Action::CycleReplayGainMode,
+        ),
+        playback_item(
+            format!("ReplayGain 预放大: {:+.1} dB", state.replaygain_preamp),
+            Action::CycleReplayGainPreamp,
+        ),
+        playback_item(
+            format!(
+                "ReplayGain 削波保护: {}",
+                if state.replaygain_clip { "开" } else { "关" }
+            ),
+            Action::ToggleReplayGainClip,
+        ),
+        playback_item(
+            format!("均衡器: {}（切换）", state.equalizer),
+            Action::CycleEqualizer,
+        ),
+        playback_item(
+            format!("声道模式: {}（切换）", state.channel_mode),
+            Action::CycleChannelMode,
+        ),
+        playback_item(
+            format!("左右平衡: {:+.2}（切换）", state.balance),
+            Action::CycleBalance,
+        ),
+        playback_item("立即淡入".to_string(), Action::FadeIn),
+        playback_item("立即淡出".to_string(), Action::FadeOut),
+        playback_item("以当前进度设置 A 点".to_string(), Action::SetAbLoopStart),
+        playback_item("以当前进度设置 B 点".to_string(), Action::SetAbLoopEnd),
+        playback_item(
+            format!("清除 A-B 循环: {}", state.ab_loop),
+            Action::ClearAbLoop,
+        ),
+    ]
+}
+
+fn playback_item(label: String, action: PlaybackMenuAction) -> MenuItem {
+    MenuItem {
+        label,
+        action: SongMenuAction::Playback(action),
+    }
 }
 
 fn item_at(
@@ -408,8 +519,8 @@ mod tests {
     use lx_core::model::source::SourceId;
 
     use super::{
-        MenuLevel, MenuOutcome, SongContextMenu, SongContextMenuOptions, SongMenuAction,
-        SongMenuKind, item_at, menu_area,
+        MenuLevel, MenuOutcome, PlaybackMenuAction, PlaybackMenuState, SongContextMenu,
+        SongContextMenuOptions, SongMenuAction, SongMenuKind, item_at, menu_area,
     };
     use crate::pages::sort::{SortMode, SortTarget};
     use ratatui::layout::{Position, Rect};
@@ -542,5 +653,47 @@ mod tests {
 
         assert_eq!(menu.selected, 4);
         assert_eq!(menu.scroll_offset, 2);
+    }
+
+    #[test]
+    fn playback_controls_open_as_a_submenu_and_dispatch_actions() {
+        let song = SongInfo::new(
+            "1".to_string(),
+            SourceId::Kw,
+            "Song".to_string(),
+            "Artist".to_string(),
+        );
+        let mut menu = SongContextMenu::new(
+            Position::new(0, 0),
+            vec![song],
+            0,
+            SongMenuKind::Standard,
+            false,
+            SongContextMenuOptions {
+                playback: Some(PlaybackMenuState {
+                    speed: 1.25,
+                    audio_device: "auto".to_string(),
+                    replaygain_mode: "track".to_string(),
+                    equalizer: "关闭".to_string(),
+                    channel_mode: "stereo".to_string(),
+                    ab_loop: "未设置".to_string(),
+                    ..PlaybackMenuState::default()
+                }),
+                ..SongContextMenuOptions::default()
+            },
+        )
+        .unwrap();
+        menu.selected = menu
+            .root_items
+            .iter()
+            .position(|item| item.action == SongMenuAction::OpenPlaybackControls)
+            .unwrap();
+
+        assert_eq!(menu.activate(), MenuOutcome::None);
+        assert_eq!(menu.level, MenuLevel::PlaybackControls);
+        assert_eq!(
+            menu.activate(),
+            MenuOutcome::Action(SongMenuAction::Playback(PlaybackMenuAction::CycleSpeed))
+        );
     }
 }

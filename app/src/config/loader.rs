@@ -90,6 +90,17 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
         config.version = 6;
         changed = true;
     }
+    if config.version < 7 {
+        // 新增播放器控制项均带有 serde(default)，旧配置只需提升版本即可。
+        config.version = 7;
+        changed = true;
+    }
+    if config.version < 8 {
+        // Fade/EQ/ReplayGain clip fields also have serde defaults; bump the
+        // version after deserialization so the next save records the schema.
+        config.version = 8;
+        changed = true;
+    }
     debug_assert!(config.version <= CURRENT_CONFIG_VERSION);
     changed
 }

@@ -1,12 +1,17 @@
 pub mod metadata;
 pub mod scanner;
 
+pub use metadata::MetadataEdit;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
@@ -20,23 +25,85 @@ pub struct LocalSong {
     pub file_path: PathBuf,
 }
 
+/// 文件元数据读取失败时保留的诊断信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalScanFailure {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// 已入库歌曲对应的文件被删除后保留的诊断信息。
+#[derive(Debug, Clone)]
+pub struct MissingLocalSong {
+    pub path: PathBuf,
+    pub song: SongInfo,
+}
+
+/// 疑似重复歌曲组。
+#[derive(Debug, Clone)]
+pub struct DuplicateLocalSongs {
+    pub key: String,
+    pub songs: Vec<SongInfo>,
+}
+
+/// 最近一次扫描的统计信息。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalScanStats {
+    pub discovered: usize,
+    pub reused: usize,
+    pub parsed: usize,
+    pub failed: usize,
+    pub removed: usize,
+}
+
+struct WatcherHandle {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    wake: mpsc::Sender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for WatcherHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.wake.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 /// 本地音源
 pub struct LocalSource {
     /// 已扫描的歌曲列表（按目录分组）
     songs: RwLock<HashMap<PathBuf, Vec<LocalSong>>>,
+    /// 每个文件的轻量指纹，用于增量扫描和目录监听。
+    fingerprints: RwLock<HashMap<PathBuf, scanner::FileFingerprint>>,
+    /// 最近一次扫描无法解析的文件。
+    failures: RwLock<Vec<LocalScanFailure>>,
+    /// 最近一次扫描发现已消失的歌曲。
+    missing: RwLock<Vec<MissingLocalSong>>,
+    scan_stats: RwLock<LocalScanStats>,
     /// 当前加载的目录列表
     loaded_paths: RwLock<Vec<PathBuf>>,
     scan_generation: AtomicU64,
     scan_in_progress: AtomicU64,
+    watch_generation: AtomicU64,
+    watcher: Mutex<Option<WatcherHandle>>,
 }
 
 impl LocalSource {
     pub fn new() -> Self {
         Self {
             songs: RwLock::new(HashMap::new()),
+            fingerprints: RwLock::new(HashMap::new()),
+            failures: RwLock::new(Vec::new()),
+            missing: RwLock::new(Vec::new()),
+            scan_stats: RwLock::new(LocalScanStats::default()),
             loaded_paths: RwLock::new(Vec::new()),
             scan_generation: AtomicU64::new(0),
             scan_in_progress: AtomicU64::new(0),
+            watch_generation: AtomicU64::new(0),
+            watcher: Mutex::new(None),
         }
     }
 
@@ -67,19 +134,88 @@ impl LocalSource {
             source: self,
             generation,
         };
+        // Clone the previous snapshot before metadata I/O. Unchanged files can then reuse
+        // their parsed tags and embedded-cover path instead of being parsed again.
+        let previous_songs = self.songs.read().unwrap().clone();
+        let previous_fingerprints = self.fingerprints.read().unwrap().clone();
+        let previous_missing = self.missing.read().unwrap().clone();
         let mut all_songs: HashMap<PathBuf, Vec<LocalSong>> = HashMap::new();
+        let mut all_fingerprints = HashMap::new();
+        let mut failures = Vec::new();
+        let mut missing = previous_missing
+            .into_iter()
+            .filter(|item| !item.path.exists())
+            .collect::<Vec<_>>();
         let mut errors = Vec::new();
+        let previous_file_count = previous_fingerprints.len();
+        let mut reused = 0;
+        let mut parsed = 0;
 
         for path_str in paths {
             let path = expand_path(path_str);
             if !path.exists() || !path.is_dir() {
                 errors.push(format!("目录不存在: {}", path_str));
+                let root = path.canonicalize().unwrap_or(path);
+                if let Some(previous_root) = previous_songs.get(&root) {
+                    missing.extend(previous_root.iter().map(|local| MissingLocalSong {
+                        path: local.file_path.clone(),
+                        song: local.song.clone(),
+                    }));
+                }
                 continue;
             }
 
-            let songs = scanner::scan_directory(&path, max_depth);
+            let root = path.canonicalize().unwrap_or(path);
+            let previous = previous_songs
+                .get(&root)
+                .into_iter()
+                .flatten()
+                .map(|local| (local.file_path.clone(), local.clone()))
+                .collect::<HashMap<_, _>>();
+            let previous_root_fingerprints = previous
+                .keys()
+                .filter_map(|file| {
+                    previous_fingerprints
+                        .get(file)
+                        .copied()
+                        .map(|fingerprint| (file.clone(), fingerprint))
+                })
+                .collect::<HashMap<_, _>>();
+            let report = scanner::scan_directory_incremental(
+                &root,
+                max_depth,
+                &previous,
+                &previous_root_fingerprints,
+            );
+            let songs = report.songs;
             let count = songs.len();
-            all_songs.insert(path.canonicalize().unwrap_or(path), songs);
+            let current_root_paths = report
+                .fingerprints
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            reused += report.reused;
+            parsed += report.parsed;
+            all_fingerprints.extend(report.fingerprints);
+            failures.extend(report.failures.into_iter().map(|failure| LocalScanFailure {
+                path: failure.path,
+                error: failure.error,
+            }));
+
+            // Keep a lightweight record for files removed since the previous snapshot. This is
+            // useful for playlists/history, where the path is still meaningful to the user.
+            if let Some(previous_root) = previous_songs.get(&root) {
+                for local in previous_root {
+                    if !current_root_paths.contains(&local.file_path) && !local.file_path.exists() {
+                        missing.push(MissingLocalSong {
+                            path: local.file_path.clone(),
+                            song: local.song.clone(),
+                        });
+                    }
+                }
+            }
+
+            all_songs.insert(root, songs);
             if count > 0 {
                 tracing::info!("扫描本地音乐: {} 首 ({})", count, path_str);
             }
@@ -88,7 +224,22 @@ impl LocalSource {
         if self.scan_generation.load(Ordering::SeqCst) != generation {
             return errors;
         }
+        let present = all_fingerprints
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        *self.scan_stats.write().unwrap() = LocalScanStats {
+            discovered: all_fingerprints.len(),
+            reused,
+            parsed,
+            failed: failures.len(),
+            removed: previous_file_count.saturating_sub(all_fingerprints.len()),
+        };
         *self.songs.write().unwrap() = all_songs;
+        *self.fingerprints.write().unwrap() = all_fingerprints;
+        *self.failures.write().unwrap() = failures;
+        missing.retain(|item| !present.contains(&item.path));
+        *self.missing.write().unwrap() = deduplicate_missing(missing);
         *self.loaded_paths.write().unwrap() = paths.iter().map(|path| expand_path(path)).collect();
 
         if errors.is_empty() {
@@ -115,14 +266,28 @@ impl LocalSource {
 
     /// 从当前扫描结果中移除一个文件，避免异步复扫完成前仍显示已删除歌曲。
     pub fn remove_by_path(&self, path: &Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let mut groups = self.songs.write().unwrap();
         let mut removed = false;
         for songs in groups.values_mut() {
             let previous_len = songs.len();
-            songs.retain(|song| song.file_path != path);
+            songs.retain(|song| song.file_path != path && song.file_path != canonical);
             removed |= songs.len() != previous_len;
         }
         groups.retain(|_, songs| !songs.is_empty());
+        if removed {
+            let mut fingerprints = self.fingerprints.write().unwrap();
+            fingerprints.remove(path);
+            fingerprints.remove(&canonical);
+            self.failures
+                .write()
+                .unwrap()
+                .retain(|failure| failure.path != path && failure.path != canonical);
+            self.missing
+                .write()
+                .unwrap()
+                .retain(|missing| missing.path != path && missing.path != canonical);
+        }
         removed
     }
 
@@ -136,10 +301,202 @@ impl LocalSource {
         None
     }
 
+    /// 使用 lofty 将标签/封面写回文件，并立即刷新内存中的歌曲元数据。
+    pub fn edit_metadata(&self, path: &Path, edit: &MetadataEdit) -> Result<SongInfo, String> {
+        metadata::write_metadata(path, edit)?;
+        let mut song = metadata::read_metadata(path)?;
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        song.file_path = Some(canonical.clone());
+        let mut groups = self.songs.write().unwrap();
+        for songs in groups.values_mut() {
+            if let Some(local) = songs.iter_mut().find(|local| local.file_path == canonical) {
+                local.song = song.clone();
+            }
+        }
+        Ok(song)
+    }
+
     /// 获取已加载的目录
     pub fn loaded_paths(&self) -> Vec<PathBuf> {
         self.loaded_paths.read().unwrap().clone()
     }
+
+    /// 增量刷新当前已加载目录，不改变目录配置。
+    pub fn refresh(&self, max_depth: u32) -> Vec<String> {
+        let paths = self
+            .loaded_paths()
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        self.scan(&paths, max_depth)
+    }
+
+    /// 最近一次扫描中无法解析的文件。
+    pub fn scan_failures(&self) -> Vec<LocalScanFailure> {
+        self.failures.read().unwrap().clone()
+    }
+
+    /// 最近一次扫描统计。
+    pub fn scan_stats(&self) -> LocalScanStats {
+        *self.scan_stats.read().unwrap()
+    }
+
+    /// 与 `scan_failures` 等价的便捷别名，便于页面按“损坏文件”语义读取。
+    pub fn corrupt_files(&self) -> Vec<LocalScanFailure> {
+        self.scan_failures()
+    }
+
+    /// 最近一次扫描中从文件系统消失的歌曲。
+    pub fn missing_songs(&self) -> Vec<MissingLocalSong> {
+        self.missing.read().unwrap().clone()
+    }
+
+    /// 与 `missing_songs` 等价的便捷别名。
+    pub fn missing_files(&self) -> Vec<MissingLocalSong> {
+        self.missing_songs()
+    }
+
+    /// 返回疑似重复歌曲。重复判定基于规范化的标题、歌手、专辑和时长，
+    /// 不需要读取整个音频文件，适合在界面中即时展示。
+    pub fn duplicate_groups(&self) -> Vec<DuplicateLocalSongs> {
+        let mut groups: HashMap<String, Vec<SongInfo>> = HashMap::new();
+        for song in self.all_songs() {
+            groups.entry(duplicate_key(&song)).or_default().push(song);
+        }
+        let mut duplicates = groups
+            .into_iter()
+            .filter(|(_, songs)| songs.len() > 1)
+            .map(|(key, mut songs)| {
+                songs.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+                DuplicateLocalSongs { key, songs }
+            })
+            .collect::<Vec<_>>();
+        duplicates.sort_by(|a, b| a.key.cmp(&b.key));
+        duplicates
+    }
+
+    /// 与 `duplicate_groups` 等价的便捷别名。
+    pub fn duplicates(&self) -> Vec<DuplicateLocalSongs> {
+        self.duplicate_groups()
+    }
+
+    /// 最近一次监听器更新的序号。序号变化时，调用者应重新读取 `all_songs()`。
+    pub fn watch_generation(&self) -> u64 {
+        self.watch_generation.load(Ordering::Acquire)
+    }
+
+    /// 启动跨平台文件系统监听器。
+    ///
+    /// `notify` 负责接收原生创建/删除/修改事件，收到一批事件后再调用增量扫描；
+    /// 未变化的文件仍由指纹缓存复用。重复调用会停止旧监听器。
+    pub fn start_watcher(
+        self: &Arc<Self>,
+        paths: Vec<String>,
+        max_depth: u32,
+        interval: Duration,
+    ) -> Result<(), String> {
+        self.stop_watcher();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut fs_watcher = recommended_watcher(move |event| {
+            let _ = event_tx.send(event);
+        })
+        .map_err(|error| format!("创建文件监听器失败: {error}"))?;
+        for path in &paths {
+            let path = expand_path(path);
+            if path.is_dir() {
+                fs_watcher
+                    .watch(&path, RecursiveMode::Recursive)
+                    .map_err(|error| format!("监听目录 {} 失败: {error}", path.display()))?;
+            }
+        }
+        let weak = Arc::downgrade(self);
+        let interval = interval.max(Duration::from_millis(250));
+        let initial_paths = paths.clone();
+        let join = thread::spawn(move || {
+            // Make the watcher useful when a caller starts it before the first explicit scan.
+            // Existing entries are reused through the same fingerprint cache.
+            if let Some(source) = weak.upgrade() {
+                let generation = source.begin_scan();
+                let _ = source.scan_for_generation(&initial_paths, max_depth, generation);
+            }
+            while !stop_thread.load(Ordering::Acquire) {
+                if wake_rx.try_recv().is_ok() {
+                    break;
+                }
+                match event_rx.recv_timeout(interval) {
+                    Ok(Ok(_event)) => {
+                        // Coalesce editor save bursts into one scan.
+                        while event_rx.try_recv().is_ok() {}
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!("本地文件监听失败: {error}");
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if stop_thread.load(Ordering::Acquire) {
+                    break;
+                }
+                let Some(source) = weak.upgrade() else {
+                    break;
+                };
+                let generation = source.begin_scan();
+                let _ = source.scan_for_generation(&paths, max_depth, generation);
+                source.watch_generation.fetch_add(1, Ordering::AcqRel);
+            }
+            drop(fs_watcher);
+            let _ = wake_rx;
+        });
+        *self.watcher.lock().unwrap() = Some(WatcherHandle {
+            stop,
+            wake: wake_tx,
+            join: Some(join),
+        });
+        Ok(())
+    }
+
+    /// 停止目录监听器。
+    pub fn stop_watcher(&self) {
+        self.watcher.lock().unwrap().take();
+    }
+}
+
+impl Drop for LocalSource {
+    fn drop(&mut self) {
+        // WatcherHandle 的 Drop 会停止并 join 线程。
+        let _ = self.watcher.get_mut().ok().and_then(Option::take);
+    }
+}
+
+fn deduplicate_missing(mut missing: Vec<MissingLocalSong>) -> Vec<MissingLocalSong> {
+    let mut seen = std::collections::HashSet::new();
+    missing.retain(|item| seen.insert(item.path.clone()));
+    missing.sort_by(|a, b| a.path.cmp(&b.path));
+    missing
+}
+
+fn duplicate_key(song: &SongInfo) -> String {
+    let normalize = |value: &str| {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        normalize(&song.name),
+        normalize(&song.singer),
+        normalize(&song.album_name),
+        song.duration.as_millis()
+    )
 }
 
 struct ScanCompletion<'a> {
@@ -205,6 +562,23 @@ impl MusicSource for LocalSource {
         song: &SongInfo,
         _quality: Quality,
     ) -> Result<SongUrl, FetchError> {
+        if let Some(url) = song.extra.get("import_url")
+            && (url.starts_with("http://") || url.starts_with("https://"))
+        {
+            return Ok(SongUrl {
+                url: url.clone(),
+                quality: song
+                    .qualities
+                    .iter()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(Quality::High320),
+                duration: song.duration,
+                cover_url: song.cover_url.clone(),
+                qualities: song.qualities.iter().copied().collect(),
+                headers: vec![],
+            });
+        }
         let path = match song.file_path.as_ref() {
             Some(p) => p.clone(),
             None => {
@@ -294,7 +668,7 @@ mod tests {
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
-    use super::{LocalSong, LocalSource};
+    use super::{LocalSong, LocalSource, MissingLocalSong};
 
     #[test]
     fn stale_scan_cannot_replace_newer_paths() {
@@ -345,5 +719,61 @@ mod tests {
         assert!(source.all_songs().is_empty());
         assert!(source.songs.read().unwrap().is_empty());
         assert!(!source.remove_by_path(&path));
+    }
+
+    #[test]
+    fn duplicate_groups_use_normalized_metadata() {
+        let source = LocalSource::new();
+        let mut first = SongInfo::new(
+            "/music/one.flac".to_string(),
+            SourceId::Local,
+            "  Song  ".to_string(),
+            "Artist".to_string(),
+        );
+        first.album_name = "Album".to_string();
+        first.duration = std::time::Duration::from_secs(180);
+        first.file_path = Some(PathBuf::from("/music/one.flac"));
+        let mut second = first.clone();
+        second.id = "/music/two.flac".to_string();
+        second.file_path = Some(PathBuf::from("/music/two.flac"));
+        source.songs.write().unwrap().insert(
+            PathBuf::from("/music"),
+            vec![
+                LocalSong {
+                    song: first,
+                    file_path: PathBuf::from("/music/one.flac"),
+                },
+                LocalSong {
+                    song: second,
+                    file_path: PathBuf::from("/music/two.flac"),
+                },
+            ],
+        );
+
+        let groups = source.duplicate_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].songs.len(), 2);
+    }
+
+    #[test]
+    fn missing_entries_are_deduplicated() {
+        let source = LocalSource::new();
+        let path = PathBuf::from("/music/gone.flac");
+        let song = SongInfo::new(
+            path.to_string_lossy().into_owned(),
+            SourceId::Local,
+            "gone".to_string(),
+            "artist".to_string(),
+        );
+        *source.missing.write().unwrap() = vec![
+            MissingLocalSong {
+                path: path.clone(),
+                song: song.clone(),
+            },
+            MissingLocalSong { path, song },
+        ];
+        // A refresh with no configured paths still keeps the diagnostic until the path returns.
+        source.scan(&[], 0);
+        assert_eq!(source.missing_files().len(), 1);
     }
 }

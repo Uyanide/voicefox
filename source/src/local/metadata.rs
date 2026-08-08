@@ -1,9 +1,12 @@
 //! 音频元数据读取（使用 lofty）
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
+use lofty::picture::Picture;
 use lofty::tag::{Accessor, ItemKey, Tag};
 
 use lx_core::model::song::SongInfo;
@@ -11,6 +14,53 @@ use lx_core::model::source::{AudioProperties, Quality};
 
 static COVER_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 const COVER_TEMP_INFIX: &str = ".part.";
+
+/// 可写入音频文件的标签字段。
+///
+/// `None` 表示保留原值；设置为 `Some` 时会更新对应字段。封面数据必须是
+/// `lofty` 支持的 JPEG/PNG 等格式。
+#[derive(Debug, Clone, Default)]
+pub struct MetadataEdit {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub cover: Option<Vec<u8>>,
+}
+
+/// 将标签和可选封面写回本地音频文件。
+pub fn write_metadata(path: &Path, edit: &MetadataEdit) -> Result<(), String> {
+    let mut tagged =
+        lofty::read_from_path(path).map_err(|error| format!("读取标签失败: {error}"))?;
+
+    if tagged.primary_tag_mut().is_none() {
+        let tag_type = tagged.primary_tag_type();
+        if !tagged.supports_tag_type(tag_type) {
+            return Err(format!("{} 不支持写入标签", path.display()));
+        }
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged
+        .primary_tag_mut()
+        .ok_or_else(|| format!("{} 没有可写入的标签", path.display()))?;
+    if let Some(title) = edit.title.as_ref() {
+        tag.set_title(title.clone());
+    }
+    if let Some(artist) = edit.artist.as_ref() {
+        tag.set_artist(artist.clone());
+    }
+    if let Some(album) = edit.album.as_ref() {
+        tag.set_album(album.clone());
+    }
+    if let Some(cover) = edit.cover.as_ref() {
+        let picture = Picture::from_reader(&mut Cursor::new(cover))
+            .map_err(|error| format!("封面格式无效: {error}"))?;
+        tag.set_picture(0, picture);
+    }
+
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|error| format!("写入标签失败: {error}"))
+}
 
 /// 读取音频文件的元数据
 pub fn read_metadata(path: &Path) -> Result<SongInfo, String> {
@@ -159,8 +209,11 @@ fn extract_cover(tagged: &lofty::file::TaggedFile, audio_path: &Path) -> Option<
         let _ = std::fs::create_dir_all(&cache_dir);
     }
 
-    // 用文件路径的 hash 作为缓存文件名
-    let hash = simple_hash(audio_path.to_string_lossy().as_bytes());
+    // 路径相同的文件可能被重新嵌入了封面。将图片内容纳入缓存键，避免标签编辑后
+    // 继续显示旧封面；未变化的文件仍会命中缓存。
+    let mut cache_key = audio_path.to_string_lossy().as_bytes().to_vec();
+    cache_key.extend_from_slice(picture.data());
+    let hash = simple_hash(&cache_key);
     let cover_path = cache_dir.join(format!("{}.jpg", hash));
 
     if cover_path.exists() {

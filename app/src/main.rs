@@ -33,7 +33,7 @@ use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::leaderboard::LeaderboardInfo;
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
-use lx_core::model::source::{Quality, SourceId};
+use lx_core::model::source::{PlayerState, Quality, SourceId};
 use lx_core::traits::player::PlayerEvent;
 use lx_core::traits::source::SongUrl;
 use ratatui::DefaultTerminal;
@@ -44,7 +44,8 @@ use tokio::sync::mpsc;
 use context::AppContext;
 use pages::components;
 use pages::components::context_menu::{
-    MenuOutcome, SongContextMenu, SongContextMenuOptions, SongMenuAction, SongMenuKind,
+    MenuOutcome, PlaybackMenuAction, PlaybackMenuState, SongContextMenu, SongContextMenuOptions,
+    SongMenuAction, SongMenuKind,
 };
 use pages::sidebar::NavTab;
 use pages::sort::{SortMode, SortState, SortTarget};
@@ -106,6 +107,13 @@ enum DeleteConfirmationAction {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalDiagnosticsKind {
+    Corrupt,
+    Missing,
+    Duplicates,
+}
+
 impl ClickTracker {
     fn is_double_click(&mut self, event: MouseEvent) -> bool {
         if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -145,6 +153,37 @@ fn nav_page_scope(tab: NavTab) -> &'static str {
         NavTab::LocalMusic => "local",
         NavTab::Settings => "settings",
     }
+}
+
+fn playback_menu_state(ctx: &AppContext) -> PlaybackMenuState {
+    let config = ctx.config.read().unwrap();
+    let ab_loop = ctx
+        .player
+        .ab_loop()
+        .map(|points| {
+            format!(
+                "{} - {}",
+                format_clock(points.start),
+                format_clock(points.end)
+            )
+        })
+        .unwrap_or_else(|| "未设置".to_string());
+    PlaybackMenuState {
+        speed: config.player.playback_speed,
+        audio_device: config.player.audio_device.clone(),
+        replaygain_mode: config.player.replaygain_mode.clone(),
+        replaygain_preamp: config.player.replaygain_preamp,
+        replaygain_clip: config.player.replaygain_clip,
+        equalizer: context::equalizer_label(&config.player.equalizer_bands).to_string(),
+        channel_mode: config.player.channel_mode.clone(),
+        balance: config.player.balance,
+        ab_loop,
+    }
+}
+
+fn format_clock(value: Duration) -> String {
+    let total = value.as_secs();
+    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 fn should_go_to_main(
@@ -191,6 +230,7 @@ fn execute_song_menu_action(
             song: Box::new(menu.song().clone()),
             position: InsertPosition::End,
         },
+        SongMenuAction::OpenPlaybackControls => AppAction::None,
         SongMenuAction::OpenCustomPlaylists => {
             ctx.notify(Notification::info("请选择一个自建歌单"));
             AppAction::None
@@ -221,6 +261,25 @@ fn execute_song_menu_action(
                 "已添加收藏"
             };
             ctx.notify(Notification::success(message));
+            AppAction::None
+        }
+        SongMenuAction::Playback(control) => {
+            let message = match control {
+                PlaybackMenuAction::CycleSpeed => ctx.cycle_playback_speed(),
+                PlaybackMenuAction::UseDefaultAudioDevice => ctx.set_audio_output_device("auto"),
+                PlaybackMenuAction::CycleReplayGainMode => ctx.cycle_replaygain_mode(),
+                PlaybackMenuAction::CycleReplayGainPreamp => ctx.cycle_replaygain_preamp(),
+                PlaybackMenuAction::ToggleReplayGainClip => ctx.toggle_replaygain_clip(),
+                PlaybackMenuAction::CycleEqualizer => ctx.cycle_equalizer_preset(),
+                PlaybackMenuAction::CycleChannelMode => ctx.cycle_channel_mode(),
+                PlaybackMenuAction::CycleBalance => ctx.cycle_balance(),
+                PlaybackMenuAction::FadeIn => ctx.fade_in_now(),
+                PlaybackMenuAction::FadeOut => ctx.fade_out_now(),
+                PlaybackMenuAction::SetAbLoopStart => ctx.set_ab_loop_start_now(),
+                PlaybackMenuAction::SetAbLoopEnd => ctx.set_ab_loop_end_now(),
+                PlaybackMenuAction::ClearAbLoop => ctx.clear_ab_loop(),
+            };
+            ctx.notify(Notification::info(message));
             AppAction::None
         }
         SongMenuAction::CycleSort(target) => {
@@ -300,6 +359,33 @@ fn main() -> anyhow::Result<()> {
             .context("libmpv 运行时自检失败，请确认程序与动态库来自同一个发布包")?;
         drop(player);
         println!("libmpv runtime check passed");
+        return Ok(());
+    }
+
+    if let Some(path) = cli.export_data.as_deref() {
+        storage::Storage::new()
+            .export_data(path)
+            .map_err(anyhow::Error::msg)?;
+        println!("数据已导出到 {}", path.display());
+        return Ok(());
+    }
+
+    if let Some(path) = cli.import_data.as_deref() {
+        let backup = storage::Storage::new()
+            .import_data(path)
+            .map_err(anyhow::Error::msg)?;
+        println!("数据导入完成；原数据已备份到 {}", backup.display());
+        return Ok(());
+    }
+
+    if let Some(path) = cli.import_playlist.as_deref() {
+        let report = storage::Storage::new()
+            .import_external_playlist(path)
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "歌单导入完成: {}（导入 {} 首，跳过 {} 首）",
+            report.playlist_name, report.imported, report.skipped
+        );
         return Ok(());
     }
 
@@ -483,6 +569,7 @@ fn run_app(
     let mut local_filter = components::list_filter::ListFilter::new();
     let mut history_filter = components::list_filter::ListFilter::new();
     let mut confirm_delete: Option<LocalDeleteConfirmation> = None;
+    let mut local_diagnostics: Option<LocalDiagnosticsKind> = None;
     let mut song_menu: Option<SongContextMenu> = None;
     let mut ui_areas = UiAreas::default();
     let mut click_tracker = ClickTracker::default();
@@ -500,6 +587,8 @@ fn run_app(
     let mut last_periodic_render = Instant::now();
     let mut last_notification_cleanup = Instant::now();
     let mut last_playback_session_save = Instant::now();
+    let mut last_local_watch_generation = ctx.source_manager.local_source().watch_generation();
+    let mut faded_generation = 0_u64;
     let mut mouse_capture_enabled = ctx.config.read().unwrap().ui.enable_mouse;
     // 安装 tmux 的 client-attached hook，析构时自动卸载
     let attach_watcher = tmux::AttachWatcher::install();
@@ -1029,11 +1118,44 @@ fn run_app(
             last_playback_session_save = Instant::now();
         }
 
+        // 本地目录监听器在后台完成增量扫描后递增代次；让 TUI 及时显示新增、删除
+        // 或标签修改，而不必等用户手动切换页面。
+        let local_watch_generation = ctx.source_manager.local_source().watch_generation();
+        if local_watch_generation != last_local_watch_generation {
+            last_local_watch_generation = local_watch_generation;
+            needs_render = true;
+        }
+
         // borrow 很便宜，所以不受 render_interval 门控
         let state = *ctx.player_state.borrow();
         if state != last_player_state {
             last_player_state = state;
             needs_render = true;
+        }
+        // Start the configured fade-out near the end of a track.  The engine
+        // keeps the logical volume unchanged, so the next track can fade back
+        // in without losing the user's volume preference.
+        let active_generation = ctx.active_player_generation.load(Ordering::Acquire);
+        let (fade_out_ms, position, duration) = {
+            let config = ctx.config.read().unwrap();
+            (
+                config.player.fade_out_ms,
+                *ctx.position.borrow(),
+                *ctx.duration.borrow(),
+            )
+        };
+        if active_generation != faded_generation {
+            faded_generation = 0;
+        }
+        if state == PlayerState::Playing
+            && fade_out_ms > 0
+            && !duration.is_zero()
+            && position < duration
+            && position >= duration.saturating_sub(Duration::from_millis(fade_out_ms))
+            && faded_generation != active_generation
+        {
+            ctx.player.fade_out(Duration::from_millis(fade_out_ms));
+            faded_generation = active_generation;
         }
         #[cfg(target_os = "linux")]
         if let Some(handle) = mpris_handle.as_ref() {
@@ -1093,6 +1215,7 @@ fn run_app(
                 &local_filter,
                 &mut ui_areas,
                 &confirm_delete,
+                &local_diagnostics,
                 &song_menu,
                 &bili_login_page,
             )?;
@@ -1245,7 +1368,20 @@ fn run_app(
                 continue;
             }
 
-            if !text_input_active && let Some(tab) = pages::sidebar::handle_input(&key) {
+            // Settings owns its option keys (including numeric playback
+            // controls); resolve that ownership before the global sidebar
+            // shortcuts so `1`-`6` do not unexpectedly switch tabs.
+            let settings_owns_key = active_tab == NavTab::Settings
+                && !text_input_active
+                && settings_page
+                    .lock()
+                    .unwrap()
+                    .consumes_key(&key, &kb_resolver);
+
+            if !text_input_active
+                && !settings_owns_key
+                && let Some(tab) = pages::sidebar::handle_input(&key)
+            {
                 active_tab = tab;
                 needs_render = true;
                 continue;
@@ -1253,12 +1389,6 @@ fn run_app(
 
             // 1b. 全局快捷键（查表模式，保留完全相同的默认行为）
             // 设置页的选项键覆盖了大半个字母表，与全局键位必然冲突，交由页面独占
-            let settings_owns_key = active_tab == NavTab::Settings
-                && !text_input_active
-                && settings_page
-                    .lock()
-                    .unwrap()
-                    .consumes_key(&key, &kb_resolver);
             if !settings_owns_key && let Some(action) = kb_resolver.resolve_global(&key) {
                 match action {
                     Action::GlobalQuit if !text_input_active => {
@@ -1645,6 +1775,27 @@ fn run_app(
                     }
                 }
                 NavTab::LocalMusic => {
+                    if let Some(kind) = local_diagnostics {
+                        match (key.modifiers, key.code) {
+                            (KeyModifiers::NONE, KeyCode::Esc) => {
+                                local_diagnostics = None;
+                            }
+                            (KeyModifiers::NONE, KeyCode::Char('i' | 'I')) => {
+                                local_diagnostics = Some(match kind {
+                                    LocalDiagnosticsKind::Corrupt => LocalDiagnosticsKind::Missing,
+                                    LocalDiagnosticsKind::Missing => {
+                                        LocalDiagnosticsKind::Duplicates
+                                    }
+                                    LocalDiagnosticsKind::Duplicates => {
+                                        LocalDiagnosticsKind::Corrupt
+                                    }
+                                });
+                            }
+                            _ => {}
+                        }
+                        needs_render = true;
+                        continue;
+                    }
                     // 1. 过滤输入模式优先消耗按键
                     if local_filter.handle_input(&key) {
                         if !local_filter.is_active() {
@@ -1789,6 +1940,17 @@ fn run_app(
                         }
                     } else {
                         match (key.modifiers, key.code) {
+                            (KeyModifiers::NONE, KeyCode::Char('i' | 'I')) => {
+                                let source = ctx.source_manager.local_source();
+                                local_diagnostics = Some(if !source.corrupt_files().is_empty() {
+                                    LocalDiagnosticsKind::Corrupt
+                                } else if !source.missing_files().is_empty() {
+                                    LocalDiagnosticsKind::Missing
+                                } else {
+                                    LocalDiagnosticsKind::Duplicates
+                                });
+                                needs_render = true;
+                            }
                             (KeyModifiers::NONE, KeyCode::Char('s')) => {
                                 let mode = local_state.cycle();
                                 ctx.notify(Notification::info(format!(
@@ -2061,6 +2223,7 @@ fn run_app(
                                 sort,
                                 custom_playlists,
                                 current_custom_playlist,
+                                playback: Some(playback_menu_state(&ctx)),
                             },
                         );
                         needs_render = true;
@@ -2162,6 +2325,7 @@ fn run_app(
                 &local_filter,
                 &mut ui_areas,
                 &confirm_delete,
+                &local_diagnostics,
                 &song_menu,
                 &bili_login_page,
             )?;
@@ -2187,6 +2351,7 @@ fn draw_app(
     local_filter: &components::list_filter::ListFilter,
     ui_areas: &mut UiAreas,
     confirm_delete: &Option<LocalDeleteConfirmation>,
+    local_diagnostics: &Option<LocalDiagnosticsKind>,
     song_menu: &Option<SongContextMenu>,
     bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
 ) -> anyhow::Result<()> {
@@ -2261,6 +2426,8 @@ fn draw_app(
                     let paths = ctx.config.read().unwrap().local_music.paths.clone();
                     let all_songs = pages::local_music::sorted_local_songs(ctx, local_state);
                     let is_scanning = local_src.is_scanning();
+                    let scan_stats = local_src.scan_stats();
+                    let missing_count = local_src.missing_files().len();
 
                     let songs: Vec<_> = if local_filter.query().is_empty() {
                         all_songs
@@ -2283,22 +2450,29 @@ fn draw_app(
                         format!(" · 过滤 '{}' ({} 匹配)", local_filter.query(), songs.len())
                     };
 
+                    let diagnostics = if scan_stats.failed > 0 || missing_count > 0 {
+                        format!(" · 损坏 {} · 缺失 {}", scan_stats.failed, missing_count)
+                    } else {
+                        String::new()
+                    };
                     let block = Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::new().fg(crate::theme::muted(ctx)))
                         .title(if is_scanning {
                             format!(
-                                "本地音乐 ({} 首，扫描中) · 排序 {} · s 切换{}",
+                                "本地音乐 ({} 首，扫描中) · 排序 {} · s 切换{}{}",
                                 songs.len(),
                                 local_state.mode.label(SortTarget::Local),
-                                filter_suffix
+                                filter_suffix,
+                                diagnostics
                             )
                         } else {
                             format!(
-                                "本地音乐 ({} 首) · 排序 {} · s 切换{}",
+                                "本地音乐 ({} 首) · 排序 {} · s 切换{}{}",
                                 songs.len(),
                                 local_state.mode.label(SortTarget::Local),
-                                filter_suffix
+                                filter_suffix,
+                                diagnostics
                             )
                         });
                     let inner = block.inner(content_area);
@@ -2427,6 +2601,10 @@ fn draw_app(
             }
         }
 
+        if let Some(kind) = local_diagnostics {
+            render_local_diagnostics(content_area, frame.buffer_mut(), ctx, *kind);
+        }
+
         if let Some(page) = bili_login_page {
             use ratatui::widgets::{Clear, Widget};
 
@@ -2458,6 +2636,93 @@ fn draw_app(
         }
     })?;
     Ok(())
+}
+
+fn render_local_diagnostics(
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    ctx: &AppContext,
+    kind: LocalDiagnosticsKind,
+) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+
+    let source = ctx.source_manager.local_source();
+    let mut lines = Vec::new();
+    let title = match kind {
+        LocalDiagnosticsKind::Corrupt => "损坏文件",
+        LocalDiagnosticsKind::Missing => "缺失文件",
+        LocalDiagnosticsKind::Duplicates => "重复歌曲",
+    };
+    match kind {
+        LocalDiagnosticsKind::Corrupt => {
+            for failure in source.corrupt_files() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        failure.path.display().to_string(),
+                        Style::new().fg(crate::theme::text(ctx)),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(failure.error, Style::new().fg(crate::theme::muted(ctx))),
+                ]));
+            }
+        }
+        LocalDiagnosticsKind::Missing => {
+            for missing in source.missing_files() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        missing.path.display().to_string(),
+                        Style::new().fg(crate::theme::text(ctx)),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(missing.song.name, Style::new().fg(crate::theme::muted(ctx))),
+                ]));
+            }
+        }
+        LocalDiagnosticsKind::Duplicates => {
+            for group in source.duplicate_groups() {
+                let names = group
+                    .songs
+                    .iter()
+                    .map(|song| {
+                        song.file_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| song.id.clone())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  <->  ");
+                lines.push(Line::from(Span::styled(
+                    names,
+                    Style::new().fg(crate::theme::text(ctx)),
+                )));
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "没有诊断项",
+            Style::new().fg(crate::theme::muted(ctx)),
+        )));
+    }
+    let width = area.width.saturating_sub(4).min(110);
+    let height = area.height.saturating_sub(4).max(5);
+    let overlay = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    Clear.render(overlay, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(crate::theme::rosewater(ctx)))
+        .title(format!("本地库诊断 · {title} · i 切换，Esc 关闭"));
+    let inner = block.inner(overlay);
+    block.render(overlay, buf);
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
 }
 
 fn calculate_bili_login_area(area: Rect) -> Rect {
@@ -2858,10 +3123,12 @@ fn execute_action(
             let generation = next_generation(&ctx.local_scan_request_id);
             let request_seq = Arc::clone(&ctx.local_scan_request_id);
             let local_source = ctx.source_manager.local_source();
+            let watcher_source = Arc::clone(&local_source);
             let source_generation = local_source.begin_scan();
             let settings = Arc::clone(settings_page);
             let tx = action_tx.clone();
             rt.spawn(async move {
+                let watcher_paths = paths.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let errors =
                         local_source.scan_for_generation(&paths, max_depth, source_generation);
@@ -2871,6 +3138,13 @@ fn execute_action(
                 .await;
                 if request_seq.load(Ordering::SeqCst) != generation {
                     return;
+                }
+                if let Err(error) = watcher_source.start_watcher(
+                    watcher_paths,
+                    max_depth,
+                    std::time::Duration::from_secs(2),
+                ) {
+                    tracing::warn!("启动本地音乐监听失败: {error}");
                 }
                 let (errors, count) = match result {
                     Ok(result) => result,
@@ -3043,9 +3317,13 @@ fn start_song_playback(
     let play_request_id = Arc::clone(&ctx.play_request_id);
     let attempted_sources = Arc::clone(&ctx.play_attempted_sources);
     let js_source_index = Arc::clone(&ctx.play_js_source_index);
-    let (quality, auto_toggle) = {
+    let (quality, auto_toggle, fade_in_ms) = {
         let config = ctx.config.read().unwrap();
-        (config.player.quality, config.source.auto_toggle)
+        (
+            config.player.quality,
+            config.source.auto_toggle,
+            config.player.fade_in_ms,
+        )
     };
     let tx = action_tx.clone();
 
@@ -3057,10 +3335,12 @@ fn start_song_playback(
                 song,
                 quality,
                 auto_toggle,
-                Arc::clone(&play_request_id),
-                Arc::clone(&attempted_sources),
-                Arc::clone(&js_source_index),
-                request_id,
+                PlaybackResolveRequest {
+                    play_request_id: Arc::clone(&play_request_id),
+                    attempted_sources: Arc::clone(&attempted_sources),
+                    js_source_index: Arc::clone(&js_source_index),
+                    request_id,
+                },
             ),
         )
         .await;
@@ -3105,11 +3385,21 @@ fn start_song_playback(
         if !accepted || play_request_id.load(Ordering::SeqCst) != request_id {
             return;
         }
+        let cue_start = resolved_song
+            .extra
+            .get("cue_start_ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis);
         if let Some((position, paused)) = restored_state {
             player.seek(position);
             if paused {
                 player.pause();
             }
+        } else if let Some(position) = cue_start {
+            player.seek(position);
+        }
+        if fade_in_ms > 0 && restored_state.is_none_or(|(_, paused)| !paused) {
+            player.fade_in(Duration::from_millis(fade_in_ms));
         }
 
         // 自动换源可能匹配到另一个版本，歌词必须跟随最终交给 libmpv 的歌曲。
@@ -3205,16 +3495,26 @@ fn mark_bili_parts_checked(song: &mut SongInfo) {
         .insert("bili_parts_checked".to_string(), "true".to_string());
 }
 
+struct PlaybackResolveRequest {
+    play_request_id: Arc<AtomicU64>,
+    attempted_sources: Arc<std::sync::Mutex<std::collections::HashSet<SourceId>>>,
+    js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
+    request_id: u64,
+}
+
 async fn resolve_playable_song(
     source_manager: Arc<lx_source::manager::SourceManager>,
     song: SongInfo,
     quality: Quality,
     auto_toggle: bool,
-    play_request_id: Arc<AtomicU64>,
-    attempted_sources: Arc<std::sync::Mutex<std::collections::HashSet<SourceId>>>,
-    js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
-    request_id: u64,
+    request: PlaybackResolveRequest,
 ) -> Result<Option<(SongInfo, SongUrl)>, String> {
+    let PlaybackResolveRequest {
+        play_request_id,
+        attempted_sources,
+        js_source_index,
+        request_id,
+    } = request;
     let next_js_source_index = js_source_index
         .lock()
         .unwrap()

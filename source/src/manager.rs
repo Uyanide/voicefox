@@ -8,6 +8,7 @@ use std::sync::Arc;
 use lx_core::model::leaderboard::LeaderboardInfo;
 use lx_core::model::lyric::LyricData;
 use lx_core::model::playlist::Playlist;
+use lx_core::model::playlist::{Album, Artist};
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::{Quality, SourceId};
 use lx_core::traits::source::{FetchError, MusicSource, SearchError, SearchResult, SongUrl};
@@ -421,6 +422,39 @@ impl SourceManager {
     ) -> Result<Vec<SongInfo>, FetchError> {
         self.online_source_fetch(source)?
             .get_playlist_detail(playlist_id, page)
+            .await
+    }
+
+    pub async fn artist_songs(
+        &self,
+        artist: &Artist,
+        page: u32,
+        limit: u32,
+    ) -> Result<SearchResult, SearchError> {
+        self.online_source(artist.source)?
+            .get_artist_songs(artist, page, limit)
+            .await
+    }
+
+    pub async fn artist_albums(
+        &self,
+        artist: &Artist,
+        page: u32,
+        limit: u32,
+    ) -> Result<Vec<Album>, SearchError> {
+        self.online_source(artist.source)?
+            .get_artist_albums(artist, page, limit)
+            .await
+    }
+
+    pub async fn album_songs(
+        &self,
+        album: &Album,
+        page: u32,
+        limit: u32,
+    ) -> Result<SearchResult, SearchError> {
+        self.online_source(album.source)?
+            .get_album_songs(album, page, limit)
             .await
     }
 

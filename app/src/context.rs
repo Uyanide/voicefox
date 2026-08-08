@@ -10,7 +10,7 @@ use lx_core::events::Notification;
 use lx_core::model::config::Config;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::PlayerState;
-use lx_core::traits::player::Player;
+use lx_core::traits::player::{AbLoop, ChannelMode, EqualizerBand, Player, ReplayGainMode};
 
 use crate::cover::CoverService;
 use crate::notification::DesktopNotifier;
@@ -42,6 +42,8 @@ pub struct AppContext {
     pub current_song: Arc<std::sync::RwLock<Option<SongInfo>>>,
     pub play_request_id: Arc<AtomicU64>,
     pub active_player_generation: Arc<AtomicU64>,
+    /// A-B 循环尚未配对的 A 点，供快捷键和右键菜单共享。
+    pub pending_ab_loop_start: std::sync::Mutex<Option<Duration>>,
     pub play_attempted_sources: Arc<std::sync::Mutex<HashSet<lx_core::model::source::SourceId>>>,
     pub play_js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
     pub local_scan_request_id: Arc<AtomicU64>,
@@ -69,6 +71,14 @@ impl AppContext {
         lx_source::configure_network(&config.network.proxy_url, config.network.timeout);
         let player: Arc<dyn Player> = Arc::new(lx_player::engine::MpvEngine::new()?);
         player.set_volume(config.player.volume);
+        player.set_playback_speed(config.player.playback_speed);
+        player.set_audio_output_device(&config.player.audio_device);
+        player.set_replaygain_mode(parse_replaygain_mode(&config.player.replaygain_mode));
+        player.set_replaygain_preamp(config.player.replaygain_preamp);
+        player.set_replaygain_clip(config.player.replaygain_clip);
+        player.set_channel_mode(parse_channel_mode(&config.player.channel_mode));
+        player.set_balance(config.player.balance);
+        player.set_equalizer_bands(&config.player.equalizer_bands);
 
         // 创建音源管理器（JS 音源在 TUI 启动后异步加载）
         let source_manager = Arc::new(SourceManager::new(
@@ -111,6 +121,7 @@ impl AppContext {
             current_song: Arc::new(std::sync::RwLock::new(None)),
             play_request_id: Arc::new(AtomicU64::new(0)),
             active_player_generation: Arc::new(AtomicU64::new(0)),
+            pending_ab_loop_start: std::sync::Mutex::new(None),
             play_attempted_sources: Arc::new(std::sync::Mutex::new(HashSet::new())),
             play_js_source_index: Arc::new(std::sync::Mutex::new(None)),
             local_scan_request_id: Arc::new(AtomicU64::new(0)),
@@ -193,5 +204,258 @@ impl AppContext {
             position: *self.position.borrow(),
             state,
         })
+    }
+
+    pub fn cycle_playback_speed(&self) -> String {
+        let speed = {
+            let mut config = self.config.write().unwrap();
+            config.player.playback_speed = next_playback_speed(config.player.playback_speed);
+            config.player.playback_speed
+        };
+        self.player.set_playback_speed(speed);
+        self.persist_control_update(format!("播放速度: {speed:.2}x"))
+    }
+
+    pub fn set_audio_output_device(&self, device: &str) -> String {
+        let device = if device.trim().is_empty() {
+            "auto"
+        } else {
+            device.trim()
+        };
+        self.player.set_audio_output_device(device);
+        self.config.write().unwrap().player.audio_device = device.to_string();
+        self.persist_control_update(format!("音频设备: {device}"))
+    }
+
+    pub fn cycle_replaygain_mode(&self) -> String {
+        let mode = {
+            let mut config = self.config.write().unwrap();
+            config.player.replaygain_mode = match config.player.replaygain_mode.as_str() {
+                "off" => "track",
+                "track" => "album",
+                _ => "off",
+            }
+            .to_string();
+            config.player.replaygain_mode.clone()
+        };
+        self.player
+            .set_replaygain_mode(parse_replaygain_mode(&mode));
+        self.persist_control_update(format!("ReplayGain: {mode}"))
+    }
+
+    pub fn cycle_replaygain_preamp(&self) -> String {
+        let preamp = {
+            let mut config = self.config.write().unwrap();
+            config.player.replaygain_preamp =
+                next_replaygain_preamp(config.player.replaygain_preamp);
+            config.player.replaygain_preamp
+        };
+        self.player.set_replaygain_preamp(preamp);
+        self.persist_control_update(format!("ReplayGain 预放大: {preamp:+.1} dB"))
+    }
+
+    pub fn cycle_channel_mode(&self) -> String {
+        let mode = {
+            let mut config = self.config.write().unwrap();
+            config.player.channel_mode = match config.player.channel_mode.as_str() {
+                "auto" => "stereo",
+                "stereo" => "mono",
+                "mono" => "left",
+                "left" => "right",
+                _ => "auto",
+            }
+            .to_string();
+            config.player.channel_mode.clone()
+        };
+        self.player.set_channel_mode(parse_channel_mode(&mode));
+        self.persist_control_update(format!("声道模式: {mode}"))
+    }
+
+    pub fn cycle_balance(&self) -> String {
+        let balance = {
+            let mut config = self.config.write().unwrap();
+            config.player.balance = next_balance(config.player.balance);
+            config.player.balance
+        };
+        self.player.set_balance(balance);
+        self.persist_control_update(format!("左右平衡: {balance:+.2}"))
+    }
+
+    pub fn toggle_replaygain_clip(&self) -> String {
+        let enabled = {
+            let mut config = self.config.write().unwrap();
+            config.player.replaygain_clip = !config.player.replaygain_clip;
+            config.player.replaygain_clip
+        };
+        self.player.set_replaygain_clip(enabled);
+        self.persist_control_update(format!(
+            "ReplayGain 削波保护: {}",
+            if enabled { "开启" } else { "关闭" }
+        ))
+    }
+
+    pub fn cycle_equalizer_preset(&self) -> String {
+        let bands = {
+            let mut config = self.config.write().unwrap();
+            config.player.equalizer_bands = next_equalizer_preset(&config.player.equalizer_bands);
+            config.player.equalizer_bands.clone()
+        };
+        self.player.set_equalizer_bands(&bands);
+        self.persist_control_update(format!("均衡器: {}", equalizer_label(&bands)))
+    }
+
+    pub fn fade_in_now(&self) -> String {
+        let duration = self.config.read().unwrap().player.fade_in_ms.max(250);
+        self.player.fade_in(Duration::from_millis(duration));
+        format!("已开始淡入（{}）", fade_duration_label(duration))
+    }
+
+    pub fn fade_out_now(&self) -> String {
+        let duration = self.config.read().unwrap().player.fade_out_ms.max(250);
+        self.player.fade_out(Duration::from_millis(duration));
+        format!("已开始淡出（{}）", fade_duration_label(duration))
+    }
+
+    pub fn set_ab_loop_start_now(&self) -> String {
+        let start = *self.position.borrow();
+        if start >= *self.duration.borrow() {
+            return "无法设置 A 点：当前没有可循环的播放位置".to_string();
+        }
+        *self.pending_ab_loop_start.lock().unwrap() = Some(start);
+        format!("A 点: {}", format_duration(start))
+    }
+
+    pub fn set_ab_loop_end_now(&self) -> String {
+        let end = *self.position.borrow();
+        let mut pending = self.pending_ab_loop_start.lock().unwrap();
+        let Some(start) = *pending else {
+            return "请先设置 A 点".to_string();
+        };
+        let Some(points) = AbLoop::new(start, end) else {
+            return "B 点必须晚于 A 点".to_string();
+        };
+        self.player.set_ab_loop(Some(points));
+        *pending = None;
+        format!(
+            "A-B 循环: {} - {}",
+            format_duration(points.start),
+            format_duration(points.end)
+        )
+    }
+
+    pub fn clear_ab_loop(&self) -> String {
+        *self.pending_ab_loop_start.lock().unwrap() = None;
+        self.player.clear_ab_loop();
+        "已清除 A-B 循环".to_string()
+    }
+
+    fn persist_control_update(&self, message: String) -> String {
+        match crate::config::loader::save(&self.config.read().unwrap(), &self.config_path) {
+            Ok(()) => message,
+            Err(error) => format!("{message}（配置保存失败: {error}）"),
+        }
+    }
+}
+
+pub(crate) fn equalizer_label(bands: &[EqualizerBand]) -> &'static str {
+    if bands.is_empty() {
+        "关闭"
+    } else if bands == equalizer_bass().as_slice() {
+        "低音增强"
+    } else if bands == equalizer_vocal().as_slice() {
+        "人声"
+    } else {
+        "自定义"
+    }
+}
+
+fn equalizer_bass() -> Vec<EqualizerBand> {
+    vec![
+        EqualizerBand::new(60.0, 5.0),
+        EqualizerBand::new(150.0, 3.0),
+        EqualizerBand::new(400.0, 0.0),
+        EqualizerBand::new(1_000.0, -1.0),
+        EqualizerBand::new(4_000.0, 0.0),
+        EqualizerBand::new(12_000.0, 1.0),
+    ]
+}
+
+fn equalizer_vocal() -> Vec<EqualizerBand> {
+    vec![
+        EqualizerBand::new(60.0, -2.0),
+        EqualizerBand::new(150.0, -1.0),
+        EqualizerBand::new(400.0, 1.0),
+        EqualizerBand::new(1_000.0, 3.0),
+        EqualizerBand::new(4_000.0, 2.0),
+        EqualizerBand::new(12_000.0, -1.0),
+    ]
+}
+
+fn next_equalizer_preset(bands: &[EqualizerBand]) -> Vec<EqualizerBand> {
+    let bass = equalizer_bass();
+    if bands.is_empty() {
+        bass
+    } else if bands == bass.as_slice() {
+        equalizer_vocal()
+    } else {
+        Vec::new()
+    }
+}
+
+fn next_playback_speed(speed: f64) -> f64 {
+    const VALUES: &[f64] = &[0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    let index = VALUES
+        .iter()
+        .position(|value| (*value - speed).abs() < f64::EPSILON)
+        .unwrap_or(2);
+    VALUES[(index + 1) % VALUES.len()]
+}
+
+fn next_replaygain_preamp(value: f64) -> f64 {
+    const VALUES: &[f64] = &[-6.0, 0.0, 6.0];
+    let index = VALUES
+        .iter()
+        .position(|candidate| (*candidate - value).abs() < f64::EPSILON)
+        .unwrap_or(1);
+    VALUES[(index + 1) % VALUES.len()]
+}
+
+fn next_balance(value: f64) -> f64 {
+    const VALUES: &[f64] = &[-1.0, -0.5, 0.0, 0.5, 1.0];
+    let index = VALUES
+        .iter()
+        .position(|candidate| (*candidate - value).abs() < f64::EPSILON)
+        .unwrap_or(2);
+    VALUES[(index + 1) % VALUES.len()]
+}
+
+fn fade_duration_label(value: u64) -> String {
+    if value.is_multiple_of(1_000) {
+        format!("{} 秒", value / 1_000)
+    } else {
+        format!("{value} ms")
+    }
+}
+
+fn format_duration(value: Duration) -> String {
+    let total = value.as_secs();
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+fn parse_replaygain_mode(value: &str) -> ReplayGainMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "track" => ReplayGainMode::Track,
+        "album" => ReplayGainMode::Album,
+        _ => ReplayGainMode::Off,
+    }
+}
+
+fn parse_channel_mode(value: &str) -> ChannelMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "stereo" => ChannelMode::Stereo,
+        "mono" => ChannelMode::Mono,
+        "left" => ChannelMode::Left,
+        "right" => ChannelMode::Right,
+        _ => ChannelMode::Auto,
     }
 }

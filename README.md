@@ -59,6 +59,14 @@ voicefox 是一个运行在终端中的音乐播放器，使用 Rust 编写，�
 
 ## 最近更新
 
+### 2026-08-08：完整播放控制、增量本地库与数据迁移（v0.3.0）
+
+- 播放器增加播放速度、音频输出设备、ReplayGain、均衡器、声道模式、左右平衡、A-B 循环、无缝播放和淡入淡出控制。
+- 设置页新增这些控制项和数据导入导出快捷键；快捷键使用现有 `[keybindings.pages.settings]` 配置，可单独重绑，鼠标点击设置项与快捷键共用同一动作。
+- 歌曲右键菜单增加“播放控制”子菜单，可直接切换速度、ReplayGain、均衡器、声道和平衡，并执行淡入淡出与 A-B 循环。
+- 本地音乐库支持 `notify` 文件监听、增量扫描、重复/损坏/缺失诊断、OPUS/CUE/AIFF 识别和 `lofty` 标签封面读写。
+- 数据导出采用版本化 JSON、原子写入和自动备份；支持旧格式迁移，以及 M3U、LX Music 和网易云风格歌单导入。
+
 ### 2026-08-04：播放器迁移到 libmpv2
 
 - 播放器改为通过 `libmpv2 6.0.0` 在 voicefox 进程内控制 libmpv，不再启动 `mpv` 命令行程序或使用 JSON IPC。
@@ -691,6 +699,28 @@ voicefox 支持通过配置文件自定义快捷键，无需修改代码。配�
 | `local_filter` | `"/"` | 进入过滤模式 |
 | `list_cycle_sort` | `"s"` | 切换排序方式 |
 
+**设置页面的播放与数据动作**：
+
+这些动作默认使用数字键和大写字母；可以在 `[keybindings.pages.settings]` 中逐项重绑。设置页会显示重绑后的按键，鼠标点击对应行与按键执行相同动作。
+
+| 配置项 | 默认值 | 功能 |
+|--------|--------|------|
+| `settings_cycle_playback_speed` | `"1"` | 循环播放速度 |
+| `settings_edit_audio_device` | `"2"` | 编辑 libmpv 音频设备名 |
+| `settings_cycle_replay_gain_mode` | `"3"` | 切换 ReplayGain 模式 |
+| `settings_cycle_channel_mode` | `"4"` | 切换自动 / 立体声 / 单声道 / 左 / 右 |
+| `settings_cycle_replay_gain_preamp` | `"5"` | 调整 ReplayGain 预放大 |
+| `settings_cycle_balance` | `"6"` | 调整左右平衡 |
+| `settings_toggle_replay_gain_clip` | `"7"` | 切换削波保护 |
+| `settings_cycle_fade_in_duration` | `"8"` | 循环淡入时长 |
+| `settings_cycle_fade_out_duration` | `"9"` | 循环淡出时长 |
+| `settings_cycle_equalizer_preset` | `"0"` | 循环均衡器预设 |
+| `settings_run_fade_in` / `settings_run_fade_out` | `"F"` / `"G"` | 立即淡入 / 淡出当前歌曲 |
+| `settings_set_ab_loop_start` / `settings_set_ab_loop_end` | `"L"` / `"U"` | 设置 A / B 点 |
+| `settings_clear_ab_loop` | `"C"` | 清除 A-B 循环 |
+| `settings_export_data` / `settings_import_data` | `"E"` / `"I"` | 导出 / 导入版本化数据备份 |
+| `settings_import_playlist` | `"J"` | 输入路径并导入 M3U、LX Music 或网易云歌单 |
+
 ### 配置示例
 
 以下示例只修改了部分键位，其余未指定的键位保持默认：
@@ -702,6 +732,10 @@ global_next_track = "k"
 [keybindings.pages.search]
 list_select_up = "e"
 list_select_down = "n"
+
+[keybindings.pages.settings]
+settings_cycle_playback_speed = "Ctrl+1"
+settings_cycle_equalizer_preset = "Ctrl+0"
 ```
 
 ### 页面名列表

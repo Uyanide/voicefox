@@ -313,9 +313,11 @@ fn source_display_name(path: &std::path::Path, origin: &str) -> String {
             .unwrap_or("JS 音源")
             .to_string();
     }
-    (!file_name.is_empty())
-        .then(|| file_name.to_string())
-        .unwrap_or_else(|| "JS 音源".to_string())
+    if file_name.is_empty() {
+        "JS 音源".to_string()
+    } else {
+        file_name.to_string()
+    }
 }
 
 fn metadata_value(code: &str, key: &str) -> Option<String> {
