@@ -11,7 +11,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use notify::{RecursiveMode, Watcher, recommended_watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
 
 use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
@@ -403,7 +404,10 @@ impl LocalSource {
         let stop_thread = Arc::clone(&stop);
         let (wake_tx, wake_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
-        let mut fs_watcher = recommended_watcher(move |event| {
+        let mut fs_watcher = recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if matches!(&event, Ok(event) if is_non_mutating_access(event)) {
+                return;
+            }
             let _ = event_tx.send(event);
         })
         .map_err(|error| format!("创建文件监听器失败: {error}"))?;
@@ -466,6 +470,16 @@ impl LocalSource {
     pub fn stop_watcher(&self) {
         self.watcher.lock().unwrap().take();
     }
+}
+
+/// 判断事件是否为非破坏性访问，避免监听器自激。
+fn is_non_mutating_access(event: &notify::Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Access(AccessKind::Close(AccessMode::Read))
+            | EventKind::Access(AccessKind::Open(_))
+            | EventKind::Access(AccessKind::Read)
+    )
 }
 
 impl Drop for LocalSource {
