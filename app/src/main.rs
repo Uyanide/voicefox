@@ -1387,7 +1387,7 @@ fn run_app(
                 continue;
             }
 
-            // 1b. 全局快捷键（查表模式，保留完全相同的默认行为）
+            // 1b. 全局快捷键（查表模式）；页面专属动作在下方处理
             // 设置页的选项键覆盖了大半个字母表，与全局键位必然冲突，交由页面独占
             if !settings_owns_key && let Some(action) = kb_resolver.resolve_global(&key) {
                 match action {
@@ -1453,9 +1453,7 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalSeekForward
-                        if !text_input_active
-                            && active_tab != NavTab::Leaderboard
-                            && active_tab != NavTab::Playlists =>
+                        if !text_input_active && active_tab == NavTab::Main =>
                     {
                         let pos = *ctx.position.borrow();
                         ctx.seek(pos + Duration::from_secs(5));
@@ -1463,9 +1461,7 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalSeekBackward
-                        if !text_input_active
-                            && active_tab != NavTab::Leaderboard
-                            && active_tab != NavTab::Playlists =>
+                        if !text_input_active && active_tab == NavTab::Main =>
                     {
                         let pos = *ctx.position.borrow();
                         if pos > Duration::from_secs(5) {
@@ -1515,7 +1511,10 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalGoToMain
-                        if should_go_to_main(
+                        if !matches!(
+                            (key.modifiers, key.code),
+                            (KeyModifiers::NONE, KeyCode::Esc)
+                        ) && should_go_to_main(
                             active_tab,
                             text_input_active,
                             playlists.selected_playlist.is_some(),
@@ -1526,11 +1525,7 @@ fn run_app(
                         needs_render = true;
                         continue;
                     }
-                    Action::GlobalToggleFavorite
-                        if !text_input_active
-                            && active_tab != NavTab::Favorites
-                            && active_tab != NavTab::Playlists =>
-                    {
+                    Action::GlobalToggleFavorite if !text_input_active => {
                         if let Some(song) = ctx.current_song.read().unwrap().as_ref() {
                             if ctx.storage.is_favorite(song) {
                                 ctx.storage.remove_favorite(song);
@@ -1590,10 +1585,7 @@ fn run_app(
                     continue;
                 }
                 (KeyModifiers::NONE, KeyCode::Right)
-                    if !text_input_active
-                        && active_tab != NavTab::Search
-                        && active_tab != NavTab::Leaderboard
-                        && active_tab != NavTab::Playlists =>
+                    if !text_input_active && active_tab == NavTab::Main =>
                 {
                     let pos = *ctx.position.borrow();
                     ctx.seek(pos + Duration::from_secs(5));
@@ -1601,10 +1593,7 @@ fn run_app(
                     continue;
                 }
                 (KeyModifiers::NONE, KeyCode::Left)
-                    if !text_input_active
-                        && active_tab != NavTab::Search
-                        && active_tab != NavTab::Leaderboard
-                        && active_tab != NavTab::Playlists =>
+                    if !text_input_active && active_tab == NavTab::Main =>
                 {
                     let pos = *ctx.position.borrow();
                     if pos > Duration::from_secs(5) {
@@ -1906,6 +1895,19 @@ fn run_app(
                                     );
                                 }
                             }
+                            Action::ListToggleFavorite => {
+                                if let Some(song) = songs.get(local_state.selected).cloned() {
+                                    execute_action(
+                                        AppAction::ToggleFavoriteSong(Box::new(song)),
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                            }
                             Action::LocalDelete => {
                                 if let Some(song) = songs.get(local_state.selected) {
                                     if let Some(path) = &song.file_path {
@@ -2045,6 +2047,19 @@ fn run_app(
                                             song: Box::new(song),
                                             position: InsertPosition::Next,
                                         },
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                            }
+                            (KeyModifiers::NONE, KeyCode::Char('f')) => {
+                                if let Some(song) = songs.get(local_state.selected).cloned() {
+                                    execute_action(
+                                        AppAction::ToggleFavoriteSong(Box::new(song)),
                                         &ctx,
                                         rt,
                                         &action_tx,
@@ -2968,6 +2983,17 @@ fn execute_action(
                 (InsertPosition::Next, _) => {
                     format!("下一首播放: {} - {}", song.name, song.singer)
                 }
+            };
+            ctx.notify(Notification::success(message));
+        }
+        AppAction::ToggleFavoriteSong(song) => {
+            let song = *song;
+            let message = if ctx.storage.is_favorite(&song) {
+                ctx.storage.remove_favorite(&song);
+                "已取消收藏"
+            } else {
+                ctx.storage.add_favorite(&song);
+                "已添加收藏"
             };
             ctx.notify(Notification::success(message));
         }

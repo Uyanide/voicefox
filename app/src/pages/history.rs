@@ -208,6 +208,12 @@ pub fn handle_input(
                 }
                 return AppAction::None;
             }
+            Action::ListToggleFavorite => {
+                if let Some(song) = history.get(state.selected).cloned() {
+                    return AppAction::ToggleFavoriteSong(Box::new(song));
+                }
+                return AppAction::None;
+            }
             _ => {}
         }
     }
@@ -276,10 +282,15 @@ pub fn handle_input(
                 };
             }
         }
-        (KeyModifiers::NONE, KeyCode::Char('d')) => {
+        (KeyModifiers::NONE, KeyCode::Char('d')) | (KeyModifiers::NONE, KeyCode::Delete) => {
             if let Some(song) = history.get(state.selected).cloned() {
                 state.selected = state.selected.min(history.len().saturating_sub(2));
                 return AppAction::RemoveHistory(Box::new(song));
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Char('f')) => {
+            if let Some(song) = history.get(state.selected).cloned() {
+                return AppAction::ToggleFavoriteSong(Box::new(song));
             }
         }
         (KeyModifiers::SHIFT, KeyCode::Char('D')) | (KeyModifiers::NONE, KeyCode::Char('D')) => {

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.2] - 2026-08-09
+
+### Fixed
+
+- Unified `Ctrl+L` as the favorite toggle for the currently playing song on every page.
+- Added configurable `f` favorite toggles for the selected song or playlist, and `Delete` for history entries.
+- Made queue playback accept both `Enter` and `l`.
+- Restricted seek shortcuts to the queue page and assigned `[` / `]` to source switching on search.
+- Fixed search variant overlays so `Esc` and a second `v` close them; idle `Esc` no longer jumps to the queue tab.
+
 ## [0.3.1] - 2026-08-08
 
 ### Fixed

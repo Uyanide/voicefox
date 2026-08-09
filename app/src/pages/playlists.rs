@@ -465,6 +465,9 @@ impl PlaylistsPage {
                     }
                     return AppAction::None;
                 }
+                Action::ListToggleFavorite => {
+                    return self.toggle_selected_favorite(ctx);
+                }
                 Action::ListGoBack => {
                     return self.go_back();
                 }
@@ -548,9 +551,8 @@ impl PlaylistsPage {
                 self.leave_playlist();
             }
             (KeyModifiers::NONE, KeyCode::Esc) => return self.go_back(),
-            (KeyModifiers::NONE, KeyCode::Char('f'))
-            | (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
-                return self.toggle_favorite(ctx);
+            (KeyModifiers::NONE, KeyCode::Char('f')) => {
+                return self.toggle_selected_favorite(ctx);
             }
             (KeyModifiers::NONE, KeyCode::Char('c'))
                 if self.is_custom_scope() && self.selected_playlist.is_none() =>
@@ -1152,6 +1154,16 @@ impl PlaylistsPage {
         }
     }
 
+    fn toggle_selected_favorite(&mut self, ctx: &AppContext) -> AppAction {
+        if self.selected_playlist.is_some() {
+            if let Some(song) = self.songs.get(self.selected).cloned() {
+                return AppAction::ToggleFavoriteSong(Box::new(song));
+            }
+            return AppAction::None;
+        }
+        self.toggle_favorite(ctx)
+    }
+
     fn enter_selected_playlist(&mut self, ctx: &AppContext) {
         if self.selected_playlist.is_some() || self.selected >= self.playlists.len() {
             return;
@@ -1195,10 +1207,10 @@ impl PlaylistsPage {
     fn go_back(&mut self) -> AppAction {
         if self.selected_playlist.is_some() {
             self.leave_playlist();
-            AppAction::None
-        } else {
-            AppAction::GoBack
         }
+        // Esc is page-local.  Leaving the top-level tab is done with the
+        // sidebar or Tab navigation rather than a second Esc press.
+        AppAction::None
     }
 
     fn refresh_current(&mut self, ctx: &AppContext) {
@@ -1657,14 +1669,14 @@ mod tests {
     }
 
     #[test]
-    fn playlist_go_back_leaves_the_open_playlist_then_returns_to_main() {
+    fn playlist_go_back_leaves_the_open_playlist_but_stays_on_the_tab() {
         let mut page = PlaylistsPage::new(Vec::new());
         page.playlists = vec![playlist("custom-1", SourceId::Local)];
         page.selected_playlist = Some(0);
 
         assert!(matches!(page.go_back(), AppAction::None));
         assert!(page.selected_playlist.is_none());
-        assert!(matches!(page.go_back(), AppAction::GoBack));
+        assert!(matches!(page.go_back(), AppAction::None));
     }
 
     #[test]

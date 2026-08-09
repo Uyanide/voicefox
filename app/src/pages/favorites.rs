@@ -173,13 +173,20 @@ impl FavoritesPage {
                     }
                     return AppAction::None;
                 }
-                Action::ListGoBack => {
-                    if self.filter.query().is_empty() {
-                        return AppAction::GoBack;
+                Action::ListToggleFavorite => {
+                    if let Some(original_index) = filtered.get(self.selected).copied()
+                        && let Some(song) = favorites.get(original_index).cloned()
+                    {
+                        return AppAction::ToggleFavoriteSong(Box::new(song));
                     }
-                    self.filter.reset();
-                    self.selected = 0;
-                    self.scroll = 0;
+                    return AppAction::None;
+                }
+                Action::ListGoBack => {
+                    if !self.filter.query().is_empty() {
+                        self.filter.reset();
+                        self.selected = 0;
+                        self.scroll = 0;
+                    }
                     return AppAction::None;
                 }
                 _ => {}
@@ -198,12 +205,11 @@ impl FavoritesPage {
                 )));
             }
             (KeyModifiers::NONE, KeyCode::Esc) => {
-                if self.filter.query().is_empty() {
-                    return AppAction::GoBack;
+                if !self.filter.query().is_empty() {
+                    self.filter.reset();
+                    self.selected = 0;
+                    self.scroll = 0;
                 }
-                self.filter.reset();
-                self.selected = 0;
-                self.scroll = 0;
             }
             (KeyModifiers::NONE, KeyCode::Up) => {
                 if !filtered.is_empty() {
@@ -275,9 +281,7 @@ impl FavoritesPage {
                     };
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Char('d'))
-            | (KeyModifiers::NONE, KeyCode::Delete)
-            | (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+            (KeyModifiers::NONE, KeyCode::Char('d')) | (KeyModifiers::NONE, KeyCode::Delete) => {
                 if let Some(original_index) = filtered.get(self.selected).copied()
                     && let Some(song) = favorites.get(original_index)
                     && ctx.storage.remove_favorite(song)
@@ -288,6 +292,13 @@ impl FavoritesPage {
                     return AppAction::ShowNotification(lx_core::events::Notification::info(
                         "已取消收藏",
                     ));
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('f')) => {
+                if let Some(original_index) = filtered.get(self.selected).copied()
+                    && let Some(song) = favorites.get(original_index).cloned()
+                {
+                    return AppAction::ToggleFavoriteSong(Box::new(song));
                 }
             }
             _ => {}
@@ -344,7 +355,7 @@ impl FavoritesPage {
         self.viewport_height = list.height.max(1) as usize;
 
         if favorites.is_empty() {
-            Paragraph::new("暂无收藏，在播放时按 Ctrl+L 添加")
+            Paragraph::new("暂无收藏，播放时按 Ctrl+L 或列表中按 f 添加")
                 .style(Style::new().fg(crate::theme::muted(ctx)))
                 .render(list, buf);
             return;

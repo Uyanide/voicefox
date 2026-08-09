@@ -53,6 +53,10 @@ pub enum AppAction {
         song: Box<SongInfo>,
         position: InsertPosition,
     },
+    /// Toggle the favorite state of a selected song.  Keeping this as an
+    /// application action lets pages without direct storage access (for
+    /// example search) use the same behavior as the other song lists.
+    ToggleFavoriteSong(Box<SongInfo>),
     RetrySong {
         song: Box<SongInfo>,
     },

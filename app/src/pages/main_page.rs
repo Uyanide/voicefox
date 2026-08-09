@@ -168,6 +168,12 @@ impl MainPage {
                     }
                     return AppAction::None;
                 }
+                Action::ListToggleFavorite => {
+                    if let Some(song) = songs.get(self.selected).cloned() {
+                        return AppAction::ToggleFavoriteSong(Box::new(song));
+                    }
+                    return AppAction::None;
+                }
                 _ => {}
             }
         }
@@ -212,11 +218,16 @@ impl MainPage {
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
                 self.selected = (self.selected + 5).min(songs.len().saturating_sub(1));
             }
-            (KeyModifiers::NONE, KeyCode::Enter) if self.selected < songs.len() => {
+            _ if super::is_song_activation_key(key) && self.selected < songs.len() => {
                 return AppAction::PlaySong {
                     songs,
                     index: self.selected,
                 };
+            }
+            (KeyModifiers::NONE, KeyCode::Char('f')) => {
+                if let Some(song) = songs.get(self.selected).cloned() {
+                    return AppAction::ToggleFavoriteSong(Box::new(song));
+                }
             }
             _ => {}
         }

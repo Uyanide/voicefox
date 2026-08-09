@@ -217,6 +217,14 @@ impl LeaderboardPage {
                     }
                     return AppAction::None;
                 }
+                Action::ListToggleFavorite => {
+                    if self.selected_board.is_some()
+                        && let Some(song) = self.songs.get(self.selected).cloned()
+                    {
+                        return AppAction::ToggleFavoriteSong(Box::new(song));
+                    }
+                    return AppAction::None;
+                }
                 Action::ListGoBack => {
                     if self.selected_board.is_some() {
                         self.leave_board();
@@ -239,9 +247,9 @@ impl LeaderboardPage {
             (KeyModifiers::CONTROL, KeyCode::Left)
             | (KeyModifiers::CONTROL, KeyCode::Char('h'))
             | (KeyModifiers::NONE, KeyCode::Char('[')) => self.select_previous_source(),
-            (KeyModifiers::CONTROL, KeyCode::Right)
-            | (KeyModifiers::CONTROL, KeyCode::Char('l'))
-            | (KeyModifiers::NONE, KeyCode::Char(']')) => self.select_next_source(),
+            (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::NONE, KeyCode::Char(']')) => {
+                self.select_next_source()
+            }
             (KeyModifiers::NONE, KeyCode::Left) if self.selected_board.is_none() => {
                 self.select_previous_source();
             }
@@ -295,6 +303,11 @@ impl LeaderboardPage {
                         song: Box::new(song),
                         position: InsertPosition::Next,
                     };
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('f')) if self.selected_board.is_some() => {
+                if let Some(song) = self.songs.get(self.selected).cloned() {
+                    return AppAction::ToggleFavoriteSong(Box::new(song));
                 }
             }
             (KeyModifiers::NONE, KeyCode::Char('h'))

@@ -116,6 +116,13 @@ impl SearchPage {
             return AppAction::None;
         }
 
+        // The variant picker is a modal overlay.  Route every key to it before
+        // handling search input or page-level bindings so Esc/v can close the
+        // overlay instead of bubbling up as page navigation.
+        if !self.variant_indices.is_empty() {
+            return self.handle_variant_input(key);
+        }
+
         if self.input_mode {
             match (key.modifiers, key.code) {
                 (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -166,6 +173,14 @@ impl SearchPage {
             return AppAction::None;
         }
 
+        // Brackets are source selectors on the search page.  Keep them out
+        // of input mode so users can still type them in a query.
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('[')) => return self.cycle_source(-1),
+            (KeyModifiers::NONE, KeyCode::Char(']')) => return self.cycle_source(1),
+            _ => {}
+        }
+
         if let Some(action) = resolver.resolve("search", &key) {
             match action {
                 Action::SearchInputMode => {
@@ -211,6 +226,11 @@ impl SearchPage {
                 Action::ListActivate => {
                     if !self.results.is_empty() {
                         return self.activate_selected_result();
+                    }
+                }
+                Action::ListToggleFavorite => {
+                    if let Some(song) = self.results.get(self.selected).cloned() {
+                        return AppAction::ToggleFavoriteSong(Box::new(song));
                     }
                 }
                 Action::ListSelectUp => {
@@ -268,7 +288,9 @@ impl SearchPage {
                     return self.cycle_source(1);
                 }
                 Action::ListGoBack => {
-                    return AppAction::GoBack;
+                    // Search has no nested page to leave.  Esc is consumed by
+                    // the input/variant overlays above; while idle it is a
+                    // no-op so the current tab remains visible.
                 }
                 _ => {}
             }
@@ -276,14 +298,19 @@ impl SearchPage {
         }
 
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Esc) => {
-                return AppAction::GoBack;
-            }
+            // Keep Esc local to search.  Modal states (input, variants and
+            // Bilibili parts) have already consumed it above.
+            (KeyModifiers::NONE, KeyCode::Esc) => {}
             (KeyModifiers::NONE, KeyCode::Char('i')) | (KeyModifiers::NONE, KeyCode::Char('/')) => {
                 self.input_mode = true;
             }
             (KeyModifiers::NONE, KeyCode::Char('v')) => {
                 self.open_variants();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('f')) => {
+                if let Some(song) = self.results.get(self.selected).cloned() {
+                    return AppAction::ToggleFavoriteSong(Box::new(song));
+                }
             }
             (KeyModifiers::NONE, KeyCode::Char('a')) => {
                 if let Some(song) = self.results.get(self.selected).cloned() {
@@ -1078,6 +1105,16 @@ impl SearchPage {
                     };
                 }
             }
+            (KeyModifiers::NONE, KeyCode::Char('f')) => {
+                if let Some(song) = self
+                    .variant_indices
+                    .get(self.variant_selected)
+                    .and_then(|index| self.results.get(*index))
+                    .cloned()
+                {
+                    return AppAction::ToggleFavoriteSong(Box::new(song));
+                }
+            }
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 if let Some(index) = self.variant_indices.get(self.variant_selected).copied() {
                     self.selected = index;
@@ -1403,6 +1440,68 @@ mod tests {
             page.handle_input(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &resolver);
 
         assert_eq!(page.source_filter, Some(SourceId::Kw));
+        assert!(matches!(action, AppAction::None));
+    }
+
+    #[test]
+    fn brackets_cycle_search_scope_outside_input_mode() {
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        page.input_mode = false;
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+
+        page.handle_input(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+            &resolver,
+        );
+        assert_eq!(page.source_filter, Some(SourceId::Kw));
+
+        page.handle_input(
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            &resolver,
+        );
+        assert_eq!(page.source_filter, None);
+    }
+
+    #[test]
+    fn variant_picker_closes_with_escape_or_second_v() {
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        page.input_mode = false;
+        page.results = vec![
+            song("kw-1", SourceId::Kw, "晴天", "周杰伦"),
+            song("kg-1", SourceId::Kg, "晴天", "周杰伦"),
+        ];
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+
+        page.handle_input(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &resolver,
+        );
+        assert_eq!(page.variant_indices, vec![0, 1]);
+        page.handle_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &resolver);
+        assert!(page.variant_indices.is_empty());
+
+        page.handle_input(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &resolver,
+        );
+        page.handle_input(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &resolver,
+        );
+        assert!(page.variant_indices.is_empty());
+    }
+
+    #[test]
+    fn idle_escape_stays_on_search_page() {
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        page.input_mode = false;
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+
+        let action = page.handle_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &resolver);
+
         assert!(matches!(action, AppAction::None));
     }
 

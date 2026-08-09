@@ -67,6 +67,8 @@ pub enum Action {
     ListPageDown,
     /// 激活选中项（播放 / 进入）
     ListActivate,
+    /// 收藏或取消收藏当前页面选中的歌曲/歌单
+    ListToggleFavorite,
     /// 返回/退出（Esc）
     ListGoBack,
     /// 添加到队列尾部
@@ -262,6 +264,8 @@ fn default_global_bindings() -> HashMap<Action, String> {
     m.insert(Action::GlobalNextTrack, "n".to_string());
     m.insert(Action::GlobalPrevTrack, "b".to_string());
     m.insert(Action::GlobalCycleMode, "m".to_string());
+    // The application gates these global actions to the queue page; search
+    // reuses the bracket keys for source switching.
     m.insert(Action::GlobalSeekForward, "]".to_string());
     m.insert(Action::GlobalSeekBackward, "[".to_string());
     m.insert(Action::GlobalVolumeUp, ".".to_string());
@@ -290,6 +294,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     search.insert(Action::ListPageUp, "Ctrl+u".to_string());
     search.insert(Action::ListPageDown, "Ctrl+d".to_string());
     search.insert(Action::ListActivate, "l".to_string());
+    search.insert(Action::ListToggleFavorite, "f".to_string());
     search.insert(Action::ListAddToQueue, "a".to_string());
     search.insert(Action::ListAddToQueueNext, "A".to_string());
     search.insert(Action::SearchCycleSourcePrev, "Left".to_string());
@@ -306,6 +311,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     main.insert(Action::ListPageUp, "Ctrl+u".to_string());
     main.insert(Action::ListPageDown, "Ctrl+d".to_string());
     main.insert(Action::ListActivate, "Enter".to_string());
+    main.insert(Action::ListToggleFavorite, "f".to_string());
     pages.insert("main".to_string(), main);
 
     // --- 排行榜 ---
@@ -317,6 +323,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     leaderboard.insert(Action::ListPageUp, "Ctrl+u".to_string());
     leaderboard.insert(Action::ListPageDown, "Ctrl+d".to_string());
     leaderboard.insert(Action::ListActivate, "Enter".to_string());
+    leaderboard.insert(Action::ListToggleFavorite, "f".to_string());
     leaderboard.insert(Action::ListAddToQueue, "a".to_string());
     leaderboard.insert(Action::ListAddToQueueNext, "A".to_string());
     leaderboard.insert(Action::SearchCycleSourcePrev, "Left".to_string());
@@ -333,6 +340,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     playlists.insert(Action::ListPageUp, "Ctrl+u".to_string());
     playlists.insert(Action::ListPageDown, "Ctrl+d".to_string());
     playlists.insert(Action::ListActivate, "Enter".to_string());
+    playlists.insert(Action::ListToggleFavorite, "f".to_string());
     playlists.insert(Action::ListAddToQueue, "a".to_string());
     playlists.insert(Action::ListAddToQueueNext, "A".to_string());
     playlists.insert(Action::SearchCycleSourcePrev, "Left".to_string());
@@ -350,6 +358,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     favorites.insert(Action::ListPageUp, "Ctrl+u".to_string());
     favorites.insert(Action::ListPageDown, "Ctrl+d".to_string());
     favorites.insert(Action::ListActivate, "Enter".to_string());
+    favorites.insert(Action::ListToggleFavorite, "f".to_string());
     favorites.insert(Action::ListAddToQueue, "a".to_string());
     favorites.insert(Action::ListAddToQueueNext, "A".to_string());
     favorites.insert(Action::ListCycleSort, "s".to_string());
@@ -366,6 +375,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     history.insert(Action::ListPageUp, "Ctrl+u".to_string());
     history.insert(Action::ListPageDown, "Ctrl+d".to_string());
     history.insert(Action::ListActivate, "Enter".to_string());
+    history.insert(Action::ListToggleFavorite, "f".to_string());
     history.insert(Action::ListAddToQueue, "a".to_string());
     history.insert(Action::ListAddToQueueNext, "A".to_string());
     history.insert(Action::ListCycleSort, "s".to_string());
@@ -381,6 +391,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     local.insert(Action::ListPageUp, "Ctrl+u".to_string());
     local.insert(Action::ListPageDown, "Ctrl+d".to_string());
     local.insert(Action::ListActivate, "Enter".to_string());
+    local.insert(Action::ListToggleFavorite, "f".to_string());
     local.insert(Action::ListAddToQueue, "a".to_string());
     local.insert(Action::ListAddToQueueNext, "A".to_string());
     local.insert(Action::ListCycleSort, "s".to_string());
@@ -735,6 +746,32 @@ mod tests {
                 Some(&"s".to_string())
             );
         }
+    }
+
+    #[test]
+    fn list_favorite_action_defaults_to_f_on_song_pages() {
+        let config = KeybindingConfig::default();
+        for page in [
+            "main",
+            "search",
+            "leaderboard",
+            "playlists",
+            "favorites",
+            "history",
+            "local",
+        ] {
+            assert_eq!(
+                config
+                    .pages
+                    .get(page)
+                    .and_then(|bindings| bindings.get(&Action::ListToggleFavorite)),
+                Some(&"f".to_string())
+            );
+        }
+        assert_eq!(
+            config.global.get(&Action::GlobalToggleFavorite),
+            Some(&"Ctrl+l".to_string())
+        );
     }
 
     #[test]
