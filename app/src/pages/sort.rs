@@ -85,6 +85,40 @@ impl SortState {
     }
 }
 
+/// 排序列表缓存：只在数据版本或排序方式变化时重新拉取并排序。
+///
+/// 列表页每帧渲染都会读取整份数据（本地曲库 / 收藏 / 历史），
+/// 直接 clone + 排序会让内存水位被高频分配顶高；本缓存把
+/// “数据没变就不重建”的逻辑收敛到一处，渲染路径退化为零拷贝。
+#[derive(Default)]
+pub struct SortedListCache {
+    version: u64,
+    mode: Option<SortMode>,
+    songs: Vec<SongInfo>,
+}
+
+impl SortedListCache {
+    /// 返回与 `version` / `mode` 匹配的已排序列表；缓存命中时直接借用，
+    /// 未命中时才调用 `source` 拉取数据并排序。
+    pub fn get_or_build(
+        &mut self,
+        version: u64,
+        mode: SortMode,
+        target: SortTarget,
+        source: impl FnOnce() -> Vec<SongInfo>,
+    ) -> &[SongInfo] {
+        if self.version != version || self.mode != Some(mode) {
+            self.version = version;
+            self.mode = Some(mode);
+            self.songs = sorted_songs(source(), mode, target);
+        }
+        &self.songs
+    }
+}
+
+/// 返回排序后的下标。`sorted_songs` 基于本函数实现；页面渲染统一走
+/// `SortedListCache`，本函数目前仅由测试直接使用。
+#[allow(dead_code)]
 pub fn sorted_indices(songs: &[SongInfo], mode: SortMode, target: SortTarget) -> Vec<usize> {
     let mut indices = (0..songs.len()).collect::<Vec<_>>();
     indices.sort_by(|left, right| {

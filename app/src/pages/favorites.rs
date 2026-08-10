@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
-use crate::pages::sort::{SortMode, SortTarget, sorted_indices};
+use crate::pages::sort::{SortMode, SortTarget, SortedListCache};
 
 pub struct FavoritesPage {
     selected: usize,
@@ -306,9 +306,15 @@ impl FavoritesPage {
         AppAction::None
     }
 
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-        let favorites = ctx.storage.load_favorites();
-        let filtered = self.filtered_song_indices(&favorites);
+    pub fn render(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        ctx: &AppContext,
+        cache: &mut SortedListCache,
+    ) {
+        let favorites = self.sorted_favorites(ctx, cache);
+        let filtered = self.filtered_song_indices(favorites);
         self.clamp_selection(filtered.len());
 
         let block = Block::default()
@@ -406,10 +412,11 @@ impl FavoritesPage {
         event: MouseEvent,
         area: Rect,
         ctx: &AppContext,
+        cache: &mut SortedListCache,
         activate: bool,
     ) -> AppAction {
-        let favorites = ctx.storage.load_favorites();
-        let filtered = self.filtered_song_indices(&favorites);
+        let favorites = self.sorted_favorites(ctx, cache);
+        let filtered = self.filtered_song_indices(favorites);
         let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
@@ -455,9 +462,10 @@ impl FavoritesPage {
         event: MouseEvent,
         area: Rect,
         ctx: &AppContext,
+        cache: &mut SortedListCache,
     ) -> Option<(Vec<SongInfo>, usize)> {
-        let favorites = ctx.storage.load_favorites();
-        let filtered = self.filtered_song_indices(&favorites);
+        let favorites = self.sorted_favorites(ctx, cache);
+        let filtered = self.filtered_song_indices(favorites);
         let inner = Block::default().borders(Borders::ALL).inner(area);
         let search_height = u16::from(self.filter.is_active() || !self.filter.query().is_empty());
         let list_y = inner.y.saturating_add(search_height).saturating_add(1);
@@ -479,8 +487,9 @@ impl FavoritesPage {
 
     fn filtered_song_indices(&self, favorites: &[SongInfo]) -> Vec<usize> {
         let query = self.filter.query().trim().to_lowercase();
-        sorted_indices(favorites, self.sort_mode, SortTarget::Favorites)
-            .into_iter()
+        // favorites 已经是按当前排序方式排好序的缓存结果，这里只做过滤，
+        // 不再重复排序。
+        (0..favorites.len())
             .filter(|index| {
                 let song = &favorites[*index];
                 query.is_empty()
@@ -490,6 +499,19 @@ impl FavoritesPage {
                     || song.source.as_str().contains(&query)
             })
             .collect()
+    }
+
+    /// 返回按当前排序方式排列的收藏列表（来自页面缓存，命中时零拷贝）。
+    fn sorted_favorites<'a>(
+        &self,
+        ctx: &AppContext,
+        cache: &'a mut SortedListCache,
+    ) -> &'a [SongInfo] {
+        let version = ctx.storage.generation();
+        let mode = self.sort_mode;
+        cache.get_or_build(version, mode, SortTarget::Favorites, || {
+            ctx.storage.load_favorites()
+        })
     }
 
     fn clamp_selection(&mut self, len: usize) {
@@ -531,7 +553,9 @@ mod tests {
             SongInfo::new("2".into(), SourceId::Kw, "B".into(), "Y".into()),
         ];
 
-        assert_eq!(page.filtered_song_indices(&songs), vec![1, 0]);
+        // filtered_song_indices 只负责过滤；排序由 SortedListCache 提供，
+        // 输入按当前排序方式排好序时顺序保持不变。
+        assert_eq!(page.filtered_song_indices(&songs), vec![0, 1]);
         assert_eq!(page.cycle_sort(), SortMode::Oldest);
         assert_eq!(page.filtered_song_indices(&songs), vec![0, 1]);
     }

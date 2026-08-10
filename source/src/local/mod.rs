@@ -76,18 +76,22 @@ impl Drop for WatcherHandle {
 /// 本地音源
 pub struct LocalSource {
     /// 已扫描的歌曲列表（按目录分组）
-    songs: RwLock<HashMap<PathBuf, Vec<LocalSong>>>,
+    songs: RwLock<Arc<HashMap<PathBuf, Vec<LocalSong>>>>,
     /// 每个文件的轻量指纹，用于增量扫描和目录监听。
-    fingerprints: RwLock<HashMap<PathBuf, scanner::FileFingerprint>>,
+    fingerprints: RwLock<Arc<HashMap<PathBuf, scanner::FileFingerprint>>>,
     /// 最近一次扫描无法解析的文件。
-    failures: RwLock<Vec<LocalScanFailure>>,
+    failures: RwLock<Arc<Vec<LocalScanFailure>>>,
     /// 最近一次扫描发现已消失的歌曲。
-    missing: RwLock<Vec<MissingLocalSong>>,
+    missing: RwLock<Arc<Vec<MissingLocalSong>>>,
+    /// 最近一次扫描时各根目录的目录签名；签名未变时跳过全目录遍历。
+    last_scan_signatures: RwLock<HashMap<PathBuf, scanner::DirSignature>>,
     scan_stats: RwLock<LocalScanStats>,
     /// 当前加载的目录列表
     loaded_paths: RwLock<Vec<PathBuf>>,
     scan_generation: AtomicU64,
     scan_in_progress: AtomicU64,
+    /// 最近一次成功提交扫描结果的序号；页面据此判断排序缓存是否需要重建。
+    library_generation: AtomicU64,
     watch_generation: AtomicU64,
     watcher: Mutex<Option<WatcherHandle>>,
 }
@@ -95,17 +99,24 @@ pub struct LocalSource {
 impl LocalSource {
     pub fn new() -> Self {
         Self {
-            songs: RwLock::new(HashMap::new()),
-            fingerprints: RwLock::new(HashMap::new()),
-            failures: RwLock::new(Vec::new()),
-            missing: RwLock::new(Vec::new()),
+            songs: RwLock::new(Arc::new(HashMap::new())),
+            fingerprints: RwLock::new(Arc::new(HashMap::new())),
+            failures: RwLock::new(Arc::new(Vec::new())),
+            missing: RwLock::new(Arc::new(Vec::new())),
+            last_scan_signatures: RwLock::new(HashMap::new()),
             scan_stats: RwLock::new(LocalScanStats::default()),
             loaded_paths: RwLock::new(Vec::new()),
             scan_generation: AtomicU64::new(0),
             scan_in_progress: AtomicU64::new(0),
+            library_generation: AtomicU64::new(0),
             watch_generation: AtomicU64::new(0),
             watcher: Mutex::new(None),
         }
+    }
+
+    /// 曲库代次，每次扫描提交新结果时递增。
+    pub fn library_generation(&self) -> u64 {
+        self.library_generation.load(Ordering::Acquire)
     }
 
     pub fn begin_scan(&self) -> u64 {
@@ -122,7 +133,7 @@ impl LocalSource {
     /// 扫描指定目录并加载歌曲
     pub fn scan(&self, paths: &[String], max_depth: u32) -> Vec<String> {
         let generation = self.begin_scan();
-        self.scan_for_generation(paths, max_depth, generation)
+        self.scan_for_generation(paths, max_depth, generation, false)
     }
 
     pub fn scan_for_generation(
@@ -130,6 +141,7 @@ impl LocalSource {
         paths: &[String],
         max_depth: u32,
         generation: u64,
+        force: bool,
     ) -> Vec<String> {
         let _completion = ScanCompletion {
             source: self,
@@ -140,12 +152,15 @@ impl LocalSource {
         let previous_songs = self.songs.read().unwrap().clone();
         let previous_fingerprints = self.fingerprints.read().unwrap().clone();
         let previous_missing = self.missing.read().unwrap().clone();
-        let mut all_songs: HashMap<PathBuf, Vec<LocalSong>> = HashMap::new();
-        let mut all_fingerprints = HashMap::new();
+        let previous_signatures = self.last_scan_signatures.read().unwrap().clone();
+        let mut all_songs: HashMap<PathBuf, Vec<LocalSong>> = previous_songs.as_ref().clone();
+        let mut all_fingerprints = previous_fingerprints.as_ref().clone();
         let mut failures = Vec::new();
+        let mut signatures = previous_signatures.clone();
         let mut missing = previous_missing
-            .into_iter()
+            .iter()
             .filter(|item| !item.path.exists())
+            .cloned()
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
         let previous_file_count = previous_fingerprints.len();
@@ -167,6 +182,28 @@ impl LocalSource {
             }
 
             let root = path.canonicalize().unwrap_or(path);
+            // 无变化快路径：目录签名与上次一致时，整个子树必然没有
+            // 文件被创建/删除/重命名，直接沿用上次的歌曲与指纹，跳过
+            // 一次全目录遍历。
+            if !force
+                && let (Some(previous), Some(current)) = (
+                previous_signatures.get(&root),
+                scanner::DirSignature::from_path(&root),
+            )
+                && *previous == current
+                && previous_songs.contains_key(&root)
+            {
+                reused += previous_songs[&root].len();
+                all_fingerprints.extend(
+                    previous_fingerprints
+                        .iter()
+                        .filter(|(file, _)| file.starts_with(&root))
+                        .map(|(file, fingerprint)| (file.clone(), *fingerprint)),
+                );
+                signatures.insert(root, current);
+                continue;
+            }
+
             let previous = previous_songs
                 .get(&root)
                 .into_iter()
@@ -216,6 +253,10 @@ impl LocalSource {
                 }
             }
 
+            let signature = scanner::DirSignature::from_path(&root);
+            if let Some(signature) = signature {
+                signatures.insert(root.clone(), signature);
+            }
             all_songs.insert(root, songs);
             if count > 0 {
                 tracing::info!("扫描本地音乐: {} 首 ({})", count, path_str);
@@ -236,12 +277,14 @@ impl LocalSource {
             failed: failures.len(),
             removed: previous_file_count.saturating_sub(all_fingerprints.len()),
         };
-        *self.songs.write().unwrap() = all_songs;
-        *self.fingerprints.write().unwrap() = all_fingerprints;
-        *self.failures.write().unwrap() = failures;
+        *self.songs.write().unwrap() = Arc::new(all_songs);
+        *self.fingerprints.write().unwrap() = Arc::new(all_fingerprints);
+        *self.failures.write().unwrap() = Arc::new(failures);
         missing.retain(|item| !present.contains(&item.path));
-        *self.missing.write().unwrap() = deduplicate_missing(missing);
+        *self.missing.write().unwrap() = Arc::new(deduplicate_missing(missing));
+        *self.last_scan_signatures.write().unwrap() = signatures;
         *self.loaded_paths.write().unwrap() = paths.iter().map(|path| expand_path(path)).collect();
+        self.library_generation.fetch_add(1, Ordering::Release);
 
         if errors.is_empty() {
             let total: usize = self.songs.read().unwrap().values().map(|v| v.len()).sum();
@@ -268,7 +311,8 @@ impl LocalSource {
     /// 从当前扫描结果中移除一个文件，避免异步复扫完成前仍显示已删除歌曲。
     pub fn remove_by_path(&self, path: &Path) -> bool {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let mut groups = self.songs.write().unwrap();
+        let mut songs_guard = self.songs.write().unwrap();
+        let groups = Arc::make_mut(&mut songs_guard);
         let mut removed = false;
         for songs in groups.values_mut() {
             let previous_len = songs.len();
@@ -277,16 +321,27 @@ impl LocalSource {
         }
         groups.retain(|_, songs| !songs.is_empty());
         if removed {
-            let mut fingerprints = self.fingerprints.write().unwrap();
+            // 让目录签名失效，下一次扫描必须重新遍历目录，否则无变化
+            // 快路径会把刚才删除的文件带回来。
+            let root = path
+                .canonicalize()
+                .or_else(|_| canonical.canonicalize())
+                .unwrap_or_else(|_| canonical.clone());
+            let mut signatures = self.last_scan_signatures.write().unwrap();
+            if let Some(root_key) = signatures.keys().find(|key| root.starts_with(key)).cloned() {
+                signatures.remove(&root_key);
+            } else {
+                signatures.remove(&root);
+            }
+            let mut fingerprints_guard = self.fingerprints.write().unwrap();
+            let fingerprints = Arc::make_mut(&mut fingerprints_guard);
             fingerprints.remove(path);
             fingerprints.remove(&canonical);
-            self.failures
-                .write()
-                .unwrap()
+            let mut failures_guard = self.failures.write().unwrap();
+            Arc::make_mut(&mut failures_guard)
                 .retain(|failure| failure.path != path && failure.path != canonical);
-            self.missing
-                .write()
-                .unwrap()
+            let mut missing_guard = self.missing.write().unwrap();
+            Arc::make_mut(&mut missing_guard)
                 .retain(|missing| missing.path != path && missing.path != canonical);
         }
         removed
@@ -308,7 +363,8 @@ impl LocalSource {
         let mut song = metadata::read_metadata(path)?;
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         song.file_path = Some(canonical.clone());
-        let mut groups = self.songs.write().unwrap();
+        let mut songs_guard = self.songs.write().unwrap();
+        let groups = Arc::make_mut(&mut songs_guard);
         for songs in groups.values_mut() {
             if let Some(local) = songs.iter_mut().find(|local| local.file_path == canonical) {
                 local.song = song.clone();
@@ -334,7 +390,7 @@ impl LocalSource {
 
     /// 最近一次扫描中无法解析的文件。
     pub fn scan_failures(&self) -> Vec<LocalScanFailure> {
-        self.failures.read().unwrap().clone()
+        (**self.failures.read().unwrap()).clone()
     }
 
     /// 最近一次扫描统计。
@@ -349,7 +405,17 @@ impl LocalSource {
 
     /// 最近一次扫描中从文件系统消失的歌曲。
     pub fn missing_songs(&self) -> Vec<MissingLocalSong> {
-        self.missing.read().unwrap().clone()
+        (**self.missing.read().unwrap()).clone()
+    }
+
+    /// 最近一次扫描中无法解析的文件数量（供界面渲染，避免整表克隆）。
+    pub fn failure_count(&self) -> usize {
+        self.failures.read().unwrap().len()
+    }
+
+    /// 最近一次扫描中从文件系统消失的歌曲数量（供界面渲染，避免整表克隆）。
+    pub fn missing_count(&self) -> usize {
+        self.missing.read().unwrap().len()
     }
 
     /// 与 `missing_songs` 等价的便捷别名。
@@ -423,11 +489,14 @@ impl LocalSource {
         let interval = interval.max(Duration::from_millis(250));
         let initial_paths = paths.clone();
         let join = thread::spawn(move || {
-            // Make the watcher useful when a caller starts it before the first explicit scan.
-            // Existing entries are reused through the same fingerprint cache.
-            if let Some(source) = weak.upgrade() {
+            // 调用方（扫描动作）通常已经完成一次扫描；此时 loaded_paths 非空，
+            // 跳过线程内的初始扫描，避免同一份目录同时跑两遍扫描把内存峰值翻倍。
+            // 仅在从未扫描过时补一次初始扫描，让监听器先于首次显式扫描也能工作。
+            if let Some(source) = weak.upgrade()
+                && source.loaded_paths().is_empty()
+            {
                 let generation = source.begin_scan();
-                let _ = source.scan_for_generation(&initial_paths, max_depth, generation);
+                let _ = source.scan_for_generation(&initial_paths, max_depth, generation, false);
             }
             while !stop_thread.load(Ordering::Acquire) {
                 if wake_rx.try_recv().is_ok() {
@@ -452,7 +521,7 @@ impl LocalSource {
                     break;
                 };
                 let generation = source.begin_scan();
-                let _ = source.scan_for_generation(&paths, max_depth, generation);
+                let _ = source.scan_for_generation(&paths, max_depth, generation, false);
                 source.watch_generation.fetch_add(1, Ordering::AcqRel);
             }
             drop(fs_watcher);
@@ -677,6 +746,7 @@ fn read_local_lyric(audio_path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::path::PathBuf;
 
     use lx_core::model::song::SongInfo;
@@ -690,8 +760,8 @@ mod tests {
         let stale_generation = source.begin_scan();
         let current_generation = source.begin_scan();
 
-        source.scan_for_generation(&[], 0, current_generation);
-        source.scan_for_generation(&[".".to_string()], 0, stale_generation);
+        source.scan_for_generation(&[], 0, current_generation, false);
+        source.scan_for_generation(&[".".to_string()], 0, stale_generation, false);
 
         assert!(source.loaded_paths().is_empty());
         assert!(!source.is_scanning());
@@ -703,10 +773,10 @@ mod tests {
         let stale_generation = source.begin_scan();
         let current_generation = source.begin_scan();
 
-        source.scan_for_generation(&[], 0, stale_generation);
+        source.scan_for_generation(&[], 0, stale_generation, false);
         assert!(source.is_scanning());
 
-        source.scan_for_generation(&[], 0, current_generation);
+        source.scan_for_generation(&[], 0, current_generation, false);
         assert!(!source.is_scanning());
     }
 
@@ -721,7 +791,7 @@ mod tests {
             "artist".to_string(),
         );
         song.file_path = Some(path.clone());
-        source.songs.write().unwrap().insert(
+        Arc::make_mut(&mut *source.songs.write().unwrap()).insert(
             PathBuf::from("/music"),
             vec![LocalSong {
                 song,
@@ -750,7 +820,7 @@ mod tests {
         let mut second = first.clone();
         second.id = "/music/two.flac".to_string();
         second.file_path = Some(PathBuf::from("/music/two.flac"));
-        source.songs.write().unwrap().insert(
+        Arc::make_mut(&mut *source.songs.write().unwrap()).insert(
             PathBuf::from("/music"),
             vec![
                 LocalSong {
@@ -779,13 +849,13 @@ mod tests {
             "gone".to_string(),
             "artist".to_string(),
         );
-        *source.missing.write().unwrap() = vec![
+        *source.missing.write().unwrap() = Arc::new(vec![
             MissingLocalSong {
                 path: path.clone(),
                 song: song.clone(),
             },
             MissingLocalSong { path, song },
-        ];
+        ]);
         // A refresh with no configured paths still keeps the diagnostic until the path returns.
         source.scan(&[], 0);
         assert_eq!(source.missing_files().len(), 1);

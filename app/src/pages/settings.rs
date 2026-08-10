@@ -839,7 +839,11 @@ impl SettingsPage {
                     } else {
                         self.status_msg = Some("正在扫描本地音乐...".to_string());
                     }
-                    return AppAction::ScanLocalMusic { paths, max_depth };
+                    return AppAction::ScanLocalMusic {
+                        paths,
+                        max_depth,
+                        force: true,
+                    };
                 }
                 AppAction::None
             }
@@ -929,6 +933,7 @@ impl SettingsPage {
                     return Some(AppAction::ScanLocalMusic {
                         paths: remaining,
                         max_depth,
+                        force: true,
                     });
                 }
                 Some(AppAction::None)
@@ -936,7 +941,11 @@ impl SettingsPage {
             (KeyModifiers::NONE, KeyCode::Char('r')) => {
                 let max_depth = ctx.config.read().unwrap().local_music.max_depth;
                 self.status_msg = Some("正在扫描本地音乐...".to_string());
-                Some(AppAction::ScanLocalMusic { paths, max_depth })
+                Some(AppAction::ScanLocalMusic {
+                    paths,
+                    max_depth,
+                    force: true,
+                })
             }
             _ => None,
         }

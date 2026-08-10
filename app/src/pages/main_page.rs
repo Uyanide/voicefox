@@ -80,9 +80,17 @@ impl MainPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
-        let (songs, current) = ctx.playlist.snapshot();
-        if self.selected >= songs.len() {
-            self.selected = current.min(songs.len().saturating_sub(1));
+        let len = {
+            let songs = ctx.playlist.borrow();
+            let current = ctx.playlist.current_index();
+            if self.selected >= songs.len() {
+                self.selected = current.min(songs.len().saturating_sub(1));
+            }
+            songs.len()
+        };
+
+        if self.selected >= len {
+            self.selected = len.saturating_sub(1);
         }
 
         if let Some(command) = queue_edit_command(key) {
@@ -95,13 +103,15 @@ impl MainPage {
                     AppAction::None
                 }
                 QueueEditCommand::MoveDown => {
-                    if self.selected + 1 < songs.len() {
+                    if self.selected + 1 < len {
                         ctx.playlist.move_item(self.selected, self.selected + 1);
                         self.selected += 1;
                     }
                     AppAction::None
                 }
-                QueueEditCommand::RemoveSelected => self.remove_at(self.selected, ctx),
+                QueueEditCommand::RemoveSelected => {
+                    self.remove_at(self.selected, ctx)
+                }
                 QueueEditCommand::Clear => {
                     ctx.playlist.clear();
                     ctx.stop_player();
@@ -118,10 +128,10 @@ impl MainPage {
         if let Some(action) = resolver.resolve_page("main", key) {
             match action {
                 Action::ListSelectUp => {
-                    if !songs.is_empty() {
+                    if len != 0 {
                         self.selected = if self.selected == 0 {
                             if ctx.config.read().unwrap().ui.wrap_navigation {
-                                songs.len() - 1
+                                len - 1
                             } else {
                                 0
                             }
@@ -132,8 +142,8 @@ impl MainPage {
                     return AppAction::None;
                 }
                 Action::ListSelectDown => {
-                    if !songs.is_empty() {
-                        self.selected = if self.selected + 1 < songs.len() {
+                    if len != 0 {
+                        self.selected = if self.selected + 1 < len {
                             self.selected + 1
                         } else if ctx.config.read().unwrap().ui.wrap_navigation {
                             0
@@ -148,7 +158,7 @@ impl MainPage {
                     return AppAction::None;
                 }
                 Action::ListSelectLast => {
-                    self.selected = songs.len().saturating_sub(1);
+                    self.selected = len.saturating_sub(1);
                     return AppAction::None;
                 }
                 Action::ListPageUp => {
@@ -156,11 +166,12 @@ impl MainPage {
                     return AppAction::None;
                 }
                 Action::ListPageDown => {
-                    self.selected = (self.selected + 5).min(songs.len().saturating_sub(1));
+                    self.selected = (self.selected + 5).min(len.saturating_sub(1));
                     return AppAction::None;
                 }
                 Action::ListActivate => {
-                    if self.selected < songs.len() {
+                    if self.selected < len {
+                        let (songs, _) = ctx.playlist.snapshot();
                         return AppAction::PlaySong {
                             songs,
                             index: self.selected,
@@ -169,7 +180,12 @@ impl MainPage {
                     return AppAction::None;
                 }
                 Action::ListToggleFavorite => {
-                    if let Some(song) = songs.get(self.selected).cloned() {
+                    let song = ctx
+                        .playlist
+                        .borrow()
+                        .get(self.selected)
+                        .cloned();
+                    if let Some(song) = song {
                         return AppAction::ToggleFavoriteSong(Box::new(song));
                     }
                     return AppAction::None;
@@ -180,10 +196,10 @@ impl MainPage {
 
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Up) => {
-                if !songs.is_empty() {
+                if len != 0 {
                     self.selected = if self.selected == 0 {
                         if ctx.config.read().unwrap().ui.wrap_navigation {
-                            songs.len() - 1
+                            len - 1
                         } else {
                             0
                         }
@@ -193,8 +209,8 @@ impl MainPage {
                 }
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if !songs.is_empty() {
-                    self.selected = if self.selected + 1 < songs.len() {
+                if len != 0 {
+                    self.selected = if self.selected + 1 < len {
                         self.selected + 1
                     } else if ctx.config.read().unwrap().ui.wrap_navigation {
                         0
@@ -209,23 +225,25 @@ impl MainPage {
             (KeyModifiers::NONE, KeyCode::End)
             | (KeyModifiers::NONE, KeyCode::Char('G'))
             | (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
-                self.selected = songs.len().saturating_sub(1);
+                self.selected = len.saturating_sub(1);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
                 self.selected = self.selected.saturating_sub(5);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.selected = (self.selected + 5).min(songs.len().saturating_sub(1));
+                self.selected = (self.selected + 5).min(len.saturating_sub(1));
             }
-            _ if super::is_song_activation_key(key) && self.selected < songs.len() => {
+            _ if super::is_song_activation_key(key) && self.selected < len => {
+                let (songs, _) = ctx.playlist.snapshot();
                 return AppAction::PlaySong {
                     songs,
                     index: self.selected,
                 };
             }
             (KeyModifiers::NONE, KeyCode::Char('f')) => {
-                if let Some(song) = songs.get(self.selected).cloned() {
+                let song = ctx.playlist.borrow().get(self.selected).cloned();
+                if let Some(song) = song {
                     return AppAction::ToggleFavoriteSong(Box::new(song));
                 }
             }
@@ -284,44 +302,58 @@ impl MainPage {
         ctx: &AppContext,
         activate: bool,
     ) -> AppAction {
-        let (songs, current) = ctx.playlist.snapshot();
         let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
-        match event.kind {
-            MouseEventKind::ScrollUp => {
-                self.dragging = None;
-                self.selected = self.selected.saturating_sub(scroll_amount);
-            }
-            MouseEventKind::ScrollDown => {
-                self.dragging = None;
-                self.selected = (self.selected + scroll_amount).min(songs.len().saturating_sub(1));
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(index) = queue_index_at(event, area, self.scroll, songs.len()) {
-                    self.selected = index;
-                    self.dragging = Some(index);
-                    if activate {
-                        self.dragging = None;
-                        return AppAction::PlaySong { songs, index };
-                    }
-                } else {
+        let mut play_songs = None;
+        let mut drag_target = None;
+        {
+            // 只读阶段：从队列快照中取出本次事件需要的少量信息。
+            let songs = ctx.playlist.borrow();
+            let current = ctx.playlist.current_index();
+            match event.kind {
+                MouseEventKind::ScrollUp => {
                     self.dragging = None;
-                    self.selected = current.min(songs.len().saturating_sub(1));
+                    self.selected = self.selected.saturating_sub(scroll_amount);
                 }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(from) = self.dragging
-                    && let Some(target) = queue_index_at(event, area, self.scroll, songs.len())
-                    && from != target
-                {
-                    ctx.playlist.move_item(from, target);
-                    self.selected = target;
-                    self.dragging = Some(target);
+                MouseEventKind::ScrollDown => {
+                    self.dragging = None;
+                    self.selected =
+                        (self.selected + scroll_amount).min(songs.len().saturating_sub(1));
                 }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) = queue_index_at(event, area, self.scroll, songs.len()) {
+                        self.selected = index;
+                        self.dragging = Some(index);
+                        if activate {
+                            play_songs = Some(songs.to_vec());
+                        }
+                    } else {
+                        self.dragging = None;
+                        self.selected = current.min(songs.len().saturating_sub(1));
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(from) = self.dragging {
+                        drag_target = queue_index_at(event, area, self.scroll, songs.len())
+                            .filter(|&target| target != from);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.dragging = None;
+                }
+                _ => {}
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.dragging = None;
-            }
-            _ => {}
+        }
+        // 借用已释放，写操作不会与读锁互相等待。
+        if let (Some(from), Some(target)) = (self.dragging, drag_target) {
+            ctx.playlist.move_item(from, target);
+            self.selected = target;
+            self.dragging = Some(target);
+        }
+        if let Some(songs) = play_songs {
+            return AppAction::PlaySong {
+                songs,
+                index: self.selected,
+            };
         }
         AppAction::None
     }
@@ -332,21 +364,24 @@ impl MainPage {
         area: Rect,
         ctx: &AppContext,
     ) -> Option<(Vec<lx_core::model::song::SongInfo>, usize)> {
-        let (songs, _) = ctx.playlist.snapshot();
+        let songs = ctx.playlist.borrow();
         let index = queue_index_at(event, area, self.scroll, songs.len())?;
         self.selected = index;
         self.dragging = None;
-        Some((songs, index))
+        Some((songs.to_vec(), index))
     }
 
     pub fn remove_at(&mut self, index: usize, ctx: &AppContext) -> AppAction {
-        let (songs, current) = ctx.playlist.snapshot();
+        let songs = ctx.playlist.borrow();
+        let current = ctx.playlist.current_index();
         if index >= songs.len() {
             return AppAction::None;
         }
         let removing_current = index == current;
+        drop(songs);
         ctx.playlist.remove(index);
-        let (remaining, next) = ctx.playlist.snapshot();
+        let remaining = ctx.playlist.borrow();
+        let next = ctx.playlist.current_index();
         self.selected = index.min(remaining.len().saturating_sub(1));
         self.scroll = self.scroll.min(remaining.len().saturating_sub(1));
         if !removing_current {
@@ -360,7 +395,7 @@ impl MainPage {
             AppAction::None
         } else {
             AppAction::PlaySong {
-                songs: remaining,
+                songs: remaining.to_vec(),
                 index: next,
             }
         }
@@ -368,7 +403,9 @@ impl MainPage {
 
     fn render_queue(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let accent = crate::theme::accent(ctx);
-        let (songs, current) = ctx.playlist.snapshot();
+        // 借用队列快照，每帧渲染不再复制整张播放列表。
+        let songs = ctx.playlist.borrow();
+        let current = ctx.playlist.current_index();
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
@@ -381,7 +418,7 @@ impl MainPage {
                 .render(inner, buf);
             return;
         }
-        self.selected = self.selected.min(songs.len() - 1);
+        self.selected = self.selected.min(songs.len().saturating_sub(1));
         if inner.height == 0 {
             return;
         }

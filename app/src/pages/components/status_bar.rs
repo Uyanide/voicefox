@@ -26,7 +26,8 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
     let position = *ctx.position.borrow();
     let duration = *ctx.duration.borrow();
     let volume = ctx.player.volume();
-    let (queue, queue_index) = ctx.playlist.snapshot();
+    let queue = ctx.playlist.borrow();
+    let queue_index = ctx.playlist.current_index();
     let (quality, status_bar_items) = {
         let config = ctx.config.read().unwrap();
         (config.player.quality, config.ui.status_bar_items.clone())

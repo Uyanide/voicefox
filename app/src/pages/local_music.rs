@@ -5,16 +5,17 @@ use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{Block, Borders};
 
 use crate::context::AppContext;
-use crate::pages::sort::{SortState, SortTarget, sorted_songs};
+use crate::pages::sort::{SortState, SortTarget, SortedListCache};
 
 pub fn handle_mouse(
     event: MouseEvent,
     area: Rect,
     ctx: &AppContext,
     state: &mut SortState,
+    cache: &mut SortedListCache,
     activate: bool,
 ) -> AppAction {
-    let songs = sorted_local_songs(ctx, state);
+    let songs = sorted_local_songs(ctx, state, cache);
     let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
     match event.kind {
         MouseEventKind::ScrollUp => {
@@ -28,7 +29,10 @@ pub fn handle_mouse(
             if let Some(index) = song_index_at(area, position, state.scroll, songs.len()) {
                 state.selected = index;
                 if activate {
-                    return AppAction::PlaySong { songs, index };
+                    return AppAction::PlaySong {
+                        songs: songs.to_vec(),
+                        index,
+                    };
                 }
             }
         }
@@ -42,19 +46,28 @@ pub fn context_song_at(
     area: Rect,
     ctx: &AppContext,
     state: &mut SortState,
+    cache: &mut SortedListCache,
 ) -> Option<(Vec<SongInfo>, usize)> {
-    let songs = sorted_local_songs(ctx, state);
+    let songs = sorted_local_songs(ctx, state, cache);
     let position = Position::new(event.column, event.row);
     let index = song_index_at(area, position, state.scroll, songs.len())?;
     state.selected = index;
-    Some((songs, index))
+    Some((songs.to_vec(), index))
 }
 
-pub fn sorted_local_songs(ctx: &AppContext, state: &SortState) -> Vec<SongInfo> {
-    sorted_songs(
-        ctx.source_manager.local_source().all_songs(),
+/// 获取排序后的本地歌曲列表，结果按曲库代次 + 排序方式缓存，
+/// 渲染路径不再每帧全量 clone + 排序。
+pub fn sorted_local_songs<'a>(
+    ctx: &AppContext,
+    state: &SortState,
+    cache: &'a mut SortedListCache,
+) -> &'a [SongInfo] {
+    let source = ctx.source_manager.local_source();
+    cache.get_or_build(
+        source.library_generation(),
         state.mode,
         SortTarget::Local,
+        || source.all_songs(),
     )
 }
 

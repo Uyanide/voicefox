@@ -81,6 +81,13 @@ impl MpvEngine {
     pub fn new() -> anyhow::Result<Self> {
         let mpv = Arc::new(
             Mpv::with_initializer(|init| {
+                // 与用户的全局 mpv 配置隔离：不加载 ~/.config/mpv/mpv.conf 和
+                // scripts。那是面向视频播放的重型配置（GPU 着色器、脚本、ICC、
+                // pipewire 等），与 voicefox 的 vo=null 音乐播放无关，却会让
+                // 进程内 libmpv 在网络流播放时多占用数百 MB（实测同一份配置下
+                // HTTP 播放 RSS 从约 76MB 涨到 568MB）。
+                init.set_option("config", false)?;
+                init.set_option("load-scripts", false)?;
                 init.set_option("vo", "null")?;
                 init.set_option("cache", "yes")?;
                 init.set_option("audio-client-name", "voicefox")?;
@@ -88,6 +95,19 @@ impl MpvEngine {
                 // consecutive tracks can start without an avoidable gap.
                 if let Err(error) = init.set_option("gapless-audio", "yes") {
                     warn!("libmpv gapless-audio option unavailable: {error}");
+                }
+                // 限制网络播放的内存缓冲。mpv 默认会把 demuxer 预读上限设到
+                // 150MiB，在线歌曲连续播放时进程内 RSS 会随缓存水位升高且
+                // allocator 不会立刻归还；音乐场景 32MiB 预读足够，长期播放
+                // 内存保持有界。
+                if let Err(error) = init.set_option("demuxer-max-bytes", 32 * 1024 * 1024) {
+                    warn!("libmpv demuxer-max-bytes option unavailable: {error}");
+                }
+                if let Err(error) = init.set_option("demuxer-max-back-bytes", 4 * 1024 * 1024) {
+                    warn!("libmpv demuxer-max-back-bytes option unavailable: {error}");
+                }
+                if let Err(error) = init.set_option("cache-size", 16 * 1024) {
+                    warn!("libmpv cache-size option unavailable: {error}");
                 }
                 Ok(())
             })

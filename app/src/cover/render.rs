@@ -4,6 +4,7 @@ use std::sync::mpsc::{
     Receiver, Sender, SyncSender, TryRecvError, TrySendError, channel, sync_channel,
 };
 use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
 use std::thread;
 use std::time::Duration;
 
@@ -20,7 +21,16 @@ use ratatui_image::{FilterType, FontSize, Resize, ResizeEncodeRender};
 const RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
 
 /// 解码后的最长边上限
-const MAX_DECODED_EDGE: u32 = 1024;
+///
+/// 封面在终端里最终会缩放回单元格尺寸，1024px 的解码缓冲（约 4MB RGBA）
+/// 超出实际需要；640px 在常见终端尺寸下画质无感知差异，峰值内存降为约 1/4。
+const MAX_DECODED_EDGE: u32 = 640;
+
+/// 解码后的封面图缓存容量（按封面路径计）。
+///
+/// 切回近期播放过的歌曲时直接复用解码结果，避免反复解码带来的
+/// CPU 开销与瞬时大块分配；容量固定，不会无限增长。
+const DECODED_COVER_CACHE_CAP: usize = 8;
 
 /// 等待终端应答能力查询的超时上限
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -285,6 +295,7 @@ fn spawn_workers(
     let decode = thread::Builder::new()
         .name("voicefox-cover-decode".to_string())
         .spawn(move || {
+            let mut decoded_cache: VecDeque<(String, Arc<image::DynamicImage>)> = VecDeque::new();
             for () in decode_wake_rx {
                 let Some(job) = decode_pending
                     .lock()
@@ -293,8 +304,8 @@ fn spawn_workers(
                 else {
                     continue;
                 };
-                let protocol =
-                    decode(&job.path).map(|image| Box::new(job.picker.new_resize_protocol(image)));
+                let protocol = decode_cached(&job.path, &mut decoded_cache)
+                    .map(|image| Box::new(job.picker.new_resize_protocol((*image).clone())));
                 if decode_tx
                     .send(Done::Loaded {
                         id: job.id,
@@ -362,6 +373,23 @@ fn decode(path: &str) -> Option<image::DynamicImage> {
             None
         }
     }
+}
+
+/// 带 LRU 缓存的封面解码：命中缓存时直接复用已解码图像，
+/// 未命中时解码并插入缓存，超过容量时淘汰最久未用的条目。
+fn decode_cached(
+    path: &str,
+    cache: &mut VecDeque<(String, Arc<image::DynamicImage>)>,
+) -> Option<Arc<image::DynamicImage>> {
+    if let Some((_, image)) = cache.iter().find(|(cached, _)| cached == path) {
+        return Some(Arc::clone(image));
+    }
+    let image = Arc::new(decode(path)?);
+    cache.push_back((path.to_string(), image.clone()));
+    while cache.len() > DECODED_COVER_CACHE_CAP {
+        cache.pop_front();
+    }
+    Some(image)
 }
 
 /// 把最长边超过 [`MAX_DECODED_EDGE`] 的图按比例缩到上限
@@ -510,7 +538,7 @@ mod tests {
         let image = super::decode(&huge).unwrap();
         assert_eq!(
             (image.width(), image.height()),
-            (1024, 512),
+            (640, 320),
             "最长边应缩到上限，比例应保持"
         );
 

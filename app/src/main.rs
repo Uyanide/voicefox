@@ -6,15 +6,18 @@ mod cli;
 mod config;
 mod context;
 mod cover;
+mod data_cache;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod notification;
 mod pages;
 mod playlist;
 mod storage;
+
 mod theme;
 mod tmux;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -42,13 +45,14 @@ use ratatui::style::Style;
 use tokio::sync::mpsc;
 
 use context::AppContext;
+use data_cache::DataCache;
 use pages::components;
 use pages::components::context_menu::{
     MenuOutcome, PlaybackMenuAction, PlaybackMenuState, SongContextMenu, SongContextMenuOptions,
     SongMenuAction, SongMenuKind,
 };
 use pages::sidebar::NavTab;
-use pages::sort::{SortMode, SortState, SortTarget};
+use pages::sort::{SortMode, SortState, SortTarget, SortedListCache};
 use storage::SavedPlayerState;
 
 enum LeaderboardResponse {
@@ -566,6 +570,7 @@ fn run_app(
     let mut favorites_page = pages::favorites::FavoritesPage::new();
     let mut history_state = SortState::new(SortMode::Newest);
     let mut local_state = SortState::new(SortMode::TitleAsc);
+    let mut data_cache = DataCache::default();
     let mut local_filter = components::list_filter::ListFilter::new();
     let mut history_filter = components::list_filter::ListFilter::new();
     let mut confirm_delete: Option<LocalDeleteConfirmation> = None;
@@ -649,6 +654,7 @@ fn run_app(
             AppAction::ScanLocalMusic {
                 paths: local_music_paths,
                 max_depth: local_music_max_depth,
+                force: false,
             },
             &ctx,
             rt,
@@ -763,6 +769,7 @@ fn run_app(
                 let action = AppAction::ScanLocalMusic {
                     paths: config.local_music.paths.clone(),
                     max_depth: config.local_music.max_depth,
+                    force: false,
                 };
                 drop(config);
                 execute_action(
@@ -873,8 +880,8 @@ fn run_app(
                     PlayerEvent::Ended { generation }
                         if generation == ctx.active_player_generation.load(Ordering::SeqCst) =>
                     {
-                        if let Some((songs, index)) = ctx.playlist.next_entry() {
-                            let _ = action_tx.send(AppAction::PlaySong { songs, index });
+                        if let Some((songs, index)) = ctx.playlist.next_entry_arc() {
+                            let _ = action_tx.send(AppAction::PlayFromQueue { songs, index });
                         }
                     }
                     PlayerEvent::Error {
@@ -1212,6 +1219,9 @@ fn run_app(
                 &mut favorites_page,
                 &mut history_state,
                 &mut local_state,
+                &mut data_cache.local,
+                &mut data_cache.history,
+                &mut data_cache.favorites,
                 &history_filter,
                 &local_filter,
                 &mut ui_areas,
@@ -1307,7 +1317,11 @@ fn run_app(
                                 let max_depth = config.local_music.max_depth;
                                 drop(config);
                                 execute_action(
-                                    AppAction::ScanLocalMusic { paths, max_depth },
+                                    AppAction::ScanLocalMusic {
+                                        paths,
+                                        max_depth,
+                                        force: true,
+                                    },
                                     &ctx,
                                     rt,
                                     &action_tx,
@@ -1405,9 +1419,9 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalNextTrack if !text_input_active => {
-                        if let Some((songs, index)) = ctx.playlist.next_manual_entry() {
+                        if let Some((songs, index)) = ctx.playlist.next_manual_entry_arc() {
                             execute_action(
-                                AppAction::PlaySong { songs, index },
+                                AppAction::PlayFromQueue { songs, index },
                                 &ctx,
                                 rt,
                                 &action_tx,
@@ -1420,9 +1434,9 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalPrevTrack if !text_input_active => {
-                        if let Some((songs, index)) = ctx.playlist.prev_manual_entry() {
+                        if let Some((songs, index)) = ctx.playlist.prev_manual_entry_arc() {
                             execute_action(
-                                AppAction::PlaySong { songs, index },
+                                AppAction::PlayFromQueue { songs, index },
                                 &ctx,
                                 rt,
                                 &action_tx,
@@ -1555,9 +1569,9 @@ fn run_app(
             // Fallback：不在自定义配置中的全局键位别名（保持向后兼容）
             match (key.modifiers, key.code) {
                 (KeyModifiers::SHIFT, KeyCode::Char('>')) if !text_input_active => {
-                    if let Some((songs, index)) = ctx.playlist.next_manual_entry() {
+                    if let Some((songs, index)) = ctx.playlist.next_manual_entry_arc() {
                         execute_action(
-                            AppAction::PlaySong { songs, index },
+                            AppAction::PlayFromQueue { songs, index },
                             &ctx,
                             rt,
                             &action_tx,
@@ -1570,9 +1584,9 @@ fn run_app(
                     continue;
                 }
                 (KeyModifiers::SHIFT, KeyCode::Char('<')) if !text_input_active => {
-                    if let Some((songs, index)) = ctx.playlist.prev_manual_entry() {
+                    if let Some((songs, index)) = ctx.playlist.prev_manual_entry_arc() {
                         execute_action(
-                            AppAction::PlaySong { songs, index },
+                            AppAction::PlayFromQueue { songs, index },
                             &ctx,
                             rt,
                             &action_tx,
@@ -1718,6 +1732,7 @@ fn run_app(
                         &mut history_state,
                         history_filter.query(),
                         &kb_resolver,
+                        &mut data_cache.history,
                     );
                     // 保持在历史页面，不强制切换到主页
                     execute_action(
@@ -1795,18 +1810,22 @@ fn run_app(
                     }
 
                     // 2. 计算排序+过滤后的歌曲列表
-                    let all_songs = pages::local_music::sorted_local_songs(&ctx, &local_state);
-                    let songs = if local_filter.query().is_empty() {
-                        all_songs
+                    let all_songs =
+                        pages::local_music::sorted_local_songs(&ctx, &local_state, &mut data_cache.local);
+                    let songs: Cow<'_, [SongInfo]> = if local_filter.query().is_empty() {
+                        Cow::Borrowed(all_songs)
                     } else {
                         let query = local_filter.query().trim().to_lowercase();
-                        all_songs
-                            .into_iter()
+                        Cow::Owned(
+                            all_songs
+                                .iter()
                             .filter(|s| {
                                 s.name.to_lowercase().contains(&query)
                                     || s.singer.to_lowercase().contains(&query)
                             })
-                            .collect()
+                                .cloned()
+                                .collect(),
+                        )
                     };
 
                     if let Some(action) = kb_resolver.resolve_page("local", &key) {
@@ -1822,7 +1841,11 @@ fn run_app(
                                 let paths = ctx.config.read().unwrap().local_music.paths.clone();
                                 let max_depth = ctx.config.read().unwrap().local_music.max_depth;
                                 execute_action(
-                                    AppAction::ScanLocalMusic { paths, max_depth },
+                                    AppAction::ScanLocalMusic {
+                                        paths,
+                                        max_depth,
+                                        force: true,
+                                    },
                                     &ctx,
                                     rt,
                                     &action_tx,
@@ -1927,7 +1950,7 @@ fn run_app(
                             {
                                 execute_action(
                                     AppAction::PlaySong {
-                                        songs,
+                                        songs: songs.into_owned(),
                                         index: local_state.selected,
                                     },
                                     &ctx,
@@ -1964,7 +1987,11 @@ fn run_app(
                                 let paths = ctx.config.read().unwrap().local_music.paths.clone();
                                 let max_depth = ctx.config.read().unwrap().local_music.max_depth;
                                 execute_action(
-                                    AppAction::ScanLocalMusic { paths, max_depth },
+                                    AppAction::ScanLocalMusic {
+                                        paths,
+                                        max_depth,
+                                        force: true,
+                                    },
                                     &ctx,
                                     rt,
                                     &action_tx,
@@ -2011,7 +2038,7 @@ fn run_app(
                                 if !songs.is_empty() && local_state.selected < songs.len() {
                                     execute_action(
                                         AppAction::PlaySong {
-                                            songs,
+                                            songs: songs.to_vec(),
                                             index: local_state.selected,
                                         },
                                         &ctx,
@@ -2185,7 +2212,12 @@ fn run_app(
                             .context_song_at(mouse, ui_areas.content)
                             .map(|target| (target, SongMenuKind::Standard, None)),
                         NavTab::Favorites => favorites_page
-                            .context_song_at(mouse, ui_areas.content, &ctx)
+                            .context_song_at(
+                                mouse,
+                                ui_areas.content,
+                                &ctx,
+                                &mut data_cache.favorites,
+                            )
                             .map(|target| {
                                 (
                                     target,
@@ -2199,6 +2231,7 @@ fn run_app(
                             &ctx,
                             &mut history_state,
                             history_filter.query(),
+                            &mut data_cache.history,
                         )
                         .map(|target| {
                             (
@@ -2212,6 +2245,7 @@ fn run_app(
                             ui_areas.content,
                             &ctx,
                             &mut local_state,
+                            &mut data_cache.local,
                         )
                         .map(|target| {
                             (
@@ -2261,7 +2295,13 @@ fn run_app(
                         playlists.handle_mouse(mouse, ui_areas.content, activate, &ctx)
                     }
                     NavTab::Favorites => {
-                        favorites_page.handle_mouse(mouse, ui_areas.content, &ctx, activate)
+                        favorites_page.handle_mouse(
+                            mouse,
+                            ui_areas.content,
+                            &ctx,
+                            &mut data_cache.favorites,
+                            activate,
+                        )
                     }
                     NavTab::History => pages::history::handle_mouse(
                         mouse,
@@ -2269,6 +2309,7 @@ fn run_app(
                         &ctx,
                         &mut history_state,
                         history_filter.query(),
+                        &mut data_cache.history,
                         activate,
                     ),
                     NavTab::Settings => settings_page.lock().unwrap().handle_mouse(
@@ -2282,6 +2323,7 @@ fn run_app(
                         ui_areas.content,
                         &ctx,
                         &mut local_state,
+                        &mut data_cache.local,
                         activate,
                     ),
                 };
@@ -2336,6 +2378,9 @@ fn run_app(
                 &mut favorites_page,
                 &mut history_state,
                 &mut local_state,
+                &mut data_cache.local,
+                &mut data_cache.history,
+                &mut data_cache.favorites,
                 &history_filter,
                 &local_filter,
                 &mut ui_areas,
@@ -2362,6 +2407,9 @@ fn draw_app(
     favorites_page: &mut pages::favorites::FavoritesPage,
     history_state: &mut SortState,
     local_state: &mut SortState,
+    data_cache_local: &mut SortedListCache,
+    data_cache_history: &mut SortedListCache,
+    data_cache_favorites: &mut SortedListCache,
     history_filter: &components::list_filter::ListFilter,
     local_filter: &components::list_filter::ListFilter,
     ui_areas: &mut UiAreas,
@@ -2416,7 +2464,7 @@ fn draw_app(
                 playlists.render(content_area, frame.buffer_mut(), ctx);
             }
             NavTab::Favorites => {
-                favorites_page.render(content_area, frame.buffer_mut(), ctx);
+                favorites_page.render(content_area, frame.buffer_mut(), ctx, data_cache_favorites);
             }
             NavTab::History => {
                 pages::history::render(
@@ -2425,6 +2473,7 @@ fn draw_app(
                     ctx,
                     history_state,
                     history_filter,
+                    data_cache_history,
                 );
             }
             NavTab::Settings => {
@@ -2439,22 +2488,26 @@ fn draw_app(
                 'local_content: {
                     let local_src = ctx.source_manager.local_source();
                     let paths = ctx.config.read().unwrap().local_music.paths.clone();
-                    let all_songs = pages::local_music::sorted_local_songs(ctx, local_state);
+                    let all_songs =
+                        pages::local_music::sorted_local_songs(ctx, local_state, data_cache_local);
                     let is_scanning = local_src.is_scanning();
                     let scan_stats = local_src.scan_stats();
-                    let missing_count = local_src.missing_files().len();
+                    let missing_count = local_src.missing_count();
 
-                    let songs: Vec<_> = if local_filter.query().is_empty() {
-                        all_songs
+                    let songs: Cow<'_, [SongInfo]> = if local_filter.query().is_empty() {
+                        Cow::Borrowed(all_songs)
                     } else {
                         let query = local_filter.query().trim().to_lowercase();
-                        all_songs
-                            .into_iter()
-                            .filter(|s| {
-                                s.name.to_lowercase().contains(&query)
-                                    || s.singer.to_lowercase().contains(&query)
-                            })
-                            .collect()
+                        Cow::Owned(
+                            all_songs
+                                .iter()
+                                .filter(|s| {
+                                    s.name.to_lowercase().contains(&query)
+                                        || s.singer.to_lowercase().contains(&query)
+                                })
+                                .cloned()
+                                .collect(),
+                        )
                     };
 
                     local_state.selected = local_state.selected.min(songs.len().saturating_sub(1));
@@ -2778,10 +2831,10 @@ fn execute_mpris_command(
 ) -> bool {
     use mpris::MprisCommand;
 
-    let play_entry = |entry: Option<(Vec<SongInfo>, usize)>| {
+    let play_entry = |entry: Option<(Arc<Vec<SongInfo>>, usize)>| {
         if let Some((songs, index)) = entry {
             execute_action(
-                AppAction::PlaySong { songs, index },
+                AppAction::PlayFromQueue { songs, index },
                 ctx,
                 rt,
                 action_tx,
@@ -2798,8 +2851,8 @@ fn execute_mpris_command(
         MprisCommand::Pause => ctx.player.pause(),
         MprisCommand::Toggle => ctx.player.toggle(),
         MprisCommand::Stop => ctx.stop_player(),
-        MprisCommand::Next => play_entry(ctx.playlist.next_manual_entry()),
-        MprisCommand::Previous => play_entry(ctx.playlist.prev_manual_entry()),
+        MprisCommand::Next => play_entry(ctx.playlist.next_manual_entry_arc()),
+        MprisCommand::Previous => play_entry(ctx.playlist.prev_manual_entry_arc()),
         MprisCommand::SeekBy(offset) => {
             let current = ctx.position.borrow().as_micros();
             let target = if offset >= 0 {
@@ -2954,6 +3007,12 @@ fn execute_action(
         AppAction::PlaySongAfterFailure { songs, index } => {
             begin_song_from_list(songs, index, true, ctx, rt, action_tx);
         }
+        AppAction::PlayFromQueue { songs, index } => {
+            begin_song_from_arc(songs, index, false, ctx, rt, action_tx);
+        }
+        AppAction::PlayFromQueueAfterFailure { songs, index } => {
+            begin_song_from_arc(songs, index, true, ctx, rt, action_tx);
+        }
         AppAction::RestorePlayback {
             songs,
             index,
@@ -3005,7 +3064,7 @@ fn execute_action(
                 return;
             }
             ctx.stop_player();
-            if let Some((songs, index)) = ctx.playlist.next_after_failure() {
+            if let Some((songs, index)) = ctx.playlist.next_after_failure_arc() {
                 let failed = ctx
                     .current_song
                     .read()
@@ -3014,7 +3073,7 @@ fn execute_action(
                     .map(|song| format!("{} - {}", song.name, song.singer))
                     .unwrap_or_else(|| "当前歌曲".to_string());
                 ctx.notify(Notification::warning(format!("{error}；已跳过 {failed}")).tui_only());
-                begin_song_from_list(songs, index, true, ctx, rt, action_tx);
+                begin_song_from_arc(songs, index, true, ctx, rt, action_tx);
             } else {
                 ctx.notify(Notification::error(format!(
                     "{error}；队列中没有更多可播放歌曲"
@@ -3145,7 +3204,11 @@ fn execute_action(
                 ctx.notify(Notification::info("播放历史已经是空的"));
             }
         }
-        AppAction::ScanLocalMusic { paths, max_depth } => {
+        AppAction::ScanLocalMusic {
+            paths,
+            max_depth,
+            force,
+        } => {
             let generation = next_generation(&ctx.local_scan_request_id);
             let request_seq = Arc::clone(&ctx.local_scan_request_id);
             let local_source = ctx.source_manager.local_source();
@@ -3156,8 +3219,12 @@ fn execute_action(
             rt.spawn(async move {
                 let watcher_paths = paths.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let errors =
-                        local_source.scan_for_generation(&paths, max_depth, source_generation);
+                    let errors = local_source.scan_for_generation(
+                        &paths,
+                        max_depth,
+                        source_generation,
+                        force,
+                    );
                     let count = local_source.all_songs().len();
                     (errors, count)
                 })
@@ -3299,6 +3366,35 @@ fn begin_song_from_list(
         ctx.playlist.set_playlist_after_failure(songs, index);
     } else {
         ctx.playlist.set_playlist(songs, index);
+    }
+    ctx.play_attempted_sources.lock().unwrap().clear();
+    *ctx.play_js_source_index.lock().unwrap() = None;
+    start_song_playback(song, true, None, ctx, rt, action_tx);
+}
+
+/// 从当前队列继续播放：歌曲列表以 `Arc` 共享，不深拷贝整张队列。
+///
+/// 自动切歌（播放结束 / 播放失败跳过 / MPRIS 与快捷键切歌）都走此路径。
+/// B 站分 P 歌曲仍需展开成普通列表，罕见情况下回退到 Vec 流程。
+fn begin_song_from_arc(
+    songs: Arc<Vec<SongInfo>>,
+    index: usize,
+    after_failure: bool,
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+) {
+    let Some(song) = songs.get(index).cloned() else {
+        return;
+    };
+    if should_expand_bili_parts(&song) {
+        begin_song_from_list(songs.to_vec(), index, after_failure, ctx, rt, action_tx);
+        return;
+    }
+    if after_failure {
+        ctx.playlist.set_playlist_arc_after_failure(songs, index);
+    } else {
+        ctx.playlist.set_playlist_arc(songs, index);
     }
     ctx.play_attempted_sources.lock().unwrap().clear();
     *ctx.play_js_source_index.lock().unwrap() = None;

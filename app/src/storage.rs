@@ -5,12 +5,84 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
+
+/// 播放历史的紧凑存储条目。
+///
+/// 历史页只展示歌曲名/歌手/专辑/时长/来源，播放时 URL 也会重新解析，
+/// 因此不需要持久化 `SongInfo` 里的大字段（`extra` 哈希表、`toggle_source`
+/// 递归结构、`audio` 编码参数等）。存成紧凑条目后，收藏/历史文件体积和
+/// 内存占用都能明显下降；`#[serde(default)]` 保证旧版完整 `SongInfo` JSON
+/// 仍可平滑读入。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default = "default_history_source")]
+    pub source: SourceId,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub singer: String,
+    #[serde(default)]
+    pub album_name: String,
+    #[serde(default)]
+    pub duration: Duration,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub qualities: std::collections::BTreeSet<lx_core::model::source::Quality>,
+    #[serde(default)]
+    pub file_path: Option<PathBuf>,
+}
+
+fn default_history_source() -> SourceId {
+    SourceId::Kw
+}
+
+impl HistoryEntry {
+    /// 从完整歌曲信息中提取历史需要的字段，丢弃重型字段。
+    fn from_song(song: &SongInfo) -> Self {
+        Self {
+            id: song.id.clone(),
+            source: song.source,
+            name: song.name.clone(),
+            singer: song.singer.clone(),
+            album_name: song.album_name.clone(),
+            duration: song.duration,
+            cover_url: song.cover_url.clone(),
+            qualities: song.qualities.clone(),
+            file_path: song.file_path.clone(),
+        }
+    }
+
+    /// 还原为可播放的 `SongInfo`。播放路径会重新解析 URL，因此重型字段
+    /// 使用默认空值即可。
+    fn into_song(self) -> SongInfo {
+        SongInfo {
+            id: self.id,
+            source: self.source,
+            name: self.name,
+            singer: self.singer,
+            album_name: self.album_name,
+            album_id: String::new(),
+            duration: self.duration,
+            cover_url: self.cover_url,
+            qualities: self.qualities,
+            audio: None,
+            extra: Default::default(),
+            toggle_source: None,
+            file_path: self.file_path,
+            file_ext: None,
+        }
+    }
+}
 
 /// Version of the user-data interchange document.  Keep this independent of
 /// the application config version so data can migrate on its own schedule.
@@ -28,7 +100,7 @@ pub struct DataBackup {
     #[serde(default)]
     pub custom_playlists: Vec<CustomPlaylist>,
     #[serde(default)]
-    pub history: Vec<SongInfo>,
+    pub history: Vec<HistoryEntry>,
 }
 
 /// Result of importing an external playlist file.
@@ -120,7 +192,9 @@ pub struct Storage {
     favorites: RwLock<Vec<SongInfo>>,
     favorite_playlists: RwLock<Vec<Playlist>>,
     custom_playlists: RwLock<Vec<CustomPlaylist>>,
-    history: RwLock<Vec<SongInfo>>,
+    history: RwLock<Vec<HistoryEntry>>,
+    /// 数据代次：任何收藏/歌单/历史写入都会递增，供页面缓存判断是否重建。
+    generation: AtomicU64,
 }
 
 impl Storage {
@@ -133,16 +207,26 @@ impl Storage {
         let favorites = Self::load_file(&dir.join("favorites.json"));
         let favorite_playlists = Self::load_file(&dir.join("favorite_playlists.json"));
         let custom_playlists = Self::load_file(&dir.join("custom_playlists.json"));
-        let history = Self::load_file(&dir.join("history.json"));
+        let history = Self::load_history_file(&dir.join("history.json"));
         let storage = Self {
             data_dir: dir,
             favorites: RwLock::new(favorites),
             favorite_playlists: RwLock::new(favorite_playlists),
             custom_playlists: RwLock::new(custom_playlists),
             history: RwLock::new(history),
+            generation: AtomicU64::new(0),
         };
         storage.create_startup_backup();
         storage
+    }
+
+    /// 数据代次，收藏或历史发生变化时递增。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Export all durable user library data in one versioned document.
@@ -352,6 +436,7 @@ impl Storage {
             let json = value.map_err(|error| error.to_string())?;
             save_atomic(&self.data_dir.join(name), &json)?;
         }
+        self.bump_generation();
         Ok(())
     }
 
@@ -618,7 +703,7 @@ impl Storage {
     pub fn add_history(&self, song: &SongInfo, limit: usize) {
         let mut history = self.history.write().unwrap();
         history.retain(|s| !(s.id == song.id && s.source == song.source));
-        history.insert(0, song.clone());
+        history.insert(0, HistoryEntry::from_song(song));
         history.truncate(limit.max(1));
         self.save_history(&history);
     }
@@ -670,7 +755,13 @@ impl Storage {
     }
 
     pub fn load_history(&self) -> Vec<SongInfo> {
-        self.history.read().unwrap().clone()
+        self.history
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(HistoryEntry::into_song)
+            .collect()
     }
 
     // ── 播放会话 ──────────────────────────────────────
@@ -688,9 +779,39 @@ impl Storage {
         Some(session)
     }
 
+    /// 保留给测试与外部调用；生产持久化走
+    /// [`save_playback_session_borrowed`](Self::save_playback_session_borrowed)。
+    #[allow(dead_code)]
     pub fn save_playback_session(&self, session: &PlaybackSession) -> Result<(), String> {
         let path = self.data_dir.join("playback_state.json");
         let json = serde_json::to_vec_pretty(session).map_err(|error| error.to_string())?;
+        save_atomic(&path, &json)
+    }
+
+    /// 零拷贝保存播放会话：队列以 `&[SongInfo]` 借用序列化，
+    /// 不再为 5 秒一次的定时持久化深拷贝整张播放列表。
+    pub fn save_playback_session_borrowed(
+        &self,
+        playlist: &[SongInfo],
+        current_index: usize,
+        position: Duration,
+        state: SavedPlayerState,
+    ) -> Result<(), String> {
+        #[derive(serde::Serialize)]
+        struct PlaybackSessionRef<'a> {
+            playlist: &'a [SongInfo],
+            current_index: usize,
+            position: Duration,
+            state: SavedPlayerState,
+        }
+        let session = PlaybackSessionRef {
+            playlist,
+            current_index,
+            position,
+            state,
+        };
+        let path = self.data_dir.join("playback_state.json");
+        let json = serde_json::to_vec_pretty(&session).map_err(|error| error.to_string())?;
         save_atomic(&path, &json)
     }
 
@@ -714,8 +835,19 @@ impl Storage {
         }
     }
 
-    fn save_history(&self, history: &[SongInfo]) {
+    fn save_history(&self, history: &[HistoryEntry]) {
         self.save_file("history.json", history);
+    }
+
+    fn load_history_file(path: &Path) -> Vec<HistoryEntry> {
+        if path.exists() {
+            match fs::read_to_string(path) {
+                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+                Err(_) => vec![],
+            }
+        } else {
+            vec![]
+        }
     }
 
     fn save_file<T: Serialize + ?Sized>(&self, file_name: &str, value: &T) {
@@ -724,7 +856,9 @@ impl Storage {
             && let Err(error) = save_atomic(&path, &json)
         {
             tracing::warn!("保存数据文件 {} 失败: {}", path.display(), error);
+            return;
         }
+        self.bump_generation();
     }
 }
 
@@ -1097,6 +1231,7 @@ mod tests {
     };
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
+    use std::sync::atomic::AtomicU64;
     use std::sync::RwLock;
     use std::time::Duration;
 
@@ -1153,6 +1288,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         let first = song("1", SourceId::Kw, "One", "Artist");
         let second = song("2", SourceId::Kg, "Two", "Artist");
@@ -1194,6 +1330,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         let session = PlaybackSession {
             playlist: vec![song("1", SourceId::Bili, "第一 P", "UP主")],
@@ -1230,6 +1367,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         assert!(storage.create_custom_playlist("   ").is_err());
         let playlist = storage.create_custom_playlist("通勤").unwrap();
@@ -1298,6 +1436,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         let playlist = storage.create_custom_playlist("批量").unwrap();
         storage
@@ -1346,6 +1485,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         let first_playlist = storage.create_custom_playlist("通勤").unwrap();
         let second_playlist = storage.create_custom_playlist("夜晚").unwrap();
@@ -1404,6 +1544,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         let source = make_storage(source_dir);
         let favorite = song("favorite", SourceId::Wy, "Favorite", "Artist");
@@ -1444,6 +1585,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         storage.add_favorite(&song("keep", SourceId::Kw, "Keep", "Artist"));
         let path = root.join("future.json");
@@ -1471,6 +1613,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         let m3u = root.join("mix.m3u");
         std::fs::write(
@@ -1516,6 +1659,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         let path = root.join("legacy.json");
         let favorite = song("legacy", SourceId::Wy, "Legacy", "Artist");

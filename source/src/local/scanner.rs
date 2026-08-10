@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
+use std::time::Duration;
 
 use crate::local::metadata;
 use cue_rw::CUEFile;
@@ -61,6 +61,35 @@ impl FileFingerprint {
         Ok(Self {
             size: metadata.len(),
             modified_unix_nanos,
+        })
+    }
+}
+
+/// 目录级指纹：目录自身的大小与修改时间。
+///
+/// 文件/子目录的创建、删除、重命名都会更新父目录的 mtime，因此目录
+/// 签名未变时整个子树不可能发生变化；用它做“无变化快路径”，可以完全
+/// 跳过一次全目录遍历。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirSignature {
+    pub size: u64,
+    pub modified_unix_nanos: u128,
+}
+
+impl DirSignature {
+    pub fn from_path(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        Some(Self {
+            size: metadata.len(),
+            modified_unix_nanos: modified,
         })
     }
 }

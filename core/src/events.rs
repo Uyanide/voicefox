@@ -1,5 +1,6 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 use std::time::Duration;
+use std::sync::Arc;
 
 use crate::model::song::SongInfo;
 use crate::model::source::SourceId;
@@ -34,6 +35,17 @@ pub enum AppAction {
     },
     PlaySongAfterFailure {
         songs: Vec<SongInfo>,
+        index: usize,
+    },
+    /// 从当前队列继续播放下一首。歌曲列表以 `Arc` 共享，
+    /// 避免每次自动切歌都深拷贝整张队列。
+    PlayFromQueue {
+        songs: Arc<Vec<SongInfo>>,
+        index: usize,
+    },
+    /// 播放失败跳过后的下一首，保留连续失败计数。
+    PlayFromQueueAfterFailure {
+        songs: Arc<Vec<SongInfo>>,
         index: usize,
     },
     /// Resolve a search-result Bilibili video before playback; multi-part videos open a picker.
@@ -89,6 +101,9 @@ pub enum AppAction {
     ScanLocalMusic {
         paths: Vec<String>,
         max_depth: u32,
+        /// 用户主动重扫（添加/移除目录、按 r）时强制全量遍历；
+        /// 自动触发（启动、进入页面、watcher）走目录签名快路径。
+        force: bool,
     },
     /// 从设置页发起的外部歌单导入。文件解析与写盘都在后台任务中完成，
     /// 避免在 TUI 主循环里同步解析大歌单并反复写盘。

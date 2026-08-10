@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::pages::components::list_filter::ListFilter;
-use crate::pages::sort::{SortState, SortTarget, sorted_songs};
+use crate::pages::sort::{SortState, SortTarget, SortedListCache};
 
 pub fn render(
     area: Rect,
@@ -20,13 +20,15 @@ pub fn render(
     ctx: &AppContext,
     state: &mut SortState,
     filter: &ListFilter,
+    cache: &mut SortedListCache,
 ) {
-    let history = filtered_history(ctx, state, filter.query());
+    let (sorted, indices) = history_view(ctx, state, filter.query(), cache);
+    let history_len = indices.len();
     let filter_visible = filter.is_active() || !filter.query().is_empty();
     let filter_suffix = if filter.query().is_empty() {
         String::new()
     } else {
-        format!(" · 过滤 '{}' ({} 匹配)", filter.query(), history.len())
+        format!(" · 过滤 '{}' ({} 匹配)", filter.query(), history_len)
     };
 
     let block = Block::default()
@@ -34,7 +36,7 @@ pub fn render(
         .border_style(Style::new().fg(crate::theme::border(ctx)))
         .title(format!(
             "播放历史 ({} 首) · 排序 {} · s 切换{}",
-            history.len(),
+            history_len,
             state.mode.label(SortTarget::History),
             filter_suffix
         ));
@@ -53,7 +55,7 @@ pub fn render(
         inner.height
     };
 
-    if history.is_empty() {
+    if history_len == 0 {
         Paragraph::new(Line::from(Span::styled(
             if filter.query().is_empty() {
                 "暂无播放历史"
@@ -70,7 +72,7 @@ pub fn render(
     }
 
     // 确保 selected 不越界
-    if state.selected >= history.len() {
+    if state.selected >= history_len {
         state.selected = 0;
     }
 
@@ -98,7 +100,7 @@ pub fn render(
     if visible_height == 0 {
         return;
     }
-    let total = history.len();
+    let total = history_len;
 
     // 自动调整 scroll
     if state.selected >= state.scroll + visible_height {
@@ -109,14 +111,17 @@ pub fn render(
     state.scroll = state.scroll.min(total.saturating_sub(visible_height));
 
     let end = (state.scroll + visible_height).min(total);
-    for (i, song) in history.iter().enumerate().take(end).skip(state.scroll) {
-        let row = i - state.scroll;
+    for (view_index, &song_index) in indices.iter().enumerate().take(end).skip(state.scroll) {
+        let Some(song) = sorted.get(song_index) else {
+            continue;
+        };
+        let row = view_index - state.scroll;
         if row as u16 >= list.height {
             break;
         }
-        let text = super::components::song_table::row(song, i, list.width);
+        let text = super::components::song_table::row(song, view_index, list.width);
         let line_area = Rect::new(list.x, list.y + row as u16, list.width, 1);
-        let style = if i == state.selected {
+        let style = if view_index == state.selected {
             selected_style
         } else {
             normal_style
@@ -131,8 +136,17 @@ pub fn handle_input(
     state: &mut SortState,
     filter_query: &str,
     resolver: &KeybindingResolver,
+    cache: &mut SortedListCache,
 ) -> AppAction {
-    let history = filtered_history(ctx, state, filter_query);
+    let (sorted, indices) = history_view(ctx, state, filter_query, cache);
+    let len = indices.len();
+    // 按键路径按视图下标直接取歌，避免每次按键都复制整份过滤结果。
+    let song_at = |view_index: usize| {
+        indices
+            .get(view_index)
+            .and_then(|&index| sorted.get(index))
+            .cloned()
+    };
 
     if let Some(action) = resolver.resolve_page("history", key) {
         match action {
@@ -147,18 +161,18 @@ pub fn handle_input(
                 return AppAction::None;
             }
             Action::ListSelectUp => {
-                if !history.is_empty() {
+                if len != 0 {
                     if state.selected > 0 {
                         state.selected -= 1;
                     } else if ctx.config.read().unwrap().ui.wrap_navigation {
-                        state.selected = history.len().saturating_sub(1);
+                        state.selected = len.saturating_sub(1);
                     }
                 }
                 return AppAction::None;
             }
             Action::ListSelectDown => {
-                if !history.is_empty() {
-                    if state.selected + 1 < history.len() {
+                if len != 0 {
+                    if state.selected + 1 < len {
                         state.selected += 1;
                     } else if ctx.config.read().unwrap().ui.wrap_navigation {
                         state.selected = 0;
@@ -171,7 +185,7 @@ pub fn handle_input(
                 return AppAction::None;
             }
             Action::ListSelectLast => {
-                state.selected = history.len().saturating_sub(1);
+                state.selected = len.saturating_sub(1);
                 return AppAction::None;
             }
             Action::ListPageUp => {
@@ -179,11 +193,11 @@ pub fn handle_input(
                 return AppAction::None;
             }
             Action::ListPageDown => {
-                state.selected = (state.selected + 10).min(history.len().saturating_sub(1));
+                state.selected = (state.selected + 10).min(len.saturating_sub(1));
                 return AppAction::None;
             }
             Action::ListAddToQueue => {
-                if let Some(song) = history.get(state.selected).cloned() {
+                if let Some(song) = song_at(state.selected) {
                     return AppAction::AddToQueue {
                         song: Box::new(song),
                         position: InsertPosition::End,
@@ -192,7 +206,7 @@ pub fn handle_input(
                 return AppAction::None;
             }
             Action::ListAddToQueueNext => {
-                if let Some(song) = history.get(state.selected).cloned() {
+                if let Some(song) = song_at(state.selected) {
                     return AppAction::AddToQueue {
                         song: Box::new(song),
                         position: InsertPosition::Next,
@@ -201,15 +215,15 @@ pub fn handle_input(
                 return AppAction::None;
             }
             Action::ListActivate => {
-                if !history.is_empty() && state.selected < history.len() {
-                    let songs = history.clone();
+                if len != 0 && state.selected < len {
+                    let songs = view_songs(sorted, &indices);
                     let index = state.selected;
                     return AppAction::PlaySong { songs, index };
                 }
                 return AppAction::None;
             }
             Action::ListToggleFavorite => {
-                if let Some(song) = history.get(state.selected).cloned() {
+                if let Some(song) = song_at(state.selected) {
                     return AppAction::ToggleFavoriteSong(Box::new(song));
                 }
                 return AppAction::None;
@@ -227,17 +241,17 @@ pub fn handle_input(
             )));
         }
         (KeyModifiers::NONE, KeyCode::Up) => {
-            if !history.is_empty() {
+            if len != 0 {
                 if state.selected > 0 {
                     state.selected -= 1;
                 } else if ctx.config.read().unwrap().ui.wrap_navigation {
-                    state.selected = history.len().saturating_sub(1);
+                    state.selected = len.saturating_sub(1);
                 }
             }
         }
         (KeyModifiers::NONE, KeyCode::Down) => {
-            if !history.is_empty() {
-                if state.selected + 1 < history.len() {
+            if len != 0 {
+                if state.selected + 1 < len {
                     state.selected += 1;
                 } else if ctx.config.read().unwrap().ui.wrap_navigation {
                     state.selected = 0;
@@ -250,24 +264,24 @@ pub fn handle_input(
         (KeyModifiers::NONE, KeyCode::End)
         | (KeyModifiers::NONE, KeyCode::Char('G'))
         | (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
-            state.selected = history.len().saturating_sub(1);
+            state.selected = len.saturating_sub(1);
         }
         (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
             state.selected = state.selected.saturating_sub(10);
         }
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (KeyModifiers::NONE, KeyCode::PageDown) => {
-            state.selected = (state.selected + 10).min(history.len().saturating_sub(1));
+            state.selected = (state.selected + 10).min(len.saturating_sub(1));
         }
         _ if super::is_song_activation_key(key)
-            && !history.is_empty()
-            && state.selected < history.len() =>
+            && len != 0
+            && state.selected < len =>
         {
-            let songs = history.clone();
+            let songs = view_songs(sorted, &indices);
             let index = state.selected;
             return AppAction::PlaySong { songs, index };
         }
         (KeyModifiers::NONE, KeyCode::Char('a')) => {
-            if let Some(song) = history.get(state.selected).cloned() {
+            if let Some(song) = song_at(state.selected) {
                 return AppAction::AddToQueue {
                     song: Box::new(song),
                     position: InsertPosition::End,
@@ -275,7 +289,7 @@ pub fn handle_input(
             }
         }
         (KeyModifiers::NONE, KeyCode::Char('A')) | (KeyModifiers::SHIFT, KeyCode::Char('A')) => {
-            if let Some(song) = history.get(state.selected).cloned() {
+            if let Some(song) = song_at(state.selected) {
                 return AppAction::AddToQueue {
                     song: Box::new(song),
                     position: InsertPosition::Next,
@@ -283,13 +297,13 @@ pub fn handle_input(
             }
         }
         (KeyModifiers::NONE, KeyCode::Char('d')) | (KeyModifiers::NONE, KeyCode::Delete) => {
-            if let Some(song) = history.get(state.selected).cloned() {
-                state.selected = state.selected.min(history.len().saturating_sub(2));
+            if let Some(song) = song_at(state.selected) {
+                state.selected = state.selected.min(len.saturating_sub(2));
                 return AppAction::RemoveHistory(Box::new(song));
             }
         }
         (KeyModifiers::NONE, KeyCode::Char('f')) => {
-            if let Some(song) = history.get(state.selected).cloned() {
+            if let Some(song) = song_at(state.selected) {
                 return AppAction::ToggleFavoriteSong(Box::new(song));
             }
         }
@@ -308,34 +322,40 @@ pub fn handle_mouse(
     ctx: &AppContext,
     state: &mut SortState,
     filter_query: &str,
+    cache: &mut SortedListCache,
     activate: bool,
 ) -> AppAction {
-    let history = filtered_history(ctx, state, filter_query);
+    let (sorted, indices) = history_view(ctx, state, filter_query, cache);
+    let len = indices.len();
     let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
+    let mut activate_index = None;
     match event.kind {
         MouseEventKind::ScrollUp => {
             state.selected = state.selected.saturating_sub(scroll_amount);
         }
         MouseEventKind::ScrollDown => {
-            state.selected = (state.selected + scroll_amount).min(history.len().saturating_sub(1));
+            state.selected = (state.selected + scroll_amount).min(len.saturating_sub(1));
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let inner = Block::default().borders(Borders::ALL).inner(area);
             let list_y = inner.y.saturating_add(1);
             if event.row >= list_y && event.row < inner.bottom() {
                 let index = state.scroll + event.row.saturating_sub(list_y) as usize;
-                if index < history.len() {
+                if index < len {
                     state.selected = index;
                     if activate {
-                        return AppAction::PlaySong {
-                            songs: history,
-                            index,
-                        };
+                        activate_index = Some(index);
                     }
                 }
             }
         }
         _ => {}
+    }
+    if let Some(index) = activate_index {
+        return AppAction::PlaySong {
+            songs: view_songs(sorted, &indices),
+            index,
+        };
     }
     AppAction::None
 }
@@ -346,8 +366,9 @@ pub fn context_song_at(
     ctx: &AppContext,
     state: &mut SortState,
     filter_query: &str,
+    cache: &mut SortedListCache,
 ) -> Option<(Vec<SongInfo>, usize)> {
-    let history = filtered_history(ctx, state, filter_query);
+    let history = filtered_history(ctx, state, filter_query, cache);
     let inner = Block::default().borders(Borders::ALL).inner(area);
     let list_y = inner.y.saturating_add(1);
     if event.row < list_y || event.row >= inner.bottom() {
@@ -361,21 +382,50 @@ pub fn context_song_at(
     Some((history, index))
 }
 
-fn sorted_history(ctx: &AppContext, state: &SortState) -> Vec<SongInfo> {
-    sorted_songs(ctx.storage.load_history(), state.mode, SortTarget::History)
-}
-
-fn filtered_history(ctx: &AppContext, state: &SortState, filter_query: &str) -> Vec<SongInfo> {
-    let history = sorted_history(ctx, state);
-    if filter_query.is_empty() {
-        return history;
+/// 获取排序后的历史视图：已排序切片 + 匹配过滤的下标。
+///
+/// 渲染路径直接借用缓存的排序结果，只有过滤命中时才额外分配下标数组。
+fn history_view<'a>(
+    ctx: &AppContext,
+    state: &SortState,
+    filter_query: &str,
+    cache: &'a mut SortedListCache,
+) -> (&'a [SongInfo], Vec<usize>) {
+    let version = ctx.storage.generation();
+    let sorted = cache.get_or_build(version, state.mode, SortTarget::History, || {
+        ctx.storage.load_history()
+    });
+    if filter_query.trim().is_empty() {
+        let indices = (0..sorted.len()).collect();
+        return (sorted, indices);
     }
 
     let query = filter_query.trim().to_lowercase();
-    history
-        .into_iter()
-        .filter(|song| {
+    let indices = sorted
+        .iter()
+        .enumerate()
+        .filter(|(_, song)| {
             song.name.to_lowercase().contains(&query) || song.singer.to_lowercase().contains(&query)
         })
+        .map(|(index, _)| index)
+        .collect();
+    (sorted, indices)
+}
+
+/// 把历史视图下标还原成歌曲列表，仅在按键/鼠标事件等低频路径调用。
+fn view_songs(sorted: &[SongInfo], indices: &[usize]) -> Vec<SongInfo> {
+    indices
+        .iter()
+        .filter_map(|&index| sorted.get(index).cloned())
         .collect()
+}
+
+fn filtered_history(
+    ctx: &AppContext,
+    state: &SortState,
+    filter_query: &str,
+    cache: &mut SortedListCache,
+) -> Vec<SongInfo> {
+    let (sorted, indices) = history_view(ctx, state, filter_query, cache);
+    view_songs(sorted, &indices)
 }

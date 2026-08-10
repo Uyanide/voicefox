@@ -15,7 +15,7 @@ use lx_core::traits::player::{AbLoop, ChannelMode, EqualizerBand, Player, Replay
 use crate::cover::CoverService;
 use crate::notification::DesktopNotifier;
 use crate::playlist::manager::PlaylistManager;
-use crate::storage::{PlaybackSession, SavedPlayerState, Storage};
+use crate::storage::{SavedPlayerState, Storage};
 use lx_lyric::service::LyricService;
 use lx_source::bili::BiliSource;
 use lx_source::manager::SourceManager;
@@ -189,7 +189,7 @@ impl AppContext {
         if !self.config.read().unwrap().player.remember_playback_state {
             return self.storage.clear_playback_session();
         }
-        let (playlist, current_index) = self.playlist.snapshot();
+        let (playlist, current_index) = self.playlist.snapshot_arc();
         if playlist.is_empty() {
             return self.storage.clear_playback_session();
         }
@@ -198,12 +198,12 @@ impl AppContext {
             PlayerState::Paused => SavedPlayerState::Paused,
             PlayerState::Idle | PlayerState::Stopped => SavedPlayerState::Stopped,
         };
-        self.storage.save_playback_session(&PlaybackSession {
-            playlist,
+        self.storage.save_playback_session_borrowed(
+            &playlist,
             current_index,
-            position: *self.position.borrow(),
+            *self.position.borrow(),
             state,
-        })
+        )
     }
 
     pub fn cycle_playback_speed(&self) -> String {
