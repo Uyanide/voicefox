@@ -60,7 +60,7 @@ pub struct AppContext {
     desktop_notifier: DesktopNotifier,
 
     // --- 存储 ---
-    pub storage: Storage,
+    pub storage: Arc<Storage>,
 }
 
 impl AppContext {
@@ -99,7 +99,7 @@ impl AppContext {
         ));
         let play_mode = crate::playlist::mode::PlayMode::from_config(&config.player.play_mode);
         let playlist = Arc::new(PlaylistManager::new(play_mode));
-        let storage = Storage::new();
+        let storage = Arc::new(Storage::new());
         storage.trim_history(config.player.history_limit);
 
         let player_state = player.state_watcher();

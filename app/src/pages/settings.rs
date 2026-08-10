@@ -691,7 +691,7 @@ impl SettingsPage {
         AppAction::None
     }
 
-    fn handle_playlist_import_input(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
+    fn handle_playlist_import_input(&mut self, key: KeyEvent, _ctx: &AppContext) -> AppAction {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 self.playlist_import_mode = false;
@@ -699,20 +699,14 @@ impl SettingsPage {
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 let path = self.playlist_import_input.trim().to_string();
-                if !path.is_empty() {
-                    self.status_msg = match ctx
-                        .storage
-                        .import_external_playlist(std::path::Path::new(&path))
-                    {
-                        Ok(report) => Some(format!(
-                            "已导入歌单 {}：{} 首，跳过 {} 首",
-                            report.playlist_name, report.imported, report.skipped
-                        )),
-                        Err(error) => Some(format!("歌单导入失败: {error}")),
-                    };
-                }
                 self.playlist_import_mode = false;
                 self.playlist_import_input.clear();
+                if path.is_empty() {
+                    return AppAction::None;
+                }
+                // 导入在后台任务中完成（解析大歌单 + 一次性写盘），
+                // 完成后通过通知汇报结果，避免阻塞 TUI 主循环。
+                return AppAction::ImportExternalPlaylist(path);
             }
             (KeyModifiers::NONE, KeyCode::Backspace) => {
                 self.playlist_import_input.pop();

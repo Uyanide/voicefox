@@ -1,5 +1,6 @@
 //! 音源 + 播放器独立验证工具
-//! cargo run --bin lx-test
+//! cargo run --bin lx-test [音乐目录]
+//! 音乐目录也可通过环境变量 LXTEST_MUSIC_DIR 指定；未指定时跳过本地扫描。
 
 use lx_core::model::source::Quality;
 use lx_core::traits::source::MusicSource;
@@ -49,8 +50,17 @@ async fn main() {
 
     // 8. 本地音源扫描测试
     print!("\n[8/8] 本地音源扫描测试 ... ");
+    let local_path = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("LXTEST_MUSIC_DIR").ok())
+        .filter(|path| !path.trim().is_empty());
+    let Some(local_path) = local_path else {
+        println!("跳过（用命令行参数或 LXTEST_MUSIC_DIR 指定音乐目录）");
+        println!("\n=== 验证完成 ===");
+        return;
+    };
     let local_source = lx_source::local::LocalSource::new();
-    let paths = vec!["/home/emo/Downloads/go-musicfox".to_string()];
+    let paths = vec![local_path];
     let errors = local_source.scan(&paths, 0);
     let songs = local_source.all_songs();
     if !errors.is_empty() {

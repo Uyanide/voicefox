@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lx_core::keybinding::migrate_legacy_settings_bindings;
 use lx_core::model::config::{
@@ -154,9 +155,36 @@ pub fn save(config: &Config, path: &std::path::Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, toml_str)?;
+    save_atomic(path, toml_str.as_bytes())?;
     Ok(())
 }
+
+/// 原子写入配置文件：先写同目录临时文件再 rename。
+///
+/// 音量、播放模式等操作会高频触发配置保存，直接覆盖可能在进程崩溃或断电时
+/// 留下半个配置文件；临时文件 + rename 保证目标文件要么完整要么保持旧内容。
+fn save_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let temp_path = path.with_file_name(format!(
+        "{}.tmp-{}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        CONFIG_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        fs::write(&temp_path, content)?;
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+static CONFIG_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

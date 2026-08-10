@@ -66,13 +66,18 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
     }
 
     let midurlinfo = &json["req"]["data"]["midurlinfo"];
-    let purl = midurlinfo[0]["purl"].as_str().unwrap_or("");
+    // 接口返回的 purl 通常以 `/` 开头，去掉前导斜杠避免拼出 `//`；
+    // 统一使用 https，部分网络会拦截明文 HTTP 音频流。
+    let purl = midurlinfo[0]["purl"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches('/');
 
     if purl.is_empty() {
         return Err(FetchError::NotFound);
     }
 
-    let play_url = format!("http://dl.stream.qqmusic.qq.com/{}", purl);
+    let play_url = format!("https://dl.stream.qqmusic.qq.com/{}", purl);
 
     let qualities: Vec<Quality> = song.qualities.iter().copied().collect();
 

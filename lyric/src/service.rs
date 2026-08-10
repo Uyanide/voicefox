@@ -11,7 +11,7 @@ use lx_core::traits::lyric_fetcher::LyricFetcher;
 pub struct LyricService {
     fetcher: Arc<dyn LyricFetcher>,
     state: RwLock<LyricState>,
-    lines: RwLock<Vec<LyricLine>>,
+    lines: RwLock<Arc<Vec<LyricLine>>>,
     yrc_lines: RwLock<Vec<YrcLine>>,
     trans_lines: RwLock<Vec<(usize, String)>>,
     show_translation: RwLock<bool>,
@@ -25,7 +25,7 @@ impl LyricService {
         Self {
             fetcher,
             state: RwLock::new(LyricState::default()),
-            lines: RwLock::new(Vec::new()),
+            lines: RwLock::new(Arc::new(Vec::new())),
             yrc_lines: RwLock::new(Vec::new()),
             trans_lines: RwLock::new(Vec::new()),
             show_translation: RwLock::new(false),
@@ -37,7 +37,7 @@ impl LyricService {
 
     pub fn prepare(&self) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.lines.write().unwrap().clear();
+        *self.lines.write().unwrap() = Arc::new(Vec::new());
         self.yrc_lines.write().unwrap().clear();
         self.trans_lines.write().unwrap().clear();
         *self.state.write().unwrap() = LyricState::default();
@@ -88,7 +88,7 @@ impl LyricService {
         };
 
         if self.generation.load(Ordering::SeqCst) == generation {
-            *self.lines.write().unwrap() = lrc_lines;
+            *self.lines.write().unwrap() = Arc::new(lrc_lines);
             *self.yrc_lines.write().unwrap() = yrc_lines;
             *self.trans_lines.write().unwrap() = trans;
             *self.state.write().unwrap() = LyricState::default();
@@ -107,7 +107,9 @@ impl LyricService {
         if lines.is_empty() {
             let mut state = self.state.write().unwrap();
             state.current_line = 0;
-            state.lines = vec![];
+            if !state.lines.is_empty() {
+                state.lines = Arc::new(vec![]);
+            }
             state.translation = None;
             state.yrc_words.clear();
             state.position_ms = position.as_millis() as u64;
@@ -118,14 +120,11 @@ impl LyricService {
         let offset = *self.offset_ms.read().unwrap();
         let pos_ms = (position.as_millis() as i64).saturating_add(offset).max(0) as u64;
 
-        // 找到当前时间戳对应的行：最后一个 timestamp <= pos_ms 的行
+        // 找到当前时间戳对应的行：最后一个 timestamp <= pos_ms 的行。
+        // 歌词按时间升序排列，用二分查找代替逐行扫描。
         let current = lines
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, line)| line.timestamp <= pos_ms)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            .partition_point(|line| line.timestamp <= pos_ms)
+            .saturating_sub(1);
 
         let trans = self.trans_lines.read().unwrap();
         let translation = if *self.show_translation.read().unwrap() {
@@ -151,6 +150,7 @@ impl LyricService {
 
         let mut state = self.state.write().unwrap();
         state.current_line = current;
+        // Arc 共享同一份歌词，引用计数递增是 O(1)，不会逐帧深拷贝整份歌词。
         state.lines = lines.clone();
         state.translation = translation;
         state.yrc_words = yrc_words;

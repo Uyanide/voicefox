@@ -90,6 +90,9 @@ pub enum AppAction {
         paths: Vec<String>,
         max_depth: u32,
     },
+    /// 从设置页发起的外部歌单导入。文件解析与写盘都在后台任务中完成，
+    /// 避免在 TUI 主循环里同步解析大歌单并反复写盘。
+    ImportExternalPlaylist(String),
     BiliLogin,
     BiliLogout,
     BiliLoginSuccess,

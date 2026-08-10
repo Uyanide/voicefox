@@ -3191,6 +3191,27 @@ fn execute_action(
                 }
             });
         }
+        AppAction::ImportExternalPlaylist(path) => {
+            // 歌单解析与写盘都放到后台线程，完成后用通知汇报结果，
+            // 避免在 TUI 主循环里同步解析大歌单并反复写盘。
+            let storage = Arc::clone(&ctx.storage);
+            let tx = action_tx.clone();
+            rt.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    storage.import_external_playlist(std::path::Path::new(&path))
+                })
+                .await;
+                let notification = match result {
+                    Ok(Ok(report)) => Notification::success(format!(
+                        "已导入歌单 {}：{} 首，跳过 {} 首",
+                        report.playlist_name, report.imported, report.skipped
+                    )),
+                    Ok(Err(error)) => Notification::error(format!("歌单导入失败: {error}")),
+                    Err(error) => Notification::error(format!("歌单导入任务失败: {error}")),
+                };
+                let _ = tx.send(AppAction::ShowNotification(notification));
+            });
+        }
         AppAction::Navigate(_)
         | AppAction::GoBack
         | AppAction::Quit

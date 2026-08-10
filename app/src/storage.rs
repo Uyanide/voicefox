@@ -211,7 +211,9 @@ impl Storage {
         let playlist_name = self.unique_import_name(stem);
         let playlist = self.create_custom_playlist(&playlist_name)?;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut imported = 0;
+        // 先解析并去重全部条目，再一次性批量写入歌单，避免每首歌触发一次
+        // 全量序列化与磁盘写入（N 首歌会退化为 O(N^2) 的写放大）。
+        let mut songs_to_add = Vec::new();
         let mut skipped = 0;
         let mut identities = HashSet::new();
         for entry in entries {
@@ -224,15 +226,18 @@ impl Storage {
                 skipped += 1;
                 continue;
             }
-            match self.add_song_to_custom_playlist(&playlist.id, &song) {
-                Ok(true) => imported += 1,
-                Ok(false) => skipped += 1,
-                Err(error) => {
-                    let _ = self.delete_custom_playlist(&playlist.id);
-                    return Err(format!("写入导入歌单失败: {error}"));
-                }
-            }
+            songs_to_add.push(song);
         }
+        let imported = match self.add_songs_to_custom_playlist(&playlist.id, &songs_to_add) {
+            Ok((added, duplicate_skipped)) => {
+                skipped += duplicate_skipped;
+                added
+            }
+            Err(error) => {
+                let _ = self.delete_custom_playlist(&playlist.id);
+                return Err(format!("写入导入歌单失败: {error}"));
+            }
+        };
         if imported == 0 {
             let _ = self.delete_custom_playlist(&playlist.id);
             return Err("歌单中没有可识别的歌曲".to_string());
@@ -516,6 +521,42 @@ impl Storage {
             playlist.songs.push(song.clone());
             playlist.updated_at_unix_nanos = unix_nanos();
             Ok(true)
+        })
+    }
+
+    /// 批量把歌曲加入自定义歌单，整个批次只更新一次内存并写盘一次。
+    ///
+    /// 返回 `(新增数量, 因与歌单内已有歌曲重复而跳过的数量)`。
+    /// 单曲调用仍走 `add_song_to_custom_playlist`，大歌单导入使用本方法，
+    /// 避免 N 首歌曲触发 N 次全量序列化和磁盘写入。
+    pub fn add_songs_to_custom_playlist(
+        &self,
+        playlist_id: &str,
+        songs: &[SongInfo],
+    ) -> Result<(usize, usize), String> {
+        self.update_custom_playlists(|playlists| {
+            let playlist = playlists
+                .iter_mut()
+                .find(|playlist| playlist.id == playlist_id)
+                .ok_or_else(|| "自定义歌单不存在".to_string())?;
+            let mut added = 0;
+            let mut skipped = 0;
+            for song in songs {
+                if playlist
+                    .songs
+                    .iter()
+                    .any(|item| same_song_identity(item, song))
+                {
+                    skipped += 1;
+                    continue;
+                }
+                playlist.songs.push(song.clone());
+                added += 1;
+            }
+            if added > 0 {
+                playlist.updated_at_unix_nanos = unix_nanos();
+            }
+            Ok((added, skipped))
         })
     }
 
@@ -1240,6 +1281,43 @@ mod tests {
         assert!(storage.delete_custom_playlist(&playlist.id).unwrap());
         assert!(storage.custom_playlist_summaries().is_empty());
 
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn batch_add_reports_added_and_duplicate_skipped_counts() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "voicefox-custom-playlist-batch-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = Storage {
+            data_dir: data_dir.clone(),
+            favorites: RwLock::new(Vec::new()),
+            favorite_playlists: RwLock::new(Vec::new()),
+            custom_playlists: RwLock::new(Vec::new()),
+            history: RwLock::new(Vec::new()),
+        };
+        let playlist = storage.create_custom_playlist("批量").unwrap();
+        storage
+            .add_song_to_custom_playlist(&playlist.id, &song("a", SourceId::Wy, "A", "Artist"))
+            .unwrap();
+
+        let batch = vec![
+            song("a", SourceId::Wy, "A", "Artist"), // 重复
+            song("b", SourceId::Wy, "B", "Artist"),
+            song("c", SourceId::Kw, "C", "Artist"),
+        ];
+        let (added, skipped) = storage
+            .add_songs_to_custom_playlist(&playlist.id, &batch)
+            .unwrap();
+
+        assert_eq!((added, skipped), (2, 1));
+        assert_eq!(storage.custom_playlist(&playlist.id).unwrap().songs.len(), 3);
+        let persisted: Vec<CustomPlaylist> =
+            Storage::load_file(&data_dir.join("custom_playlists.json"));
+        assert_eq!(persisted[0].songs.len(), 3);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

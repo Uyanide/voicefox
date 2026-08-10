@@ -2,7 +2,6 @@
 
 use lx_core::model::lyric::YrcLine;
 
-pub mod krc; // 酷狗 KRC
 pub mod lrc; // 标准 LRC
 pub mod qrc; // QQ音乐 QRC
 pub mod yrc; // 网易云 YRC

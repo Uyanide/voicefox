@@ -1,62 +1,43 @@
+# voicefox 推荐配置示例
+# 完整字段说明见 README「配置说明」；所有字段均可省略（使用默认值）。
+
 [player]
 engine = "mpv"
-quality = "320k"
+quality = "flac"            # 128k / 320k / flac / flac24bit
 volume = 80
-play_mode = "list-loop"
+playback_speed = 1.0
+audio_device = "auto"       # "auto" 使用系统默认输出设备
+replaygain_mode = "track"   # off / track / album
+replaygain_preamp = 0.0
+replaygain_clip = true      # 预放大后限制削波，防止爆音
+channel_mode = "auto"       # auto / stereo / mono / left / right
+balance = 0.0               # -1 全左，1 全右
+# 均衡器，格式：[{ frequency_hz = 100.0, gain_db = 2.0 }]；留空表示关闭
+equalizer_bands = []
+fade_in_ms = 0              # 新曲淡入毫秒，0 关闭；如 200
+fade_out_ms = 0             # 曲末淡出毫秒，0 关闭；如 800
+play_mode = "list-loop"     # list-loop / single-loop / random / list / none
 remember_playback_state = true
-# 播放历史最多保留多少条
-history_limit = 100
+history_limit = 200
 
 [source]
 enabled = ["kw", "kg", "tx", "wy", "mg", "bili"]
 default = "kw"
-auto_toggle = true
+auto_toggle = true          # 播放失败时自动尝试其它音源的同曲匹配
 # JS 音源脚本 URL 或本地路径（lx-music user API 协议）
-# 用户可以加载社区维护的音源脚本，例如：
+# 数组顺序即播放地址解析优先级，例如：
 # js_sources = ["https://ghproxy.net/raw.githubusercontent.com/pdone/lx-music-source/main/juhe/latest.js"]
 # js_sources = ["/home/user/lx-source/latest.js"]
 js_sources = []
 
 [lyric]
 show_translation = true
-show_yrc = true
-offset = 0
+show_yrc = true             # 逐字歌词高亮（YRC/QRC）
+offset = 0                  # 歌词整体偏移毫秒，正数提前，负数延后
 
 [network]
-proxy_url = ""
-timeout = 15
-
-[theme]
-use_dark = true
-accent = "#cba6f7"
-text = "#cdd6f4"
-muted = "#a6adc8"
-border = "#585b70"
-rosewater = "#f5e0dc"
-flamingo = "#f2cdcd"
-pink = "#f5c2e7"
-mauve = "#cba6f7"
-red = "#f38ba8"
-maroon = "#eba0ac"
-peach = "#fab387"
-yellow = "#f9e2af"
-green = "#a6e3a1"
-teal = "#94e2d5"
-sky = "#89dceb"
-sapphire = "#74c7ec"
-blue = "#89b4fa"
-lavender = "#b4befe"
-subtext_1 = "#bac2de"
-subtext_0 = "#a6adc8"
-overlay_2 = "#9399b2"
-overlay_1 = "#7f849c"
-overlay_0 = "#6c7086"
-surface_2 = "#585b70"
-surface_1 = "#45475a"
-surface_0 = "#313244"
-base = "#1e1e2e"
-mantle = "#181825"
-crust = "#11111b"
+proxy_url = ""              # 例如 "http://127.0.0.1:7890"
+timeout = 15                # HTTP 超时秒数
 
 [ui]
 enable_mouse = true
@@ -64,11 +45,9 @@ wrap_navigation = true
 scroll_amount = 3
 aggregate_search = true
 show_cover = true
-# auto/kitty/sixel/iterm2/halfblocks；手动指定可跳过终端协议探测
-cover_protocol = "auto"
-max_fps = 20
+cover_protocol = "auto"     # auto / kitty / sixel / iterm2 / halfblocks
+max_fps = 20                # 1-60，越小越省电
 # 底部状态栏内容；数组顺序即从左到右的显示顺序，删除某项可将其隐藏
-# 可选项: state/source/sort/song/time/volume/play-mode/quality/queue/js-source-state
 status_bar_items = [
     "state",
     "source",
@@ -82,9 +61,29 @@ status_bar_items = [
     "js-source-state",
 ]
 
+[notification]
+enable = true               # 桌面系统通知（Linux D-Bus）
+inApp = true                # TUI 内浮动 toast
+inAppTimeout = 4            # toast 停留秒数，运行时限制 1-60
+albumCover = true           # 桌面通知附带专辑封面
+trackChange = true          # 切歌时发送桌面通知
+
+[integration]
+mpris = true                # Linux MPRIS / Waybar / 媒体键，修改后重启生效
+
 [local_music]
 enabled = true
 # 音乐目录路径列表，支持多个
-paths = []
+paths = ["/home/user/Music"]
 # 扫描深度，0 为不限制
 max_depth = 0
+
+# [theme] 主题（可选，默认 Catppuccin Mocha；省略该节即使用默认配色）
+# use_dark = true
+# accent = "#cba6f7"
+# text = "#cdd6f4"
+# ...
+
+# [keybindings] 键位（可选，格式见 README「键位配置」；省略即使用默认键位）
+# [keybindings.global]
+# global_quit = "q"

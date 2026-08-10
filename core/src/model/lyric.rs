@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// 歌词数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -45,7 +46,8 @@ pub struct YrcWord {
 #[derive(Debug, Clone, Default)]
 pub struct LyricState {
     pub current_line: usize,
-    pub lines: Vec<LyricLine>,
+    /// 歌词行快照。用 `Arc` 共享，播放进度高频更新时不必逐帧深拷贝整份歌词。
+    pub lines: Arc<Vec<LyricLine>>,
     pub translation: Option<String>,
     pub yrc_words: Vec<YrcWord>,
     /// 当前播放器位置（毫秒），用于逐字高亮。
