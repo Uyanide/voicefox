@@ -2,8 +2,8 @@
 //!
 //! 对标 go-musicfox PlaylistManager + lx-music player/action.ts
 
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use lx_core::events::InsertPosition;
 use lx_core::model::song::SongInfo;

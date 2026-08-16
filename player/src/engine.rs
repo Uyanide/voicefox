@@ -8,7 +8,7 @@ use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Format, Mpv, mpv_end_file_reason};
 use lx_core::model::source::PlayerState;
 use lx_core::traits::player::{
-    AbLoop, ChannelMode, EqualizerBand, Player, PlayerEvent, ReplayGainMode,
+    AbLoop, AudioInfo, ChannelMode, EqualizerBand, Player, PlayerEvent, ReplayGainMode,
 };
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
@@ -18,6 +18,9 @@ const AUDIO_PTS_OBSERVER: u64 = 2;
 const DURATION_OBSERVER: u64 = 3;
 const PAUSE_OBSERVER: u64 = 4;
 const BUFFERING_OBSERVER: u64 = 5;
+const AUDIO_CODEC_OBSERVER: u64 = 6;
+const AUDIO_BITRATE_OBSERVER: u64 = 7;
+const AUDIO_SAMPLE_RATE_OBSERVER: u64 = 8;
 
 const DEFAULT_PLAYBACK_SPEED: f64 = 1.0;
 const MIN_PLAYBACK_SPEED: f64 = 0.01;
@@ -38,6 +41,7 @@ struct EventLoopContext {
     position_tx: watch::Sender<Duration>,
     audible_position_tx: watch::Sender<Duration>,
     duration_tx: watch::Sender<Duration>,
+    audio_info_tx: watch::Sender<AudioInfo>,
     event_tx: mpsc::UnboundedSender<PlayerEvent>,
     generation: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
@@ -57,6 +61,7 @@ pub struct MpvEngine {
     audible_position_rx: watch::Receiver<Duration>,
     duration_tx: watch::Sender<Duration>,
     duration_rx: watch::Receiver<Duration>,
+    audio_info_rx: watch::Receiver<AudioInfo>,
     event_tx: mpsc::UnboundedSender<PlayerEvent>,
     event_rx: Mutex<Option<mpsc::UnboundedReceiver<PlayerEvent>>>,
     volume: AtomicU32,
@@ -153,11 +158,22 @@ impl MpvEngine {
             .context("监听 libmpv 暂停状态失败")?;
         mpv.observe_property("cache-buffering-state", Format::Double, BUFFERING_OBSERVER)
             .context("监听 libmpv 缓冲状态失败")?;
+        mpv.observe_property("audio-codec-name", Format::String, AUDIO_CODEC_OBSERVER)
+            .context("监听 libmpv 音频编码失败")?;
+        mpv.observe_property("audio-bitrate", Format::Double, AUDIO_BITRATE_OBSERVER)
+            .context("监听 libmpv 音频码率失败")?;
+        mpv.observe_property(
+            "audio-samplerate",
+            Format::Int64,
+            AUDIO_SAMPLE_RATE_OBSERVER,
+        )
+        .context("监听 libmpv 音频采样率失败")?;
 
         let (state_tx, state_rx) = watch::channel(PlayerState::Idle);
         let (position_tx, position_rx) = watch::channel(Duration::ZERO);
         let (audible_position_tx, audible_position_rx) = watch::channel(Duration::ZERO);
         let (duration_tx, duration_rx) = watch::channel(Duration::ZERO);
+        let (audio_info_tx, audio_info_rx) = watch::channel(AudioInfo::default());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let generation = Arc::new(AtomicU64::new(0));
         let paused = Arc::new(AtomicBool::new(false));
@@ -170,6 +186,7 @@ impl MpvEngine {
             position_tx: position_tx.clone(),
             audible_position_tx: audible_position_tx.clone(),
             duration_tx: duration_tx.clone(),
+            audio_info_tx: audio_info_tx.clone(),
             event_tx: event_tx.clone(),
             generation: Arc::clone(&generation),
             paused: Arc::clone(&paused),
@@ -193,6 +210,7 @@ impl MpvEngine {
             audible_position_rx,
             duration_tx,
             duration_rx,
+            audio_info_rx,
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             volume: AtomicU32::new(80),
@@ -308,6 +326,7 @@ fn run_event_loop(event_client: Arc<Mpv>, context: EventLoopContext) {
                 current_file_generation = Some(generation);
                 last_media_position = None;
                 has_audio_position = false;
+                let _ = context.audio_info_tx.send(AudioInfo::default());
                 if generation != 0 {
                     let _ = context.state_tx.send(loading_state(&context.paused));
                 }
@@ -340,6 +359,7 @@ fn run_event_loop(event_client: Arc<Mpv>, context: EventLoopContext) {
                 else {
                     continue;
                 };
+                let _ = context.audio_info_tx.send(AudioInfo::default());
 
                 match reason {
                     mpv_end_file_reason::Eof => {
@@ -385,6 +405,25 @@ fn run_event_loop(event_client: Arc<Mpv>, context: EventLoopContext) {
                     ("duration", PropertyData::Double(seconds)) => {
                         if let Some(duration) = duration_from_mpv_seconds(seconds) {
                             let _ = context.duration_tx.send(duration);
+                        }
+                    }
+                    ("audio-codec-name", PropertyData::Str(codec)) => {
+                        context.audio_info_tx.send_modify(|info| {
+                            info.codec = (!codec.trim().is_empty()).then(|| codec.to_string());
+                        });
+                    }
+                    ("audio-bitrate", PropertyData::Double(bitrate)) => {
+                        if bitrate.is_finite() && bitrate > 0.0 {
+                            context.audio_info_tx.send_modify(|info| {
+                                info.bitrate_kbps = Some((bitrate / 1000.0).round() as u32);
+                            });
+                        }
+                    }
+                    ("audio-samplerate", PropertyData::Int64(sample_rate)) => {
+                        if let Ok(sample_rate) = u32::try_from(sample_rate) {
+                            context.audio_info_tx.send_modify(|info| {
+                                info.sample_rate_hz = Some(sample_rate);
+                            });
                         }
                     }
                     ("pause", PropertyData::Flag(paused)) => {
@@ -739,6 +778,10 @@ impl Player for MpvEngine {
 
     fn duration_watcher(&self) -> watch::Receiver<Duration> {
         self.duration_rx.clone()
+    }
+
+    fn audio_info_watcher(&self) -> watch::Receiver<AudioInfo> {
+        self.audio_info_rx.clone()
     }
 
     fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<PlayerEvent>> {

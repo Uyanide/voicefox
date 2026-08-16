@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// 单个音源的最近一次连通性检测结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceHealth {
+    pub id: SourceId,
+    pub name: String,
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub result_count: u32,
+    pub detail: String,
+}
+
 /// 音源标识
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SourceId {

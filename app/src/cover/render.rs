@@ -1,10 +1,10 @@
 //! 封面在终端里的实际绘制
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{
     Receiver, Sender, SyncSender, TryRecvError, TrySendError, channel, sync_channel,
 };
 use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
 use std::thread;
 use std::time::Duration;
 

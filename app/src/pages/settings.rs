@@ -64,6 +64,59 @@ enum SettingsFocus {
     StatusBar,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsCategory {
+    Interface,
+    Playback,
+    Sources,
+    Integration,
+    Data,
+}
+
+impl SettingsCategory {
+    fn next(self) -> Self {
+        match self {
+            Self::Interface => Self::Playback,
+            Self::Playback => Self::Sources,
+            Self::Sources => Self::Integration,
+            Self::Integration => Self::Data,
+            Self::Data => Self::Interface,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Interface => Self::Data,
+            Self::Playback => Self::Interface,
+            Self::Sources => Self::Playback,
+            Self::Integration => Self::Sources,
+            Self::Data => Self::Integration,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Interface => "界面",
+            Self::Playback => "播放",
+            Self::Sources => "音源与歌词",
+            Self::Integration => "通知与集成",
+            Self::Data => "数据与本地库",
+        }
+    }
+
+    fn option_indices(self) -> &'static [usize] {
+        match self {
+            Self::Interface => &[0, 1, 2, 3, 4, 31, 32, 33, 39],
+            Self::Playback => &[
+                5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            ],
+            Self::Sources => &[23, 24, 25, 26, 27, 28, 29, 30],
+            Self::Integration => &[34, 35, 36, 37, 38, 44],
+            Self::Data => &[40, 41, 42, 43],
+        }
+    }
+}
+
 impl SettingsFocus {
     fn next(self) -> Self {
         match self {
@@ -109,6 +162,7 @@ pub struct SettingsPage {
     status_drag_target: Option<usize>,
     /// 当前聚焦区域
     focus: SettingsFocus,
+    category: SettingsCategory,
 }
 
 impl SettingsPage {
@@ -155,7 +209,7 @@ impl SettingsPage {
             return true;
         }
         match key.code {
-            KeyCode::Up | KeyCode::Down => true,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => true,
             KeyCode::Char(character) => SETTINGS_PAGE_CHAR_KEYS.contains(&character),
             _ => false,
         }
@@ -181,6 +235,7 @@ impl SettingsPage {
             status_item_scroll: 0,
             status_drag_target: None,
             focus: SettingsFocus::JsSources,
+            category: SettingsCategory::Interface,
         }
     }
 
@@ -244,6 +299,17 @@ impl SettingsPage {
                 return AppAction::None;
             }
 
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Left {
+                self.category = self.category.previous();
+                self.status_msg = None;
+                return AppAction::None;
+            }
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Right {
+                self.category = self.category.next();
+                self.status_msg = None;
+                return AppAction::None;
+            }
+
             // 当前列表区域的按键优先处理。
             if self.focus == SettingsFocus::LocalPaths
                 && let Some(action) = self.handle_local_keys(key, ctx, resolver)
@@ -300,6 +366,12 @@ impl SettingsPage {
                         }
                         return AppAction::RemoveSource(url);
                     }
+                }
+                (KeyModifiers::NONE, KeyCode::Char('h'))
+                    if self.focus == SettingsFocus::JsSources =>
+                {
+                    self.status_msg = Some("正在检测音源…".to_string());
+                    return AppAction::CheckSourceHealth;
                 }
                 (KeyModifiers::NONE, KeyCode::Char('t')) => {
                     self.update_config(ctx, |config| {
@@ -1119,7 +1191,7 @@ impl SettingsPage {
         let local_paths = &config.local_music.paths;
         let accent = crate::theme::accent(ctx);
         let muted = crate::theme::muted(ctx);
-        let chunks = settings_chunks(area, self.focus);
+        let chunks = settings_chunks(area, self.focus, self.category);
         let proxy_label = if config.network.proxy_url.is_empty() {
             "未设置".to_string()
         } else {
@@ -1141,7 +1213,7 @@ impl SettingsPage {
         let options_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(" 设置选项 ");
+            .title(format!(" 设置 · {}  [←/→切换分类] ", self.category.label()));
         let options_inner = options_block.inner(chunks[0]);
         options_block.render(chunks[0], buf);
         let options = vec![
@@ -1452,6 +1524,12 @@ impl SettingsPage {
                 )
             },
         ];
+        let option_indices = self.category.option_indices();
+        let options = options
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, line)| option_indices.contains(&index).then_some(line))
+            .collect();
         render_setting_options(options, options_inner, buf);
 
         let source_block = Block::default()
@@ -1461,7 +1539,7 @@ impl SettingsPage {
             } else {
                 crate::theme::border(ctx)
             }))
-            .title(" JS 音源 [s/a/d] ");
+            .title(" JS 音源 [s/a/d/h] ");
         let source_inner = source_block.inner(chunks[1]);
         source_block.render(chunks[1], buf);
         if source_inner.height > 0 {
@@ -1480,11 +1558,48 @@ impl SettingsPage {
             // mouse hit targets match what is rendered even when the source
             // status text changes length.
             Paragraph::new(Line::from(vec![
-                Span::styled(" [a] 添加  [d] 删除  ", Style::new().fg(muted)),
+                Span::styled(" [a] 添加  [d] 删除  [h] 检测  ", Style::new().fg(muted)),
                 Span::styled(source_state.0, Style::new().fg(source_state.1)),
             ]))
             .render(
                 Rect::new(source_inner.x, source_inner.y, source_inner.width, 1),
+                buf,
+            );
+            let checking = ctx
+                .source_health_checking
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let health_line = {
+                let health = ctx.source_health.read().unwrap();
+                if checking {
+                    " 音源检测中…".to_string()
+                } else if health.is_empty() {
+                    " 尚未检测音源".to_string()
+                } else {
+                    let summary = health
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{} {}{}ms",
+                                item.name,
+                                if item.ok { "✓" } else { "✗" },
+                                item.latency_ms
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    format!(" 检测结果: {summary}")
+                }
+            };
+            Paragraph::new(Line::from(Span::styled(
+                truncate_display(&health_line, source_inner.width as usize),
+                Style::new().fg(if checking {
+                    crate::theme::yellow(ctx)
+                } else {
+                    muted
+                }),
+            )))
+            .render(
+                Rect::new(source_inner.x, source_inner.y + 1, source_inner.width, 1),
                 buf,
             );
         }
@@ -1843,7 +1958,7 @@ impl SettingsPage {
         if self.any_input_active() {
             return AppAction::None;
         }
-        let chunks = settings_chunks(area, self.focus);
+        let chunks = settings_chunks(area, self.focus, self.category);
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::ScrollUp => {
@@ -1907,13 +2022,20 @@ impl SettingsPage {
                 if !right_click {
                     let options_inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
                     if options_inner.contains(position) {
-                        let index = setting_option_index(options_inner, position);
-                        if let Some(Some(action)) = SETTING_OPTION_ACTIONS.get(index as usize)
+                        let visible_index = setting_option_index(options_inner, position);
+                        let option_index = self
+                            .category
+                            .option_indices()
+                            .get(visible_index as usize)
+                            .copied();
+                        if let Some(Some(action)) =
+                            option_index.and_then(|index| SETTING_OPTION_ACTIONS.get(index))
                             && let Some(result) = self.handle_bound_action(*action, ctx)
                         {
                             return result;
                         }
-                        if let Some(&key) = SETTING_OPTION_KEYS.get(index as usize)
+                        if let Some(&key) =
+                            option_index.and_then(|index| SETTING_OPTION_KEYS.get(index))
                             && key != '\0'
                         {
                             return self.handle_input(
@@ -1933,7 +2055,7 @@ impl SettingsPage {
                         let key = command_key_at(
                             source_inner,
                             position,
-                            &[("[a] 添加", 'a'), ("[d] 删除", 'd')],
+                            &[("[a] 添加", 'a'), ("[d] 删除", 'd'), ("[h] 检测", 'h')],
                         );
                         if let Some(key) = key {
                             return self.handle_input(
@@ -2318,12 +2440,12 @@ fn format_duration(value: std::time::Duration) -> String {
 /// 在更新配置项后更新这些常量!
 ///
 /// 鼠标点击时触发的按键，顺序必须与 render 中的选项列表一致
-const SETTING_OPTION_KEYS: [char; 43] = [
+const SETTING_OPTION_KEYS: [char; 45] = [
     't', 'g', 'w', 'c', 'e', 'Q', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0',
-    '\0', '\0', 'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z', 'i', 'o', 'x',
-    'X', 'R', 'p', 'D', '\0', '\0', '\0', 'b',
+    '\0', '\0', '\0', '\0', 'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z', 'i',
+    'o', 'x', 'X', 'R', 'p', 'D', '\0', '\0', '\0', 'b',
 ];
-const SETTING_OPTION_ACTIONS: [Option<Action>; 43] = [
+const SETTING_OPTION_ACTIONS: [Option<Action>; 45] = [
     None,
     None,
     None,
@@ -2333,8 +2455,8 @@ const SETTING_OPTION_ACTIONS: [Option<Action>; 43] = [
     Some(Action::SettingsCyclePlaybackSpeed),
     Some(Action::SettingsEditAudioDevice),
     Some(Action::SettingsCycleReplayGainMode),
-    Some(Action::SettingsCycleChannelMode),
     Some(Action::SettingsCycleReplayGainPreamp),
+    Some(Action::SettingsCycleChannelMode),
     Some(Action::SettingsCycleBalance),
     Some(Action::SettingsToggleReplayGainClip),
     Some(Action::SettingsCycleFadeInDuration),
@@ -2343,6 +2465,8 @@ const SETTING_OPTION_ACTIONS: [Option<Action>; 43] = [
     Some(Action::SettingsRunFadeIn),
     Some(Action::SettingsRunFadeOut),
     Some(Action::SettingsSetAbLoopStart),
+    Some(Action::SettingsSetAbLoopEnd),
+    Some(Action::SettingsClearAbLoop),
     None,
     None,
     None,
@@ -2368,17 +2492,16 @@ const SETTING_OPTION_ACTIONS: [Option<Action>; 43] = [
     Some(Action::SettingsImportPlaylist),
     None,
 ];
-const SETTINGS_OPTION_COUNT: u16 = SETTING_OPTION_KEYS.len() as u16;
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 const THREE_COLUMN_OPTIONS_MIN_WIDTH: u16 = 72;
 const ALL_MANAGEMENT_PANELS_MIN_WIDTH: u16 = 108;
 
 /// 设置页在非输入模式下响应的字符键：选项键之外还有列表操作键
-/// （a 添加 / d 删除 / s 切换焦点 / r 扫描 / y 与 [ 见 `handle_input`）。
+/// （a 添加 / d 删除 / h 检测 / s 切换焦点 / r 扫描 / y 与 [ 见 `handle_input`）。
 /// 列表导航键来自页面级绑定，由 `consumes_key` 查表解析，不列在这里。
 const SETTINGS_PAGE_CHAR_KEYS: &[char] = &[
-    'a', 'd', 'r', 's', 'y', '[', 'm', 'Q', 'v', 'p', 'b', 'n', 'o', 'c', 'e', 'f', 'g', 'i', 't',
-    'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']',
+    'a', 'd', 'h', 'r', 's', 'y', '[', 'm', 'Q', 'v', 'p', 'b', 'n', 'o', 'c', 'e', 'f', 'g', 'i',
+    't', 'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']',
 ];
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
@@ -2431,15 +2554,16 @@ fn setting_option_columns(area: Rect) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
-fn setting_options_height(panel_width: u16) -> u16 {
+fn setting_options_height(panel_width: u16, option_count: usize) -> u16 {
     let inner_width = panel_width.saturating_sub(2);
     let columns = setting_option_column_count(inner_width) as u16;
-    let rows = SETTINGS_OPTION_COUNT.div_ceil(columns);
+    let rows = (option_count as u16).div_ceil(columns);
     rows.saturating_add(2)
 }
 
-fn settings_chunks(area: Rect, focus: SettingsFocus) -> [Rect; 4] {
-    let option_height = setting_options_height(area.width).min(area.height);
+fn settings_chunks(area: Rect, focus: SettingsFocus, category: SettingsCategory) -> [Rect; 4] {
+    let option_height =
+        setting_options_height(area.width, category.option_indices().len()).min(area.height);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(option_height), Constraint::Min(0)])
@@ -2486,8 +2610,8 @@ mod tests {
 
     use super::{
         KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, SETTING_OPTION_ACTIONS, SETTING_OPTION_KEYS,
-        SettingsFocus, SettingsPage, command_key_at, reorder_status_bar_items, setting_line,
-        setting_option_index, setting_value_line, settings_chunks, shorten_source,
+        SettingsCategory, SettingsFocus, SettingsPage, command_key_at, reorder_status_bar_items,
+        setting_line, setting_option_index, setting_value_line, settings_chunks, shorten_source,
     };
 
     /// 各设置项取值统一起始的列号
@@ -2651,9 +2775,13 @@ mod tests {
 
     #[test]
     fn narrow_settings_show_only_the_focused_management_panel() {
-        let chunks = settings_chunks(Rect::new(0, 0, 80, 24), SettingsFocus::StatusBar);
+        let chunks = settings_chunks(
+            Rect::new(0, 0, 80, 24),
+            SettingsFocus::StatusBar,
+            SettingsCategory::Interface,
+        );
 
-        assert_eq!(chunks[0].height, 17);
+        assert_eq!(chunks[0].height, 5);
         assert_eq!(chunks[1], Rect::default());
         assert_eq!(chunks[2], Rect::default());
         assert!(chunks[3].height > 0);
@@ -2662,9 +2790,13 @@ mod tests {
 
     #[test]
     fn wide_settings_keep_all_management_panels_visible() {
-        let chunks = settings_chunks(Rect::new(0, 0, 120, 30), SettingsFocus::JsSources);
+        let chunks = settings_chunks(
+            Rect::new(0, 0, 120, 30),
+            SettingsFocus::JsSources,
+            SettingsCategory::Interface,
+        );
 
-        assert_eq!(chunks[0].height, 17);
+        assert_eq!(chunks[0].height, 5);
         assert_eq!(chunks[1].y, chunks[0].bottom());
         assert_eq!(chunks[2].y, chunks[0].bottom());
         assert_eq!(chunks[3].y, chunks[0].bottom());
@@ -2673,7 +2805,11 @@ mod tests {
 
     #[test]
     fn setting_mouse_rows_follow_the_two_column_layout() {
-        let panel = settings_chunks(Rect::new(0, 0, 60, 24), SettingsFocus::JsSources)[0];
+        let panel = settings_chunks(
+            Rect::new(0, 0, 60, 24),
+            SettingsFocus::JsSources,
+            SettingsCategory::Interface,
+        )[0];
         let inner = Block::default().borders(Borders::ALL).inner(panel);
         let right_column_x = inner.x + inner.width / 2 + 1;
 
@@ -2686,14 +2822,18 @@ mod tests {
             1
         );
         assert_eq!(
-            setting_option_index(inner, Position::new(right_column_x, inner.y + 5)),
-            11
+            setting_option_index(inner, Position::new(right_column_x, inner.y + 1)),
+            3
         );
     }
 
     #[test]
     fn setting_mouse_rows_follow_the_three_column_layout() {
-        let panel = settings_chunks(Rect::new(0, 0, 80, 24), SettingsFocus::JsSources)[0];
+        let panel = settings_chunks(
+            Rect::new(0, 0, 80, 24),
+            SettingsFocus::JsSources,
+            SettingsCategory::Interface,
+        )[0];
         let inner = Block::default().borders(Borders::ALL).inner(panel);
         let third_column_x = inner.x + inner.width * 5 / 6;
 
@@ -2702,8 +2842,8 @@ mod tests {
             2
         );
         assert_eq!(
-            setting_option_index(inner, Position::new(third_column_x, inner.y + 5)),
-            17
+            setting_option_index(inner, Position::new(third_column_x, inner.y + 1)),
+            5
         );
     }
 

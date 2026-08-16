@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 use crate::local::metadata;
 use cue_rw::CUEFile;

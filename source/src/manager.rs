@@ -4,13 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use lx_core::model::leaderboard::LeaderboardInfo;
 use lx_core::model::lyric::LyricData;
 use lx_core::model::playlist::Playlist;
 use lx_core::model::playlist::{Album, Artist};
 use lx_core::model::song::SongInfo;
-use lx_core::model::source::{Quality, SourceId};
+use lx_core::model::source::{Quality, SourceHealth, SourceId};
 use lx_core::traits::source::{FetchError, MusicSource, SearchError, SearchResult, SongUrl};
 
 use crate::bili::BiliSource;
@@ -222,6 +223,32 @@ impl SourceManager {
             .copied()
             .filter(|source| enabled.contains(source))
             .collect()
+    }
+
+    /// 对当前启用的内置及 JS 音源执行轻量搜索检测。
+    pub async fn health_check(&self) -> Vec<SourceHealth> {
+        let enabled = self.enabled_sources();
+        let mut tasks = tokio::task::JoinSet::new();
+        for source_id in enabled {
+            if let Some(source) = self.sources.get(&source_id).map(Arc::clone) {
+                tasks.spawn(check_source(source_id, source));
+            }
+        }
+        for source in self.js_sources() {
+            tasks.spawn(check_source(SourceId::Local, source));
+        }
+        let mut results = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(result) = result {
+                results.push(result);
+            }
+        }
+        results.sort_by(|a, b| {
+            a.id.as_str()
+                .cmp(b.id.as_str())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        results
     }
 
     pub fn get(&self, id: SourceId) -> Option<Arc<dyn MusicSource>> {
@@ -699,6 +726,43 @@ impl SourceManager {
         });
 
         all
+    }
+}
+
+async fn check_source(id: SourceId, source: Arc<dyn MusicSource>) -> SourceHealth {
+    let name = source.name().to_string();
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        source.search("周杰伦", 1, 1),
+    )
+    .await;
+    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    match result {
+        Ok(Ok(result)) => SourceHealth {
+            id,
+            name,
+            ok: true,
+            latency_ms,
+            result_count: result.items.len() as u32,
+            detail: "搜索正常".to_string(),
+        },
+        Ok(Err(error)) => SourceHealth {
+            id,
+            name,
+            ok: false,
+            latency_ms,
+            result_count: 0,
+            detail: error.to_string(),
+        },
+        Err(_) => SourceHealth {
+            id,
+            name,
+            ok: false,
+            latency_ms,
+            result_count: 0,
+            detail: "请求超时（8 秒）".to_string(),
+        },
     }
 }
 

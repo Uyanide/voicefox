@@ -109,9 +109,7 @@ impl MainPage {
                     }
                     AppAction::None
                 }
-                QueueEditCommand::RemoveSelected => {
-                    self.remove_at(self.selected, ctx)
-                }
+                QueueEditCommand::RemoveSelected => self.remove_at(self.selected, ctx),
                 QueueEditCommand::Clear => {
                     ctx.playlist.clear();
                     ctx.stop_player();
@@ -180,11 +178,7 @@ impl MainPage {
                     return AppAction::None;
                 }
                 Action::ListToggleFavorite => {
-                    let song = ctx
-                        .playlist
-                        .borrow()
-                        .get(self.selected)
-                        .cloned();
+                    let song = ctx.playlist.borrow().get(self.selected).cloned();
                     if let Some(song) = song {
                         return AppAction::ToggleFavoriteSong(Box::new(song));
                     }

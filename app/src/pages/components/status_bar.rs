@@ -25,6 +25,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
     let current_song = ctx.current_song.read().unwrap();
     let position = *ctx.position.borrow();
     let duration = *ctx.duration.borrow();
+    let audio_info = ctx.audio_info.borrow().clone();
     let volume = ctx.player.volume();
     let queue = ctx.playlist.borrow();
     let queue_index = ctx.playlist.current_index();
@@ -49,7 +50,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
             format_duration(duration)
         )
     };
-    let song = current_song.as_ref().map_or_else(
+    let mut song = current_song.as_ref().map_or_else(
         || "voicefox".to_string(),
         |song| {
             if song.singer.trim().is_empty() {
@@ -74,6 +75,10 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
         })
         .unwrap_or_else(|| "-".to_string());
     let source_online = ctx.source_manager.has_js_source();
+    let show_quality_item = status_bar_items.contains(&StatusBarItem::Quality);
+    if !show_quality_item && let Some(audio_label) = audio_info.label() {
+        song.push_str(&format!(" · {audio_label}"));
+    }
     let queue_position = if queue.is_empty() {
         "0/0".to_string()
     } else {
@@ -144,7 +149,9 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
                 Style::new().fg(crate::theme::lavender(ctx)).bg(background),
             )),
             StatusBarItem::Quality => Some((
-                quality.label().to_string(),
+                audio_info
+                    .label()
+                    .unwrap_or_else(|| quality.label().to_string()),
                 Style::new().fg(crate::theme::peach(ctx)).bg(background),
             )),
             StatusBarItem::Queue => Some((

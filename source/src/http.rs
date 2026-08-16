@@ -45,9 +45,7 @@ pub fn client() -> reqwest::Client {
 
 fn client_store() -> &'static RwLock<Arc<reqwest::Client>> {
     static CLIENT: OnceLock<RwLock<Arc<reqwest::Client>>> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        RwLock::new(Arc::new(build_client(&options().read().unwrap().clone())))
-    })
+    CLIENT.get_or_init(|| RwLock::new(Arc::new(build_client(&options().read().unwrap().clone()))))
 }
 
 fn build_client(options: &NetworkOptions) -> reqwest::Client {

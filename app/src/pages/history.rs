@@ -272,10 +272,7 @@ pub fn handle_input(
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (KeyModifiers::NONE, KeyCode::PageDown) => {
             state.selected = (state.selected + 10).min(len.saturating_sub(1));
         }
-        _ if super::is_song_activation_key(key)
-            && len != 0
-            && state.selected < len =>
-        {
+        _ if super::is_song_activation_key(key) && len != 0 && state.selected < len => {
             let songs = view_songs(sorted, &indices);
             let index = state.selected;
             return AppAction::PlaySong { songs, index };

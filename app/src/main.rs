@@ -1414,7 +1414,14 @@ fn run_app(
                         return Ok(());
                     }
                     Action::GlobalPlayPause if !text_input_active => {
-                        ctx.player.toggle();
+                        toggle_or_start_current(
+                            &ctx,
+                            rt,
+                            &action_tx,
+                            &search_page,
+                            &settings_page,
+                            &search_seq,
+                        );
                         needs_render = true;
                         continue;
                     }
@@ -1619,12 +1626,12 @@ fn run_app(
                     continue;
                 }
                 (KeyModifiers::NONE, KeyCode::Up) if active_tab == NavTab::Main => {
-                    ctx.player.volume_up(5);
+                    persist_volume(&ctx, ctx.player.volume().saturating_add(5));
                     needs_render = true;
                     continue;
                 }
                 (KeyModifiers::NONE, KeyCode::Down) if active_tab == NavTab::Main => {
-                    ctx.player.volume_down(5);
+                    persist_volume(&ctx, ctx.player.volume().saturating_sub(5));
                     needs_render = true;
                     continue;
                 }
@@ -1810,8 +1817,11 @@ fn run_app(
                     }
 
                     // 2. 计算排序+过滤后的歌曲列表
-                    let all_songs =
-                        pages::local_music::sorted_local_songs(&ctx, &local_state, &mut data_cache.local);
+                    let all_songs = pages::local_music::sorted_local_songs(
+                        &ctx,
+                        &local_state,
+                        &mut data_cache.local,
+                    );
                     let songs: Cow<'_, [SongInfo]> = if local_filter.query().is_empty() {
                         Cow::Borrowed(all_songs)
                     } else {
@@ -1819,10 +1829,10 @@ fn run_app(
                         Cow::Owned(
                             all_songs
                                 .iter()
-                            .filter(|s| {
-                                s.name.to_lowercase().contains(&query)
-                                    || s.singer.to_lowercase().contains(&query)
-                            })
+                                .filter(|s| {
+                                    s.name.to_lowercase().contains(&query)
+                                        || s.singer.to_lowercase().contains(&query)
+                                })
                                 .cloned()
                                 .collect(),
                         )
@@ -2294,15 +2304,13 @@ fn run_app(
                     NavTab::Playlists => {
                         playlists.handle_mouse(mouse, ui_areas.content, activate, &ctx)
                     }
-                    NavTab::Favorites => {
-                        favorites_page.handle_mouse(
-                            mouse,
-                            ui_areas.content,
-                            &ctx,
-                            &mut data_cache.favorites,
-                            activate,
-                        )
-                    }
+                    NavTab::Favorites => favorites_page.handle_mouse(
+                        mouse,
+                        ui_areas.content,
+                        &ctx,
+                        &mut data_cache.favorites,
+                        activate,
+                    ),
                     NavTab::History => pages::history::handle_mouse(
                         mouse,
                         ui_areas.content,
@@ -2847,9 +2855,13 @@ fn execute_mpris_command(
 
     match command {
         MprisCommand::Quit => return true,
-        MprisCommand::Play => ctx.player.resume(),
+        MprisCommand::Play => {
+            resume_or_start_current(ctx, rt, action_tx, search_page, settings_page, search_seq)
+        }
         MprisCommand::Pause => ctx.player.pause(),
-        MprisCommand::Toggle => ctx.player.toggle(),
+        MprisCommand::Toggle => {
+            toggle_or_start_current(ctx, rt, action_tx, search_page, settings_page, search_seq)
+        }
         MprisCommand::Stop => ctx.stop_player(),
         MprisCommand::Next => play_entry(ctx.playlist.next_manual_entry_arc()),
         MprisCommand::Previous => play_entry(ctx.playlist.prev_manual_entry_arc()),
@@ -2868,6 +2880,67 @@ fn execute_mpris_command(
         }
     }
     false
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn resume_or_start_current(
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    search_seq: &Arc<AtomicU64>,
+) {
+    if *ctx.player_state.borrow() == PlayerState::Paused {
+        ctx.player.resume();
+    } else if matches!(
+        *ctx.player_state.borrow(),
+        PlayerState::Idle | PlayerState::Stopped
+    ) {
+        start_current_queue_entry(ctx, rt, action_tx, search_page, settings_page, search_seq);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn toggle_or_start_current(
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    search_seq: &Arc<AtomicU64>,
+) {
+    match *ctx.player_state.borrow() {
+        PlayerState::Playing | PlayerState::Loading => ctx.player.pause(),
+        PlayerState::Paused => ctx.player.resume(),
+        PlayerState::Idle | PlayerState::Stopped => {
+            start_current_queue_entry(ctx, rt, action_tx, search_page, settings_page, search_seq);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_current_queue_entry(
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    search_seq: &Arc<AtomicU64>,
+) {
+    let (songs, index) = ctx.playlist.snapshot_arc();
+    if songs.get(index).is_some() {
+        execute_action(
+            AppAction::PlayFromQueue { songs, index },
+            ctx,
+            rt,
+            action_tx,
+            search_page,
+            settings_page,
+            search_seq,
+        );
+    }
 }
 
 fn persist_volume(ctx: &AppContext, volume: u32) {
@@ -3164,6 +3237,43 @@ fn execute_action(
             sp.status_msg = Some(format!("✗ 音源加载失败: {}", error));
             ctx.notify(Notification::error(format!("JS 音源导入失败: {}", error)));
         }
+        AppAction::CheckSourceHealth => {
+            if ctx
+                .source_health_checking
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            let source_manager = Arc::clone(&ctx.source_manager);
+            let tx = action_tx.clone();
+            rt.spawn(async move {
+                let results = source_manager.health_check().await;
+                let _ = tx.send(AppAction::SourceHealthChecked { results });
+            });
+        }
+        AppAction::SourceHealthChecked { results } => {
+            ctx.source_health_checking
+                .store(false, std::sync::atomic::Ordering::Release);
+            let healthy = results.iter().filter(|result| result.ok).count();
+            let total = results.len();
+            let failures = results
+                .iter()
+                .filter(|result| !result.ok)
+                .map(|result| format!("{}: {}", result.name, result.detail))
+                .collect::<Vec<_>>();
+            *ctx.source_health.write().unwrap() = results;
+            settings_page.lock().unwrap().status_msg = Some(if failures.is_empty() {
+                format!("音源检测完成：{healthy}/{total} 可用")
+            } else {
+                format!(
+                    "音源检测完成：{healthy}/{total} 可用；失败：{}",
+                    failures.join("；")
+                )
+            });
+            ctx.notify(
+                Notification::info(format!("音源检测完成：{healthy}/{total} 可用")).tui_only(),
+            );
+        }
         AppAction::RemoveSource(url) => {
             tracing::info!("removing JS source: {url}");
             let generation = ctx.source_manager.begin_js_source_request(true);
@@ -3303,9 +3413,16 @@ fn begin_song_from_list(
         return;
     };
     if should_expand_bili_parts(&song) {
-        let request_id = ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let request_id = next_play_request(ctx);
         let _ = prepare_player(ctx);
-        *ctx.current_song.write().unwrap() = Some(song.clone());
+        if !set_current_song_if_current(
+            &ctx.current_song,
+            &ctx.play_request_id,
+            request_id,
+            song.clone(),
+        ) {
+            return;
+        }
         ctx.notify(Notification::info(format!("正在解析分 P: {}", song.name)).tui_only());
         let bili_source = Arc::clone(&ctx.bili_source);
         let play_request_id = Arc::clone(&ctx.play_request_id);
@@ -3409,9 +3526,17 @@ fn start_song_playback(
     rt: &tokio::runtime::Runtime,
     action_tx: &mpsc::UnboundedSender<AppAction>,
 ) {
-    let request_id = ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1;
+    let request_id = next_play_request(ctx);
     let player_generation = prepare_player(ctx);
     let lyric_generation = ctx.lyric_service.prepare();
+    if !set_current_song_if_current(
+        &ctx.current_song,
+        &ctx.play_request_id,
+        request_id,
+        song.clone(),
+    ) {
+        return;
+    }
     let (show_cover, album_cover_notification, track_change_notification) = {
         let config = ctx.config.read().unwrap();
         (
@@ -3427,10 +3552,17 @@ fn start_song_playback(
         cover_service.clear();
         let initial_cover = initial_cover.clone();
         let cover = Arc::clone(&cover_service);
+        let request_guard = Arc::clone(&ctx.play_request_id);
         let wake_tx = action_tx.clone();
         rt.spawn(async move {
+            if request_guard.load(Ordering::SeqCst) != request_id {
+                return;
+            }
             if let Err(error) = cover.load(initial_cover).await {
                 tracing::debug!("load initial cover failed: {}", error);
+            }
+            if request_guard.load(Ordering::SeqCst) != request_id {
+                return;
             }
             // 封面加载不会产生任何事件，暂停时必须主动唤醒渲染循环
             let _ = wake_tx.send(AppAction::None);
@@ -3443,7 +3575,6 @@ fn start_song_playback(
         let limit = ctx.config.read().unwrap().player.history_limit;
         ctx.storage.add_history(&song, limit);
     }
-    *ctx.current_song.write().unwrap() = Some(song.clone());
     if add_history {
         let _ = action_tx.send(AppAction::ShowNotification(
             Notification::info(format!("正在加载: {} - {}", song.name, song.singer)).tui_only(),
@@ -3496,12 +3627,10 @@ fn start_song_playback(
             Ok(Ok(Some(resolved))) => resolved,
             Ok(Ok(None)) => return,
             Ok(Err(error)) => {
-                player.stop();
                 let _ = tx.send(AppAction::PlaybackFailed { request_id, error });
                 return;
             }
             Err(_) => {
-                player.stop();
                 let _ = tx.send(AppAction::PlaybackFailed {
                     request_id,
                     error: "获取播放地址超时，请稍后重试".to_string(),
@@ -3514,7 +3643,14 @@ fn start_song_playback(
         let headers = song_url.headers;
         // libmpv 可能在 loadfile 返回后立刻报错，先保存实际匹配到的歌曲，
         // 让错误处理继续重试正确的候选音源。
-        *current_song.write().unwrap() = Some(resolved_song.clone());
+        if !set_current_song_if_current(
+            &current_song,
+            &play_request_id,
+            request_id,
+            resolved_song.clone(),
+        ) {
+            return;
+        }
         let player_for_start = Arc::clone(&player);
         let request_guard = Arc::clone(&play_request_id);
         let accepted = tokio::task::spawn_blocking(move || {
@@ -3574,7 +3710,14 @@ fn start_song_playback(
         {
             resolved_song.cover_url = Some(url);
         }
-        *current_song.write().unwrap() = Some(resolved_song.clone());
+        if !set_current_song_if_current(
+            &current_song,
+            &play_request_id,
+            request_id,
+            resolved_song.clone(),
+        ) {
+            return;
+        }
         let playing_message = format!(
             "{} - {} [{}]",
             resolved_song.name,
@@ -3594,8 +3737,14 @@ fn start_song_playback(
             && resolved_song.cover_url.is_some()
             && resolved_song.cover_url != initial_cover
         {
+            if play_request_id.load(Ordering::SeqCst) != request_id {
+                return;
+            }
             if let Err(error) = cover_service.load(resolved_song.cover_url.clone()).await {
                 tracing::debug!("load cover failed: {}", error);
+            }
+            if play_request_id.load(Ordering::SeqCst) != request_id {
+                return;
             }
             let _ = tx.send(AppAction::None);
         }
@@ -3614,6 +3763,9 @@ fn start_song_playback(
         } else {
             None
         };
+        if play_request_id.load(Ordering::SeqCst) != request_id {
+            return;
+        }
         if track_change_notification {
             let mut notification = Notification::info(playing_message)
                 .with_title(playing_title)
@@ -3625,6 +3777,25 @@ fn start_song_playback(
             let _ = tx.send(AppAction::ShowNotification(notification));
         }
     });
+}
+
+fn next_play_request(ctx: &AppContext) -> u64 {
+    let _song_guard = ctx.current_song.write().unwrap();
+    ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn set_current_song_if_current(
+    current_song: &std::sync::RwLock<Option<SongInfo>>,
+    play_request_id: &AtomicU64,
+    request_id: u64,
+    song: SongInfo,
+) -> bool {
+    let mut current = current_song.write().unwrap();
+    if play_request_id.load(Ordering::SeqCst) != request_id {
+        return false;
+    }
+    *current = Some(song);
+    true
 }
 
 fn should_expand_bili_parts(song: &SongInfo) -> bool {

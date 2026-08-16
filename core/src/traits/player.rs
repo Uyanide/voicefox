@@ -5,6 +5,41 @@ use tokio::sync::{mpsc, watch};
 
 use crate::model::source::PlayerState;
 
+/// 播放器从实际音频流读取的参数。
+///
+/// 与音源请求的质量档位不同，这些值来自解码器，因此能反映最终拿到的文件。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioInfo {
+    pub codec: Option<String>,
+    /// 码率，单位为 kb/s。
+    pub bitrate_kbps: Option<u32>,
+    /// 采样率，单位为 Hz。
+    pub sample_rate_hz: Option<u32>,
+}
+
+impl AudioInfo {
+    /// 适合状态栏展示的紧凑标签。
+    pub fn label(&self) -> Option<String> {
+        let codec = self.codec.as_deref()?.trim();
+        if codec.is_empty() {
+            return None;
+        }
+        let mut parts = vec![codec.to_uppercase()];
+        if let Some(bitrate) = self.bitrate_kbps {
+            parts.push(format!("{bitrate}K"));
+        }
+        if let Some(sample_rate) = self.sample_rate_hz {
+            let khz = if sample_rate.is_multiple_of(1000) {
+                (sample_rate / 1000).to_string()
+            } else {
+                format!("{:.1}", sample_rate as f64 / 1000.0)
+            };
+            parts.push(format!("{khz}kHz"));
+        }
+        Some(parts.join(" "))
+    }
+}
+
 /// ReplayGain 应用模式。
 ///
 /// `Album` 会在专辑增益缺失时由 mpv 回退到曲目增益。
@@ -102,6 +137,11 @@ pub trait Player: Send + Sync {
     }
     /// 总时长观察者
     fn duration_watcher(&self) -> watch::Receiver<Duration>;
+    /// 实际音频参数观察者。没有解码器信息的实现返回空值。
+    fn audio_info_watcher(&self) -> watch::Receiver<AudioInfo> {
+        let (_sender, receiver) = watch::channel(AudioInfo::default());
+        receiver
+    }
 
     /// 离散事件（Ended, Error, Buffering）— 调用后 receiver 被消耗
     fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<PlayerEvent>>;
@@ -204,7 +244,7 @@ pub trait Player: Send + Sync {
 mod tests {
     use std::time::Duration;
 
-    use super::{AbLoop, ChannelMode, EqualizerBand, ReplayGainMode};
+    use super::{AbLoop, AudioInfo, ChannelMode, EqualizerBand, ReplayGainMode};
 
     #[test]
     fn ab_loop_requires_a_strictly_positive_range() {
@@ -218,5 +258,15 @@ mod tests {
         assert_eq!(ReplayGainMode::default(), ReplayGainMode::Off);
         assert_eq!(ChannelMode::default(), ChannelMode::Auto);
         assert_eq!(EqualizerBand::new(100.0, 2.0).frequency_hz, 100.0);
+    }
+
+    #[test]
+    fn audio_info_label_uses_observed_values() {
+        let info = AudioInfo {
+            codec: Some("flac".to_string()),
+            bitrate_kbps: Some(921),
+            sample_rate_hz: Some(44_100),
+        };
+        assert_eq!(info.label().as_deref(), Some("FLAC 921K 44.1kHz"));
     }
 }

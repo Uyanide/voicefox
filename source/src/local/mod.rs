@@ -187,9 +187,9 @@ impl LocalSource {
             // 一次全目录遍历。
             if !force
                 && let (Some(previous), Some(current)) = (
-                previous_signatures.get(&root),
-                scanner::DirSignature::from_path(&root),
-            )
+                    previous_signatures.get(&root),
+                    scanner::DirSignature::from_path(&root),
+                )
                 && *previous == current
                 && previous_songs.contains_key(&root)
             {
@@ -746,8 +746,8 @@ fn read_local_lyric(audio_path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;

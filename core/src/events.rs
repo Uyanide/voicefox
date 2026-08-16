@@ -1,8 +1,9 @@
 use crossterm::event::{KeyEvent, MouseEvent};
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::model::song::SongInfo;
+use crate::model::source::SourceHealth;
 use crate::model::source::SourceId;
 
 /// 终端输入事件
@@ -94,6 +95,10 @@ pub enum AppAction {
     SourceImportFailed {
         error: String,
         generation: u64,
+    },
+    CheckSourceHealth,
+    SourceHealthChecked {
+        results: Vec<SourceHealth>,
     },
     RemoveSource(String),
     RemoveHistory(Box<SongInfo>),

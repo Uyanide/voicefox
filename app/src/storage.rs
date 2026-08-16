@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lx_core::model::playlist::Playlist;
@@ -1231,8 +1231,8 @@ mod tests {
     };
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
-    use std::sync::atomic::AtomicU64;
     use std::sync::RwLock;
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     fn song(id: &str, source: SourceId, name: &str, singer: &str) -> SongInfo {
@@ -1453,7 +1453,10 @@ mod tests {
             .unwrap();
 
         assert_eq!((added, skipped), (2, 1));
-        assert_eq!(storage.custom_playlist(&playlist.id).unwrap().songs.len(), 3);
+        assert_eq!(
+            storage.custom_playlist(&playlist.id).unwrap().songs.len(),
+            3
+        );
         let persisted: Vec<CustomPlaylist> =
             Storage::load_file(&data_dir.join("custom_playlists.json"));
         assert_eq!(persisted[0].songs.len(), 3);
