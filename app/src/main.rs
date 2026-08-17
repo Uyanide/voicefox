@@ -2911,7 +2911,11 @@ fn toggle_or_start_current(
     settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
     search_seq: &Arc<AtomicU64>,
 ) {
-    match *ctx.player_state.borrow() {
+    // Copy the state out of the watch channel first: pause()/resume() send
+    // a new state into the same watch channel, and a live watch::Ref holds
+    // the RwLock read guard that the send needs as a write lock.
+    let state = *ctx.player_state.borrow();
+    match state {
         PlayerState::Playing | PlayerState::Loading => ctx.player.pause(),
         PlayerState::Paused => ctx.player.resume(),
         PlayerState::Idle | PlayerState::Stopped => {
