@@ -307,6 +307,28 @@ impl SearchPage {
             (KeyModifiers::NONE, KeyCode::Char('v')) => {
                 self.open_variants();
             }
+            // 从当前结果快速追搜元数据，避免手动重新输入长歌手名或专辑名。
+            (KeyModifiers::NONE, KeyCode::Char('@')) => {
+                if let Some((singer, song_source)) = self
+                    .results
+                    .get(self.selected)
+                    .map(|song| (song.singer.clone(), song.source))
+                {
+                    let source = (song_source == SourceId::Bili && self.source_filter.is_none())
+                        .then_some(SourceId::Bili)
+                        .or(self.source_filter);
+                    return self.search_metadata(&singer, source);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('#')) => {
+                if let Some(album) = self
+                    .results
+                    .get(self.selected)
+                    .map(|song| song.album_name.clone())
+                {
+                    return self.search_metadata(&album, self.source_filter);
+                }
+            }
             (KeyModifiers::NONE, KeyCode::Char('f')) => {
                 if let Some(song) = self.results.get(self.selected).cloned() {
                     return AppAction::ToggleFavoriteSong(Box::new(song));
@@ -412,6 +434,18 @@ impl SearchPage {
         }
 
         AppAction::None
+    }
+
+    fn search_metadata(&mut self, value: &str, source: Option<SourceId>) -> AppAction {
+        let keyword = value.trim().to_string();
+        if keyword.is_empty() {
+            return AppAction::None;
+        }
+        self.input = keyword.clone();
+        self.input_mode = false;
+        self.last_input_time = std::time::Instant::now();
+        self.last_searched_input = keyword.clone();
+        AppAction::Search { keyword, source }
     }
 
     fn can_load_more(&self) -> bool {
@@ -641,7 +675,7 @@ impl SearchPage {
                 ""
             };
             format!(
-                "搜索结果 {}/{}{} · v 选择音源",
+                "搜索结果 {}/{}{} · v 音源 · @ 歌手 · # 专辑",
                 self.results.len(),
                 self.total,
                 loading_more
@@ -1519,6 +1553,29 @@ mod tests {
         );
 
         assert!(matches!(action, AppAction::PlaySong { index: 0, .. }));
+    }
+
+    #[test]
+    fn at_and_hash_follow_up_searches_use_selected_metadata() {
+        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        page.input_mode = false;
+        let mut selected = song("kw-1", SourceId::Kw, "晴天", "周杰伦");
+        selected.album_name = "叶惠美".to_string();
+        page.results = vec![selected];
+        let resolver =
+            KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
+
+        let action = page.handle_input(
+            KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE),
+            &resolver,
+        );
+        assert!(matches!(action, AppAction::Search { ref keyword, .. } if keyword == "周杰伦"));
+
+        let action = page.handle_input(
+            KeyEvent::new(KeyCode::Char('#'), KeyModifiers::NONE),
+            &resolver,
+        );
+        assert!(matches!(action, AppAction::Search { ref keyword, .. } if keyword == "叶惠美"));
     }
 
     #[test]

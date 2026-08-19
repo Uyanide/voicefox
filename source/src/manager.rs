@@ -387,20 +387,63 @@ impl SourceManager {
             )));
         }
 
-        items.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.singer.to_lowercase().cmp(&b.singer.to_lowercase()))
-                .then_with(|| a.source.as_str().cmp(b.source.as_str()))
-        });
         let mut seen = HashSet::new();
         items.retain(|song| seen.insert((song.source, song.id.clone())));
+        Self::sort_search_results(&mut items, keyword);
         Ok(SearchResult {
             items,
             total,
             has_more,
         })
+    }
+
+    fn sort_search_results(items: &mut [SongInfo], keyword: &str) {
+        let keyword = Self::normalize_search_text(keyword);
+        items.sort_by(|a, b| {
+            Self::search_relevance(a, &keyword)
+                .cmp(&Self::search_relevance(b, &keyword))
+                .then_with(|| {
+                    Self::normalize_search_text(&a.name).cmp(&Self::normalize_search_text(&b.name))
+                })
+                .then_with(|| {
+                    Self::normalize_search_text(&a.singer)
+                        .cmp(&Self::normalize_search_text(&b.singer))
+                })
+                .then_with(|| a.source.as_str().cmp(b.source.as_str()))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+
+    fn search_relevance(song: &SongInfo, keyword: &str) -> u8 {
+        if keyword.is_empty() {
+            return 5;
+        }
+        let name = Self::normalize_search_text(&song.name);
+        let singer = Self::normalize_search_text(&song.singer);
+        let album = Self::normalize_search_text(&song.album_name);
+        if name == keyword {
+            0
+        } else if name.starts_with(keyword) {
+            1
+        } else if singer == keyword {
+            2
+        } else if name.contains(keyword) {
+            3
+        } else if singer.contains(keyword) {
+            4
+        } else if album.contains(keyword) {
+            5
+        } else {
+            6
+        }
+    }
+
+    fn normalize_search_text(value: &str) -> String {
+        value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
     }
 
     pub async fn leaderboard(
