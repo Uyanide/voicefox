@@ -1,7 +1,7 @@
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
-use lx_core::traits::source::FetchError;
+use lx_core::traits::source::{FetchError, SearchError};
 use serde_json::Value;
 
 use crate::http;
@@ -49,6 +49,32 @@ pub async fn get_detail(id: &str, page: u32) -> Result<Vec<SongInfo>, FetchError
         .as_array()
         .ok_or_else(|| FetchError::Parse("网易云歌单歌曲列表为空".to_string()))?;
     Ok(items.iter().filter_map(super::search::parse_song).collect())
+}
+
+pub async fn search_list(keyword: &str, page: u32) -> Result<Vec<Playlist>, SearchError> {
+    let offset = 30 * page.saturating_sub(1);
+    let url = format!(
+        "https://music.163.com/api/search/get/web?csrf_token=&s={}&type=1000&limit=30&offset={offset}",
+        urlencoding::encode(keyword)
+    );
+    let json: Value = http::client()
+        .get(url)
+        .header("Referer", "https://music.163.com/")
+        .send()
+        .await
+        .map_err(|e| SearchError::Network(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| SearchError::Parse(e.to_string()))?;
+    if json["code"].as_i64() != Some(200) {
+        return Err(SearchError::Api("网易云歌单搜索失败".to_string()));
+    }
+    Ok(json["result"]["playlists"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(parse_playlist)
+        .collect())
 }
 
 fn parse_playlist(item: &Value) -> Option<Playlist> {

@@ -484,6 +484,17 @@ impl SourceManager {
             .await
     }
 
+    pub async fn search_playlists(
+        &self,
+        source: SourceId,
+        keyword: &str,
+        page: u32,
+    ) -> Result<Vec<Playlist>, SearchError> {
+        self.online_source(source)?
+            .search_playlists(keyword, page)
+            .await
+    }
+
     pub async fn playlist_detail(
         &self,
         source: SourceId,

@@ -52,6 +52,9 @@ pub struct SearchPage {
     pub input_mode: bool,
     pub source_filter: Option<SourceId>,
     pub result_source_filter: Option<SourceId>,
+    artist_filter: Option<String>,
+    album_filter: Option<String>,
+    base_keyword: String,
     pub variant_indices: Vec<usize>,
     pub variant_selected: usize,
     search_scopes: Vec<(Option<SourceId>, &'static str)>,
@@ -91,6 +94,9 @@ impl SearchPage {
             input_mode: false,
             source_filter,
             result_source_filter: None,
+            artist_filter: None,
+            album_filter: None,
+            base_keyword: String::new(),
             variant_indices: Vec::new(),
             variant_selected: 0,
             search_scopes,
@@ -133,6 +139,7 @@ impl SearchPage {
                     if !(keyword.is_empty()
                         || self.is_searching && self.last_searched_input == keyword)
                     {
+                        self.prepare_plain_search(&keyword);
                         self.last_input_time = std::time::Instant::now();
                         self.last_searched_input = keyword.clone();
                         return AppAction::Search {
@@ -198,6 +205,7 @@ impl SearchPage {
                         return self.activate_selected_result();
                     }
                     self.last_input_time = std::time::Instant::now();
+                    self.prepare_plain_search(&keyword);
                     self.last_searched_input = keyword.clone();
                     return AppAction::Search {
                         keyword,
@@ -317,7 +325,7 @@ impl SearchPage {
                     let source = (song_source == SourceId::Bili && self.source_filter.is_none())
                         .then_some(SourceId::Bili)
                         .or(self.source_filter);
-                    return self.search_metadata(&singer, source);
+                    return self.search_metadata(&singer, source, true);
                 }
             }
             (KeyModifiers::NONE, KeyCode::Char('#')) => {
@@ -326,7 +334,7 @@ impl SearchPage {
                     .get(self.selected)
                     .map(|song| song.album_name.clone())
                 {
-                    return self.search_metadata(&album, self.source_filter);
+                    return self.search_metadata(&album, self.source_filter, false);
                 }
             }
             (KeyModifiers::NONE, KeyCode::Char('f')) => {
@@ -368,6 +376,7 @@ impl SearchPage {
                     return self.activate_selected_result();
                 }
                 self.last_input_time = std::time::Instant::now();
+                self.prepare_plain_search(&keyword);
                 self.last_searched_input = keyword.clone();
                 return AppAction::Search {
                     keyword,
@@ -436,16 +445,55 @@ impl SearchPage {
         AppAction::None
     }
 
-    fn search_metadata(&mut self, value: &str, source: Option<SourceId>) -> AppAction {
+    fn search_metadata(
+        &mut self,
+        value: &str,
+        source: Option<SourceId>,
+        artist: bool,
+    ) -> AppAction {
         let keyword = value.trim().to_string();
         if keyword.is_empty() {
             return AppAction::None;
+        }
+        let current = if artist {
+            self.artist_filter.as_deref()
+        } else {
+            self.album_filter.as_deref()
+        };
+        if current == Some(keyword.as_str()) {
+            if artist {
+                self.artist_filter = None;
+            } else {
+                self.album_filter = None;
+            }
+            let restore = self.base_keyword.trim().to_string();
+            self.input = restore.clone();
+            self.input_mode = false;
+            if restore.is_empty() {
+                return AppAction::None;
+            }
+            self.last_searched_input = restore.clone();
+            return AppAction::Search {
+                keyword: restore,
+                source: self.source_filter,
+            };
+        }
+        if artist {
+            self.artist_filter = Some(keyword.clone());
+        } else {
+            self.album_filter = Some(keyword.clone());
         }
         self.input = keyword.clone();
         self.input_mode = false;
         self.last_input_time = std::time::Instant::now();
         self.last_searched_input = keyword.clone();
         AppAction::Search { keyword, source }
+    }
+
+    fn prepare_plain_search(&mut self, keyword: &str) {
+        self.base_keyword = keyword.to_string();
+        self.artist_filter = None;
+        self.album_filter = None;
     }
 
     fn can_load_more(&self) -> bool {
@@ -674,11 +722,18 @@ impl SearchPage {
             } else {
                 ""
             };
+            let filters = match (&self.artist_filter, &self.album_filter) {
+                (Some(artist), Some(album)) => format!(" · 歌手:{} · 专辑:{}", artist, album),
+                (Some(artist), None) => format!(" · 歌手:{}", artist),
+                (None, Some(album)) => format!(" · 专辑:{}", album),
+                (None, None) => String::new(),
+            };
             format!(
-                "搜索结果 {}/{}{} · v 音源 · @ 歌手 · # 专辑",
+                "搜索结果 {}/{}{}{} · v 音源 · @ 歌手(再按删除) · # 专辑(再按删除)",
                 self.results.len(),
                 self.total,
-                loading_more
+                loading_more,
+                filters
             )
         };
         let result_block = Block::default().borders(Borders::ALL).title(result_title);

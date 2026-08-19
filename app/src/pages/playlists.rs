@@ -51,6 +51,12 @@ pub enum PlaylistLoadRequest {
         page: u32,
         append: bool,
     },
+    Search {
+        source: SourceId,
+        keyword: String,
+        page: u32,
+        append: bool,
+    },
     Songs {
         source: SourceId,
         playlist_id: String,
@@ -75,6 +81,8 @@ pub struct PlaylistsPage {
     list_loading: bool,
     list_page: u32,
     list_has_more: bool,
+    search_input: Option<String>,
+    search_keyword: Option<String>,
     songs_loaded: bool,
     songs_loading: bool,
     playlist_scroll_offset: usize,
@@ -104,6 +112,8 @@ impl PlaylistsPage {
             list_loading: false,
             list_page: 0,
             list_has_more: false,
+            search_input: None,
+            search_keyword: None,
             songs_loaded: false,
             songs_loading: false,
             playlist_scroll_offset: 0,
@@ -122,6 +132,10 @@ impl PlaylistsPage {
             Some(PlaylistScope::Source(source)) => Some(source),
             _ => None,
         }
+    }
+
+    pub fn search_keyword(&self) -> Option<&str> {
+        self.search_keyword.as_deref()
     }
 
     fn current_scope(&self) -> Option<PlaylistScope> {
@@ -249,6 +263,17 @@ impl PlaylistsPage {
             return None;
         }
         let source = self.current_source()?;
+        if let Some(keyword) = self.search_keyword.as_deref()
+            && !self.list_loading
+            && !self.list_loaded
+        {
+            return Some(PlaylistLoadRequest::Search {
+                source,
+                keyword: keyword.to_string(),
+                page: 1,
+                append: false,
+            });
+        }
         if !self.list_loading && !self.list_loaded {
             return Some(PlaylistLoadRequest::List {
                 source,
@@ -262,10 +287,20 @@ impl PlaylistsPage {
             && !self.playlists.is_empty()
             && self.selected + 1 >= self.playlists.len()
         {
-            return Some(PlaylistLoadRequest::List {
-                source,
-                page: self.list_page.saturating_add(1).max(1),
-                append: true,
+            let page = self.list_page.saturating_add(1).max(1);
+            return Some(if let Some(keyword) = &self.search_keyword {
+                PlaylistLoadRequest::Search {
+                    source,
+                    keyword: keyword.clone(),
+                    page,
+                    append: true,
+                }
+            } else {
+                PlaylistLoadRequest::List {
+                    source,
+                    page,
+                    append: true,
+                }
             });
         }
         None
@@ -275,6 +310,12 @@ impl PlaylistsPage {
         self.error_message = None;
         match request {
             PlaylistLoadRequest::List { append, .. } => {
+                self.list_loading = true;
+                if !append {
+                    self.list_loaded = false;
+                }
+            }
+            PlaylistLoadRequest::Search { append, .. } => {
                 self.list_loading = true;
                 if !append {
                     self.list_loaded = false;
@@ -296,10 +337,14 @@ impl PlaylistsPage {
     ) {
         let received_items = !playlists.is_empty();
         let mut items = if append {
-            self.list_cache
-                .get(&source)
-                .map(|cache| cache.items.clone())
-                .unwrap_or_default()
+            if self.search_keyword.is_some() {
+                self.playlists.clone()
+            } else {
+                self.list_cache
+                    .get(&source)
+                    .map(|cache| cache.items.clone())
+                    .unwrap_or_default()
+            }
         } else {
             Vec::new()
         };
@@ -314,14 +359,16 @@ impl PlaylistsPage {
         }
         let added_items = items.len() > previous_len;
         let has_more = received_items && (!append || added_items);
-        self.list_cache.insert(
-            source,
-            PlaylistListCache {
-                items: items.clone(),
-                page,
-                has_more,
-            },
-        );
+        if self.search_keyword.is_none() {
+            self.list_cache.insert(
+                source,
+                PlaylistListCache {
+                    items: items.clone(),
+                    page,
+                    has_more,
+                },
+            );
+        }
         if self.current_source() != Some(source) || self.selected_playlist.is_some() {
             return;
         }
@@ -334,6 +381,32 @@ impl PlaylistsPage {
         self.selected = self.selected.min(self.playlists.len().saturating_sub(1));
         if !append {
             self.playlist_scroll_offset = 0;
+        }
+    }
+
+    pub fn begin_search_input(&mut self) {
+        if self.selected_playlist.is_none() && self.current_source().is_some() {
+            self.search_input = Some(self.search_keyword.clone().unwrap_or_default());
+        }
+    }
+
+    pub fn clear_playlist_search(&mut self) {
+        self.search_input = None;
+        self.search_keyword = None;
+        self.list_loaded = false;
+        self.list_page = 0;
+        self.list_has_more = false;
+    }
+
+    fn submit_search(&mut self) {
+        if let Some(value) = self.search_input.take() {
+            let value = value.trim().to_string();
+            self.search_keyword = (!value.is_empty()).then_some(value);
+            self.list_loaded = false;
+            self.list_page = 0;
+            self.list_has_more = false;
+            self.playlists.clear();
+            self.selected = 0;
         }
     }
 
@@ -373,6 +446,18 @@ impl PlaylistsPage {
                 }
                 self.error_message = Some(message);
             }
+            PlaylistLoadRequest::Search { source, append, .. }
+                if self.current_source() == Some(*source) && self.selected_playlist.is_none() =>
+            {
+                self.list_loading = false;
+                // 搜索不受支持时保留/恢复热门列表，避免把页面留在空白错误态。
+                self.search_keyword = None;
+                self.list_loaded = false;
+                self.list_has_more = false;
+                self.error_message = Some(format!(
+                    "该音源不支持歌单搜索，已切换为热门歌单（{message}）"
+                ));
+            }
             PlaylistLoadRequest::Songs {
                 source,
                 playlist_id,
@@ -405,6 +490,22 @@ impl PlaylistsPage {
         }
         if self.pending_delete.is_some() {
             return self.handle_delete_confirmation(key, ctx);
+        }
+        if let Some(input) = self.search_input.as_mut() {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Esc) => self.search_input = None,
+                (KeyModifiers::NONE, KeyCode::Enter) => self.submit_search(),
+                (KeyModifiers::NONE, KeyCode::Backspace) => {
+                    input.pop();
+                }
+                (modifiers, KeyCode::Char(c))
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    input.push(c)
+                }
+                _ => {}
+            }
+            return AppAction::None;
         }
         if let Some(action) = resolver.resolve_page("playlists", key) {
             match action {
@@ -576,6 +677,14 @@ impl PlaylistsPage {
                 self.begin_custom_delete();
             }
             (KeyModifiers::NONE, KeyCode::Char('r')) => self.refresh_current(ctx),
+            (KeyModifiers::NONE, KeyCode::Char('/')) | (KeyModifiers::NONE, KeyCode::Char('s')) => {
+                self.begin_search_input();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('c'))
+                if self.search_keyword.is_some() && self.selected_playlist.is_none() =>
+            {
+                self.clear_playlist_search();
+            }
             _ => {}
         }
         AppAction::None
@@ -862,12 +971,16 @@ impl PlaylistsPage {
             } else {
                 ""
             };
-            format!(
-                "热门歌单 ({}，第 {} 页){}",
-                self.playlists.len(),
-                self.list_page.max(1),
-                suffix
-            )
+            if let Some(keyword) = &self.search_keyword {
+                format!("歌单搜索：{} ({}){}", keyword, self.playlists.len(), suffix)
+            } else {
+                format!(
+                    "热门歌单 ({}，第 {} 页){}",
+                    self.playlists.len(),
+                    self.list_page.max(1),
+                    suffix
+                )
+            }
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1281,6 +1394,8 @@ impl PlaylistsPage {
         self.selected = 0;
         self.playlist_scroll_offset = 0;
         self.song_scroll_offset = 0;
+        self.search_input = None;
+        self.search_keyword = None;
         if let Some(source) = self.current_source() {
             if let Some(cache) = self.list_cache.get(&source) {
                 self.playlists = cache.items.clone();

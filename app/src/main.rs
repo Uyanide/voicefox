@@ -77,6 +77,14 @@ enum PlaylistResponse {
         append: bool,
         result: Result<Vec<Playlist>, String>,
     },
+    Search {
+        request_id: u64,
+        source: SourceId,
+        keyword: String,
+        page: u32,
+        append: bool,
+        result: Result<Vec<Playlist>, String>,
+    },
     Songs {
         request_id: u64,
         source: SourceId,
@@ -992,6 +1000,32 @@ fn run_app(
                             };
                             playlists.update_error(&request, error.clone());
                             ctx.notify(Notification::error(format!("加载热门歌单失败: {error}")));
+                        }
+                    }
+                    needs_render = true;
+                }
+                PlaylistResponse::Search {
+                    request_id,
+                    source,
+                    keyword,
+                    page,
+                    append,
+                    result,
+                } if request_id == playlist_request_id
+                    && playlists.current_source() == Some(source)
+                    && playlists.search_keyword() == Some(keyword.as_str()) =>
+                {
+                    match result {
+                        Ok(items) => playlists.update_playlists(source, page, append, items),
+                        Err(error) => {
+                            let request = pages::playlists::PlaylistLoadRequest::Search {
+                                source,
+                                keyword,
+                                page,
+                                append,
+                            };
+                            playlists.update_error(&request, error.clone());
+                            ctx.notify(Notification::info(error));
                         }
                     }
                     needs_render = true;
@@ -4217,6 +4251,30 @@ fn spawn_playlist_request(
                         Ok(Ok(playlists)) => Ok(playlists),
                         Ok(Err(error)) => Err(error.to_string()),
                         Err(_) => Err("请求超时，请稍后重试".to_string()),
+                    },
+                }
+            }
+            pages::playlists::PlaylistLoadRequest::Search {
+                source,
+                keyword,
+                page,
+                append,
+            } => {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    source_manager.search_playlists(source, &keyword, page),
+                )
+                .await;
+                PlaylistResponse::Search {
+                    request_id,
+                    source,
+                    keyword,
+                    page,
+                    append,
+                    result: match result {
+                        Ok(Ok(items)) => Ok(items),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("歌单搜索超时，已回退热门歌单".to_string()),
                     },
                 }
             }

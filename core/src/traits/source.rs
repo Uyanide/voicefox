@@ -58,6 +58,14 @@ pub trait MusicSource: Send + Sync {
     async fn get_playlists(&self, _tag_id: &str, _page: u32) -> Result<Vec<Playlist>, FetchError> {
         Ok(vec![])
     }
+    /// 按关键词搜索歌单。未实现的音源返回“不支持”，调用方应回退到热门歌单。
+    async fn search_playlists(
+        &self,
+        _keyword: &str,
+        _page: u32,
+    ) -> Result<Vec<Playlist>, SearchError> {
+        Err(SearchError::Other("该音源不支持歌单搜索".to_string()))
+    }
     async fn get_playlist_detail(
         &self,
         _id: &str,

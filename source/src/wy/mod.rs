@@ -76,6 +76,14 @@ impl MusicSource for WySource {
         playlist::get_list(page).await
     }
 
+    async fn search_playlists(
+        &self,
+        keyword: &str,
+        page: u32,
+    ) -> Result<Vec<Playlist>, SearchError> {
+        playlist::search_list(keyword, page).await
+    }
+
     async fn get_playlist_detail(&self, id: &str, page: u32) -> Result<Vec<SongInfo>, FetchError> {
         playlist::get_detail(id, page).await
     }
