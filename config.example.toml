@@ -50,15 +50,11 @@ max_fps = 20                # 1-60，越小越省电
 # 底部状态栏内容；数组顺序即从左到右的显示顺序，删除某项可将其隐藏
 status_bar_items = [
     "state",
-    "source",
-    "sort",
     "song",
     "time",
     "volume",
     "play-mode",
     "quality",
-    "queue",
-    "js-source-state",
 ]
 
 [notification]

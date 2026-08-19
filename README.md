@@ -303,7 +303,7 @@ voicefox
 
 ```toml
 [player]
-quality = "flac"        # 128k / 320k / flac / flac24bit
+quality = "flac"        # 请求音质：128k / 320k / flac / flac24bit
 play_mode = "list-loop" # list-loop / single-loop / random / list / none
 history_limit = 200
 
@@ -318,6 +318,8 @@ enabled = true
 paths = ["/home/user/Music"]
 max_depth = 0           # 扫描深度，0 为不限制
 ```
+
+`quality` 是请求音质，不一定等于最终拿到的编码和码率。播放后状态栏会优先显示 libmpv 检测到的实际音频参数；在设置页的 JS 音源面板按 `h` 可运行音源健康检测。
 
 需要一份开箱即用的完整推荐配置？直接复制 [docs/CONFIGURATION.md](docs/CONFIGURATION.md) 中的「推荐配置」小节。
 

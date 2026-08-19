@@ -17,7 +17,7 @@ voicefox --config /path/to/config.toml
 ```toml
 [player]
 engine = "mpv"
-quality = "flac"            # 128k / 320k / flac / flac24bit，按带宽和耳机自行取舍
+quality = "flac"            # 请求档位：128k / 320k / flac / flac24bit
 volume = 80
 playback_speed = 1.0
 audio_device = "auto"       # "auto" 使用系统默认输出设备
@@ -62,8 +62,7 @@ show_cover = true
 cover_protocol = "auto"     # auto / kitty / sixel / iterm2 / halfblocks
 max_fps = 20                # 1-60，越小越省电
 status_bar_items = [
-  "state", "source", "sort", "song", "time", "volume",
-  "play-mode", "quality", "queue", "js-source-state",
+  "state", "song", "time", "volume", "play-mode", "quality",
 ]
 
 [notification]
@@ -81,6 +80,12 @@ enabled = true
 paths = ["/home/user/Music"]  # 改成你的音乐目录，可配置多个
 max_depth = 0                 # 扫描深度，0 为不限制
 ```
+
+### 请求音质与实际音质
+
+`player.quality` 只表示向音源请求的音质档位，不保证音源一定能提供该档位。不同音源可能降级、回退或返回未严格标注码率的地址。
+
+播放开始后，状态栏的 `quality` 字段会优先显示 libmpv 从实际音频流读取的编码、码率和采样率，例如 `MP3 320K 44.1kHz`。如果播放器尚未拿到音频流参数，则暂时显示配置中的请求档位。
 
 ## 配置字段说明
 
@@ -153,11 +158,17 @@ max_depth = 0                 # 扫描深度，0 为不限制
 | `time` | 当前进度与歌曲时长 |
 | `volume` | 播放音量 |
 | `play-mode` | 列表循环、单曲循环、随机等播放模式 |
-| `quality` | 当前请求音质 |
+| `quality` | 实际播放音频的编码、码率和采样率；尚未获取时显示请求音质 |
 | `queue` | 当前歌曲在播放队列中的位置 |
 | `js-source-state` | JS 自定义音源是否可用 |
 
-字段按数组顺序从左到右显示，窄终端放不下的后续字段会自动省略；未知字段在加载时忽略，重复字段自动去重。
+字段按数组顺序从左到右显示，窄终端放不下的后续字段会自动省略；未知字段在加载时忽略，重复字段自动去重。窄终端建议只保留 `state`、`song`、`time`、`volume`、`play-mode` 和 `quality`。
+
+### 音源健康检测
+
+进入设置页（`8`），将焦点切换到 **JS 音源** 面板后按 `h`，或点击面板中的“检测”。voicefox 会并发对当前启用的内置音源和已加载的 JS 音源执行轻量搜索，并显示每个音源的成功状态、延迟、返回数量和失败原因。
+
+健康检测结果用于快速判断搜索服务是否可访问，不等同于对每一首歌曲的播放地址作保证；遇到搜索成功但播放失败的情况，仍由播放时的自动换源机制继续尝试其它音源。JS 音源的远程脚本仍建议保留本地备份，以应对代理或上游地址暂时不可用。
 
 ### `[notification]` 通知
 
