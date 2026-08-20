@@ -1736,7 +1736,12 @@ fn run_app(
                     );
                 }
                 NavTab::Favorites => {
-                    let action = favorites_page.handle_input(&key, &ctx, &kb_resolver);
+                    let action = favorites_page.handle_input(
+                        &key,
+                        &ctx,
+                        &kb_resolver,
+                        &mut data_cache.favorites,
+                    );
                     if matches!(action, AppAction::GoBack) {
                         active_tab = NavTab::Main;
                         needs_render = true;

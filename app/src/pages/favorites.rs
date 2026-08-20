@@ -56,6 +56,7 @@ impl FavoritesPage {
         key: &KeyEvent,
         ctx: &AppContext,
         resolver: &KeybindingResolver,
+        cache: &mut SortedListCache,
     ) -> AppAction {
         let query_before = self.filter.query().to_string();
         if self.filter.handle_input(key) {
@@ -66,8 +67,8 @@ impl FavoritesPage {
             return AppAction::None;
         }
 
-        let favorites = ctx.storage.load_favorites();
-        let filtered = self.filtered_song_indices(&favorites);
+        let favorites = self.sorted_favorites(ctx, cache);
+        let filtered = self.filtered_song_indices(favorites);
         self.clamp_selection(filtered.len());
         let half_page = (self.viewport_height / 2).max(1);
 
@@ -528,7 +529,7 @@ impl FavoritesPage {
 #[cfg(test)]
 mod tests {
     use super::FavoritesPage;
-    use crate::pages::sort::SortMode;
+    use crate::pages::sort::{SortMode, SortTarget, sorted_songs};
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
@@ -558,5 +559,24 @@ mod tests {
         assert_eq!(page.filtered_song_indices(&songs), vec![0, 1]);
         assert_eq!(page.cycle_sort(), SortMode::Oldest);
         assert_eq!(page.filtered_song_indices(&songs), vec![0, 1]);
+    }
+
+    #[test]
+    fn keyboard_selection_indices_follow_the_sorted_favorites() {
+        let page = FavoritesPage::new();
+        let stored = vec![
+            SongInfo::new("1".into(), SourceId::Kw, "C".into(), "X".into()),
+            SongInfo::new("2".into(), SourceId::Kw, "B".into(), "Y".into()),
+            SongInfo::new("3".into(), SourceId::Kw, "A".into(), "Z".into()),
+        ];
+        let sorted = sorted_songs(stored, SortMode::TitleAsc, SortTarget::Favorites);
+        let filtered = page.filtered_song_indices(&sorted);
+        let songs = filtered
+            .iter()
+            .filter_map(|index| sorted.get(*index).cloned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(songs[0].name, "A");
+        assert_eq!(songs[2].name, "C");
     }
 }
