@@ -15,26 +15,36 @@ jobs:
   build:
     name: Build ${{ matrix.asset_name }}
     runs-on: ${{ matrix.runner }}
+
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ── Linux x86_64 ──
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             binary_path: target/x86_64-unknown-linux-gnu/release/voicefox
             asset_name: voicefox-linux-x86_64
+
+          # ── Linux ARM64 ──
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             binary_path: target/aarch64-unknown-linux-gnu/release/voicefox
             asset_name: voicefox-linux-aarch64
+
+          # ── Windows x86_64 ──
           - runner: windows-2022
             target: x86_64-pc-windows-gnu
             binary_path: target/x86_64-pc-windows-gnu/release/voicefox.exe
             asset_name: voicefox-windows-x86_64.zip
+
+          # ── macOS Intel ──
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             binary_path: target/x86_64-apple-darwin/release/voicefox
             asset_name: voicefox-macos-x86_64
+
+          # ── macOS ARM64 ──
           - runner: macos-15
             target: aarch64-apple-darwin
             binary_path: target/aarch64-apple-darwin/release/voicefox
@@ -44,16 +54,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # ── Linux ──
       - name: Install Linux libmpv
         if: startsWith(matrix.runner, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmpv-dev
 
+      # ── macOS ──
       - name: Install macOS libmpv
         if: startsWith(matrix.runner, 'macos')
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
         run: |
           brew install mpv
           echo "RUSTFLAGS=-Lnative=$(brew --prefix mpv)/lib" >> "$GITHUB_ENV"
 
+      # ── Windows ──
       - name: Install MinGW toolchain
         if: matrix.target == 'x86_64-pc-windows-gnu'
         uses: msys2/setup-msys2@v2
@@ -67,110 +84,169 @@ jobs:
         shell: pwsh
         run: |
           rustup target add x86_64-pc-windows-gnu
+
           "C:\msys64\mingw64\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $libmpvUrl = "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z"
+
+          $libmpvUrl = "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev/mpv-dev-x86_64-20260607-git-71ebd08.7z"
+
           curl.exe --location --fail --retry 3 --retry-delay 2 `
             --output mpv-dev.7z $libmpvUrl
+
           if ($LASTEXITCODE -ne 0) {
             throw "Downloading libmpv failed with exit code $LASTEXITCODE"
           }
+
           if ((Get-Item mpv-dev.7z).Length -lt 1MB) {
             throw "Downloaded libmpv archive is unexpectedly small"
           }
+
           7z t mpv-dev.7z | Out-Host
+
           if ($LASTEXITCODE -ne 0) {
             throw "Downloaded libmpv archive is invalid"
           }
+
           New-Item -ItemType Directory -Force -Path mpv-source/64 | Out-Null
+
           7z x mpv-dev.7z "-ompv-source/64" | Out-Host
+
           if ($LASTEXITCODE -ne 0) {
             throw "Extracting libmpv failed with exit code $LASTEXITCODE"
           }
+
           "MPV_SOURCE=$((Get-Location).Path)\mpv-source" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Build
+      # ── Build ──
+      - name: Build non-Windows
         if: matrix.target != 'x86_64-pc-windows-gnu'
-        run: cargo build --locked --release --package voicefox-app --target "${{ matrix.target }}"
+        run: >
+          cargo build
+          --locked
+          --release
+          --package voicefox-app
+          --target "${{ matrix.target }}"
 
       - name: Build Windows
         if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: cargo build --locked --release --package voicefox-app --target "${{ matrix.target }}" --features lx-player/build_libmpv
+        run: >
+          cargo build
+          --locked
+          --release
+          --package voicefox-app
+          --target "${{ matrix.target }}"
+          --features lx-player/build_libmpv
 
+      # ── Validation ──
       - name: Validate non-Windows libmpv runtime
         if: matrix.target != 'x86_64-pc-windows-gnu'
-        run: '"${{ matrix.binary_path }}" --check-libmpv'
+        run: |
+          "${{ matrix.binary_path }}" --check-libmpv
 
       - name: Inspect macOS libmpv linkage
         if: startsWith(matrix.runner, 'macos')
         run: |
           mpv_lib="$(brew --prefix mpv)/lib/libmpv.dylib"
+
           file "$mpv_lib"
           file "${{ matrix.binary_path }}"
+
           otool -L "${{ matrix.binary_path }}"
 
+      # ── Package Linux / macOS ──
       - name: Build non-Windows release asset
         if: matrix.target != 'x86_64-pc-windows-gnu'
         shell: bash
         run: |
           mkdir -p dist
-          cp "${{ matrix.binary_path }}" "dist/${{ matrix.asset_name }}"
+          cp "${{ matrix.binary_path }}" \
+            "dist/${{ matrix.asset_name }}"
 
+      # ── Package Windows ──
       - name: Validate and build Windows release asset
         if: matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "${{ matrix.binary_path }}" dist/voicefox.exe
-          Copy-Item mpv-source/64/libmpv-2.dll dist/libmpv-2.dll
+
+          Copy-Item `
+            "${{ matrix.binary_path }}" `
+            dist/voicefox.exe
+
+          Copy-Item `
+            mpv-source/64/libmpv-2.dll `
+            dist/libmpv-2.dll
+
           Push-Location dist
+
           try {
             $objdump = Get-Command objdump.exe -ErrorAction SilentlyContinue
+
             if ($null -eq $objdump) {
               $objdumpPath = @(
                 "C:\msys64\mingw64\bin\objdump.exe",
                 "C:\msys64\usr\bin\objdump.exe"
-              ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+              ) |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
+
               if ($null -ne $objdumpPath) {
                 $objdump = Get-Item $objdumpPath
               }
             }
+
             if ($null -eq $objdump) {
               Write-Warning "objdump.exe was not found; skipping import-table diagnostics"
-            } else {
+            }
+            else {
               $imports = (& $objdump.Path -p voicefox.exe | Out-String)
-              $imports | Select-String "DLL Name:|mpv_client_api_version"
+
+              $imports |
+                Select-String "DLL Name:|mpv_client_api_version"
+
               if ($imports -notmatch "DLL Name:\s+libmpv-2\.dll") {
                 throw "voicefox.exe does not import the bundled libmpv-2.dll"
               }
+
               if ($imports -notmatch "mpv_client_api_version") {
                 throw "voicefox.exe does not import mpv_client_api_version"
               }
             }
+
             .\voicefox.exe --check-libmpv
+
             if ($LASTEXITCODE -ne 0) {
               throw "Bundled libmpv runtime check failed with exit code $LASTEXITCODE"
             }
-            7z a "${{ matrix.asset_name }}" voicefox.exe libmpv-2.dll | Out-Host
+
+            7z a "${{ matrix.asset_name }}" `
+              voicefox.exe `
+              libmpv-2.dll | Out-Host
+
             if ($LASTEXITCODE -ne 0) {
               throw "Packaging Windows release failed with exit code $LASTEXITCODE"
             }
-          } finally {
+          }
+          finally {
             Pop-Location
           }
 
+      # ── Temporary artifact ──
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}
           if-no-files-found: error
+          retention-days: 1
 
+  # ── Publish GitHub Release ──
   publish:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-24.04
+
     permissions:
       contents: write
 
@@ -185,7 +261,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
+          if ! gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --title "voicefox $tag" \

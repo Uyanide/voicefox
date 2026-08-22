@@ -12,12 +12,17 @@ env:
 jobs:
   # ── Linux 构建 ──
   build-linux:
+    name: Build Linux x86_64
     runs-on: ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v7
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmpv-dev
 
       - name: Build
         run: cargo build --release --verbose
@@ -30,12 +35,17 @@ jobs:
         with:
           name: voicefox-linux-x86_64
           path: target/release/voicefox
+          if-no-files-found: error
+          retention-days: 1
 
-  # ── Windows 构建（使用 Windows 原生 runner） ──
+  # ── Windows 构建 ──
   build-windows:
+    name: Build Windows x86_64
     runs-on: windows-2022
+
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v7
 
       - name: Install MinGW toolchain
         uses: msys2/setup-msys2@v2
@@ -48,71 +58,113 @@ jobs:
         shell: pwsh
         run: |
           rustup target add x86_64-pc-windows-gnu
+
           "C:\msys64\mingw64\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $libmpvUrl = "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z"
+
+          $libmpvUrl = "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev/mpv-dev-x86_64-20260607-git-71ebd08.7z"
+
           curl.exe --location --fail --retry 3 --retry-delay 2 `
             --output mpv-dev.7z $libmpvUrl
+
           if ($LASTEXITCODE -ne 0) {
             throw "Downloading libmpv failed with exit code $LASTEXITCODE"
           }
+
           if ((Get-Item mpv-dev.7z).Length -lt 1MB) {
             throw "Downloaded libmpv archive is unexpectedly small"
           }
+
           7z t mpv-dev.7z | Out-Host
+
           if ($LASTEXITCODE -ne 0) {
             throw "Downloaded libmpv archive is invalid"
           }
+
           New-Item -ItemType Directory -Force -Path mpv-source/64 | Out-Null
+
           7z x mpv-dev.7z "-ompv-source/64" | Out-Host
+
           if ($LASTEXITCODE -ne 0) {
             throw "Extracting libmpv failed with exit code $LASTEXITCODE"
           }
+
           "MPV_SOURCE=$((Get-Location).Path)\mpv-source" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build
-        run: cargo build --locked --release --package voicefox-app --target x86_64-pc-windows-gnu --features lx-player/build_libmpv 2>&1
+        run: >
+          cargo build
+          --locked
+          --release
+          --package voicefox-app
+          --target x86_64-pc-windows-gnu
+          --features lx-player/build_libmpv
 
-      - name: Validate and package binary with libmpv
+      - name: Validate and package binary
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/x86_64-pc-windows-gnu/release/voicefox.exe dist/voicefox.exe
-          Copy-Item mpv-source/64/libmpv-2.dll dist/libmpv-2.dll
+
+          Copy-Item `
+            target/x86_64-pc-windows-gnu/release/voicefox.exe `
+            dist/voicefox.exe
+
+          Copy-Item `
+            mpv-source/64/libmpv-2.dll `
+            dist/libmpv-2.dll
+
           Push-Location dist
+
           try {
             $objdump = Get-Command objdump.exe -ErrorAction SilentlyContinue
+
             if ($null -eq $objdump) {
               $objdumpPath = @(
                 "C:\msys64\mingw64\bin\objdump.exe",
                 "C:\msys64\usr\bin\objdump.exe"
-              ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+              ) |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
+
               if ($null -ne $objdumpPath) {
                 $objdump = Get-Item $objdumpPath
               }
             }
+
             if ($null -eq $objdump) {
               Write-Warning "objdump.exe was not found; skipping import-table diagnostics"
-            } else {
+            }
+            else {
               $imports = (& $objdump.Path -p voicefox.exe | Out-String)
-              $imports | Select-String "DLL Name:|mpv_client_api_version"
+
+              $imports |
+                Select-String "DLL Name:|mpv_client_api_version"
+
               if ($imports -notmatch "DLL Name:\s+libmpv-2\.dll") {
                 throw "voicefox.exe does not import the bundled libmpv-2.dll"
               }
+
               if ($imports -notmatch "mpv_client_api_version") {
                 throw "voicefox.exe does not import mpv_client_api_version"
               }
             }
+
             .\voicefox.exe --check-libmpv
+
             if ($LASTEXITCODE -ne 0) {
               throw "Bundled libmpv runtime check failed with exit code $LASTEXITCODE"
             }
-            7z a voicefox-windows-x86_64.zip voicefox.exe libmpv-2.dll | Out-Host
+
+            7z a voicefox-windows-x86_64.zip `
+              voicefox.exe `
+              libmpv-2.dll | Out-Host
+
             if ($LASTEXITCODE -ne 0) {
               throw "Packaging Windows artifact failed with exit code $LASTEXITCODE"
             }
-          } finally {
+          }
+          finally {
             Pop-Location
           }
 
@@ -121,11 +173,14 @@ jobs:
         with:
           name: voicefox-windows-x86_64
           path: dist/voicefox-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 1
 
   # ── macOS 构建 ──
   build-macos:
-    name: build-macos-${{ matrix.arch }}
+    name: Build macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -135,13 +190,16 @@ jobs:
             runner_arch: x86_64
             target: x86_64-apple-darwin
             artifact: voicefox-macos-x86_64
+
           - arch: arm64
             runner: macos-15
             runner_arch: arm64
             target: aarch64-apple-darwin
             artifact: voicefox-macos-aarch64
+
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         env:
@@ -151,22 +209,34 @@ jobs:
           echo "RUSTFLAGS=-Lnative=$(brew --prefix mpv)/lib" >> "$GITHUB_ENV"
 
       - name: Build
-        run: cargo build --locked --release --package voicefox-app --target "${{ matrix.target }}" --verbose
+        run: >
+          cargo build
+          --locked
+          --release
+          --package voicefox-app
+          --target "${{ matrix.target }}"
+          --verbose
 
       - name: Inspect libmpv linkage
         run: |
           mpv_lib="$(brew --prefix mpv)/lib/libmpv.dylib"
           binary="target/${{ matrix.target }}/release/voicefox"
+
           file "$mpv_lib"
           file "$binary"
+
           file "$binary" | grep -q "${{ matrix.runner_arch }}"
+
           otool -L "$binary"
 
       - name: Validate libmpv runtime
-        run: "target/${{ matrix.target }}/release/voicefox --check-libmpv"
+        run: |
+          target/${{ matrix.target }}/release/voicefox --check-libmpv
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: target/${{ matrix.target }}/release/voicefox
+          if-no-files-found: error
+          retention-days: 1
