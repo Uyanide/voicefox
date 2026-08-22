@@ -3453,8 +3453,17 @@ fn begin_song_from_list(
     action_tx: &mpsc::UnboundedSender<AppAction>,
 ) {
     let Some(song) = songs.get(index).cloned() else {
+        tracing::debug!(index, song_count = songs.len(), "playback list index out of bounds");
         return;
     };
+    tracing::debug!(
+        index,
+        song_count = songs.len(),
+        song_id = %song.id,
+        song_name = %song.name,
+        after_failure,
+        "begin playback from list"
+    );
     if should_expand_bili_parts(&song) {
         let request_id = next_play_request(ctx);
         let _ = prepare_player(ctx);

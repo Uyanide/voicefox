@@ -126,7 +126,8 @@ impl FavoritesPage {
                         let songs = filtered
                             .iter()
                             .filter_map(|index| favorites.get(*index).cloned())
-                            .collect();
+                            .collect::<Vec<_>>();
+                        self.log_keyboard_playback(&songs);
                         return AppAction::PlaySong {
                             songs,
                             index: self.selected,
@@ -250,7 +251,8 @@ impl FavoritesPage {
                     let songs = filtered
                         .iter()
                         .filter_map(|index| favorites.get(*index).cloned())
-                        .collect();
+                        .collect::<Vec<_>>();
+                    self.log_keyboard_playback(&songs);
                     return AppAction::PlaySong {
                         songs,
                         index: self.selected,
@@ -523,6 +525,23 @@ impl FavoritesPage {
             self.selected = self.selected.min(len - 1);
             self.scroll = self.scroll.min(self.selected);
         }
+    }
+
+    fn log_keyboard_playback(&self, songs: &[SongInfo]) {
+        let selected = songs.get(self.selected);
+        let order = songs
+            .iter()
+            .take(5)
+            .map(|song| format!("{}:{}", song.id, song.name))
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            sort = ?self.sort_mode,
+            selected_index = self.selected,
+            selected_id = selected.map(|song| song.id.as_str()),
+            selected_name = selected.map(|song| song.name.as_str()),
+            ?order,
+            "favorites keyboard playback"
+        );
     }
 }
 
