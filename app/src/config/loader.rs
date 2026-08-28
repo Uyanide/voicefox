@@ -43,7 +43,13 @@ pub fn load(custom_path: &str) -> anyhow::Result<(Config, PathBuf)> {
 }
 
 fn migrate_legacy_config(config: &mut Config) -> bool {
-    let mut changed = migrate_legacy_theme(config);
+    // 主题迁移只对未记录过版本的配置执行：用户若刻意把四色配成旧默认值，
+    // 反复执行会把整个主题静默替换成 Mocha。
+    let mut changed = if config.version < 1 {
+        migrate_legacy_theme(config)
+    } else {
+        false
+    };
     changed |= sanitize_status_bar_items(&mut config.ui.status_bar_items);
     if config.version < 1 {
         if config.source.enabled == [SourceId::Kw] {
@@ -108,7 +114,15 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
         config.version = 9;
         changed = true;
     }
-    debug_assert!(config.version <= CURRENT_CONFIG_VERSION);
+    if config.version > CURRENT_CONFIG_VERSION {
+        // 用户可能带着更高版本的配置降级运行：只警告不 panic（debug_assert
+        // 会在开发构建直接崩溃），字段由 serde default 兜底。
+        tracing::warn!(
+            "配置文件版本 {} 高于当前支持的 {}，部分新字段将被忽略",
+            config.version,
+            CURRENT_CONFIG_VERSION
+        );
+    }
     changed
 }
 

@@ -4,8 +4,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -193,6 +194,9 @@ pub struct Storage {
     favorite_playlists: RwLock<Vec<Playlist>>,
     custom_playlists: RwLock<Vec<CustomPlaylist>>,
     history: RwLock<Vec<HistoryEntry>>,
+    /// 自定义歌单更新串行锁：保证"读快照 → 更新 → 落盘 → 提交内存"整体
+    /// 串行，同时不让读锁（页面只读快照）被磁盘 I/O 阻塞。
+    custom_playlists_update: Mutex<()>,
     /// 数据代次：任何收藏/歌单/历史写入都会递增，供页面缓存判断是否重建。
     generation: AtomicU64,
 }
@@ -214,6 +218,7 @@ impl Storage {
             favorite_playlists: RwLock::new(favorite_playlists),
             custom_playlists: RwLock::new(custom_playlists),
             history: RwLock::new(history),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         storage.create_startup_backup();
@@ -689,12 +694,22 @@ impl Storage {
         &self,
         update: impl FnOnce(&mut Vec<CustomPlaylist>) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut current = self.custom_playlists.write().unwrap();
-        let mut updated = current.clone();
-        let result = update(&mut updated)?;
+        // 串行化"更新 → 落盘 → 提交内存"整体过程：磁盘 I/O 期间只持有
+        // 这把小锁，读侧（custom_playlist_summaries 等每帧调用的接口）
+        // 不会再被写锁 + 磁盘写阻塞住。
+        let _guard = self.custom_playlists_update.lock().unwrap_or_else(
+            std::sync::PoisonError::into_inner,
+        );
+        let (result, updated) = {
+            let mut updated = self.custom_playlists.read().unwrap().clone();
+            let result = update(&mut updated)?;
+            (result, updated)
+        };
         let json = serde_json::to_vec_pretty(&updated).map_err(|error| error.to_string())?;
         save_atomic(&self.data_dir.join("custom_playlists.json"), &json)?;
-        *current = updated;
+        *self.custom_playlists.write().unwrap() = updated;
+        // 页面（如歌单页的 sync_saved_playlists）按 generation 判断是否重建
+        self.bump_generation();
         Ok(result)
     }
 
@@ -812,7 +827,7 @@ impl Storage {
         };
         let path = self.data_dir.join("playback_state.json");
         let json = serde_json::to_vec_pretty(&session).map_err(|error| error.to_string())?;
-        save_atomic(&path, &json)
+        save_atomic_relaxed(&path, &json)
     }
 
     pub fn clear_playback_session(&self) -> Result<(), String> {
@@ -824,11 +839,44 @@ impl Storage {
         }
     }
 
+    /// 把解析失败的数据文件改名保留现场，避免随后一次保存用空数据覆盖原文件。
+    fn quarantine_corrupt_file(path: &Path, reason: &str) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "data".to_string());
+        let backup = path.with_file_name(format!("{file_name}.corrupt-{timestamp}"));
+        match fs::rename(path, &backup) {
+            Ok(()) => tracing::error!(
+                "数据文件 {} 解析失败（{reason}），已重命名为 {} 保留现场；本次以空数据启动",
+                path.display(),
+                backup.display()
+            ),
+            Err(error) => tracing::error!(
+                "数据文件 {} 解析失败（{reason}）且改名保留失败: {error}",
+                path.display()
+            ),
+        }
+    }
+
     fn load_file<T: DeserializeOwned>(path: &std::path::Path) -> Vec<T> {
         if path.exists() {
             match fs::read_to_string(path) {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-                Err(_) => vec![],
+                Ok(json) => match serde_json::from_str(&json) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        Self::quarantine_corrupt_file(path, &error.to_string());
+                        vec![]
+                    }
+                },
+                Err(error) => {
+                    tracing::error!("读取数据文件 {} 失败: {error}", path.display());
+                    vec![]
+                }
             }
         } else {
             vec![]
@@ -842,8 +890,17 @@ impl Storage {
     fn load_history_file(path: &Path) -> Vec<HistoryEntry> {
         if path.exists() {
             match fs::read_to_string(path) {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-                Err(_) => vec![],
+                Ok(json) => match serde_json::from_str(&json) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        Self::quarantine_corrupt_file(path, &error.to_string());
+                        vec![]
+                    }
+                },
+                Err(error) => {
+                    tracing::error!("读取数据文件 {} 失败: {error}", path.display());
+                    vec![]
+                }
             }
         } else {
             vec![]
@@ -863,6 +920,17 @@ impl Storage {
 }
 
 fn save_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
+    save_atomic_impl(path, content, true)
+}
+
+/// 原子写但不做 fsync：只保证不出现半截文件，不保证断电后内容还在。
+/// 适用于可再生的缓存型数据（如播放会话），避免 5 秒一次的持久化
+/// 在 TUI 线程上产生磁盘刷写停顿。
+fn save_atomic_relaxed(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
+    save_atomic_impl(path, content, false)
+}
+
+fn save_atomic_impl(path: &std::path::Path, content: &[u8], durable: bool) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -872,12 +940,48 @@ fn save_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
         STORAGE_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let result = (|| {
-        fs::write(&temp_path, content).map_err(|error| error.to_string())?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| error.to_string())?;
+        let mut file = fs::File::create(&temp_path).map_err(|error| error.to_string())?;
+        file.write_all(content).map_err(|error| error.to_string())?;
+        // 数据落盘后再换名，避免断电时目录项先于数据持久化，留下空文件。
+        if durable {
+            file.sync_all().map_err(|error| error.to_string())?;
         }
-        fs::rename(&temp_path, path).map_err(|error| error.to_string())
+        drop(file);
+
+        #[cfg(windows)]
+        {
+            // Windows 不支持覆盖式 rename：先把旧文件挪走（而非删除），
+            // 换名失败时把它挪回来，保证任何时刻目标文件都存在。
+            let old_path = path.with_extension(format!(
+                "json.old-{}",
+                std::process::id()
+            ));
+            if path.exists() {
+                fs::rename(path, &old_path).map_err(|error| error.to_string())?;
+            }
+            match fs::rename(&temp_path, path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&old_path);
+                }
+                Err(error) => {
+                    let _ = fs::rename(&old_path, path);
+                    return Err(error.to_string());
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        fs::rename(&temp_path, path).map_err(|error| error.to_string())?;
+
+        #[cfg(unix)]
+        if durable {
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(temp_path);
@@ -1288,6 +1392,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         let first = song("1", SourceId::Kw, "One", "Artist");
@@ -1330,6 +1435,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         let session = PlaybackSession {
@@ -1367,6 +1473,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         assert!(storage.create_custom_playlist("   ").is_err());
@@ -1436,6 +1543,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         let playlist = storage.create_custom_playlist("批量").unwrap();
@@ -1488,6 +1596,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         let first_playlist = storage.create_custom_playlist("通勤").unwrap();
@@ -1547,6 +1656,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         let source = make_storage(source_dir);
@@ -1588,6 +1698,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         storage.add_favorite(&song("keep", SourceId::Kw, "Keep", "Artist"));
@@ -1616,6 +1727,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         let m3u = root.join("mix.m3u");
@@ -1662,6 +1774,7 @@ mod tests {
             favorite_playlists: RwLock::new(Vec::new()),
             custom_playlists: RwLock::new(Vec::new()),
             history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
         };
         let path = root.join("legacy.json");
