@@ -59,13 +59,14 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
     let cache_dir = cache_dir();
 
     if !cache_dir.exists() {
-        let _ = std::fs::create_dir_all(&cache_dir);
+        // async 上下文里避免阻塞 worker 的同步文件系统调用
+        let _ = tokio::fs::create_dir_all(&cache_dir).await;
     }
 
     // 本地文件直接返回路径
     if url.starts_with('/') || url.starts_with("file://") {
         let path = url.strip_prefix("file://").unwrap_or(url);
-        if !std::path::Path::new(path).exists() {
+        if !tokio::fs::try_exists(path).await.unwrap_or(false) {
             return Err("封面文件不存在".to_string());
         }
         let aspect = probe_aspect(path)

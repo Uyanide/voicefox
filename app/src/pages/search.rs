@@ -57,6 +57,10 @@ pub struct SearchPage {
     base_keyword: String,
     pub variant_indices: Vec<usize>,
     pub variant_selected: usize,
+    /// 变体弹窗的滚动偏移：选中项超出可视行数时跟随滚动
+    variant_scroll_offset: usize,
+    /// 变体弹窗最近一次渲染的可视行数，供键盘导航做可见性调整
+    variant_viewport: usize,
     search_scopes: Vec<(Option<SourceId>, &'static str)>,
     part_picker: Option<BiliPartPicker>,
     bili_parts_loading: Option<u64>,
@@ -99,6 +103,8 @@ impl SearchPage {
             base_keyword: String::new(),
             variant_indices: Vec::new(),
             variant_selected: 0,
+            variant_scroll_offset: 0,
+            variant_viewport: 1,
             search_scopes,
             part_picker: None,
             bili_parts_loading: None,
@@ -889,11 +895,16 @@ impl SearchPage {
             return self.select_source(index);
         }
 
+        // 结果列表区域：滚轮只在光标落在该区域内时移动选中，
+        // 避免光标悬停在输入框 / 音源 tab 上时列表跟着滚动（对齐 playlists.rs）。
+        let results_area = chunks[2];
         match event.kind {
-            MouseEventKind::ScrollUp => {
+            MouseEventKind::ScrollUp if results_area.contains((event.column, event.row).into()) => {
                 self.selected = self.selected.saturating_sub(self.scroll_amount);
             }
-            MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown
+                if results_area.contains((event.column, event.row).into()) =>
+            {
                 self.selected =
                     (self.selected + self.scroll_amount).min(self.results.len().saturating_sub(1));
                 if self.selected + 1 == self.results.len() && self.can_load_more() {
@@ -963,11 +974,14 @@ impl SearchPage {
             .iter()
             .position(|index| *index == self.selected)
             .unwrap_or(0);
+        self.variant_scroll_offset = 0;
+        self.ensure_variant_visible();
     }
 
     fn close_variants(&mut self) {
         self.variant_indices.clear();
         self.variant_selected = 0;
+        self.variant_scroll_offset = 0;
     }
 
     fn close_bili_part_overlay(&mut self) {
@@ -1157,6 +1171,7 @@ impl SearchPage {
                 } else if self.wrap_navigation {
                     self.variant_selected = self.variant_indices.len().saturating_sub(1);
                 }
+                self.ensure_variant_visible();
             }
             (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Right) => {
                 if self.variant_selected + 1 < self.variant_indices.len() {
@@ -1164,14 +1179,17 @@ impl SearchPage {
                 } else if self.wrap_navigation {
                     self.variant_selected = 0;
                 }
+                self.ensure_variant_visible();
             }
             (KeyModifiers::NONE, KeyCode::Home) | (KeyModifiers::NONE, KeyCode::Char('g')) => {
                 self.variant_selected = 0;
+                self.ensure_variant_visible();
             }
             (KeyModifiers::NONE, KeyCode::End)
             | (KeyModifiers::NONE, KeyCode::Char('G'))
             | (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
                 self.variant_selected = self.variant_indices.len().saturating_sub(1);
+                self.ensure_variant_visible();
             }
             (KeyModifiers::NONE, KeyCode::Char('a')) => {
                 if let Some(index) = self.variant_indices.get(self.variant_selected).copied()
@@ -1237,7 +1255,9 @@ impl SearchPage {
                 let inner = Block::default().borders(Borders::ALL).inner(popup);
                 let list_y = inner.y.saturating_add(1);
                 if event.row >= list_y && event.row < inner.bottom() {
-                    let index = event.row.saturating_sub(list_y) as usize;
+                    // 弹窗可滚动时行号要加上滚动偏移才是真正的变体下标
+                    let index =
+                        self.variant_scroll_offset + event.row.saturating_sub(list_y) as usize;
                     if index < self.variant_indices.len() {
                         self.variant_selected = index;
                         if activate {
@@ -1254,7 +1274,7 @@ impl SearchPage {
         AppAction::None
     }
 
-    fn render_variant_picker(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+    fn render_variant_picker(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if self.variant_indices.is_empty() {
             return;
         }
@@ -1286,17 +1306,23 @@ impl SearchPage {
         )))
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
 
-        for (row, result_index) in self
-            .variant_indices
+        let visible_rows = inner.height.saturating_sub(1) as usize;
+        if visible_rows == 0 {
+            return;
+        }
+        // 记录可视行数，供键盘导航的可见性调整使用
+        self.variant_viewport = visible_rows;
+        self.ensure_variant_visible();
+        let end = (self.variant_scroll_offset + visible_rows).min(self.variant_indices.len());
+        for (row, result_index) in self.variant_indices[self.variant_scroll_offset..end]
             .iter()
             .copied()
-            .take(inner.height.saturating_sub(1) as usize)
             .enumerate()
         {
             let Some(song) = self.results.get(result_index) else {
                 continue;
             };
-            let style = if row == self.variant_selected {
+            let style = if self.variant_scroll_offset + row == self.variant_selected {
                 Style::new()
                     .fg(crate::theme::selection_fg(ctx))
                     .bg(crate::theme::accent(ctx))
@@ -1313,6 +1339,19 @@ impl SearchPage {
                 buf,
             );
         }
+    }
+
+    /// 让变体选中项保持在弹窗可视窗口内（渲染与键盘导航共用）。
+    fn ensure_variant_visible(&mut self) {
+        let visible_rows = self.variant_viewport.max(1);
+        if self.variant_selected < self.variant_scroll_offset {
+            self.variant_scroll_offset = self.variant_selected;
+        } else if self.variant_selected >= self.variant_scroll_offset + visible_rows {
+            self.variant_scroll_offset = self.variant_selected + 1 - visible_rows;
+        }
+        self.variant_scroll_offset = self
+            .variant_scroll_offset
+            .min(self.variant_indices.len().saturating_sub(visible_rows));
     }
     fn render_bili_part_overlay(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if self.bili_parts_loading.is_some() {

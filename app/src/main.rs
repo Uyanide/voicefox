@@ -17,7 +17,6 @@ mod storage;
 mod theme;
 mod tmux;
 
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -307,12 +306,27 @@ fn execute_song_menu_action(
             AppAction::None
         }
         SongMenuAction::RemoveFromQueue => {
-            let action = main_page.remove_at(menu.index(), ctx);
-            ctx.notify(Notification::success(format!(
-                "已从队列移除: {}",
-                menu.song().name
-            )));
-            action
+            // 菜单打开期间队列可能已变化（自动切歌/插入/删除）：
+            // 执行前校验目标位置仍是同一首歌，防止用过期下标误删。
+            let expected = menu.song();
+            let unchanged = ctx
+                .playlist
+                .borrow()
+                .get(menu.index())
+                .is_some_and(|current| current.id == expected.id && current.source == expected.source);
+            if !unchanged {
+                ctx.notify(Notification::warning(
+                    "队列已变化，请重新右键选择要移除的歌曲",
+                ));
+                AppAction::None
+            } else {
+                let action = main_page.remove_at(menu.index(), ctx);
+                ctx.notify(Notification::success(format!(
+                    "已从队列移除: {}",
+                    menu.song().name
+                )));
+                action
+            }
         }
         SongMenuAction::RemoveFromHistory => {
             history_state.selected = menu.index().min(menu.songs().len().saturating_sub(2));
@@ -423,14 +437,20 @@ fn main() -> anyhow::Result<()> {
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     }
 
-    // 安装 crossterm panic hook，确保 panic 时 restore 终端
+    // 安装 crossterm panic hook，确保 panic 时 restore 终端。
+    // 仅主线程 panic 时才恢复终端：后台任务（tokio worker、事件线程等）
+    // panic 时进程仍会继续运行主循环，提前 restore 会让后续 draw 把
+    // 转义序列写进裸 shell，彻底打花终端。主线程名默认为 None，
+    // tokio worker 与项目内命名线程都有名字。
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("fatal panic: {info}");
-        if mouse_enabled {
-            let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        if std::thread::current().name().is_none() {
+            if mouse_enabled {
+                let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+            }
+            ratatui::restore();
         }
-        ratatui::restore();
         original_hook(info);
     }));
 
@@ -1268,7 +1288,11 @@ fn run_app(
         }
 
         // === 2. 事件驱动：轮询终端事件 ===
-        let terminal_event = if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+        // 轮询超时不能长于一帧：50ms 会让实际刷新率钳在 ~20fps，
+        // max_fps 配置形同虚设。
+        let terminal_event = if event::poll(render_interval.min(Duration::from_millis(50)))
+            .unwrap_or(false)
+        {
             event::read().ok()
         } else {
             None
@@ -1855,27 +1879,16 @@ fn run_app(
                         continue;
                     }
 
-                    // 2. 计算排序+过滤后的歌曲列表
+                    // 2. 计算排序+过滤后的歌曲视图（下标映射，不深拷贝歌曲）
                     let all_songs = pages::local_music::sorted_local_songs(
                         &ctx,
                         &local_state,
                         &mut data_cache.local,
                     );
-                    let songs: Cow<'_, [SongInfo]> = if local_filter.query().is_empty() {
-                        Cow::Borrowed(all_songs)
-                    } else {
-                        let query = local_filter.query().trim().to_lowercase();
-                        Cow::Owned(
-                            all_songs
-                                .iter()
-                                .filter(|s| {
-                                    s.name.to_lowercase().contains(&query)
-                                        || s.singer.to_lowercase().contains(&query)
-                                })
-                                .cloned()
-                                .collect(),
-                        )
-                    };
+                    let songs = pages::local_music::LocalSongView::build(
+                        all_songs,
+                        local_filter.query(),
+                    );
 
                     if let Some(action) = kb_resolver.resolve_page("local", &key) {
                         match action {
@@ -1999,7 +2012,7 @@ fn run_app(
                             {
                                 execute_action(
                                     AppAction::PlaySong {
-                                        songs: songs.into_owned(),
+                                        songs: songs.to_queue(),
                                         index: local_state.selected,
                                     },
                                     &ctx,
@@ -2087,7 +2100,7 @@ fn run_app(
                                 if !songs.is_empty() && local_state.selected < songs.len() {
                                     execute_action(
                                         AppAction::PlaySong {
-                                            songs: songs.to_vec(),
+                                            songs: songs.to_queue(),
                                             index: local_state.selected,
                                         },
                                         &ctx,
@@ -2295,6 +2308,8 @@ fn run_app(
                             &ctx,
                             &mut local_state,
                             &mut data_cache.local,
+                            local_filter.is_active() || !local_filter.query().is_empty(),
+                            local_filter.query(),
                         )
                         .map(|target| {
                             (
@@ -2371,6 +2386,8 @@ fn run_app(
                         &ctx,
                         &mut local_state,
                         &mut data_cache.local,
+                        local_filter.is_active() || !local_filter.query().is_empty(),
+                        local_filter.query(),
                         activate,
                     ),
                 };
@@ -2541,21 +2558,10 @@ fn draw_app(
                     let scan_stats = local_src.scan_stats();
                     let missing_count = local_src.missing_count();
 
-                    let songs: Cow<'_, [SongInfo]> = if local_filter.query().is_empty() {
-                        Cow::Borrowed(all_songs)
-                    } else {
-                        let query = local_filter.query().trim().to_lowercase();
-                        Cow::Owned(
-                            all_songs
-                                .iter()
-                                .filter(|s| {
-                                    s.name.to_lowercase().contains(&query)
-                                        || s.singer.to_lowercase().contains(&query)
-                                })
-                                .cloned()
-                                .collect(),
-                        )
-                    };
+                    let songs = pages::local_music::LocalSongView::build(
+                        all_songs,
+                        local_filter.query(),
+                    );
 
                     local_state.selected = local_state.selected.min(songs.len().saturating_sub(1));
 
@@ -2664,11 +2670,20 @@ fn draw_app(
                     );
 
                     let end = (sc + visible_height).min(songs.len());
-                    for (i, song) in songs.iter().enumerate().take(end).skip(sc) {
-                        let row = i - sc;
+                    for row in sc..end {
+                        let Some(song) = songs.get(row) else {
+                            break;
+                        };
+                        let i = row;
                         let text = pages::components::song_table::row(song, i, inner.width);
-                        let line_area =
-                            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1);
+                        // 数据行紧跟在列头下方：过滤条可见时整体下移一行，
+                        // 否则 row 0 会把列头覆盖掉。
+                        let line_area = Rect::new(
+                            inner.x,
+                            content_y + 1 + (row - sc) as u16,
+                            inner.width,
+                            1,
+                        );
                         let style = if i == sel {
                             Style::new()
                                 .bg(crate::theme::accent(ctx))

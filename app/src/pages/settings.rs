@@ -1,5 +1,7 @@
 //! 设置页面：支持 JS 音源 URL 或本地路径导入/删除
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
 use lx_core::keybinding::{Action, KeybindingConfig, KeybindingResolver};
@@ -13,6 +15,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::context::AppContext;
+
+/// 删除类操作（音源 / 本地目录）二次确认的窗口时长
+const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
 /// 检查 JS 音源是否已缓存到本地
 fn is_source_cached(url: &str) -> bool {
@@ -163,6 +168,10 @@ pub struct SettingsPage {
     /// 当前聚焦区域
     focus: SettingsFocus,
     category: SettingsCategory,
+    /// 删除 JS 音源的武装时刻：首次按 d 只武装，窗口内再按一次才删除
+    delete_source_armed: Option<Instant>,
+    /// 删除本地目录的武装时刻，机制同上
+    delete_local_path_armed: Option<Instant>,
 }
 
 impl SettingsPage {
@@ -236,6 +245,8 @@ impl SettingsPage {
             status_drag_target: None,
             focus: SettingsFocus::JsSources,
             category: SettingsCategory::Interface,
+            delete_source_armed: None,
+            delete_local_path_armed: None,
         }
     }
 
@@ -285,7 +296,9 @@ impl SettingsPage {
                 _ => {}
             }
         } else {
-            if let Some(action) = resolver.resolve_page("settings", &key)
+            // 同一次按键只解析一次页面级键位，两处共用结果
+            let bound_action = resolver.resolve_page("settings", &key);
+            if let Some(action) = bound_action
                 && let Some(result) = self.handle_bound_action(action, ctx)
             {
                 return result;
@@ -324,7 +337,7 @@ impl SettingsPage {
 
             let sources = ctx.config.read().unwrap().source.js_sources.clone();
 
-            if let Some(action) = resolver.resolve_page("settings", &key) {
+            if let Some(action) = bound_action {
                 match action {
                     Action::ListSelectUp => {
                         if self.selected_source > 0 {
@@ -359,6 +372,20 @@ impl SettingsPage {
                 }
                 (KeyModifiers::NONE, KeyCode::Char('d')) => {
                     if !sources.is_empty() && self.selected_source < sources.len() {
+                        // 二次确认：首次按 d 只武装并提示，窗口内再按一次才真正删除
+                        let now = Instant::now();
+                        let confirmed = matches!(
+                            self.delete_source_armed,
+                            Some(armed_at)
+                                if now.duration_since(armed_at) <= DELETE_CONFIRM_WINDOW
+                        );
+                        if !confirmed {
+                            self.delete_source_armed = Some(now);
+                            self.status_msg =
+                                Some("再按一次 d 确认删除该音源，Esc 取消".to_string());
+                            return AppAction::None;
+                        }
+                        self.delete_source_armed = None;
                         let url = sources[self.selected_source].clone();
                         self.status_msg = Some("已移除音源".to_string());
                         if self.selected_source >= sources.len().saturating_sub(1) {
@@ -606,6 +633,11 @@ impl SettingsPage {
                     } else {
                         return AppAction::BiliLogin;
                     }
+                }
+                (KeyModifiers::NONE, KeyCode::Esc) => {
+                    // Esc 取消删除类操作（音源 / 本地目录）的武装状态
+                    self.delete_source_armed = None;
+                    self.delete_local_path_armed = None;
                 }
                 _ => {}
             }
@@ -981,6 +1013,19 @@ impl SettingsPage {
             }
             (KeyModifiers::NONE, KeyCode::Char('d')) => {
                 if !paths.is_empty() && self.selected_local_path < paths.len() {
+                    // 二次确认：首次按 d 只武装并提示，窗口内再按一次才真正删除
+                    let now = Instant::now();
+                    let confirmed = matches!(
+                        self.delete_local_path_armed,
+                        Some(armed_at) if now.duration_since(armed_at) <= DELETE_CONFIRM_WINDOW
+                    );
+                    if !confirmed {
+                        self.delete_local_path_armed = Some(now);
+                        self.status_msg =
+                            Some("再按一次 d 确认删除该本地目录，Esc 取消".to_string());
+                        return Some(AppAction::None);
+                    }
+                    self.delete_local_path_armed = None;
                     let removed = paths[self.selected_local_path].clone();
                     let save_result = {
                         let mut config = ctx.config.write().unwrap();
@@ -1681,7 +1726,8 @@ impl SettingsPage {
             );
         }
 
-        let local_songs = ctx.source_manager.local_source().all_songs();
+        // 只为显示“共 N 首”，取计数即可，避免每帧全量克隆本地曲库
+        let local_song_count = ctx.source_manager.local_source().song_count();
         // Reserve one row for commands and the final row for the status/count
         // footer so list entries are never overwritten by those lines.
         let local_rows = local_inner.height.saturating_sub(3) as usize;
@@ -1733,7 +1779,7 @@ impl SettingsPage {
             let footer_y = local_inner.bottom().saturating_sub(1);
             if footer_y > local_inner.y {
                 Paragraph::new(Line::from(Span::styled(
-                    format!(" 共 {} 首歌曲", local_songs.len()),
+                    format!(" 共 {} 首歌曲", local_song_count),
                     Style::new().fg(muted),
                 )))
                 .render(

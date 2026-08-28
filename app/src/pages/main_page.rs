@@ -1,7 +1,9 @@
 //! rmpc 风格播放队列页面。
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use lx_core::events::AppAction;
+use lx_core::events::{AppAction, Notification};
 use lx_core::keybinding::{Action, KeybindingResolver};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -11,6 +13,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::cover::{CoverGeometry, CoverRenderer, CoverState};
+
+/// “D 清空整个队列”的确认窗口：首次按下武装，窗口内再按一次才执行。
+const CLEAR_QUEUE_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueEditCommand {
@@ -42,6 +47,8 @@ pub struct MainPage {
     scroll: usize,
     dragging: Option<usize>,
     cover: CoverRenderer,
+    /// “D 清空整个队列”的武装时刻，确认窗口外或 Esc 后解除
+    clear_armed: Option<Instant>,
 }
 
 impl MainPage {
@@ -51,6 +58,7 @@ impl MainPage {
             scroll: 0,
             dragging: None,
             cover,
+            clear_armed: None,
         }
     }
 
@@ -111,6 +119,19 @@ impl MainPage {
                 }
                 QueueEditCommand::RemoveSelected => self.remove_at(self.selected, ctx),
                 QueueEditCommand::Clear => {
+                    // 二次确认：首次按下只武装并提示，确认窗口内再按一次才清空
+                    let now = Instant::now();
+                    let confirmed = matches!(
+                        self.clear_armed,
+                        Some(armed_at) if now.duration_since(armed_at) <= CLEAR_QUEUE_CONFIRM_WINDOW
+                    );
+                    if !confirmed {
+                        self.clear_armed = Some(now);
+                        return AppAction::ShowNotification(Notification::warning(
+                            "再按一次 D 确认清空队列，Esc 取消",
+                        ));
+                    }
+                    self.clear_armed = None;
                     ctx.playlist.clear();
                     ctx.stop_player();
                     ctx.cover_service.clear();
@@ -121,6 +142,14 @@ impl MainPage {
                     AppAction::None
                 }
             };
+        }
+
+        if matches!(
+            (key.modifiers, key.code),
+            (KeyModifiers::NONE, KeyCode::Esc)
+        ) {
+            // Esc 取消“清空整个队列”的武装状态（其余行为不变）
+            self.clear_armed = None;
         }
 
         if let Some(action) = resolver.resolve_page("main", key) {
@@ -189,30 +218,8 @@ impl MainPage {
         }
 
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Up) => {
-                if len != 0 {
-                    self.selected = if self.selected == 0 {
-                        if ctx.config.read().unwrap().ui.wrap_navigation {
-                            len - 1
-                        } else {
-                            0
-                        }
-                    } else {
-                        self.selected - 1
-                    };
-                }
-            }
-            (KeyModifiers::NONE, KeyCode::Down) => {
-                if len != 0 {
-                    self.selected = if self.selected + 1 < len {
-                        self.selected + 1
-                    } else if ctx.config.read().unwrap().ui.wrap_navigation {
-                        0
-                    } else {
-                        self.selected
-                    };
-                }
-            }
+            // 裸 Up/Down 在主页被 main.rs 的音量快捷键拦截（见 KEYBINDINGS.md），
+            // 这里不再重复处理；列表移动走 Action::ListSelectUp/Down 绑定。
             (KeyModifiers::NONE, KeyCode::Home) | (KeyModifiers::NONE, KeyCode::Char('g')) => {
                 self.selected = 0;
             }

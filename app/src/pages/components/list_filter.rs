@@ -69,6 +69,9 @@ impl ListFilter {
     }
 
     /// 退出过滤输入模式（不清除 query）
+    // 目前仅 favorites 右键菜单改用 reset() 后暂无调用方；语义上仍是
+    // “只退输入、保留过滤条件”的独立操作，保留以免误用 reset 丢条件。
+    #[allow(dead_code)]
     pub fn deactivate(&mut self) {
         self.active = false;
     }

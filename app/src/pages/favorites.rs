@@ -479,12 +479,27 @@ impl FavoritesPage {
         if index >= filtered.len() {
             return None;
         }
+        let Some(original_index) = filtered.get(index).copied() else {
+            return None;
+        };
+        // 菜单仍按过滤视图返回 (songs, index)；但右键会退出过滤，列表回到
+        // 完整视图，selected 必须映射回原始下标，否则会指向另一首歌。
         let songs = filtered
             .iter()
             .filter_map(|original| favorites.get(*original).cloned())
             .collect::<Vec<_>>();
-        self.filter.deactivate();
-        self.selected = index;
+        // deactivate() 只退出输入模式、保留 query，这里要真正关闭过滤
+        self.filter.reset();
+        self.selected = original_index;
+        // 同步调整 scroll，让该行在完整视图中可见（与 render 的滚动逻辑一致）
+        if self.selected >= self.scroll + self.viewport_height {
+            self.scroll = self.selected.saturating_sub(self.viewport_height - 1);
+        } else if self.selected < self.scroll {
+            self.scroll = self.selected;
+        }
+        self.scroll = self
+            .scroll
+            .min(favorites.len().saturating_sub(self.viewport_height));
         Some((songs, index))
     }
 

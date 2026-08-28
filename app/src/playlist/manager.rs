@@ -8,16 +8,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use lx_core::events::InsertPosition;
 use lx_core::model::song::SongInfo;
 
-/// 队列本身用 `RwLock<Vec<SongInfo>>` 持有：
+/// 队列本身用 `RwLock<Arc<Vec<SongInfo>>>` 持有：
 ///
 /// - 渲染/鼠标路径通过 [`borrow`](Self::borrow) 直接借用，零拷贝；
-/// - 插入/删除/拖动原地修改，不再因为渲染持有一份 `Arc` 快照而触发
-///   `Arc::make_mut` 整表深拷贝；
-/// - 切歌路径需要跨线程传递列表时，才用 [`snapshot_arc`](Self::snapshot_arc)
-///   做一次浅拷贝（只复制 `SongInfo` 的指针字段，不深拷字符串等）。
+/// - 插入/删除/拖动用 [`Arc::make_mut`](std::sync::Arc::make_mut) 原地修改：
+///   没有并发快照时零拷贝，仅当切歌路径还持有旧快照时才复制一次槽位；
+/// - 切歌/持久化路径用 [`snapshot_arc`](Self::snapshot_arc) O(1) 拿到
+///   `Arc` 快照，跨线程传递不再复制任何歌曲数据。
 pub struct PlaylistManager {
     /// 当前播放列表
-    current_list: RwLock<Vec<SongInfo>>,
+    current_list: RwLock<Arc<Vec<SongInfo>>>,
     /// 当前播放索引
     current_index: AtomicUsize,
     /// 播放模式（默认列表循环）
@@ -29,7 +29,7 @@ pub struct PlaylistManager {
 impl PlaylistManager {
     pub fn new(play_mode: crate::playlist::mode::PlayMode) -> Self {
         Self {
-            current_list: RwLock::new(vec![]),
+            current_list: RwLock::new(Arc::new(vec![])),
             current_index: AtomicUsize::new(0),
             play_mode: Mutex::new(play_mode),
             consecutive_failures: Mutex::new(0),
@@ -38,22 +38,12 @@ impl PlaylistManager {
 
     /// 设置播放列表
     pub fn set_playlist(&self, songs: Vec<SongInfo>, index: usize) {
-        self.set_playlist_inner(songs, index, true);
+        self.set_playlist_arc(Arc::new(songs), index);
     }
 
     /// 自动跳过失败歌曲时更新列表，但保留连续失败计数。
     pub fn set_playlist_after_failure(&self, songs: Vec<SongInfo>, index: usize) {
-        self.set_playlist_inner(songs, index, false);
-    }
-
-    fn set_playlist_inner(&self, songs: Vec<SongInfo>, index: usize, reset_failures: bool) {
-        let mut list = self.current_list.write().unwrap();
-        *list = songs;
-        self.current_index
-            .store(index.min(list.len().saturating_sub(1)), Ordering::Release);
-        if reset_failures {
-            *self.consecutive_failures.lock().unwrap() = 0;
-        }
+        self.set_playlist_arc_after_failure(Arc::new(songs), index);
     }
 
     /// 以 `Arc` 快照设置播放列表（不复制歌曲数据），供切歌路径使用。
@@ -73,16 +63,16 @@ impl PlaylistManager {
         reset_failures: bool,
     ) {
         let mut list = self.current_list.write().unwrap();
-        *list = songs.as_ref().clone();
         self.current_index
-            .store(index.min(list.len().saturating_sub(1)), Ordering::Release);
+            .store(index.min(songs.len().saturating_sub(1)), Ordering::Release);
+        *list = songs;
         if reset_failures {
             *self.consecutive_failures.lock().unwrap() = 0;
         }
     }
 
     /// 只读借用队列，供渲染与鼠标命中测试使用（零拷贝）。
-    pub fn borrow(&self) -> std::sync::RwLockReadGuard<'_, Vec<SongInfo>> {
+    pub fn borrow(&self) -> std::sync::RwLockReadGuard<'_, Arc<Vec<SongInfo>>> {
         self.current_list.read().unwrap()
     }
 
@@ -94,16 +84,15 @@ impl PlaylistManager {
     /// 全量快照：深拷贝整张队列。仅供低频路径（右键菜单、测试）使用。
     pub fn snapshot(&self) -> (Vec<SongInfo>, usize) {
         (
-            self.current_list.read().unwrap().clone(),
+            self.current_list.read().unwrap().as_ref().clone(),
             self.current_index(),
         )
     }
 
-    /// 浅拷贝快照：只复制 `Vec` 的槽位，不深拷贝 `SongInfo` 内的
-    /// 字符串/集合。供持久化与切歌这类跨线程路径使用。
+    /// 共享快照：O(1) 复制 `Arc`。供持久化与切歌这类跨线程路径使用。
     pub fn snapshot_arc(&self) -> (Arc<Vec<SongInfo>>, usize) {
         (
-            Arc::new(self.current_list.read().unwrap().clone()),
+            Arc::clone(&self.current_list.read().unwrap()),
             self.current_index(),
         )
     }
@@ -114,11 +103,10 @@ impl PlaylistManager {
     }
 
     /// 将单首歌曲插入当前播放列表，返回插入后的索引。
-    ///
-    /// 原地修改，不复制队列中的其他歌曲。
     pub fn insert(&self, song: SongInfo, position: InsertPosition) -> usize {
         let mut list = self.current_list.write().unwrap();
         let current = self.current_index();
+        let list = Arc::make_mut(&mut *list);
         if list.is_empty() {
             list.push(song);
             self.current_index.store(0, Ordering::Release);
@@ -138,6 +126,7 @@ impl PlaylistManager {
         if target >= list.len() {
             return;
         }
+        let list = Arc::make_mut(&mut *list);
         list.remove(target);
         let current = self.current_index();
         let next = if target < current {
@@ -155,6 +144,7 @@ impl PlaylistManager {
         if from >= list.len() || to >= list.len() || from == to {
             return;
         }
+        let list = Arc::make_mut(&mut *list);
         let song = list.remove(from);
         list.insert(to, song);
 
@@ -172,7 +162,7 @@ impl PlaylistManager {
     }
 
     pub fn clear(&self) {
-        self.current_list.write().unwrap().clear();
+        *self.current_list.write().unwrap() = Arc::new(vec![]);
         self.current_index.store(0, Ordering::Release);
         *self.consecutive_failures.lock().unwrap() = 0;
     }
@@ -182,12 +172,12 @@ impl PlaylistManager {
     #[allow(dead_code)]
     pub fn next_entry(&self) -> Option<(Vec<SongInfo>, usize)> {
         self.next_entry_arc()
-            .map(|(songs, index)| (songs.to_vec(), index))
+            .map(|(songs, index)| (songs.as_ref().clone(), index))
     }
 
-    /// 浅拷贝版“下一首”：只更新索引，列表以 `Arc` 共享返回。
+    /// 共享快照版“下一首”：只更新索引，列表以 `Arc` 共享返回。
     ///
-    /// 播放结束自动切歌走此路径，避免每首歌都深拷贝整张队列。
+    /// 播放结束自动切歌走此路径，避免每首歌都复制整张队列。
     pub fn next_entry_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
         let list = self.current_list.read().unwrap();
         if list.is_empty() {
@@ -197,13 +187,13 @@ impl PlaylistManager {
         let mode = *self.play_mode.lock().unwrap();
         let next = mode.next_index(current, list.len())?;
         self.current_index.store(next, Ordering::Release);
-        Some((Arc::new(list.clone()), next))
+        Some((Arc::clone(&list), next))
     }
 
     #[allow(dead_code)]
     pub fn next_manual_entry(&self) -> Option<(Vec<SongInfo>, usize)> {
         self.next_manual_entry_arc()
-            .map(|(songs, index)| (songs.to_vec(), index))
+            .map(|(songs, index)| (songs.as_ref().clone(), index))
     }
 
     pub fn next_manual_entry_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
@@ -215,7 +205,7 @@ impl PlaylistManager {
         let mode = *self.play_mode.lock().unwrap();
         let next = mode.manual_next_index(current, list.len())?;
         self.current_index.store(next, Ordering::Release);
-        Some((Arc::new(list.clone()), next))
+        Some((Arc::clone(&list), next))
     }
 
     /// 当前歌曲所有可用解析方式都失败后选择下一首。
@@ -225,7 +215,7 @@ impl PlaylistManager {
     #[allow(dead_code)]
     pub fn next_after_failure(&self) -> Option<(Vec<SongInfo>, usize)> {
         self.next_after_failure_arc()
-            .map(|(songs, index)| (songs.to_vec(), index))
+            .map(|(songs, index)| (songs.as_ref().clone(), index))
     }
 
     pub fn next_after_failure_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
@@ -244,7 +234,7 @@ impl PlaylistManager {
         let mode = *self.play_mode.lock().unwrap();
         let next = mode.manual_next_index(current, list.len())?;
         self.current_index.store(next, Ordering::Release);
-        Some((Arc::new(list.clone()), next))
+        Some((Arc::clone(&list), next))
     }
 
     /// mpv 已确认开始播放，新的连续失败计数从零开始。
@@ -255,7 +245,7 @@ impl PlaylistManager {
     #[allow(dead_code)]
     pub fn prev_manual_entry(&self) -> Option<(Vec<SongInfo>, usize)> {
         self.prev_manual_entry_arc()
-            .map(|(songs, index)| (songs.to_vec(), index))
+            .map(|(songs, index)| (songs.as_ref().clone(), index))
     }
 
     pub fn prev_manual_entry_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
@@ -267,7 +257,7 @@ impl PlaylistManager {
         let mode = *self.play_mode.lock().unwrap();
         let previous = mode.manual_prev_index(current, list.len())?;
         self.current_index.store(previous, Ordering::Release);
-        Some((Arc::new(list.clone()), previous))
+        Some((Arc::clone(&list), previous))
     }
 
     pub fn mode(&self) -> crate::playlist::mode::PlayMode {

@@ -1,7 +1,10 @@
 //! 播放历史页面
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use lx_core::events::{AppAction, InsertPosition};
+use lx_core::events::{AppAction, InsertPosition, Notification};
 use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::song::SongInfo;
 use ratatui::buffer::Buffer;
@@ -13,6 +16,37 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use crate::context::AppContext;
 use crate::pages::components::list_filter::ListFilter;
 use crate::pages::sort::{SortState, SortTarget, SortedListCache};
+
+/// “D 清空全部历史”的页内二次确认状态：首次按下武装，窗口内再按一次才执行。
+static CLEAR_HISTORY_ARMED: Mutex<Option<Instant>> = Mutex::new(None);
+const CLEAR_HISTORY_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
+
+/// 历史视图的下标集合：无过滤时是 `0..len` 的连续区间（零分配），
+/// 只有过滤命中（低频路径）才分配命中的原始下标 Vec。
+enum HistoryIndices {
+    Identity(std::ops::Range<usize>),
+    Filtered(Vec<usize>),
+}
+
+impl HistoryIndices {
+    fn len(&self) -> usize {
+        match self {
+            Self::Identity(range) => range.len(),
+            Self::Filtered(indices) => indices.len(),
+        }
+    }
+
+    /// 视图下标 → 排序结果下标
+    fn get(&self, view_index: usize) -> Option<usize> {
+        match self {
+            Self::Identity(range) => {
+                let index = range.start.checked_add(view_index)?;
+                (index < range.end).then_some(index)
+            }
+            Self::Filtered(indices) => indices.get(view_index).copied(),
+        }
+    }
+}
 
 pub fn render(
     area: Rect,
@@ -111,7 +145,10 @@ pub fn render(
     state.scroll = state.scroll.min(total.saturating_sub(visible_height));
 
     let end = (state.scroll + visible_height).min(total);
-    for (view_index, &song_index) in indices.iter().enumerate().take(end).skip(state.scroll) {
+    for view_index in state.scroll..end {
+        let Some(song_index) = indices.get(view_index) else {
+            continue;
+        };
         let Some(song) = sorted.get(song_index) else {
             continue;
         };
@@ -144,7 +181,7 @@ pub fn handle_input(
     let song_at = |view_index: usize| {
         indices
             .get(view_index)
-            .and_then(|&index| sorted.get(index))
+            .and_then(|index| sorted.get(index))
             .cloned()
     };
 
@@ -304,9 +341,32 @@ pub fn handle_input(
                 return AppAction::ToggleFavoriteSong(Box::new(song));
             }
         }
+        (KeyModifiers::NONE, KeyCode::Esc) => {
+            // Esc 取消“清空全部历史”的武装状态（其余行为不变）
+            *CLEAR_HISTORY_ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
         (KeyModifiers::SHIFT, KeyCode::Char('D')) | (KeyModifiers::NONE, KeyCode::Char('D')) => {
-            state.reset_position();
-            return AppAction::ClearHistory;
+            // 二次确认：首次按下只武装并提示，确认窗口内再按一次才真正清空
+            let now = Instant::now();
+            let mut armed = CLEAR_HISTORY_ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(
+                *armed,
+                Some(armed_at) if now.duration_since(armed_at) <= CLEAR_HISTORY_CONFIRM_WINDOW
+            ) {
+                *armed = None;
+                drop(armed);
+                state.reset_position();
+                return AppAction::ClearHistory;
+            }
+            *armed = Some(now);
+            drop(armed);
+            return AppAction::ShowNotification(Notification::warning(
+                "再按一次 D 确认清空历史，Esc 取消",
+            ));
         }
         _ => {}
     }
@@ -335,7 +395,10 @@ pub fn handle_mouse(
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let inner = Block::default().borders(Borders::ALL).inner(area);
-            let list_y = inner.y.saturating_add(1);
+            // 与渲染布局对齐：过滤条可见时占 inner.y 一行、表头一行，
+            // 列表从 inner.y + search_height + 1 开始（参考 favorites.rs）。
+            let search_height = u16::from(!filter_query.trim().is_empty());
+            let list_y = inner.y.saturating_add(search_height).saturating_add(1);
             if event.row >= list_y && event.row < inner.bottom() {
                 let index = state.scroll + event.row.saturating_sub(list_y) as usize;
                 if index < len {
@@ -367,7 +430,9 @@ pub fn context_song_at(
 ) -> Option<(Vec<SongInfo>, usize)> {
     let history = filtered_history(ctx, state, filter_query, cache);
     let inner = Block::default().borders(Borders::ALL).inner(area);
-    let list_y = inner.y.saturating_add(1);
+    // 与渲染布局对齐：过滤条可见时列表整体下移一行（参考 favorites.rs）。
+    let search_height = u16::from(!filter_query.trim().is_empty());
+    let list_y = inner.y.saturating_add(search_height).saturating_add(1);
     if event.row < list_y || event.row >= inner.bottom() {
         return None;
     }
@@ -379,22 +444,22 @@ pub fn context_song_at(
     Some((history, index))
 }
 
-/// 获取排序后的历史视图：已排序切片 + 匹配过滤的下标。
+/// 获取排序后的历史视图：已排序切片 + 匹配过滤的下标集合。
 ///
-/// 渲染路径直接借用缓存的排序结果，只有过滤命中时才额外分配下标数组。
+/// 渲染路径直接借用缓存的排序结果；无过滤时下标是连续区间（零分配），
+/// 只有过滤命中时才额外分配下标数组。
 fn history_view<'a>(
     ctx: &AppContext,
     state: &SortState,
     filter_query: &str,
     cache: &'a mut SortedListCache,
-) -> (&'a [SongInfo], Vec<usize>) {
+) -> (&'a [SongInfo], HistoryIndices) {
     let version = ctx.storage.generation();
     let sorted = cache.get_or_build(version, state.mode, SortTarget::History, || {
         ctx.storage.load_history()
     });
     if filter_query.trim().is_empty() {
-        let indices = (0..sorted.len()).collect();
-        return (sorted, indices);
+        return (sorted, HistoryIndices::Identity(0..sorted.len()));
     }
 
     let query = filter_query.trim().to_lowercase();
@@ -406,14 +471,17 @@ fn history_view<'a>(
         })
         .map(|(index, _)| index)
         .collect();
-    (sorted, indices)
+    (sorted, HistoryIndices::Filtered(indices))
 }
 
 /// 把历史视图下标还原成歌曲列表，仅在按键/鼠标事件等低频路径调用。
-fn view_songs(sorted: &[SongInfo], indices: &[usize]) -> Vec<SongInfo> {
-    indices
-        .iter()
-        .filter_map(|&index| sorted.get(index).cloned())
+fn view_songs(sorted: &[SongInfo], indices: &HistoryIndices) -> Vec<SongInfo> {
+    (0..indices.len())
+        .filter_map(|view_index| {
+            indices
+                .get(view_index)
+                .and_then(|index| sorted.get(index).cloned())
+        })
         .collect()
 }
 

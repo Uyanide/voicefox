@@ -87,7 +87,11 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let source = song
         .as_ref()
         .map(|song| {
-            let js_index = *ctx.play_js_source_index.lock().unwrap();
+            // 锁中毒时退回原始数据渲染，避免头部每帧 panic
+            let js_index = *ctx
+                .play_js_source_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             js_index
                 .and_then(|index| ctx.source_manager.js_source_name(index))
                 .or_else(|| {

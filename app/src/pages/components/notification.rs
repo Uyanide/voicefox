@@ -42,7 +42,16 @@ pub fn area(screen: Rect, ctx: &AppContext) -> Option<Rect> {
         UnicodeWidthStr::width(title).div_ceil(content_width) as u16
     });
     let action_lines = u16::from(notification.action_url.is_some());
-    let lines = (message_width.div_ceil(content_width).clamp(1, 4) as u16)
+    // 消息不再固定截为最多 4 行：行数按屏幕可用高度动态收缩，
+    // 保证标题与 action 行永远落在弹窗可视区内 —— 否则超长消息会把
+    // action 行挤出弹窗，而 action_url_at 仍会在最后一行命中不可见按钮。
+    let frame_rows = screen.height.saturating_sub(1);
+    let chrome_rows = 2u16
+        .saturating_add(title_lines)
+        .saturating_add(action_lines);
+    let max_message_lines = frame_rows.saturating_sub(chrome_rows).max(1);
+    let lines = (message_width.div_ceil(content_width) as u16)
+        .clamp(1, max_message_lines)
         .saturating_add(title_lines)
         .saturating_add(action_lines);
     let height = lines.saturating_add(2).min(screen.height.saturating_sub(1));

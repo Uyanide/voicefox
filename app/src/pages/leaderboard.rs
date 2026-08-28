@@ -797,16 +797,8 @@ fn source_tab_rects(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
 }
 
 fn ensure_visible(selected: usize, visible: usize, total: usize, offset: &mut usize) {
-    if visible == 0 || total == 0 {
-        *offset = 0;
-        return;
-    }
-    if selected >= offset.saturating_add(visible) {
-        *offset = selected.saturating_sub(visible - 1);
-    } else if selected < *offset {
-        *offset = selected;
-    }
-    *offset = (*offset).min(total.saturating_sub(visible));
+    // 共享实现在 components::scroll，leaderboard / playlists 保持一致行为。
+    crate::pages::components::scroll::ensure_visible(selected, visible, total, offset)
 }
 
 fn source_name(source: SourceId) -> &'static str {
@@ -834,15 +826,8 @@ fn source_label(source: SourceId) -> &'static str {
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    if max <= 1 {
-        return "…".chars().take(max).collect();
-    }
-    let mut result = value.chars().take(max - 1).collect::<String>();
-    result.push('…');
-    result
+    // 按显示宽度截断（CJK 占 2 列），共享实现见 components::text
+    super::components::text::truncate_width(value, max).into_owned()
 }
 
 #[cfg(test)]

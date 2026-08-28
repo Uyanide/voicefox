@@ -375,14 +375,16 @@ fn decode(path: &str) -> Option<image::DynamicImage> {
     }
 }
 
-/// 带 LRU 缓存的封面解码：命中缓存时直接复用已解码图像，
-/// 未命中时解码并插入缓存，超过容量时淘汰最久未用的条目。
+/// 带 LRU 缓存的封面解码：命中缓存时直接复用已解码图像并把条目
+/// 移到队尾，未命中时解码并插入，超过容量时淘汰最久未用的条目。
 fn decode_cached(
     path: &str,
     cache: &mut VecDeque<(String, Arc<image::DynamicImage>)>,
 ) -> Option<Arc<image::DynamicImage>> {
-    if let Some((_, image)) = cache.iter().find(|(cached, _)| cached == path) {
-        return Some(Arc::clone(image));
+    if let Some(position) = cache.iter().position(|(cached, _)| cached == path) {
+        let (cached_path, image) = cache.remove(position).expect("position is valid");
+        cache.push_back((cached_path, Arc::clone(&image)));
+        return Some(image);
     }
     let image = Arc::new(decode(path)?);
     cache.push_back((path.to_string(), image.clone()));

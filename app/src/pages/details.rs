@@ -232,14 +232,20 @@ impl DetailsPage {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let position = Position::new(event.column, event.row);
-                if let Some(index) = self.row_at(chunks.songs, position, self.song_scroll) {
+                if let Some(index) =
+                    self.row_at(chunks.songs, position, self.song_scroll, self.songs.len())
+                {
                     self.focus = DetailsFocus::Songs;
                     self.selected_song = index;
                     if activate {
                         return self.activate();
                     }
-                } else if let Some(index) = self.row_at(chunks.albums, position, self.album_scroll)
-                {
+                } else if let Some(index) = self.row_at(
+                    chunks.albums,
+                    position,
+                    self.album_scroll,
+                    self.albums.len(),
+                ) {
                     self.focus = DetailsFocus::Albums;
                     self.selected_album = index;
                     if activate {
@@ -282,6 +288,9 @@ impl DetailsPage {
             Paragraph::new(error.as_str())
                 .style(Style::new().fg(crate::theme::red(ctx)))
                 .render(inner, buf);
+            // 错误信息占据整个内容区后直接返回，避免被下方的
+            // 歌手/专辑布局面板覆盖，用户看不到真实失败原因。
+            return;
         }
 
         match self.target {
@@ -572,12 +581,14 @@ impl DetailsPage {
             .min(self.songs.len().saturating_sub(visible));
     }
 
-    fn row_at(&self, area: Rect, position: Position, scroll: usize) -> Option<usize> {
+    /// `len` 由调用方传入：歌曲区传 `songs.len()`，专辑区传 `albums.len()`，
+    /// 两个列表长度不同时才不会互相错判边界。
+    fn row_at(&self, area: Rect, position: Position, scroll: usize, len: usize) -> Option<usize> {
         if !area.contains(position) {
             return None;
         }
         let index = scroll + position.y.saturating_sub(area.y) as usize;
-        (index < self.songs.len()).then_some(index)
+        (index < len).then_some(index)
     }
 }
 
@@ -587,11 +598,8 @@ struct DetailsChunks {
 }
 
 fn truncate(value: &str, width: u16) -> String {
-    let width = width as usize;
-    if value.chars().count() <= width {
-        return value.to_string();
-    }
-    value.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+    // 按显示宽度截断（CJK 占 2 列），共享实现见 components::text
+    super::components::text::truncate_width(value, width as usize).into_owned()
 }
 
 #[cfg(test)]

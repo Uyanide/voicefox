@@ -79,6 +79,9 @@ pub struct PlaylistsPage {
     pub selected_playlist: Option<usize>,
     list_loaded: bool,
     list_loading: bool,
+    /// 上次同步时的 storage generation：收藏/自建歌单列表只在数据
+    /// 变化后重建，避免每轮主循环全量克隆。
+    last_synced_generation: u64,
     list_page: u32,
     list_has_more: bool,
     search_input: Option<String>,
@@ -110,6 +113,7 @@ impl PlaylistsPage {
             selected_playlist: None,
             list_loaded: true,
             list_loading: false,
+            last_synced_generation: u64::MAX,
             list_page: 0,
             list_has_more: false,
             search_input: None,
@@ -234,6 +238,11 @@ impl PlaylistsPage {
         if self.selected_playlist.is_some() {
             return;
         }
+        let generation = ctx.storage.generation();
+        // scope 切换会把 list_loaded 置回 false，强制重建一次
+        if self.list_loaded && generation == self.last_synced_generation {
+            return;
+        }
         self.playlists = match self.current_scope() {
             Some(PlaylistScope::Custom) => ctx
                 .storage
@@ -246,6 +255,7 @@ impl PlaylistsPage {
         };
         self.list_loaded = true;
         self.list_loading = false;
+        self.last_synced_generation = generation;
         self.selected = self.selected.min(self.playlists.len().saturating_sub(1));
     }
 
@@ -1536,16 +1546,8 @@ fn scope_tab_rects(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
 }
 
 fn ensure_visible(selected: usize, visible: usize, total: usize, offset: &mut usize) {
-    if visible == 0 || total == 0 {
-        *offset = 0;
-        return;
-    }
-    if selected >= offset.saturating_add(visible) {
-        *offset = selected.saturating_sub(visible - 1);
-    } else if selected < *offset {
-        *offset = selected;
-    }
-    *offset = (*offset).min(total.saturating_sub(visible));
+    // 共享实现在 components::scroll，leaderboard / playlists 保持一致行为。
+    crate::pages::components::scroll::ensure_visible(selected, visible, total, offset)
 }
 
 fn render_muted(text: &str, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -1594,15 +1596,8 @@ fn custom_playlist_metadata(playlist: &CustomPlaylistSummary) -> Playlist {
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    if max <= 1 {
-        return "…".chars().take(max).collect();
-    }
-    let mut result = value.chars().take(max - 1).collect::<String>();
-    result.push('…');
-    result
+    // 按显示宽度截断（CJK 占 2 列），共享实现见 components::text
+    super::components::text::truncate_width(value, max).into_owned()
 }
 
 #[cfg(test)]
