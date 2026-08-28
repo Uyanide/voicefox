@@ -44,6 +44,10 @@ struct EventLoopContext {
     audio_info_tx: watch::Sender<AudioInfo>,
     event_tx: mpsc::UnboundedSender<PlayerEvent>,
     generation: Arc<AtomicU64>,
+    /// 最近一次 loadfile 下发时的代次：StartFile 事件据此归因，
+    /// 而不是读取处理时刻的 engine generation（快速切歌时会把
+    /// 旧文件的 StartFile 错记到新代次上）。
+    load_generation: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     pending_seek: Arc<Mutex<Option<(u64, Duration)>>>,
     shutdown: Arc<AtomicBool>,
@@ -76,6 +80,7 @@ pub struct MpvEngine {
     equalizer_bands: Mutex<Vec<EqualizerBand>>,
     fade_generation: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
+    load_generation: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     pending_seek: Arc<Mutex<Option<(u64, Duration)>>>,
     shutdown: Arc<AtomicBool>,
@@ -180,6 +185,7 @@ impl MpvEngine {
         let pending_seek = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
         let fade_generation = Arc::new(AtomicU64::new(0));
+        let load_generation = Arc::new(AtomicU64::new(0));
 
         let event_context = EventLoopContext {
             state_tx: state_tx.clone(),
@@ -189,6 +195,7 @@ impl MpvEngine {
             audio_info_tx: audio_info_tx.clone(),
             event_tx: event_tx.clone(),
             generation: Arc::clone(&generation),
+            load_generation: Arc::clone(&load_generation),
             paused: Arc::clone(&paused),
             pending_seek: Arc::clone(&pending_seek),
             shutdown: Arc::clone(&shutdown),
@@ -225,6 +232,7 @@ impl MpvEngine {
             equalizer_bands: Mutex::new(Vec::new()),
             fade_generation,
             generation,
+            load_generation,
             paused,
             pending_seek,
             shutdown,
@@ -243,7 +251,13 @@ impl MpvEngine {
             .mpv
             .set_property("http-header-fields", header_fields)
             .and_then(|()| self.mpv.set_property("pause", false))
-            .and_then(|()| self.mpv.command("loadfile", &[url, "replace"]));
+            .and_then(|()| {
+                // loadfile 下发即记录代次：事件线程用该值归因 StartFile，
+                // 避免读取处理时刻的 engine generation。
+                self.load_generation
+                    .store(generation, Ordering::SeqCst);
+                self.mpv.command("loadfile", &[url, "replace"])
+            });
 
         if let Err(error) = result {
             if self.generation.load(Ordering::SeqCst) == generation {
@@ -272,6 +286,12 @@ impl MpvEngine {
 
     fn cancel_fade_internal(&self) {
         self.fade_generation.fetch_add(1, Ordering::AcqRel);
+        // 淡出被取消时 mpv 的实际音量可能停在中间值（典型是 0）。
+        // 恢复为逻辑音量，否则 fade_out>0 且 fade_in==0 的配置下
+        // 第二首起会永久静音（UI 仍显示原音量）。
+        let _ = self
+            .mpv
+            .set_property("volume", f64::from(self.volume.load(Ordering::Relaxed)));
     }
 
     fn fade_to(&self, from: f64, to: f64, duration: Duration) {
@@ -322,7 +342,15 @@ fn run_event_loop(event_client: Arc<Mpv>, context: EventLoopContext) {
 
         match event {
             Ok(Event::StartFile) => {
-                let generation = context.generation.load(Ordering::SeqCst);
+                let generation = context.load_generation.load(Ordering::SeqCst);
+                if generation != context.generation.load(Ordering::SeqCst) {
+                    // 该文件所属的 loadfile 已被更新的 prepare/stop 取代：
+                    // 整个文件生命周期（含后续 FileLoaded/EndFile）一并忽略。
+                    current_file_generation = None;
+                    last_media_position = None;
+                    has_audio_position = false;
+                    continue;
+                }
                 current_file_generation = Some(generation);
                 last_media_position = None;
                 has_audio_position = false;
@@ -753,15 +781,23 @@ impl Player for MpvEngine {
         } else {
             position.min(duration)
         };
-        let _ = self.position_tx.send(position);
-        let _ = self.audible_position_tx.send(position);
         if *self.state_rx.borrow() == PlayerState::Loading {
+            // 文件尚未加载完成：只记录待定 seek，进度条先行展示目标位置
             let generation = self.generation.load(Ordering::SeqCst);
             *self.pending_seek.lock().unwrap() = Some((generation, position));
+            let _ = self.position_tx.send(position);
+            let _ = self.audible_position_tx.send(position);
+            return;
         }
+        // 淡出窗口内 seek 说明曲目不会自然结束，取消淡出并恢复音量，
+        // 避免本曲剩余部分静音。
+        self.cancel_fade_internal();
         if let Err(error) = self.mpv.set_property("time-pos", position.as_secs_f64()) {
             warn!("libmpv seek failed: {error}");
+            return;
         }
+        let _ = self.position_tx.send(position);
+        let _ = self.audible_position_tx.send(position);
     }
 
     fn state_watcher(&self) -> watch::Receiver<PlayerState> {
@@ -795,6 +831,8 @@ impl Player for MpvEngine {
     fn set_volume(&self, volume: u32) {
         self.cancel_fade_internal();
         let volume = volume.clamp(0, 100);
+        // 先取消进行中的淡入/淡出，避免淡出线程随后把音量改回去
+        self.cancel_fade_internal();
         if let Err(error) = self.mpv.set_property("volume", f64::from(volume)) {
             warn!("libmpv set_volume failed: {error}");
             return;
