@@ -59,7 +59,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Data structures
 dashmap = "6"
-lru = "0.13"
 
 # Extra crypto
 hex = "0.4"

@@ -580,8 +580,15 @@ impl KeybindingResolver {
     pub fn from_config(config: &KeybindingConfig) -> Self {
         let mut global = HashMap::new();
         for (action, key_str) in &config.global {
-            if let Some(binding) = parse_keybinding(key_str) {
-                global.insert(binding, *action);
+            match parse_keybinding(key_str) {
+                Some(binding) => {
+                    if let Some(previous) = global.insert(binding, *action) {
+                        tracing::warn!(
+                            "全局快捷键 {key_str} 同时绑定了 {previous:?} 和 {action:?}，保留后者"
+                        );
+                    }
+                }
+                None => tracing::warn!("无法识别的全局快捷键配置: {action:?} = {key_str}"),
             }
         }
 
@@ -589,8 +596,17 @@ impl KeybindingResolver {
         for (page_name, page_bindings) in &config.pages {
             let mut page_map = HashMap::new();
             for (action, key_str) in page_bindings {
-                if let Some(binding) = parse_keybinding(key_str) {
-                    page_map.insert(binding, *action);
+                match parse_keybinding(key_str) {
+                    Some(binding) => {
+                        if let Some(previous) = page_map.insert(binding, *action) {
+                            tracing::warn!(
+                                "页面 {page_name} 快捷键 {key_str} 同时绑定了 {previous:?} 和 {action:?}，保留后者"
+                            );
+                        }
+                    }
+                    None => tracing::warn!(
+                        "无法识别的页面快捷键配置: {page_name}/{action:?} = {key_str}"
+                    ),
                 }
             }
             pages.insert(page_name.clone(), page_map);

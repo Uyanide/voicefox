@@ -10,4 +10,5 @@ async-trait.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 crossterm.workspace = true
