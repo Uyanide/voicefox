@@ -1,14 +1,20 @@
 //! QQ 音乐 QRC 逐字歌词解析。
 
+use std::sync::OnceLock;
+
 use lx_core::model::lyric::{YrcLine, YrcWord};
 use regex::Regex;
 
 /// QRC 的时间标签位于对应字词之后：
 /// `[14727,2711]You (14727,169)know (14896,175)...`
 pub fn parse(content: &str) -> Vec<YrcLine> {
+    static LINE: OnceLock<Regex> = OnceLock::new();
+    static WORD: OnceLock<Regex> = OnceLock::new();
     let content = extract_lyric_content(content);
-    let line_regex = Regex::new(r"^\[\s*(\d+)\s*,\s*\d+\s*\]").unwrap();
-    let word_regex = Regex::new(r"\((-?\d+),(-?\d+)(?:,-?\d+)?\)").unwrap();
+    let line_regex = LINE
+        .get_or_init(|| Regex::new(r"^\[\s*(\d+)\s*,\s*\d+\s*\]").expect("valid QRC line regex"));
+    let word_regex =
+        WORD.get_or_init(|| Regex::new(r"\((-?\d+),(-?\d+)(?:,-?\d+)?\)").expect("valid QRC word regex"));
     let mut lines = Vec::new();
 
     for raw_line in content.lines() {

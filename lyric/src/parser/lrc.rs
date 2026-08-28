@@ -4,17 +4,30 @@
 //!
 //! 参考 go-musicfox pkg/lyric/lrc.go
 
+use std::sync::OnceLock;
+
 use lx_core::model::lyric::LyricLine;
 use regex::Regex;
 
 /// 解析 LRC 文本为 LyricLine 数组（按时间升序排列）
 pub fn parse(content: &str) -> Vec<LyricLine> {
-    let re = Regex::new(r"\[(\d{1,3}):(\d{2})(?:[.:,](\d{1,3}))?\]").unwrap();
-    let offset_re = Regex::new(r"(?i)\[offset:\s*([+-]?\d+)\s*\]").unwrap();
+    static TIMESTAMP: OnceLock<Regex> = OnceLock::new();
+    static OFFSET: OnceLock<Regex> = OnceLock::new();
+    static WORD_TAG: OnceLock<Regex> = OnceLock::new();
+    let re = TIMESTAMP.get_or_init(|| {
+        Regex::new(r"\[(\d{1,3}):(\d{2})(?:[.:,](\d{1,3}))?\]").expect("valid LRC timestamp regex")
+    });
+    let offset_re = OFFSET
+        .get_or_init(|| Regex::new(r"(?i)\[offset:\s*([+-]?\d+)\s*\]").expect("valid LRC offset regex"));
+    // 增强型 LRC 的行内字标签（如 <00:12.34>）不是正文，解析时剥离
+    let word_tag_re = WORD_TAG.get_or_init(|| {
+        Regex::new(r"<\d{1,3}:\d{1,2}(?:[.:,]\d{1,3})?>").expect("valid LRC word tag regex")
+    });
+    // offset 标签按规范首次出现即生效
     let offset_ms = offset_re
         .captures_iter(content)
         .filter_map(|captures| captures.get(1)?.as_str().parse::<i64>().ok())
-        .last()
+        .next()
         .unwrap_or_default();
     let mut lines: Vec<LyricLine> = Vec::new();
 
@@ -46,8 +59,11 @@ pub fn parse(content: &str) -> Vec<LyricLine> {
             }
         }
 
-        // 提取文本（最后一个时间戳之后的内容）
-        let text = line[last_end..].trim().to_string();
+        // 提取文本（最后一个时间戳之后的内容），并剥离行内 <mm:ss.xx> 字标签
+        let text = word_tag_re
+            .replace_all(&line[last_end..], "")
+            .trim()
+            .to_string();
         if text.is_empty() {
             continue;
         }
@@ -139,5 +155,20 @@ mod tests {
         let result = parse("[offset:-1500]\n[00:01]第一行\n[0:02,5]第二行");
         assert_eq!(result[0].timestamp, 0);
         assert_eq!(result[1].timestamp, 1_000);
+    }
+
+    #[test]
+    fn uses_the_first_offset_tag() {
+        let result = parse("[offset:+1000]\n[offset:+5000]\n[00:01.00]第一行");
+
+        assert_eq!(result[0].timestamp, 2_000);
+    }
+
+    #[test]
+    fn strips_enhanced_word_tags_from_text() {
+        let result = parse("[00:01.00]<00:01.00>你<00:01.50>好");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text, "你好");
     }
 }

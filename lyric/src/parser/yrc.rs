@@ -1,5 +1,7 @@
 //! 网易云 YRC 与 lx-music 统一逐字歌词格式解析。
 
+use std::sync::OnceLock;
+
 use lx_core::model::lyric::{YrcLine, YrcWord};
 use regex::Regex;
 
@@ -8,10 +10,18 @@ use regex::Regex;
 /// - `[1234,3000](1234,300,0)字...`
 /// - `[00:01.234]<0,300>字...`
 pub fn parse(content: &str) -> Vec<YrcLine> {
-    let numeric_line = Regex::new(r"^\[\s*(\d+)\s*,\s*\d+\s*\]").unwrap();
-    let timestamp_line = Regex::new(r"^\[(\d+):(\d{1,2})[.:](\d{1,3})\]").unwrap();
-    let yrc_word = Regex::new(r"\((-?\d+),(-?\d+)(?:,-?\d+)?\)").unwrap();
-    let lx_word = Regex::new(r"<(-?\d+),(-?\d+)(?:,-?\d+)?>").unwrap();
+    static NUMERIC_LINE: OnceLock<Regex> = OnceLock::new();
+    static TIMESTAMP_LINE: OnceLock<Regex> = OnceLock::new();
+    static YRC_WORD: OnceLock<Regex> = OnceLock::new();
+    static LX_WORD: OnceLock<Regex> = OnceLock::new();
+    let numeric_line = NUMERIC_LINE
+        .get_or_init(|| Regex::new(r"^\[\s*(\d+)\s*,\s*\d+\s*\]").expect("valid YRC numeric line regex"));
+    let timestamp_line = TIMESTAMP_LINE
+        .get_or_init(|| Regex::new(r"^\[(\d+):(\d{1,2})[.:](\d{1,3})\]").expect("valid YRC timestamp line regex"));
+    let yrc_word = YRC_WORD
+        .get_or_init(|| Regex::new(r"\((-?\d+),(-?\d+)(?:,-?\d+)?\)").expect("valid YRC word regex"));
+    let lx_word = LX_WORD
+        .get_or_init(|| Regex::new(r"<(-?\d+),(-?\d+)(?:,-?\d+)?>").expect("valid LX word regex"));
     let mut lines = Vec::new();
 
     for raw_line in content.lines() {

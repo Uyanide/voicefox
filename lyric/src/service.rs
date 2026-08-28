@@ -68,14 +68,13 @@ impl LyricService {
         if lrc_lines.is_empty() && !data.lyric.trim().is_empty() {
             lrc_lines = Self::plain_text_as_lines(&data.lyric, song.duration);
         }
-        let yrc_lines = if *self.show_yrc.read().unwrap() {
-            data.lxlyric
-                .as_deref()
-                .map(crate::parser::parse_karaoke)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // 逐字歌词无条件解析保留，开关判断放在 update_position（与翻译歌词
+        // 的处理方式一致），播放中切换开关也能立即对当前歌生效。
+        let yrc_lines = data
+            .lxlyric
+            .as_deref()
+            .map(crate::parser::parse_karaoke)
+            .unwrap_or_default();
         if lrc_lines.is_empty() && !yrc_lines.is_empty() {
             lrc_lines = Self::karaoke_as_lines(&yrc_lines);
         }
