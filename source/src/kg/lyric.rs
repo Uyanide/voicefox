@@ -3,6 +3,8 @@
 //! Step 1: GET http://lyrics.kugou.com/search → 获取 id + accesskey
 //! Step 2: GET http://lyrics.kugou.com/download → base64 解码 → KRC/LRC 文本
 
+use std::sync::OnceLock;
+
 use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
 use lx_core::traits::source::FetchError;
@@ -137,10 +139,16 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
 }
 
 fn parse_krc(content: &str) -> LyricData {
+    static LINE: OnceLock<regex::Regex> = OnceLock::new();
+    static WORDS: OnceLock<regex::Regex> = OnceLock::new();
     let content = content.replace('\r', "");
     let (content, rlyric_lines, tlyric_lines) = extract_language_metadata(&content);
-    let line = regex::Regex::new(r"^\[(\d+),\d+\]").expect("valid KRC line regex");
-    let words = regex::Regex::new(r"<(-?\d+),(-?\d+)(?:,-?\d+)?>").expect("valid KRC word regex");
+    let line = LINE.get_or_init(|| {
+        regex::Regex::new(r"^\[(\d+),\d+\]").expect("valid KRC line regex")
+    });
+    let words = WORDS.get_or_init(|| {
+        regex::Regex::new(r"<(-?\d+),(-?\d+)(?:,-?\d+)?>").expect("valid KRC word regex")
+    });
     let mut timestamps = Vec::new();
     let mut lrc_lines = Vec::new();
     let mut lx_lines = Vec::new();
@@ -185,8 +193,10 @@ fn parse_krc(content: &str) -> LyricData {
 }
 
 fn extract_language_metadata(content: &str) -> (String, Option<Vec<String>>, Option<Vec<String>>) {
-    let language =
-        regex::Regex::new(r"(?m)^\[language:([A-Za-z0-9+/=]+)\]\n?").expect("valid language regex");
+    static LANGUAGE: OnceLock<regex::Regex> = OnceLock::new();
+    let language = LANGUAGE.get_or_init(|| {
+        regex::Regex::new(r"(?m)^\[language:([A-Za-z0-9+/=]+)\]\n?").expect("valid language regex")
+    });
     let mut rlyric = None;
     let mut tlyric = None;
 

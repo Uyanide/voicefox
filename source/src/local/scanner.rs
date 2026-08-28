@@ -255,8 +255,7 @@ struct CueTrack {
 
 /// 解析常见的单文件 CUE。未识别的命令会被忽略，以兼容附加 REM 元数据。
 fn read_cue_tracks(path: &Path) -> Result<Vec<LocalSong>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("读取 CUE 失败: {}: {error}", path.display()))?;
+    let content = read_cue_text(path)?;
 
     // `cue-rw` handles quoted paths, multiple FILE sections, comments, track
     // flags and the 75-frames-per-second timestamp grammar.  A small fallback
@@ -267,6 +266,30 @@ fn read_cue_tracks(path: &Path) -> Result<Vec<LocalSong>, String> {
     }
 
     read_cue_tracks_legacy(path, &content)
+}
+
+/// 读取 CUE 文本。部分整轨 CUE 使用 GBK 编码，UTF-8 解析失败时降级用
+/// GB18030 重试，避免"stream did not contain valid UTF-8"导致整张专辑无法入库。
+fn read_cue_text(path: &Path) -> Result<String, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("读取 CUE 失败: {}: {error}", path.display()))?;
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(content),
+        Err(error) => {
+            let (content, _, had_errors) = encoding_rs::GB18030.decode(error.as_bytes());
+            tracing::warn!(
+                "CUE 不是有效 UTF-8，已用 GB18030 降级解码: {}",
+                path.display()
+            );
+            if had_errors {
+                return Err(format!(
+                    "读取 CUE 失败: {}: 既不是 UTF-8 也无法按 GB18030 解码",
+                    path.display()
+                ));
+            }
+            Ok(content.into_owned())
+        }
+    }
 }
 
 fn read_cue_tracks_with_crate(path: &Path, cue: &CUEFile) -> Result<Vec<LocalSong>, String> {

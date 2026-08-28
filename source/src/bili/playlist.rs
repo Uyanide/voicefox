@@ -34,9 +34,9 @@ pub async fn get_playlists(
         .await
         .map_err(FetchError::Network)?;
     if json["code"].as_i64() != Some(0) {
-        return Err(FetchError::Other(format!(
-            "获取哔哩哔哩收藏夹列表失败: {}",
-            json["message"].as_str().unwrap_or("unknown error")
+        return Err(FetchError::Other(super::api_error(
+            &json,
+            "获取哔哩哔哩收藏夹列表失败",
         )));
     }
     let folders = json["data"]["list"]
@@ -60,10 +60,15 @@ pub async fn get_playlists(
     Ok(folders)
 }
 
+/// 拉取收藏夹歌曲。
+///
+/// `MusicSource::get_playlist_detail` 的 `page` 参数在此实现中映射为收藏夹
+/// API 的起始页码（每页 `PAGE_SIZE` 条）：现有调用方只传 1，此时保持原有
+/// 全量拉取行为；传入更大的页码则从该页开始拉取，保证 page 在数学上正确生效。
 pub async fn get_playlist_detail(
     source: &BiliSource,
     playlist_id: &str,
-    _page: u32,
+    page: u32,
 ) -> Result<Vec<SongInfo>, FetchError> {
     if !source.is_logged_in() {
         return Err(FetchError::Other("请先在设置页面登录哔哩哔哩".to_string()));
@@ -73,7 +78,7 @@ pub async fn get_playlist_detail(
 
     let mut all_songs = Vec::new();
     let mut seen = HashSet::new();
-    let mut current_page = 1u32;
+    let mut current_page = page.max(1);
     loop {
         let json = source
             .get_json(
@@ -89,9 +94,9 @@ pub async fn get_playlist_detail(
             .await
             .map_err(FetchError::Network)?;
         if json["code"].as_i64() != Some(0) {
-            return Err(FetchError::Other(format!(
-                "获取哔哩哔哩收藏夹内容失败: {}",
-                json["message"].as_str().unwrap_or("unknown error")
+            return Err(FetchError::Other(super::api_error(
+                &json,
+                "获取哔哩哔哩收藏夹内容失败",
             )));
         }
         let medias = json["data"]["medias"].as_array();

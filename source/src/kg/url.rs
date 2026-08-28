@@ -12,20 +12,39 @@ use lx_core::traits::source::{FetchError, SongUrl};
 
 use super::super::http;
 
-/// 根据音质选择对应 hash（优先高音质）
-fn select_hash(song: &SongInfo, _quality: Quality) -> Option<String> {
-    // 优先 SQFileHash > HQFileHash > FileHash
-    song.extra
-        .get("SQFileHash")
-        .or_else(|| song.extra.get("HQFileHash"))
-        .or_else(|| song.extra.get("FileHash"))
-        .cloned()
+/// 根据请求音质选择对应的 hash 字段；请求字段缺失时按
+/// SQFileHash > HQFileHash > FileHash 回退，并返回实际选中的音质，
+/// 保证 SongUrl.quality 与真实下发的流一致。
+fn select_hash(song: &SongInfo, quality: Quality) -> Option<(String, Quality)> {
+    let field = match quality {
+        Quality::Low128 => "FileHash",
+        Quality::High320 => "HQFileHash",
+        Quality::Flac => "SQFileHash",
+        Quality::Flac24 => "ResFileHash",
+    };
+    if let Some(hash) = song.extra.get(field).filter(|hash| !hash.is_empty()) {
+        return Some((hash.clone(), quality));
+    }
+    // 回退链（沿用旧逻辑）：SQ > HQ > File
+    const FALLBACK: [(&str, Quality); 3] = [
+        ("SQFileHash", Quality::Flac),
+        ("HQFileHash", Quality::High320),
+        ("FileHash", Quality::Low128),
+    ];
+    FALLBACK
+        .iter()
+        .find_map(|(key, fallback_quality)| {
+            song.extra
+                .get(*key)
+                .filter(|hash| !hash.is_empty())
+                .map(|hash| (hash.clone(), *fallback_quality))
+        })
 }
 
 pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, FetchError> {
     let client = http::client();
 
-    let hash = select_hash(song, quality).ok_or(FetchError::NotFound)?;
+    let (hash, actual_quality) = select_hash(song, quality).ok_or(FetchError::NotFound)?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -87,7 +106,7 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
 
     Ok(SongUrl {
         url: play_url,
-        quality,
+        quality: actual_quality,
         duration: song.duration,
         cover_url: None,
         qualities,

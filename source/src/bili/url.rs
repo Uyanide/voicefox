@@ -41,12 +41,10 @@ pub async fn get_song_url(
         .await
         .map_err(FetchError::Network)?;
     if json["code"].as_i64() != Some(0) {
-        return Err(FetchError::Other(
-            json["message"]
-                .as_str()
-                .unwrap_or("哔哩哔哩播放地址请求失败")
-                .to_string(),
-        ));
+        return Err(FetchError::Other(super::api_error(
+            &json,
+            "哔哩哔哩播放地址请求失败",
+        )));
     }
     let selected = choose_audio(&json, quality).ok_or(FetchError::NotFound)?;
     let mut qualities = BTreeSet::new();

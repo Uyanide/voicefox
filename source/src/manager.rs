@@ -43,6 +43,32 @@ pub struct SourceManager {
     bili_source: Arc<BiliSource>,
     default: std::sync::RwLock<SourceId>,
     enabled: std::sync::RwLock<HashSet<SourceId>>,
+    /// 歌词"确认无词"负缓存（上次确认时间），避免纯音乐/无词歌曲
+    /// 每次播放都触发 JS 音源 + 全源聚合补全的长耗时请求。
+    lyric_negative_cache:
+        std::sync::Mutex<HashMap<(SourceId, String), Instant>>,
+}
+
+/// 判断是否为真本地文件歌曲：JS 音源的搜索结果同样标记为 `SourceId::Local`，
+/// 但额外带有 `extra["source"]` 平台标记，两者据此区分。
+fn is_local_file_song(song: &SongInfo) -> bool {
+    song.source == SourceId::Local && !song.extra.contains_key("source")
+}
+
+/// JS 音源搜索结果对应的平台内置音源（其 `id` 即该平台的歌曲 id），
+/// JS 音源解析失败时可用它回退。
+fn builtin_source_for_js(song: &SongInfo) -> Option<SourceId> {
+    if song.source != SourceId::Local {
+        return None;
+    }
+    match song.extra.get("source").map(String::as_str) {
+        Some("kw") => Some(SourceId::Kw),
+        Some("kg") => Some(SourceId::Kg),
+        Some("tx") => Some(SourceId::Tx),
+        Some("wy") => Some(SourceId::Wy),
+        Some("mg") => Some(SourceId::Mg),
+        _ => None,
+    }
 }
 
 impl SourceManager {
@@ -59,6 +85,7 @@ impl SourceManager {
             bili_source: Arc::clone(&bili_source),
             default: std::sync::RwLock::new(default),
             enabled: std::sync::RwLock::new(enabled.iter().copied().collect()),
+            lyric_negative_cache: std::sync::Mutex::new(HashMap::new()),
         };
         // 注册内置音源
         manager.register(Arc::new(KwSource::new()));
@@ -388,7 +415,15 @@ impl SourceManager {
         }
 
         let mut seen = HashSet::new();
-        items.retain(|song| seen.insert((song.source, song.id.clone())));
+        // JS 音源的搜索结果统一标记为 Local，去重键要带上 extra["source"]
+        // 平台标记，避免不同平台/不同 JS 音源的同数字 id 互相吞掉。
+        items.retain(|song| {
+            seen.insert((
+                song.source,
+                song.extra.get("source").cloned().unwrap_or_default(),
+                song.id.clone(),
+            ))
+        });
         Self::sort_search_results(&mut items, keyword);
         Ok(SearchResult {
             items,
@@ -591,8 +626,8 @@ impl SourceManager {
         quality: Quality,
         js_start_index: usize,
     ) -> Result<(SongUrl, Option<usize>), FetchError> {
-        // 本地歌曲走本地音源
-        if song.source == SourceId::Local {
+        // 真本地文件歌曲（非 JS 搜索结果）走本地音源
+        if is_local_file_song(song) {
             if let Some(local_src) = self.sources.get(&SourceId::Local) {
                 return local_src
                     .get_song_url(song, quality)
@@ -624,6 +659,31 @@ impl SourceManager {
             }
         }
 
+        if song.source == SourceId::Local {
+            // JS 音源搜到的歌：其 id 就是搜索时记录的平台歌曲 id，
+            // JS 音源全部失败后回退到该平台的内置音源。
+            let fallback_error = if js_errors.is_empty() {
+                FetchError::Other("未加载任何 JS 音源".to_string())
+            } else {
+                FetchError::Other(format!("JS 音源失败: {}", js_errors.join("; ")))
+            };
+            let fallback = builtin_source_for_js(song)
+                .and_then(|id| self.sources.get(&id).map(Arc::clone));
+            return match fallback {
+                None => Err(fallback_error),
+                Some(source) => source
+                    .get_song_url(song, quality)
+                    .await
+                    .map(|url| (url, None))
+                    .map_err(|error| {
+                        FetchError::Other(format!(
+                            "{fallback_error}; 内置{}音源失败: {error}",
+                            source.name()
+                        ))
+                    }),
+            };
+        }
+
         let source = self
             .sources
             .get(&song.source)
@@ -644,6 +704,17 @@ impl SourceManager {
         }
     }
 
+    /// 歌曲的内置回退音源：普通歌曲取来源音源；
+    /// JS 音源的搜索结果按 `extra["source"]` 平台标记映射到对应内置音源。
+    fn builtin_fallback_source(&self, song: &SongInfo) -> Option<Arc<dyn MusicSource>> {
+        let id = if song.source == SourceId::Local {
+            builtin_source_for_js(song)?
+        } else {
+            song.source
+        };
+        self.sources.get(&id).map(Arc::clone)
+    }
+
     /// 优先使用已导入的 lx-music JS 音源获取歌词，空结果时回退到内置搜索源。
     pub async fn get_lyric(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
         for js_source in self.js_sources() {
@@ -655,18 +726,30 @@ impl SourceManager {
         }
 
         let source = self
-            .sources
-            .get(&song.source)
-            .map(Arc::clone)
+            .builtin_fallback_source(song)
             .ok_or_else(|| FetchError::Other("歌曲来源不可用".to_string()))?;
         source.get_lyric(song).await
     }
 
     /// 获取歌词，当前音源无内容时自动从同曲候选中补全。
     pub async fn get_lyric_with_fallback(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
+        // 负缓存命中：短时间内已确认无词的歌曲直接跳过聚合补全，
+        // 避免纯音乐每次播放都触发 JS 音源 + 全源搜索的长耗时请求。
+        const NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+        let cache_key = (song.source, song.id.clone());
+        if let Ok(cache) = self.lyric_negative_cache.lock()
+            && let Some(verified_at) = cache.get(&cache_key)
+            && verified_at.elapsed() < NEGATIVE_TTL
+        {
+            return Err(FetchError::NotFound);
+        }
+
         if let Ok(data) = self.get_lyric(song).await
             && lyric_has_content(&data)
         {
+            if let Ok(mut cache) = self.lyric_negative_cache.lock() {
+                cache.remove(&cache_key);
+            }
             return Ok(data);
         }
 
@@ -679,8 +762,15 @@ impl SourceManager {
                     song.name,
                     candidate.source.as_str()
                 );
+                if let Ok(mut cache) = self.lyric_negative_cache.lock() {
+                    cache.remove(&cache_key);
+                }
                 return Ok(data);
             }
+        }
+
+        if let Ok(mut cache) = self.lyric_negative_cache.lock() {
+            cache.insert(cache_key, Instant::now());
         }
         Err(FetchError::NotFound)
     }
@@ -699,9 +789,7 @@ impl SourceManager {
         }
 
         let source = self
-            .sources
-            .get(&song.source)
-            .map(Arc::clone)
+            .builtin_fallback_source(song)
             .ok_or_else(|| FetchError::Other("歌曲来源不可用".to_string()))?;
         source.get_cover_url(song).await
     }

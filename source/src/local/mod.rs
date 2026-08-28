@@ -736,12 +736,28 @@ fn expand_path(value: &str) -> PathBuf {
 
 fn read_local_lyric(audio_path: &Path) -> Option<String> {
     let lrc_path = audio_path.with_extension("lrc");
-    if let Ok(content) = std::fs::read_to_string(lrc_path)
+    if let Some(content) = read_text_file(&lrc_path)
         && !content.trim().is_empty()
     {
         return Some(content);
     }
     metadata::read_embedded_lyric(audio_path).ok().flatten()
+}
+
+/// 读取文本文件。UTF-8 解析失败时降级用 GB18030 解码，兼容 GBK 编码的外挂歌词。
+fn read_text_file(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    match String::from_utf8(bytes) {
+        Ok(content) => Some(content),
+        Err(error) => {
+            let (content, _, _) = encoding_rs::GB18030.decode(error.as_bytes());
+            tracing::warn!(
+                "外挂歌词不是有效 UTF-8，已用 GB18030 降级解码: {}",
+                path.display()
+            );
+            Some(content.into_owned())
+        }
+    }
 }
 
 #[cfg(test)]

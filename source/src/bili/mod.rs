@@ -409,7 +409,8 @@ impl BiliSource {
     ) -> Result<Value, String> {
         self.ensure_buvid().await?;
         let json = self.get_json(endpoint, params, true).await?;
-        if json["code"].as_i64() != Some(-403) {
+        // -403 表示 WBI 签名失效；-412 风控也可能是签名过期触发，同样刷新后重试
+        if !matches!(json["code"].as_i64(), Some(-403) | Some(-412)) {
             return Ok(json);
         }
 
@@ -506,6 +507,11 @@ fn parse_user(json: &Value) -> Result<BiliUser, String> {
 
 fn api_error(json: &Value, fallback: &str) -> String {
     let code = json["code"].as_i64().unwrap_or(-1);
+    // -412（风控/限流）与 -352（风控校验失败）的原始 message 对用户不友好，
+    // 转成明确提示并保留原始 code 便于排查
+    if matches!(code, -412 | -352) {
+        return format!("B 站风控拦截，请稍后再试或重新登录 (code={code})");
+    }
     let message = json["message"]
         .as_str()
         .filter(|value| !value.is_empty())

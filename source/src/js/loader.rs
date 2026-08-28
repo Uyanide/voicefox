@@ -16,6 +16,9 @@ enum IntegrityPolicy {
     ApproveChanges,
 }
 
+/// JS 音源脚本下载大小上限，防止异常超大响应占用内存
+const MAX_SOURCE_SIZE: u64 = 10 * 1024 * 1024;
+
 fn local_source_path(input: &str) -> Option<PathBuf> {
     let value = input.strip_prefix("file://").unwrap_or(input);
     let path = if let Some(relative) = value.strip_prefix("~/") {
@@ -176,7 +179,7 @@ async fn download_source_with_policy(
         .await
         .map_err(|e| format!("下载 JS 音源失败（网络错误）: {e}"));
 
-    let resp = match response {
+    let mut resp = match response {
         Ok(resp) if resp.status().is_success() => resp,
         Ok(resp) => {
             let error = format!("下载 JS 音源失败（HTTP {}）", resp.status().as_u16());
@@ -185,16 +188,49 @@ async fn download_source_with_policy(
         Err(error) => return trusted_cache.ok_or(error),
     };
 
-    let code = resp
-        .text()
-        .await
-        .map_err(|e| format!("读取 JS 音源内容失败: {e}"));
-    let code = match code {
+    // 先看 content-length，超限直接拒绝
+    if let Some(length) = resp.content_length()
+        && length > MAX_SOURCE_SIZE
+    {
+        return trusted_cache.ok_or_else(|| {
+            format!(
+                "JS 音源超过 {}MB 大小上限，已拒绝下载",
+                MAX_SOURCE_SIZE / 1024 / 1024
+            )
+        });
+    }
+
+    // 分块累计下载并检查上限，防止超大响应拖垮内存
+    let mut code_bytes: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if code_bytes.len() as u64 + chunk.len() as u64 > MAX_SOURCE_SIZE {
+                    return trusted_cache.ok_or_else(|| {
+                        format!(
+                            "JS 音源超过 {}MB 大小上限，已拒绝下载",
+                            MAX_SOURCE_SIZE / 1024 / 1024
+                        )
+                    });
+                }
+                code_bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                let error = format!("读取 JS 音源内容失败: {error}");
+                return trusted_cache.ok_or(error);
+            }
+        }
+    }
+
+    let code = match String::from_utf8(code_bytes) {
         Ok(code) if !code.trim().is_empty() => code,
         Ok(_) => {
             return trusted_cache.ok_or_else(|| "下载的 JS 音源内容为空".to_string());
         }
-        Err(error) => return trusted_cache.ok_or(error),
+        Err(_) => {
+            return trusted_cache.ok_or_else(|| "下载的 JS 音源内容不是有效 UTF-8 文本".to_string());
+        }
     };
 
     let downloaded_hash = sha256_hex(code.as_bytes());

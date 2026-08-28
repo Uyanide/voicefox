@@ -44,9 +44,9 @@ pub async fn search(
         .await
         .map_err(SearchError::Network)?;
     if json["code"].as_i64() != Some(0) {
-        return Err(SearchError::Api(format!(
-            "哔哩哔哩搜索失败: {}",
-            json["message"].as_str().unwrap_or("unknown error")
+        return Err(SearchError::Api(super::api_error(
+            &json,
+            "哔哩哔哩搜索失败",
         )));
     }
     parse_search_result(&json, page)
@@ -159,9 +159,9 @@ async fn fetch_video(
         .await
         .map_err(SearchError::Network)?;
     if json["code"].as_i64() != Some(0) {
-        return Err(SearchError::Api(format!(
-            "获取哔哩哔哩视频失败: {}",
-            json["message"].as_str().unwrap_or("unknown error")
+        return Err(SearchError::Api(super::api_error(
+            &json,
+            "获取哔哩哔哩视频失败",
         )));
     }
     parse_video_result(&json, requested_page)

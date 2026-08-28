@@ -1,8 +1,8 @@
 //! kw 播放 URL 获取
 //!
-//! 流程:
+//! 流程（封面与播放地址并发请求）:
 //! 1. 调用 musicInfo API 获取封面
-//! 2. 调用 url API 获取播放地址
+//! 2. 调用 url API 获取播放地址，并校验响应为 http(s) 直链
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -84,10 +84,7 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
     let client = http::client();
     let song_id = &song.id;
 
-    // Step 1: 获取封面；拿不到则留空
-    let cover_url = resolve_cover_url(&client, song_id).await;
-
-    // Step 2: 构造播放 URL 请求
+    // Step 1: 构造播放 URL 请求
     let bitrate = quality_to_bitrate(quality);
 
     let timestamp = SystemTime::now()
@@ -104,24 +101,21 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         song_id, bitrate, timestamp, req_id
     );
 
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| FetchError::Network(e.to_string()))?;
+    // 封面与播放地址并发请求，避免封面串行等待拖慢出歌
+    let (cover_url, url_text) = tokio::join!(
+        resolve_cover_url(&client, song_id),
+        fetch_play_url(&client, &url)
+    );
+    let url_text = url_text?;
 
-    if !resp.status().is_success() {
-        return Err(FetchError::NotFound);
-    }
-
-    let url_text = resp
-        .text()
-        .await
-        .map_err(|e| FetchError::Network(e.to_string()))?
-        .trim()
-        .to_string();
-
-    if url_text.is_empty() {
+    // VIP 失效等场景接口会返回错误 JSON/文本，直接交给播放器会整体 loadfile 失败，
+    // 这里校验必须是 http(s) 直链
+    if !is_http_url(&url_text) {
+        // 只记录前 200 字符，避免错误响应是大段 HTML 时刷日志
+        tracing::warn!(
+            "酷我返回的播放地址无效，疑似鉴权失败: {}",
+            &url_text[..url_text.len().min(200)]
+        );
         return Err(FetchError::NotFound);
     }
 
@@ -136,4 +130,22 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         qualities,
         headers: vec![],
     })
+}
+
+/// 请求播放地址响应文本（不校验内容，由调用方判断是否为直链）
+async fn fetch_play_url(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(FetchError::NotFound);
+    }
+
+    resp.text()
+        .await
+        .map(|text| text.trim().to_string())
+        .map_err(|e| FetchError::Network(e.to_string()))
 }

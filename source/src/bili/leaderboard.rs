@@ -66,10 +66,7 @@ async fn get_music_hot(
     let code = json["code"].as_i64().unwrap_or(-1);
     tracing::debug!("bili music-hot response: code={code}");
     if code != 0 {
-        let msg = json["message"].as_str().unwrap_or("unknown");
-        return Err(SearchError::Api(format!(
-            "哔哩哔哩热歌榜失败 (code={code}, msg={msg})",
-        )));
+        return Err(SearchError::Api(super::api_error(&json, "哔哩哔哩热歌榜失败")));
     }
     let all = json["data"]["list"]
         .as_array()
@@ -153,9 +150,9 @@ async fn get_popular(
     let code = json["code"].as_i64().unwrap_or(-1);
     tracing::debug!("bili popular response: code={code}");
     if code != 0 {
-        let msg = json["message"].as_str().unwrap_or("unknown");
-        return Err(SearchError::Api(format!(
-            "哔哩哔哩全网热门失败 (code={code}, msg={msg})",
+        return Err(SearchError::Api(super::api_error(
+            &json,
+            "哔哩哔哩全网热门失败",
         )));
     }
     let list = match json["data"]["list"].as_array() {
@@ -202,9 +199,9 @@ async fn get_ranking(
         .map_err(|e| SearchError::Network(format!("哔哩哔哩全站排行榜网络错误: {e}")))?;
     let code = json["code"].as_i64().unwrap_or(-1);
     if code != 0 {
-        let msg = json["message"].as_str().unwrap_or("unknown");
-        return Err(SearchError::Api(format!(
-            "哔哩哔哩全站排行榜失败 (code={code}, msg={msg})",
+        return Err(SearchError::Api(super::api_error(
+            &json,
+            "哔哩哔哩全站排行榜失败",
         )));
     }
     tracing::debug!("bili ranking response: code={code}");

@@ -347,11 +347,21 @@ impl MusicSource for JsSource {
                         raw_lrc: None,
                     })
                 }
-                Err(_) => Ok(LyricData::default()),
+                Err(error) => {
+                    // 保持返回 default 的兼容行为，但记录错误便于排查
+                    tracing::warn!(
+                        "JS 音源获取歌词失败（音源 {source}，歌曲 {}）: {error}",
+                        info["musicInfo"]["name"].as_str().unwrap_or("未知")
+                    );
+                    Ok(LyricData::default())
+                }
             }
         })
         .await
-        .unwrap_or_else(|_| Ok(LyricData::default()))
+        .unwrap_or_else(|error| {
+            tracing::warn!("JS 音源获取歌词任务失败（歌曲 {}）: {error}", song.name);
+            Ok(LyricData::default())
+        })
     }
 
     async fn get_cover_url(&self, song: &SongInfo) -> Result<String, FetchError> {
@@ -459,6 +469,7 @@ fn get_duration(value: &serde_json::Value) -> Duration {
     let Some(text) = value.as_str() else {
         return Duration::ZERO;
     };
+    // 从秒位向前解析，支持 m:ss 与 h:mm:ss 两/三段格式
     let mut parts = text.split(':').rev();
     let seconds = parts
         .next()
@@ -468,7 +479,11 @@ fn get_duration(value: &serde_json::Value) -> Duration {
         .next()
         .and_then(|part| part.parse::<u64>().ok())
         .unwrap_or(0);
-    Duration::from_secs(minutes * 60 + seconds)
+    let hours = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .unwrap_or(0);
+    Duration::from_secs(hours * 3600 + minutes * 60 + seconds)
 }
 
 fn parse_js_search_result(result: &serde_json::Value) -> Result<SearchResult, SearchError> {

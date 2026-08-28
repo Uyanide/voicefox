@@ -35,10 +35,21 @@ impl JsEngine {
     pub fn new(source_path: &str) -> Result<Self, String> {
         let wrapper_js = include_str!("wrapper.js");
 
-        // 将 wrapper.js 写入临时文件
-        let tmp_dir = std::env::temp_dir().join("lx-tui-js");
-        std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("无法创建临时目录: {}", e))?;
-        let wrapper_path = tmp_dir.join("wrapper.js");
+        // 将 wrapper.js 写入当前用户缓存目录的私有子目录，避免多用户共用
+        // /tmp 时出现符号链接或目录抢占竞态。
+        let wrapper_dir = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("voicefox")
+            .join("js");
+        std::fs::create_dir_all(&wrapper_dir)
+            .map_err(|e| format!("无法创建 JS 引擎缓存目录: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("无法设置 JS 引擎缓存目录权限: {}", e))?;
+        }
+        let wrapper_path = wrapper_dir.join("wrapper.js");
         std::fs::write(&wrapper_path, wrapper_js)
             .map_err(|e| format!("无法写入 wrapper.js: {}", e))?;
 
@@ -51,6 +62,15 @@ impl JsEngine {
 
         let mut command = Command::new("node");
         configure_background_command(&mut command);
+        // 清空子进程环境变量，仅白名单恢复必要项：PATH 用于查找 node，
+        // HOME/USERPROFILE 为用户目录；wrapper.js 只用 Node 内置模块，
+        // 不依赖其他环境变量，故意不保留 NODE_PATH 以防注入。
+        command.env_clear();
+        for key in ["PATH", "HOME", "USERPROFILE"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
         command.arg("--permission");
         if node_supports_flag("--allow-net") {
             command.arg("--allow-net");
