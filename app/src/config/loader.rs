@@ -184,7 +184,7 @@ fn save_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
         std::process::id(),
         CONFIG_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| {
+    let result = (|| -> std::io::Result<()> {
         fs::write(&temp_path, content)?;
         #[cfg(windows)]
         {
@@ -201,10 +201,11 @@ fn save_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
             match fs::rename(&temp_path, path) {
                 Ok(()) => {
                     let _ = fs::remove_file(&old_path);
+                    Ok(())
                 }
                 Err(error) => {
                     let _ = fs::rename(&old_path, path);
-                    return Err(error);
+                    Err(error)
                 }
             }
         }

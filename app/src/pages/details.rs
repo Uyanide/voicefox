@@ -69,10 +69,6 @@ impl DetailsPage {
         }
     }
 
-    pub fn target(&self) -> &DetailsTarget {
-        &self.target
-    }
-
     pub fn update_artist(
         &mut self,
         albums: Vec<Album>,
@@ -617,7 +613,7 @@ mod tests {
             source: lx_core::model::source::SourceId::Kw,
             cover_url: None,
         });
-        assert!(matches!(artist.target(), DetailsTarget::Artist(_)));
+        assert!(matches!(artist.target, DetailsTarget::Artist(_)));
 
         let album = DetailsPage::album(Album {
             id: "1".to_string(),
@@ -626,6 +622,6 @@ mod tests {
             cover_url: None,
             artist: "歌手".to_string(),
         });
-        assert!(matches!(album.target(), DetailsTarget::Album(_)));
+        assert!(matches!(album.target, DetailsTarget::Album(_)));
     }
 }
