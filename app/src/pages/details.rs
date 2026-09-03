@@ -81,7 +81,7 @@ impl DetailsPage {
         self.albums = albums;
         self.songs = songs.unwrap_or_default();
         self.loading = false;
-        self.error = if self.songs.is_empty() {
+        self.error = if self.songs.is_empty() && self.albums.is_empty() {
             Some("未找到该歌手的歌曲".to_string())
         } else {
             None
@@ -205,7 +205,7 @@ impl DetailsPage {
         &mut self,
         event: MouseEvent,
         area: Rect,
-        ctx: &AppContext,
+        _ctx: &AppContext,
         activate: bool,
     ) -> AppAction {
         let chunks = self.content_chunks(area);
@@ -315,9 +315,11 @@ impl DetailsPage {
                     AppAction::None
                 }
             }
-            // Album navigation is not exposed by AppAction yet. Keep activation
-            // as a no-op until a corresponding application-level route exists.
-            DetailsFocus::Albums => AppAction::None,
+            DetailsFocus::Albums => self
+                .albums
+                .get(self.selected_album)
+                .map(|album| AppAction::ShowAlbumDetails(Box::new(album.clone())))
+                .unwrap_or(AppAction::None),
         }
     }
 
@@ -389,7 +391,7 @@ impl DetailsPage {
     }
 
     fn wrap_selection(&mut self, ctx: &AppContext, down: bool) {
-        if !ctx.config.read().unwrap().ui.wrap_navigation {
+        if !ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
             return;
         }
         match self.focus {

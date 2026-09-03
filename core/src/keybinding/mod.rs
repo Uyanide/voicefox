@@ -431,6 +431,21 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     bili_login.insert(Action::ListGoBack, "Esc".to_string());
     pages.insert("bili_login".to_string(), bili_login);
 
+    // --- 歌手/专辑详情 ---
+    let mut details = HashMap::new();
+    details.insert(Action::ListSelectUp, "k".to_string());
+    details.insert(Action::ListSelectDown, "j".to_string());
+    details.insert(Action::ListSelectFirst, "g".to_string());
+    details.insert(Action::ListSelectLast, "G".to_string());
+    details.insert(Action::ListPageUp, "Ctrl+u".to_string());
+    details.insert(Action::ListPageDown, "Ctrl+d".to_string());
+    details.insert(Action::ListActivate, "Enter".to_string());
+    details.insert(Action::ListToggleFavorite, "f".to_string());
+    details.insert(Action::ListAddToQueue, "a".to_string());
+    details.insert(Action::ListAddToQueueNext, "A".to_string());
+    details.insert(Action::ListGoBack, "Esc".to_string());
+    pages.insert("details".to_string(), details);
+
     pages
 }
 
@@ -661,6 +676,7 @@ pub fn colemak_preset() -> KeybindingConfig {
         "history",
         "local",
         "settings",
+        "details",
     ] {
         if let Some(bindings) = config.pages.get_mut(page) {
             bindings.insert(Action::ListSelectUp, "e".to_string());

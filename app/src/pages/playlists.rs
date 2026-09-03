@@ -832,7 +832,7 @@ impl PlaylistsPage {
         }
         let page = page_chunks(area, self.playlists.len());
         let position = Position::new(event.column, event.row);
-        let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
+        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
                 let scroll_area = if self.selected_playlist.is_some() {
@@ -1445,7 +1445,7 @@ impl PlaylistsPage {
         }
         if self.selected > 0 {
             self.selected -= 1;
-        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
             self.selected = len - 1;
         }
     }
@@ -1459,7 +1459,7 @@ impl PlaylistsPage {
             self.selected += 1;
         } else if self.selected_playlist.is_none() && self.list_has_more {
             // 保持末项选中，主循环会在下一轮请求下一页。
-        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
             self.selected = 0;
         }
     }

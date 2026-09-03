@@ -339,7 +339,7 @@ impl LeaderboardPage {
     ) -> AppAction {
         let page = page_chunks(area, self.boards.len());
         let position = Position::new(event.column, event.row);
-        let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
+        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.selected = self.selected.saturating_sub(scroll_amount);
@@ -616,7 +616,7 @@ impl LeaderboardPage {
         }
         if self.selected > 0 {
             self.selected -= 1;
-        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
             self.selected = len - 1;
         }
     }
@@ -628,7 +628,7 @@ impl LeaderboardPage {
         }
         if self.selected + 1 < len {
             self.selected += 1;
-        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
             self.selected = 0;
         }
     }

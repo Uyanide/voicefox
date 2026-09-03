@@ -264,10 +264,10 @@ impl Storage {
             .map_err(|error| format!("创建导入前备份失败: {error}"))?;
 
         self.persist_backup(&backup)?;
-        *self.favorites.write().unwrap() = backup.favorites;
-        *self.favorite_playlists.write().unwrap() = backup.favorite_playlists;
-        *self.custom_playlists.write().unwrap() = backup.custom_playlists;
-        *self.history.write().unwrap() = backup.history;
+        *self.favorites.write().unwrap_or_else(|e| e.into_inner()) = backup.favorites;
+        *self.favorite_playlists.write().unwrap_or_else(|e| e.into_inner()) = backup.favorite_playlists;
+        *self.custom_playlists.write().unwrap_or_else(|e| e.into_inner()) = backup.custom_playlists;
+        *self.history.write().unwrap_or_else(|e| e.into_inner()) = backup.history;
         Ok(automatic_backup)
     }
 
@@ -367,10 +367,10 @@ impl Storage {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            favorites: self.favorites.read().unwrap().clone(),
-            favorite_playlists: self.favorite_playlists.read().unwrap().clone(),
-            custom_playlists: self.custom_playlists.read().unwrap().clone(),
-            history: self.history.read().unwrap().clone(),
+            favorites: self.favorites.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            favorite_playlists: self.favorite_playlists.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            custom_playlists: self.custom_playlists.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            history: self.history.read().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
 
@@ -385,10 +385,10 @@ impl Storage {
     }
 
     fn create_startup_backup(&self) {
-        let has_data = !self.favorites.read().unwrap().is_empty()
-            || !self.favorite_playlists.read().unwrap().is_empty()
-            || !self.custom_playlists.read().unwrap().is_empty()
-            || !self.history.read().unwrap().is_empty();
+        let has_data = !self.favorites.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.favorite_playlists.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.custom_playlists.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.history.read().unwrap_or_else(|e| e.into_inner()).is_empty();
         if !has_data {
             return;
         }
@@ -423,11 +423,10 @@ impl Storage {
     }
 
     fn persist_backup(&self, backup: &DataBackup) -> Result<(), String> {
-        for (name, value) in [
-            (
-                "favorites.json",
-                serde_json::to_vec_pretty(&backup.favorites),
-            ),
+        // 先把四个文件全部序列化并写成临时文件，再统一换名，
+        // 避免中途失败（如磁盘满）留下只导入了一半的数据目录。
+        let staged: Vec<(&str, Vec<u8>)> = [
+            ("favorites.json", serde_json::to_vec_pretty(&backup.favorites)),
             (
                 "favorite_playlists.json",
                 serde_json::to_vec_pretty(&backup.favorite_playlists),
@@ -437,9 +436,24 @@ impl Storage {
                 serde_json::to_vec_pretty(&backup.custom_playlists),
             ),
             ("history.json", serde_json::to_vec_pretty(&backup.history)),
-        ] {
-            let json = value.map_err(|error| error.to_string())?;
-            save_atomic(&self.data_dir.join(name), &json)?;
+        ]
+        .into_iter()
+        .map(|(name, value)| Ok((name, value.map_err(|error| error.to_string())?)))
+        .collect::<Result<_, String>>()?;
+
+        let mut temp_files = Vec::new();
+        for (name, json) in &staged {
+            let target = self.data_dir.join(name);
+            let temp = stage_atomic(&target, json)?;
+            temp_files.push((temp, target));
+        }
+        // 换名阶段失败的概率极低（同目录 rename）；失败时清理未提交的临时文件并报错
+        for (temp, target) in temp_files {
+            if let Err(error) = commit_staged(&temp, &target) {
+                let _ = fs::remove_file(&temp);
+                let _ = target;
+                return Err(error);
+            }
         }
         self.bump_generation();
         Ok(())
@@ -448,7 +462,7 @@ impl Storage {
     // ── 收藏 ──────────────────────────────────────────
 
     pub fn add_favorite(&self, song: &SongInfo) -> bool {
-        let mut favs = self.favorites.write().unwrap();
+        let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
         if favs.iter().any(|favorite| songs_equivalent(favorite, song)) {
             return false;
         }
@@ -458,7 +472,7 @@ impl Storage {
     }
 
     pub fn remove_favorite(&self, song: &SongInfo) -> bool {
-        let mut favs = self.favorites.write().unwrap();
+        let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
         let old_len = favs.len();
         favs.retain(|favorite| !songs_equivalent(favorite, song));
         if favs.len() != old_len {
@@ -479,7 +493,7 @@ impl Storage {
     // ── 歌单收藏 ──────────────────────────────────────
 
     pub fn add_favorite_playlist(&self, playlist: &Playlist) -> bool {
-        let mut favorites = self.favorite_playlists.write().unwrap();
+        let mut favorites = self.favorite_playlists.write().unwrap_or_else(|e| e.into_inner());
         if favorites
             .iter()
             .any(|favorite| favorite.id == playlist.id && favorite.source == playlist.source)
@@ -492,7 +506,7 @@ impl Storage {
     }
 
     pub fn remove_favorite_playlist(&self, playlist: &Playlist) -> bool {
-        let mut favorites = self.favorite_playlists.write().unwrap();
+        let mut favorites = self.favorite_playlists.write().unwrap_or_else(|e| e.into_inner());
         let old_len = favorites.len();
         favorites
             .retain(|favorite| favorite.id != playlist.id || favorite.source != playlist.source);
@@ -512,7 +526,7 @@ impl Storage {
     }
 
     pub fn load_favorite_playlists(&self) -> Vec<Playlist> {
-        self.favorite_playlists.read().unwrap().clone()
+        self.favorite_playlists.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     // ── 自定义歌单 ────────────────────────────────────
@@ -701,13 +715,13 @@ impl Storage {
             std::sync::PoisonError::into_inner,
         );
         let (result, updated) = {
-            let mut updated = self.custom_playlists.read().unwrap().clone();
+            let mut updated = self.custom_playlists.read().unwrap_or_else(|e| e.into_inner()).clone();
             let result = update(&mut updated)?;
             (result, updated)
         };
         let json = serde_json::to_vec_pretty(&updated).map_err(|error| error.to_string())?;
         save_atomic(&self.data_dir.join("custom_playlists.json"), &json)?;
-        *self.custom_playlists.write().unwrap() = updated;
+        *self.custom_playlists.write().unwrap_or_else(|e| e.into_inner()) = updated;
         // 页面（如歌单页的 sync_saved_playlists）按 generation 判断是否重建
         self.bump_generation();
         Ok(result)
@@ -716,7 +730,7 @@ impl Storage {
     // ── 播放历史 ──────────────────────────────────────
 
     pub fn add_history(&self, song: &SongInfo, limit: usize) {
-        let mut history = self.history.write().unwrap();
+        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
         history.retain(|s| !(s.id == song.id && s.source == song.source));
         history.insert(0, HistoryEntry::from_song(song));
         history.truncate(limit.max(1));
@@ -724,7 +738,7 @@ impl Storage {
     }
 
     pub fn remove_history(&self, song: &SongInfo) -> bool {
-        let mut history = self.history.write().unwrap();
+        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
         let old_len = history.len();
         history.retain(|item| !(item.id == song.id && item.source == song.source));
         if history.len() == old_len {
@@ -735,7 +749,7 @@ impl Storage {
     }
 
     pub fn clear_history(&self) -> bool {
-        let mut history = self.history.write().unwrap();
+        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
         if history.is_empty() {
             return false;
         }
@@ -745,7 +759,7 @@ impl Storage {
     }
 
     pub fn trim_history(&self, limit: usize) -> bool {
-        let mut history = self.history.write().unwrap();
+        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
         let old_len = history.len();
         history.truncate(limit.max(1));
         if history.len() == old_len {
@@ -758,7 +772,7 @@ impl Storage {
     // ── 内部序列化 ────────────────────────────────────
 
     pub fn load_favorites(&self) -> Vec<SongInfo> {
-        self.favorites.read().unwrap().clone()
+        self.favorites.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn save_favorites(&self, favs: &[SongInfo]) {
@@ -909,13 +923,23 @@ impl Storage {
 
     fn save_file<T: Serialize + ?Sized>(&self, file_name: &str, value: &T) {
         let path = self.data_dir.join(file_name);
-        if let Ok(json) = serde_json::to_vec_pretty(value)
-            && let Err(error) = save_atomic(&path, &json)
-        {
-            tracing::warn!("保存数据文件 {} 失败: {}", path.display(), error);
-            return;
+        // 序列化或写盘失败都不递增代次：页面缓存不应基于未写盘的数据重建
+        let saved = match serde_json::to_vec_pretty(value) {
+            Ok(json) => match save_atomic(&path, &json) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!("保存数据文件 {} 失败: {}", path.display(), error);
+                    false
+                }
+            },
+            Err(error) => {
+                tracing::warn!("序列化数据文件 {} 失败: {}", path.display(), error);
+                false
+            }
+        };
+        if saved {
+            self.bump_generation();
         }
-        self.bump_generation();
     }
 }
 
@@ -928,6 +952,46 @@ fn save_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
 /// 在 TUI 线程上产生磁盘刷写停顿。
 fn save_atomic_relaxed(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
     save_atomic_impl(path, content, false)
+}
+
+/// 只写临时文件不换名，由 [`commit_staged`] 完成最终落盘。
+fn stage_atomic(path: &std::path::Path, content: &[u8]) -> Result<std::path::PathBuf, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temp_path = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        STORAGE_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = fs::File::create(&temp_path).map_err(|error| error.to_string())?;
+    file.write_all(content).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    Ok(temp_path)
+}
+
+fn commit_staged(temp_path: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let old_path = target.with_extension(format!("json.old-{}", std::process::id()));
+        if target.exists() {
+            fs::rename(target, &old_path).map_err(|error| error.to_string())?;
+        }
+        match fs::rename(temp_path, target) {
+            Ok(()) => {
+                let _ = fs::remove_file(&old_path);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::rename(&old_path, target);
+                Err(error.to_string())
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, target).map_err(|error| error.to_string())
+    }
 }
 
 fn save_atomic_impl(path: &std::path::Path, content: &[u8], durable: bool) -> Result<(), String> {
@@ -974,13 +1038,11 @@ fn save_atomic_impl(path: &std::path::Path, content: &[u8], durable: bool) -> Re
         fs::rename(&temp_path, path).map_err(|error| error.to_string())?;
 
         #[cfg(unix)]
-        if durable {
-            if let Some(parent) = path.parent() {
-                if let Ok(dir) = fs::File::open(parent) {
+        if durable
+            && let Some(parent) = path.parent()
+                && let Ok(dir) = fs::File::open(parent) {
                     let _ = dir.sync_all();
                 }
-            }
-        }
         Ok(())
     })();
     if result.is_err() {

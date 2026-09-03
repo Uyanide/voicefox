@@ -187,9 +187,28 @@ fn save_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     let result = (|| {
         fs::write(&temp_path, content)?;
         #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
+        {
+            // Windows 不支持覆盖式 rename：先把旧文件挪走（而非删除），
+            // 换名失败时挪回来，保证任何时刻配置文件都存在。
+            let old_path = path.with_extension(format!(
+                "{}.old-{}",
+                path.extension().unwrap_or_default().to_string_lossy(),
+                std::process::id()
+            ));
+            if path.exists() {
+                fs::rename(path, &old_path)?;
+            }
+            match fs::rename(&temp_path, path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&old_path);
+                }
+                Err(error) => {
+                    let _ = fs::rename(&old_path, path);
+                    return Err(error);
+                }
+            }
         }
+        #[cfg(not(windows))]
         fs::rename(&temp_path, path)
     })();
     if result.is_err() {

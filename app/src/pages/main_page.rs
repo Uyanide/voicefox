@@ -136,7 +136,7 @@ impl MainPage {
                     ctx.stop_player();
                     ctx.cover_service.clear();
                     ctx.lyric_service.clear();
-                    *ctx.current_song.write().unwrap() = None;
+                    *ctx.current_song.write().unwrap_or_else(|e| e.into_inner()) = None;
                     self.selected = 0;
                     self.scroll = 0;
                     AppAction::None
@@ -157,7 +157,7 @@ impl MainPage {
                 Action::ListSelectUp => {
                     if len != 0 {
                         self.selected = if self.selected == 0 {
-                            if ctx.config.read().unwrap().ui.wrap_navigation {
+                            if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
                                 len - 1
                             } else {
                                 0
@@ -172,7 +172,7 @@ impl MainPage {
                     if len != 0 {
                         self.selected = if self.selected + 1 < len {
                             self.selected + 1
-                        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
                             0
                         } else {
                             self.selected
@@ -261,7 +261,7 @@ impl MainPage {
                 .split(area);
             // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_HEIGHT。
             // 关闭封面时左栏全部用于歌词
-            let geometry = ctx.config.read().unwrap().ui.show_cover.then(|| {
+            let geometry = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.show_cover.then(|| {
                 CoverGeometry::from_font_size(
                     self.cover.font_size(),
                     ctx.cover_service.image_aspect(),
@@ -303,7 +303,7 @@ impl MainPage {
         ctx: &AppContext,
         activate: bool,
     ) -> AppAction {
-        let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
+        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
         let mut play_songs = None;
         let mut drag_target = None;
         {
@@ -392,7 +392,7 @@ impl MainPage {
             ctx.stop_player();
             ctx.cover_service.clear();
             ctx.lyric_service.clear();
-            *ctx.current_song.write().unwrap() = None;
+            *ctx.current_song.write().unwrap_or_else(|e| e.into_inner()) = None;
             AppAction::None
         } else {
             AppAction::PlaySong {
@@ -524,7 +524,7 @@ impl MainPage {
 
 fn render_cover_text(inner: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let cover_state = ctx.cover_service.state();
-    let song = ctx.current_song.read().unwrap();
+    let song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
     let lines = song.as_ref().map_or_else(
         || {
             vec![

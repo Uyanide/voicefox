@@ -348,19 +348,18 @@ impl MusicSource for JsSource {
                     })
                 }
                 Err(error) => {
-                    // 保持返回 default 的兼容行为，但记录错误便于排查
                     tracing::warn!(
                         "JS 音源获取歌词失败（音源 {source}，歌曲 {}）: {error}",
                         info["musicInfo"]["name"].as_str().unwrap_or("未知")
                     );
-                    Ok(LyricData::default())
+                    Err(FetchError::Other(error.to_string()))
                 }
             }
         })
         .await
         .unwrap_or_else(|error| {
             tracing::warn!("JS 音源获取歌词任务失败（歌曲 {}）: {error}", song.name);
-            Ok(LyricData::default())
+            Err(FetchError::Other(error.to_string()))
         })
     }
 

@@ -22,7 +22,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
         .render(area, buf);
 
     let state = *ctx.player_state.borrow();
-    let current_song = ctx.current_song.read().unwrap();
+    let current_song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
     let position = *ctx.position.borrow();
     let duration = *ctx.duration.borrow();
     let audio_info = ctx.audio_info.borrow().clone();
@@ -30,7 +30,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
     let queue = ctx.playlist.borrow();
     let queue_index = ctx.playlist.current_index();
     let (quality, status_bar_items) = {
-        let config = ctx.config.read().unwrap();
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (config.player.quality, config.ui.status_bar_items.clone())
     };
 

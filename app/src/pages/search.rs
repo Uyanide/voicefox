@@ -633,12 +633,13 @@ impl SearchPage {
         source_filter: Option<SourceId>,
     ) {
         if append {
+            let mut seen: std::collections::HashSet<(String, _)> = self
+                .results
+                .iter()
+                .map(|item| (item.id.clone(), item.source))
+                .collect();
             for song in result.items {
-                if !self
-                    .results
-                    .iter()
-                    .any(|item| item.id == song.id && item.source == song.source)
-                {
+                if seen.insert((song.id.clone(), song.source)) {
                     self.results.push(song);
                 }
             }

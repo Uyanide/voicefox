@@ -106,7 +106,7 @@ impl SourceManager {
     /// 开始一次 JS 音源请求。代次和当前音源受同一把锁保护，
     /// 避免旧任务在检查代次后跨过删除或新导入操作写回。
     pub fn begin_js_source_request(&self, clear_current: bool) -> u64 {
-        let mut state = self.js_sources.write().unwrap();
+        let mut state = self.js_sources.write().unwrap_or_else(|e| e.into_inner());
         state.generation = state.generation.wrapping_add(1);
         if clear_current {
             state.sources.clear();
@@ -115,7 +115,7 @@ impl SourceManager {
     }
 
     pub fn is_js_source_request_current(&self, generation: u64) -> bool {
-        self.js_sources.read().unwrap().generation == generation
+        self.js_sources.read().unwrap_or_else(|e| e.into_inner()).generation == generation
     }
 
     pub fn set_js_source_if_current(&self, generation: u64, source: Arc<dyn MusicSource>) -> bool {
@@ -141,7 +141,7 @@ impl SourceManager {
         generation: u64,
         sources: Vec<(String, Arc<dyn MusicSource>)>,
     ) -> bool {
-        let mut state = self.js_sources.write().unwrap();
+        let mut state = self.js_sources.write().unwrap_or_else(|e| e.into_inner());
         if state.generation != generation {
             return false;
         }
@@ -157,7 +157,7 @@ impl SourceManager {
         generation: u64,
         source: Arc<dyn MusicSource>,
     ) -> bool {
-        let mut state = self.js_sources.write().unwrap();
+        let mut state = self.js_sources.write().unwrap_or_else(|e| e.into_inner());
         if state.generation != generation {
             return false;
         }
@@ -172,7 +172,7 @@ impl SourceManager {
     }
 
     pub fn clear_js_source_if_current(&self, generation: u64) -> bool {
-        let mut state = self.js_sources.write().unwrap();
+        let mut state = self.js_sources.write().unwrap_or_else(|e| e.into_inner());
         if state.generation != generation {
             return false;
         }
@@ -186,7 +186,7 @@ impl SourceManager {
     }
 
     pub fn js_source_count(&self) -> usize {
-        self.js_sources.read().unwrap().sources.len()
+        self.js_sources.read().unwrap_or_else(|e| e.into_inner()).sources.len()
     }
 
     fn js_sources(&self) -> Vec<Arc<dyn MusicSource>> {
@@ -239,12 +239,12 @@ impl SourceManager {
                 .find(|source| enabled.contains(source))
                 .unwrap_or(default)
         };
-        *self.enabled.write().unwrap() = enabled;
-        *self.default.write().unwrap() = effective_default;
+        *self.enabled.write().unwrap_or_else(|e| e.into_inner()) = enabled;
+        *self.default.write().unwrap_or_else(|e| e.into_inner()) = effective_default;
     }
 
     pub fn enabled_sources(&self) -> Vec<SourceId> {
-        let enabled = self.enabled.read().unwrap();
+        let enabled = self.enabled.read().unwrap_or_else(|e| e.into_inner());
         SourceId::all_online()
             .iter()
             .copied()
@@ -293,7 +293,7 @@ impl SourceManager {
     }
 
     pub fn default_source(&self) -> Arc<dyn MusicSource> {
-        let default = *self.default.read().unwrap();
+        let default = *self.default.read().unwrap_or_else(|e| e.into_inner());
         self.sources
             .get(&default)
             .map(Arc::clone)
@@ -306,8 +306,8 @@ impl SourceManager {
         page: u32,
         limit: u32,
     ) -> Result<SearchResult, SearchError> {
-        let default = *self.default.read().unwrap();
-        if !self.enabled.read().unwrap().contains(&default) {
+        let default = *self.default.read().unwrap_or_else(|e| e.into_inner());
+        if !self.enabled.read().unwrap_or_else(|e| e.into_inner()).contains(&default) {
             return Err(SearchError::Other(format!(
                 "默认音源 {} 未启用",
                 default.as_str()
@@ -324,7 +324,7 @@ impl SourceManager {
         source: Option<SourceId>,
     ) -> Result<SearchResult, SearchError> {
         if crate::bili::looks_like_video_reference(keyword) {
-            if !self.enabled.read().unwrap().contains(&SourceId::Bili) {
+            if !self.enabled.read().unwrap_or_else(|e| e.into_inner()).contains(&SourceId::Bili) {
                 return Err(SearchError::Other("哔哩哔哩音源未启用".to_string()));
             }
             return self
@@ -338,7 +338,7 @@ impl SourceManager {
         let Some(source) = source else {
             return self.search_all(keyword, page, limit).await;
         };
-        if source != SourceId::Local && !self.enabled.read().unwrap().contains(&source) {
+        if source != SourceId::Local && !self.enabled.read().unwrap_or_else(|e| e.into_inner()).contains(&source) {
             return Err(SearchError::Other(format!(
                 "音源 {} 未启用",
                 source.as_str()
@@ -360,7 +360,7 @@ impl SourceManager {
     ) -> Result<SearchResult, SearchError> {
         let per_source_limit = (limit / 2).max(10);
         let mut tasks = tokio::task::JoinSet::new();
-        let enabled = self.enabled.read().unwrap().clone();
+        let enabled = self.enabled.read().unwrap_or_else(|e| e.into_inner()).clone();
         for source_id in SourceId::all_online() {
             if !enabled.contains(source_id) {
                 continue;
@@ -501,7 +501,7 @@ impl SourceManager {
     }
 
     pub fn leaderboard_sources(&self) -> Vec<SourceId> {
-        let enabled = self.enabled.read().unwrap();
+        let enabled = self.enabled.read().unwrap_or_else(|e| e.into_inner());
         SourceId::all_online()
             .iter()
             .copied()
@@ -579,7 +579,7 @@ impl SourceManager {
     }
 
     fn online_source(&self, source: SourceId) -> Result<Arc<dyn MusicSource>, SearchError> {
-        if source == SourceId::Local || !self.enabled.read().unwrap().contains(&source) {
+        if source == SourceId::Local || !self.enabled.read().unwrap_or_else(|e| e.into_inner()).contains(&source) {
             return Err(SearchError::Other(format!(
                 "音源 {} 未启用",
                 source.as_str()
@@ -592,7 +592,7 @@ impl SourceManager {
     }
 
     fn online_source_fetch(&self, source: SourceId) -> Result<Arc<dyn MusicSource>, FetchError> {
-        if source == SourceId::Local || !self.enabled.read().unwrap().contains(&source) {
+        if source == SourceId::Local || !self.enabled.read().unwrap_or_else(|e| e.into_inner()).contains(&source) {
             return Err(FetchError::Other(format!(
                 "音源 {} 未启用",
                 source.as_str()
@@ -621,6 +621,27 @@ impl SourceManager {
     /// 返回成功提供地址的 JS 音源索引；`None` 表示使用了本地、B 站或内置音源。
     /// mpv 实际播放失败后可从下一个索引继续，避免重复使用同一个失效链接。
     pub async fn get_song_url_from_js_index(
+        &self,
+        song: &SongInfo,
+        quality: Quality,
+        js_start_index: usize,
+    ) -> Result<(SongUrl, Option<usize>), FetchError> {
+        // JS 音源引擎本身有较长超时，串行尝试多个音源时最坏耗时会被放大，
+        // 这里对整个解析过程加一层外层超时兜底。
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.get_song_url_inner(song, quality, js_start_index),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(FetchError::Network(
+                "解析播放地址超时".to_string(),
+            )),
+        }
+    }
+
+    async fn get_song_url_inner(
         &self,
         song: &SongInfo,
         quality: Quality,
@@ -717,6 +738,15 @@ impl SourceManager {
 
     /// 优先使用已导入的 lx-music JS 音源获取歌词，空结果时回退到内置搜索源。
     pub async fn get_lyric(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
+        match tokio::time::timeout(std::time::Duration::from_secs(20), self.get_lyric_inner(song))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(FetchError::Network("获取歌词超时".to_string())),
+        }
+    }
+
+    async fn get_lyric_inner(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
         for js_source in self.js_sources() {
             if let Ok(data) = js_source.get_lyric(song).await
                 && lyric_has_content(&data)
@@ -732,46 +762,78 @@ impl SourceManager {
     }
 
     /// 获取歌词，当前音源无内容时自动从同曲候选中补全。
+    ///
+    /// 只有在所有音源都“确认无词”时才写入负缓存；网络类错误直接向上
+    /// 传播，避免一次抖动把歌曲误标为无词。
     pub async fn get_lyric_with_fallback(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
-        // 负缓存命中：短时间内已确认无词的歌曲直接跳过聚合补全，
-        // 避免纯音乐每次播放都触发 JS 音源 + 全源搜索的长耗时请求。
         const NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+        const NEGATIVE_CACHE_LIMIT: usize = 1024;
         let cache_key = (song.source, song.id.clone());
-        if let Ok(cache) = self.lyric_negative_cache.lock()
-            && let Some(verified_at) = cache.get(&cache_key)
-            && verified_at.elapsed() < NEGATIVE_TTL
         {
-            return Err(FetchError::NotFound);
+            let mut cache = self
+                .lyric_negative_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(verified_at) = cache.get(&cache_key)
+                && verified_at.elapsed() < NEGATIVE_TTL
+            {
+                return Err(FetchError::NotFound);
+            }
+            // 顺手清理过期项并限制容量，防止长跑会话中无限增长
+            cache.retain(|_, verified_at| verified_at.elapsed() < NEGATIVE_TTL);
+            if cache.len() >= NEGATIVE_CACHE_LIMIT {
+                cache.clear();
+            }
         }
 
-        if let Ok(data) = self.get_lyric(song).await
-            && lyric_has_content(&data)
-        {
-            if let Ok(mut cache) = self.lyric_negative_cache.lock() {
-                cache.remove(&cache_key);
+        let mut last_error: Option<FetchError> = None;
+        let mut attempts = |result: Result<LyricData, FetchError>,
+                            found: &mut Option<LyricData>| {
+            match result {
+                Ok(data) if lyric_has_content(&data) => {
+                    *found = Some(data);
+                }
+                Ok(_) => {}
+                Err(
+                    e @ (FetchError::Network(_) | FetchError::TooManyRequests | FetchError::Parse(_)),
+                ) => {
+                    last_error = Some(e);
+                }
+                Err(_) => {}
             }
+        };
+
+        let mut found: Option<LyricData> = None;
+        attempts(self.get_lyric(song).await, &mut found);
+        if found.is_none() {
+            for candidate in self.find_music(song).await {
+                attempts(self.get_lyric(&candidate).await, &mut found);
+                if found.is_some() {
+                    tracing::debug!(
+                        "lyrics for {} matched from {}",
+                        song.name,
+                        candidate.source.as_str()
+                    );
+                    break;
+                }
+            }
+        }
+
+        if let Some(data) = found {
+            self.lyric_negative_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&cache_key);
             return Ok(data);
         }
 
-        for candidate in self.find_music(song).await {
-            if let Ok(data) = self.get_lyric(&candidate).await
-                && lyric_has_content(&data)
-            {
-                tracing::debug!(
-                    "lyrics for {} matched from {}",
-                    song.name,
-                    candidate.source.as_str()
-                );
-                if let Ok(mut cache) = self.lyric_negative_cache.lock() {
-                    cache.remove(&cache_key);
-                }
-                return Ok(data);
-            }
+        if let Some(error) = last_error {
+            return Err(error);
         }
-
-        if let Ok(mut cache) = self.lyric_negative_cache.lock() {
-            cache.insert(cache_key, Instant::now());
-        }
+        self.lyric_negative_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cache_key, Instant::now());
         Err(FetchError::NotFound)
     }
 
@@ -802,7 +864,7 @@ impl SourceManager {
 
         // 1. 并行搜索所有其他源
         let mut tasks = tokio::task::JoinSet::new();
-        let enabled = self.enabled.read().unwrap().clone();
+        let enabled = self.enabled.read().unwrap_or_else(|e| e.into_inner()).clone();
         for id in SourceId::all_online() {
             if *id == exclude || !enabled.contains(id) {
                 continue;
@@ -987,7 +1049,7 @@ mod tests {
             _song: &SongInfo,
             quality: Quality,
         ) -> Result<SongUrl, FetchError> {
-            self.calls.lock().unwrap().push(self.name);
+            self.calls.lock().unwrap_or_else(|e| e.into_inner()).push(self.name);
             if !self.succeeds {
                 return Err(FetchError::NotFound);
             }
@@ -1075,7 +1137,7 @@ mod tests {
             .expect("the second JS source should resolve the song");
 
         assert_eq!(result.url, "https://example.com/grass.mp3");
-        assert_eq!(*calls.lock().unwrap(), vec!["juhe", "grass"]);
+        assert_eq!(*calls.lock().unwrap_or_else(|e| e.into_inner()), vec!["juhe", "grass"]);
     }
 
     #[tokio::test]
@@ -1112,7 +1174,7 @@ mod tests {
         assert_eq!(first.url, "https://example.com/juhe.mp3");
         assert_eq!(second.url, "https://example.com/grass.mp3");
         assert_eq!(second_index, Some(1));
-        assert_eq!(*calls.lock().unwrap(), vec!["juhe", "grass"]);
+        assert_eq!(*calls.lock().unwrap_or_else(|e| e.into_inner()), vec!["juhe", "grass"]);
     }
 
     #[test]

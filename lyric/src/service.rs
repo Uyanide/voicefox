@@ -37,10 +37,10 @@ impl LyricService {
 
     pub fn prepare(&self) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.lines.write().unwrap() = Arc::new(Vec::new());
-        self.yrc_lines.write().unwrap().clear();
-        self.trans_lines.write().unwrap().clear();
-        *self.state.write().unwrap() = LyricState::default();
+        *self.lines.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Vec::new());
+        self.yrc_lines.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.trans_lines.write().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.state.write().unwrap_or_else(|e| e.into_inner()) = LyricState::default();
         generation
     }
 
@@ -87,10 +87,10 @@ impl LyricService {
         };
 
         if self.generation.load(Ordering::SeqCst) == generation {
-            *self.lines.write().unwrap() = Arc::new(lrc_lines);
-            *self.yrc_lines.write().unwrap() = yrc_lines;
-            *self.trans_lines.write().unwrap() = trans;
-            *self.state.write().unwrap() = LyricState::default();
+            *self.lines.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(lrc_lines);
+            *self.yrc_lines.write().unwrap_or_else(|e| e.into_inner()) = yrc_lines;
+            *self.trans_lines.write().unwrap_or_else(|e| e.into_inner()) = trans;
+            *self.state.write().unwrap_or_else(|e| e.into_inner()) = LyricState::default();
             self.update_position(position);
         }
         Ok(())
@@ -102,9 +102,9 @@ impl LyricService {
 
     /// 根据播放位置更新当前歌词行
     pub fn update_position(&self, position: Duration) {
-        let lines = self.lines.read().unwrap();
+        let lines = self.lines.read().unwrap_or_else(|e| e.into_inner());
         if lines.is_empty() {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
             state.current_line = 0;
             if !state.lines.is_empty() {
                 state.lines = Arc::new(vec![]);
@@ -116,7 +116,7 @@ impl LyricService {
             return;
         }
 
-        let offset = *self.offset_ms.read().unwrap();
+        let offset = *self.offset_ms.read().unwrap_or_else(|e| e.into_inner());
         let pos_ms = (position.as_millis() as i64).saturating_add(offset).max(0) as u64;
 
         // 找到当前时间戳对应的行：最后一个 timestamp <= pos_ms 的行。
@@ -125,8 +125,8 @@ impl LyricService {
             .partition_point(|line| line.timestamp <= pos_ms)
             .saturating_sub(1);
 
-        let trans = self.trans_lines.read().unwrap();
-        let translation = if *self.show_translation.read().unwrap() {
+        let trans = self.trans_lines.read().unwrap_or_else(|e| e.into_inner());
+        let translation = if *self.show_translation.read().unwrap_or_else(|e| e.into_inner()) {
             trans
                 .iter()
                 .find(|(i, _)| *i == current)
@@ -134,7 +134,7 @@ impl LyricService {
         } else {
             None
         };
-        let yrc_words = if *self.show_yrc.read().unwrap() {
+        let yrc_words = if *self.show_yrc.read().unwrap_or_else(|e| e.into_inner()) {
             self.yrc_lines
                 .read()
                 .unwrap()
@@ -147,7 +147,7 @@ impl LyricService {
             Vec::new()
         };
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.current_line = current;
         // Arc 共享同一份歌词，引用计数递增是 O(1)，不会逐帧深拷贝整份歌词。
         state.lines = lines.clone();
@@ -245,19 +245,19 @@ impl LyricService {
 
     /// 获取当前歌词状态快照
     pub fn current_state(&self) -> LyricState {
-        self.state.read().unwrap().clone()
+        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn set_translation_enabled(&self, enabled: bool) {
-        *self.show_translation.write().unwrap() = enabled;
+        *self.show_translation.write().unwrap_or_else(|e| e.into_inner()) = enabled;
     }
 
     pub fn set_yrc_enabled(&self, enabled: bool) {
-        *self.show_yrc.write().unwrap() = enabled;
+        *self.show_yrc.write().unwrap_or_else(|e| e.into_inner()) = enabled;
     }
 
     pub fn set_offset_ms(&self, offset_ms: i32) {
-        *self.offset_ms.write().unwrap() = i64::from(offset_ms);
+        *self.offset_ms.write().unwrap_or_else(|e| e.into_inner()) = i64::from(offset_ms);
     }
 }
 

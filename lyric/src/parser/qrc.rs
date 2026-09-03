@@ -52,11 +52,8 @@ pub fn parse(content: &str) -> Vec<YrcLine> {
                 .and_then(|value| value.as_str().parse::<i64>().ok())
                 .unwrap_or(0)
                 .unsigned_abs();
-            let start = if raw_start < timestamp {
-                timestamp.saturating_add(raw_start)
-            } else {
-                raw_start
-            };
+            // 绝对时间戳略小于行首时间通常是舍入误差，直接钳制到行首
+            let start = raw_start.max(timestamp);
             words.push(YrcWord {
                 text,
                 start,

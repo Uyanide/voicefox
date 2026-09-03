@@ -114,7 +114,7 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         // 只记录前 200 字符，避免错误响应是大段 HTML 时刷日志
         tracing::warn!(
             "酷我返回的播放地址无效，疑似鉴权失败: {}",
-            &url_text[..url_text.len().min(200)]
+            truncate_chars(&url_text, 200)
         );
         return Err(FetchError::NotFound);
     }
@@ -132,16 +132,23 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
     })
 }
 
+/// 按字符截断，避免多字节字符被按字节切开导致 panic 或乱码
+fn truncate_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
 /// 请求播放地址响应文本（不校验内容，由调用方判断是否为直链）
 async fn fetch_play_url(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
-    let resp = client
-        .get(url)
-        .send()
+    let resp = crate::http::get_with_retry(client, url, 2)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 
     if !resp.status().is_success() {
-        return Err(FetchError::NotFound);
+        // 非 2xx 属于服务端/网络问题，不应被当作“歌曲不存在”
+        return Err(FetchError::Network(format!("HTTP {}", resp.status())));
     }
 
     resp.text()

@@ -27,16 +27,16 @@ pub fn parse(content: &str) -> Vec<YrcLine> {
     for raw_line in content.lines() {
         let line = raw_line.trim();
         let Some((timestamp, body_start)) =
-            parse_line_timestamp(line, &numeric_line, &timestamp_line)
+            parse_line_timestamp(line, numeric_line, timestamp_line)
         else {
             continue;
         };
         let body = &line[body_start..];
 
         let words = if lx_word.is_match(body) {
-            parse_prefixed_words(body, timestamp, &lx_word, true)
+            parse_prefixed_words(body, timestamp, lx_word, true)
         } else {
-            parse_prefixed_words(body, timestamp, &yrc_word, false)
+            parse_prefixed_words(body, timestamp, yrc_word, false)
         };
         if !words.is_empty() {
             lines.push(YrcLine { timestamp, words });
@@ -107,10 +107,12 @@ fn parse_prefixed_words(
             .and_then(|value| value.as_str().parse::<i64>().ok())
             .unwrap_or(0)
             .unsigned_abs();
-        let start = if starts_are_relative || raw_start < line_timestamp {
+        // 绝对时间戳略小于行首时间通常是舍入误差，直接钳制到行首，
+        // 不要当作相对偏移再叠加整个行时间戳
+        let start = if starts_are_relative {
             line_timestamp.saturating_add(raw_start)
         } else {
-            raw_start
+            raw_start.max(line_timestamp)
         };
         words.push(YrcWord {
             text,

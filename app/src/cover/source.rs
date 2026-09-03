@@ -23,25 +23,45 @@ fn cache_dir() -> PathBuf {
         .join("covers")
 }
 
-/// 清理进程异常退出后残留在缓存目录里的临时文件
+/// 缓存文件数量上限，超过后按最旧访问时间淘汰
+const CACHE_LIMIT: usize = 512;
+
+/// 清理进程异常退出后残留在缓存目录里的临时文件，并按 LRU 约束缓存总量
 pub async fn sweep_temp_files() {
     let Ok(mut entries) = tokio::fs::read_dir(cache_dir()).await else {
         return;
     };
+    // (访问时间, 路径)，非缓存文件（临时文件）跳过
+    let mut cached: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if !entry.file_name().to_string_lossy().contains(TEMP_INFIX) {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().contains(TEMP_INFIX) {
+            if let Ok(metadata) = entry.metadata().await
+                && metadata
+                    .modified()
+                    .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < TEMP_GRACE))
+            {
+                continue;
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => tracing::debug!("removed stale cover temp file {path:?}"),
+                Err(error) => tracing::debug!("remove stale cover temp file failed: {error}"),
+            }
             continue;
         }
         if let Ok(metadata) = entry.metadata().await
-            && metadata
-                .modified()
-                .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < TEMP_GRACE))
+            && let Ok(atime) = metadata.accessed()
         {
-            continue;
+            cached.push((atime, path));
         }
-        match tokio::fs::remove_file(entry.path()).await {
-            Ok(()) => tracing::debug!("removed stale cover temp file {:?}", entry.path()),
-            Err(error) => tracing::debug!("remove stale cover temp file failed: {error}"),
+    }
+    if cached.len() > CACHE_LIMIT {
+        cached.sort_by_key(|(atime, _)| *atime);
+        for (_, path) in &cached[..cached.len() - CACHE_LIMIT] {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => tracing::debug!("evicted cover cache {path:?}"),
+                Err(error) => tracing::debug!("evict cover cache failed: {error}"),
+            }
         }
     }
 }

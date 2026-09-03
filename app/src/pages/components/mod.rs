@@ -1,4 +1,4 @@
-//! 共享 UI 组件 — TODO: Phase 4
+//! 共享 UI 组件
 //!
 //! - status_bar: 底部状态栏（歌名、播放状态）
 //! - progress_bar: 播放进度条

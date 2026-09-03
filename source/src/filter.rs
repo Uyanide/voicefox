@@ -1,6 +1,6 @@
 //! 字符串过滤工具（对标 lx-music src/renderer/utils/musicSdk/utils.js）
 //!
-//! findMusic 算法使用的标准化函数 — TODO: Phase 6
+//! findMusic 算法使用的标准化函数
 
 /// 去除特殊字符 + 小写化
 pub fn filter_str(s: &str) -> String {

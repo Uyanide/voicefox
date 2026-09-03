@@ -98,8 +98,9 @@ impl MprisSnapshot {
             position_epoch,
             duration_micros: micros(duration),
             volume: f64::from(volume.min(100)) / 100.0,
-            can_go_next: queue_len > 1,
-            can_go_previous: queue_len > 1,
+            // 队列只有一首时列表循环仍可“下一首”，因此只要在播放就报告可用
+            can_go_next: queue_len > 0,
+            can_go_previous: queue_len > 0,
             ..Self::default()
         };
 
@@ -412,6 +413,20 @@ async fn run_updates(
     mut update_rx: tokio::sync::mpsc::UnboundedReceiver<MprisSnapshot>,
 ) -> zbus::Result<()> {
     while let Some(snapshot) = update_rx.recv().await {
+        // 单次更新失败（如 D-Bus 瞬断）只记录日志并继续，避免更新循环
+        // 永久退出导致桌面控件状态冻结。
+        if let Err(error) = apply_snapshot(&connection, snapshot).await {
+            tracing::warn!("MPRIS snapshot update failed: {error}");
+        }
+    }
+    Ok(())
+}
+
+async fn apply_snapshot(
+    connection: &zbus::Connection,
+    snapshot: MprisSnapshot,
+) -> zbus::Result<()> {
+    {
         let interface_ref = connection
             .object_server()
             .interface::<_, MprisPlayer>(MPRIS_PATH)

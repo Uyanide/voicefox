@@ -62,18 +62,18 @@ impl PlaylistManager {
         index: usize,
         reset_failures: bool,
     ) {
-        let mut list = self.current_list.write().unwrap();
+        let mut list = self.current_list.write().unwrap_or_else(|e| e.into_inner());
         self.current_index
             .store(index.min(songs.len().saturating_sub(1)), Ordering::Release);
         *list = songs;
         if reset_failures {
-            *self.consecutive_failures.lock().unwrap() = 0;
+            *self.consecutive_failures.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         }
     }
 
     /// 只读借用队列，供渲染与鼠标命中测试使用（零拷贝）。
     pub fn borrow(&self) -> std::sync::RwLockReadGuard<'_, Arc<Vec<SongInfo>>> {
-        self.current_list.read().unwrap()
+        self.current_list.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 当前索引
@@ -84,7 +84,7 @@ impl PlaylistManager {
     /// 全量快照：深拷贝整张队列。仅供低频路径（右键菜单、测试）使用。
     pub fn snapshot(&self) -> (Vec<SongInfo>, usize) {
         (
-            self.current_list.read().unwrap().as_ref().clone(),
+            self.current_list.read().unwrap_or_else(|e| e.into_inner()).as_ref().clone(),
             self.current_index(),
         )
     }
@@ -92,19 +92,19 @@ impl PlaylistManager {
     /// 共享快照：O(1) 复制 `Arc`。供持久化与切歌这类跨线程路径使用。
     pub fn snapshot_arc(&self) -> (Arc<Vec<SongInfo>>, usize) {
         (
-            Arc::clone(&self.current_list.read().unwrap()),
+            Arc::clone(&self.current_list.read().unwrap_or_else(|e| e.into_inner())),
             self.current_index(),
         )
     }
 
     #[cfg(target_os = "linux")]
     pub fn len(&self) -> usize {
-        self.current_list.read().unwrap().len()
+        self.current_list.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// 将单首歌曲插入当前播放列表，返回插入后的索引。
     pub fn insert(&self, song: SongInfo, position: InsertPosition) -> usize {
-        let mut list = self.current_list.write().unwrap();
+        let mut list = self.current_list.write().unwrap_or_else(|e| e.into_inner());
         let current = self.current_index();
         let list = Arc::make_mut(&mut *list);
         if list.is_empty() {
@@ -122,7 +122,7 @@ impl PlaylistManager {
     }
 
     pub fn remove(&self, target: usize) {
-        let mut list = self.current_list.write().unwrap();
+        let mut list = self.current_list.write().unwrap_or_else(|e| e.into_inner());
         if target >= list.len() {
             return;
         }
@@ -140,7 +140,7 @@ impl PlaylistManager {
     }
 
     pub fn move_item(&self, from: usize, to: usize) {
-        let mut list = self.current_list.write().unwrap();
+        let mut list = self.current_list.write().unwrap_or_else(|e| e.into_inner());
         if from >= list.len() || to >= list.len() || from == to {
             return;
         }
@@ -162,9 +162,9 @@ impl PlaylistManager {
     }
 
     pub fn clear(&self) {
-        *self.current_list.write().unwrap() = Arc::new(vec![]);
+        *self.current_list.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(vec![]);
         self.current_index.store(0, Ordering::Release);
-        *self.consecutive_failures.lock().unwrap() = 0;
+        *self.consecutive_failures.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     }
 
     /// 非零拷贝版 `next_entry`，保留给测试与外部使用；生产切歌走
@@ -179,12 +179,12 @@ impl PlaylistManager {
     ///
     /// 播放结束自动切歌走此路径，避免每首歌都复制整张队列。
     pub fn next_entry_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
-        let list = self.current_list.read().unwrap();
+        let list = self.current_list.read().unwrap_or_else(|e| e.into_inner());
         if list.is_empty() {
             return None;
         }
         let current = self.current_index();
-        let mode = *self.play_mode.lock().unwrap();
+        let mode = *self.play_mode.lock().unwrap_or_else(|e| e.into_inner());
         let next = mode.next_index(current, list.len())?;
         self.current_index.store(next, Ordering::Release);
         Some((Arc::clone(&list), next))
@@ -197,12 +197,12 @@ impl PlaylistManager {
     }
 
     pub fn next_manual_entry_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
-        let list = self.current_list.read().unwrap();
+        let list = self.current_list.read().unwrap_or_else(|e| e.into_inner());
         if list.is_empty() {
             return None;
         }
         let current = self.current_index();
-        let mode = *self.play_mode.lock().unwrap();
+        let mode = *self.play_mode.lock().unwrap_or_else(|e| e.into_inner());
         let next = mode.manual_next_index(current, list.len())?;
         self.current_index.store(next, Ordering::Release);
         Some((Arc::clone(&list), next))
@@ -219,19 +219,19 @@ impl PlaylistManager {
     }
 
     pub fn next_after_failure_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
-        let list = self.current_list.read().unwrap();
+        let list = self.current_list.read().unwrap_or_else(|e| e.into_inner());
         if list.is_empty() {
             return None;
         }
 
-        let mut failures = self.consecutive_failures.lock().unwrap();
+        let mut failures = self.consecutive_failures.lock().unwrap_or_else(|e| e.into_inner());
         *failures = failures.saturating_add(1);
         if *failures >= list.len() {
             return None;
         }
 
         let current = self.current_index();
-        let mode = *self.play_mode.lock().unwrap();
+        let mode = *self.play_mode.lock().unwrap_or_else(|e| e.into_inner());
         let next = mode.manual_next_index(current, list.len())?;
         self.current_index.store(next, Ordering::Release);
         Some((Arc::clone(&list), next))
@@ -239,7 +239,7 @@ impl PlaylistManager {
 
     /// mpv 已确认开始播放，新的连续失败计数从零开始。
     pub fn mark_playback_started(&self) {
-        *self.consecutive_failures.lock().unwrap() = 0;
+        *self.consecutive_failures.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     }
 
     #[allow(dead_code)]
@@ -249,23 +249,23 @@ impl PlaylistManager {
     }
 
     pub fn prev_manual_entry_arc(&self) -> Option<(Arc<Vec<SongInfo>>, usize)> {
-        let list = self.current_list.read().unwrap();
+        let list = self.current_list.read().unwrap_or_else(|e| e.into_inner());
         if list.is_empty() {
             return None;
         }
         let current = self.current_index();
-        let mode = *self.play_mode.lock().unwrap();
+        let mode = *self.play_mode.lock().unwrap_or_else(|e| e.into_inner());
         let previous = mode.manual_prev_index(current, list.len())?;
         self.current_index.store(previous, Ordering::Release);
         Some((Arc::clone(&list), previous))
     }
 
     pub fn mode(&self) -> crate::playlist::mode::PlayMode {
-        *self.play_mode.lock().unwrap()
+        *self.play_mode.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn cycle_mode(&self) -> crate::playlist::mode::PlayMode {
-        let mut mode = self.play_mode.lock().unwrap();
+        let mut mode = self.play_mode.lock().unwrap_or_else(|e| e.into_inner());
         *mode = mode.next_mode();
         *mode
     }

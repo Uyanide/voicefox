@@ -75,7 +75,7 @@ pub fn handle_mouse(
 ) -> AppAction {
     let all_songs = sorted_local_songs(ctx, state, cache);
     let view = LocalSongView::build(all_songs, filter_query);
-    let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
+    let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
     match event.kind {
         MouseEventKind::ScrollUp => {
             state.selected = state.selected.saturating_sub(scroll_amount);

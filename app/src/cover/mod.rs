@@ -51,8 +51,8 @@ impl CoverService {
 
     pub fn clear(&self) {
         self.request_id.fetch_add(1, Ordering::SeqCst);
-        *self.image.write().unwrap() = None;
-        *self.state.write().unwrap() = CoverState::Empty;
+        *self.image.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.state.write().unwrap_or_else(|e| e.into_inner()) = CoverState::Empty;
     }
 
     /// 当前封面的本地路径
@@ -74,7 +74,7 @@ impl CoverService {
     }
 
     pub fn state(&self) -> CoverState {
-        self.state.read().unwrap().clone()
+        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 把封面下载到本地缓存，不改变当前显示的封面
@@ -92,17 +92,17 @@ impl CoverService {
 
     pub async fn load(&self, url: Option<String>) -> Result<(), String> {
         let request_id = self.request_id.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.image.write().unwrap() = None;
+        *self.image.write().unwrap_or_else(|e| e.into_inner()) = None;
 
         let Some(url) = url
             .map(|url| source::normalize_url(&url))
             .filter(|url| !url.trim().is_empty())
         else {
-            *self.state.write().unwrap() =
+            *self.state.write().unwrap_or_else(|e| e.into_inner()) =
                 CoverState::Unavailable("当前音源没有返回封面".to_string());
             return Ok(());
         };
-        *self.state.write().unwrap() = CoverState::Loading;
+        *self.state.write().unwrap_or_else(|e| e.into_inner()) = CoverState::Loading;
 
         let mut last_error = "封面请求失败".to_string();
         let mut result: Option<CoverImage> = None;
@@ -127,10 +127,10 @@ impl CoverService {
 
         if self.request_id.load(Ordering::SeqCst) == request_id {
             if result.is_some() {
-                *self.image.write().unwrap() = result.clone();
-                *self.state.write().unwrap() = CoverState::Ready;
+                *self.image.write().unwrap_or_else(|e| e.into_inner()) = result.clone();
+                *self.state.write().unwrap_or_else(|e| e.into_inner()) = CoverState::Ready;
             } else {
-                *self.state.write().unwrap() = CoverState::Unavailable(last_error.clone());
+                *self.state.write().unwrap_or_else(|e| e.into_inner()) = CoverState::Unavailable(last_error.clone());
             }
         }
 

@@ -167,7 +167,7 @@ fn nav_page_scope(tab: NavTab) -> &'static str {
 }
 
 fn playback_menu_state(ctx: &AppContext) -> PlaybackMenuState {
-    let config = ctx.config.read().unwrap();
+    let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
     let ab_loop = ctx
         .player
         .ab_loop()
@@ -362,6 +362,28 @@ fn execute_song_menu_action(
             }
             AppAction::None
         }
+        SongMenuAction::ViewArtist => {
+            match menu.songs().get(menu.index()) {
+                Some(song) if !song.singer.trim().is_empty() => {
+                    AppAction::ShowArtistDetails(Box::new(song.clone()))
+                }
+                _ => AppAction::None,
+            }
+        }
+        SongMenuAction::ViewAlbum => {
+            match menu.songs().get(menu.index()) {
+                Some(song) if !song.album_name.trim().is_empty() => {
+                    AppAction::ShowAlbumDetails(Box::new(lx_core::model::playlist::Album {
+                        id: song.album_id.clone(),
+                        name: song.album_name.clone(),
+                        source: song.source,
+                        cover_url: song.cover_url.clone(),
+                        artist: song.singer.clone(),
+                    }))
+                }
+                _ => AppAction::None,
+            }
+        }
     };
     execute_action(
         app_action,
@@ -432,7 +454,7 @@ fn main() -> anyhow::Result<()> {
 
     // 启动 TUI
     let mut terminal = ratatui::init();
-    let mouse_enabled = ctx.config.read().unwrap().ui.enable_mouse;
+    let mouse_enabled = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.enable_mouse;
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     }
@@ -537,7 +559,7 @@ fn run_app(
     let (playlist_tx, mut playlist_rx) = mpsc::unbounded_channel::<PlaylistResponse>();
     let mut player_event_rx = ctx.player.take_event_receiver();
     #[cfg(target_os = "linux")]
-    let (mpris_handle, mut mpris_command_rx) = if ctx.config.read().unwrap().integration.mpris {
+    let (mpris_handle, mut mpris_command_rx) = if ctx.config.read().unwrap_or_else(|e| e.into_inner()).integration.mpris {
         match rt.block_on(mpris::start()) {
             Ok((handle, receiver)) => (Some(handle), Some(receiver)),
             Err(error) => {
@@ -556,7 +578,7 @@ fn run_app(
     let mut playlist_request_id: u64 = 0;
 
     // 键位解析器（从配置加载自定义键位）
-    let keybindings = ctx.config.read().unwrap().keybindings.clone();
+    let keybindings = ctx.config.read().unwrap_or_else(|e| e.into_inner()).keybindings.clone();
     let kb_resolver = KeybindingResolver::from_config(&keybindings);
 
     // 导航状态
@@ -565,7 +587,7 @@ fn run_app(
 
     // 页面状态
     let (search_source_filter, wrap_navigation, scroll_amount, enabled_sources) = {
-        let config = ctx.config.read().unwrap();
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (
             if config.ui.aggregate_search {
                 None
@@ -585,7 +607,7 @@ fn run_app(
     )));
     let settings_page = Arc::new(std::sync::Mutex::new(pages::settings::SettingsPage::new()));
     let (cover_protocol, mut cover_enabled) = {
-        let config = ctx.config.read().unwrap();
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (config.ui.cover_protocol.clone(), config.ui.show_cover)
     };
     let mut main_page = pages::main_page::MainPage::new(cover::CoverRenderer::detect(
@@ -615,14 +637,14 @@ fn run_app(
     let mut needs_render = true;
     // 播放器状态由播放线程改写，没有事件通知，只能靠比对上一轮的值发现变化
     let mut last_player_state = *ctx.player_state.borrow();
-    let max_fps = ctx.config.read().unwrap().ui.max_fps.clamp(1, 60);
+    let max_fps = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.max_fps.clamp(1, 60);
     let render_interval = Duration::from_millis(1_000 / u64::from(max_fps));
     let mut last_periodic_render = Instant::now();
     let mut last_notification_cleanup = Instant::now();
     let mut last_playback_session_save = Instant::now();
     let mut last_local_watch_generation = ctx.source_manager.local_source().watch_generation();
     let mut faded_generation = 0_u64;
-    let mut mouse_capture_enabled = ctx.config.read().unwrap().ui.enable_mouse;
+    let mut mouse_capture_enabled = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.enable_mouse;
     // 安装 tmux 的 client-attached hook，析构时自动卸载
     let attach_watcher = tmux::AttachWatcher::install();
     let mut last_cover_redraw = Instant::now() - COVER_REDRAW_THROTTLE;
@@ -634,7 +656,7 @@ fn run_app(
     let mut last_position_epoch = ctx.position_epoch();
 
     // === 后台异步加载 JS 音源（不阻塞启动） ===
-    let js_urls = ctx.config.read().unwrap().source.js_sources.clone();
+    let js_urls = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.clone();
     let default_source = ctx
         .config
         .read()
@@ -653,7 +675,7 @@ fn run_app(
         rt,
     );
 
-    if ctx.config.read().unwrap().player.remember_playback_state
+    if ctx.config.read().unwrap_or_else(|e| e.into_inner()).player.remember_playback_state
         && let Some(session) = ctx.storage.load_playback_session()
     {
         let (start_playback, paused) = playback_restore_flags(session.state);
@@ -675,9 +697,9 @@ fn run_app(
     }
 
     // === 初始扫描本地音乐 ===
-    let local_music_paths = ctx.config.read().unwrap().local_music.paths.clone();
-    let local_music_max_depth = ctx.config.read().unwrap().local_music.max_depth;
-    if !local_music_paths.is_empty() && ctx.config.read().unwrap().local_music.enabled {
+    let local_music_paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
+    let local_music_max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
+    if !local_music_paths.is_empty() && ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.enabled {
         execute_action(
             AppAction::ScanLocalMusic {
                 paths: local_music_paths,
@@ -747,7 +769,7 @@ fn run_app(
             }
         }
 
-        let mouse_requested = ctx.config.read().unwrap().ui.enable_mouse;
+        let mouse_requested = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.enable_mouse;
         if mouse_requested != mouse_capture_enabled {
             if mouse_requested {
                 let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -757,7 +779,7 @@ fn run_app(
             mouse_capture_enabled = mouse_requested;
         }
 
-        let cover_requested = ctx.config.read().unwrap().ui.show_cover;
+        let cover_requested = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.show_cover;
         if cover_requested != cover_enabled {
             if cover_requested {
                 let cover_url = ctx
@@ -785,7 +807,7 @@ fn run_app(
             let previous_tab = observed_active_tab;
             observed_active_tab = active_tab;
             let local_source = ctx.source_manager.local_source();
-            let config = ctx.config.read().unwrap();
+            let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
             if should_scan_local_music_on_entry(
                 previous_tab,
                 active_tab,
@@ -832,10 +854,10 @@ fn run_app(
                     let wake_tx = action_tx.clone();
                     bili_generate_task = Some(rt.spawn(async move {
                         let result = {
-                            let source = Arc::clone(&page_clone.lock().unwrap().source);
+                            let source = Arc::clone(&page_clone.lock().unwrap_or_else(|e| e.into_inner()).source);
                             source.generate_qr_code().await
                         };
-                        let mut p = page_clone.lock().unwrap();
+                        let mut p = page_clone.lock().unwrap_or_else(|e| e.into_inner());
                         match result {
                             Ok(qr) => {
                                 let qr_lines = pages::bili_login::render_qr_terminal(&qr.url, 1);
@@ -916,8 +938,8 @@ fn run_app(
                         generation,
                         message: error,
                     } if generation == ctx.active_player_generation.load(Ordering::SeqCst) => {
-                        let retry_song = ctx.current_song.read().unwrap().clone();
-                        let auto_toggle = ctx.config.read().unwrap().source.auto_toggle;
+                        let retry_song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        let auto_toggle = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.auto_toggle;
                         if auto_toggle
                             && retry_song
                                 .as_ref()
@@ -1100,9 +1122,11 @@ fn run_app(
         // === 1. 周期维护 ===
         // 这些工作必须独立于终端事件执行，否则持续按键或拖动鼠标会让
         // 搜索防抖、歌词同步和进度渲染长期得不到运行机会。
-        if active_tab == NavTab::Search {
+        {
+            // 防抖计时在切页后也要继续走，否则输入后 300ms 内切走标签
+            // 会永远丢掉这次搜索
             let action = {
-                let mut sp = search_page.lock().unwrap();
+                let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
                 sp.tick()
             };
             if let Some(action) = action {
@@ -1137,7 +1161,7 @@ fn run_app(
             && bili_poll_deadline.elapsed() >= Duration::from_secs(2)
         {
             let params = {
-                let mut page = page.lock().unwrap();
+                let mut page = page.lock().unwrap_or_else(|e| e.into_inner());
                 if page.should_poll() {
                     page.begin_poll()
                 } else {
@@ -1149,7 +1173,7 @@ fn run_app(
                 let wake_tx = action_tx.clone();
                 bili_poll_task = Some(rt.spawn(async move {
                     let result = source.poll_qr_code(&key).await;
-                    page.lock().unwrap().apply_check_result(result);
+                    page.lock().unwrap_or_else(|e| e.into_inner()).apply_check_result(result);
                     let _ = wake_tx.send(AppAction::None);
                 }));
                 bili_poll_deadline = Instant::now();
@@ -1158,9 +1182,9 @@ fn run_app(
         }
 
         if last_notification_cleanup.elapsed() >= Duration::from_millis(250) {
-            let notifications_enabled = ctx.config.read().unwrap().notification.in_app;
+            let notifications_enabled = ctx.config.read().unwrap_or_else(|e| e.into_inner()).notification.in_app;
             let lifetime = ctx.notification_timeout();
-            let mut notifs = ctx.notifications.write().unwrap();
+            let mut notifs = ctx.notifications.write().unwrap_or_else(|e| e.into_inner());
             let previous_len = notifs.len();
             if notifications_enabled {
                 notifs.retain(|notification| !notification.is_expired(lifetime));
@@ -1198,7 +1222,7 @@ fn run_app(
         // in without losing the user's volume preference.
         let active_generation = ctx.active_player_generation.load(Ordering::Acquire);
         let (fade_out_ms, position, duration) = {
-            let config = ctx.config.read().unwrap();
+            let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
             (
                 config.player.fade_out_ms,
                 *ctx.position.borrow(),
@@ -1239,12 +1263,12 @@ fn run_app(
             ctx.lyric_service
                 .update_position(*ctx.lyric_position.borrow());
             let input_active = active_tab == NavTab::Search
-                && search_page.lock().unwrap().input_mode
+                && search_page.lock().unwrap_or_else(|e| e.into_inner()).input_mode
                 || active_tab == NavTab::Settings
-                    && settings_page.lock().unwrap().any_input_active()
+                    && settings_page.lock().unwrap_or_else(|e| e.into_inner()).any_input_active()
                 || active_tab == NavTab::Favorites && favorites_page.input_mode()
                 || active_tab == NavTab::Playlists && playlists.input_active();
-            let notification_active = !ctx.notifications.read().unwrap().is_empty();
+            let notification_active = !ctx.notifications.read().unwrap_or_else(|e| e.into_inner()).is_empty();
             needs_render |= matches!(
                 state,
                 lx_core::model::source::PlayerState::Playing
@@ -1254,6 +1278,9 @@ fn run_app(
                 || bili_login_page.is_some();
             last_periodic_render = Instant::now();
         }
+
+        // 高频配置修改（音量/播放控制）合并落盘
+        ctx.flush_dirty_config();
 
         // 封面的解码与编码在后台线程进行，完成后才有内容可以绘制
         needs_render |= main_page.poll_cover();
@@ -1303,9 +1330,9 @@ fn run_app(
             let key = *key;
             // 1a. 侧边栏全局快捷键（1-8）—— 输入模式下跳过
             let settings_input_mode =
-                active_tab == NavTab::Settings && settings_page.lock().unwrap().any_input_active();
+                active_tab == NavTab::Settings && settings_page.lock().unwrap_or_else(|e| e.into_inner()).any_input_active();
             let search_input_mode =
-                active_tab == NavTab::Search && search_page.lock().unwrap().input_mode;
+                active_tab == NavTab::Search && search_page.lock().unwrap_or_else(|e| e.into_inner()).input_mode;
             let favorites_input_mode =
                 active_tab == NavTab::Favorites && favorites_page.input_mode();
             let playlists_input_mode = active_tab == NavTab::Playlists && playlists.input_active();
@@ -1319,7 +1346,7 @@ fn run_app(
                 || history_input_mode;
 
             if let Some(ref page) = bili_login_page {
-                let action = page.lock().unwrap().handle_input(key, &kb_resolver);
+                let action = page.lock().unwrap_or_else(|e| e.into_inner()).handle_input(key, &kb_resolver);
                 match action {
                     AppAction::BiliLoginSuccess => {
                         let _ = action_tx.send(AppAction::BiliLoginSuccess);
@@ -1370,7 +1397,7 @@ fn run_app(
                                         "文件已删除，但清理自建歌单失败: {error}"
                                     )));
                                 }
-                                let config = ctx.config.read().unwrap();
+                                let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
                                 let paths = config.local_music.paths.clone();
                                 let max_depth = config.local_music.max_depth;
                                 drop(config);
@@ -1435,6 +1462,55 @@ fn run_app(
                             &mut local_state,
                             &mut confirm_delete,
                         );
+                    }
+                }
+                needs_render = true;
+                continue;
+            }
+
+            // 歌手/专辑详情浮层：打开时独占按键
+            if ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                let action = ctx
+                    .details_page
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+                    .expect("details page checked above")
+                    .handle_input(&key, &ctx, &kb_resolver);
+                match action {
+                    AppAction::GoBack => {
+                        *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    }
+                    AppAction::None => {}
+                    action => execute_action(
+                        action,
+                        &ctx,
+                        rt,
+                        &action_tx,
+                        &search_page,
+                        &settings_page,
+                        &search_seq,
+                    ),
+                }
+                needs_render = true;
+                continue;
+            }
+
+            // 本地库诊断浮层：打开时独占 Esc/i，且不被侧边栏切页关闭
+            if let Some(kind) = local_diagnostics {
+                match (key.modifiers, key.code) {
+                    (KeyModifiers::NONE, KeyCode::Esc) => {
+                        local_diagnostics = None;
+                    }
+                    (KeyModifiers::NONE, KeyCode::Char('i' | 'I')) => {
+                        local_diagnostics = Some(match kind {
+                            LocalDiagnosticsKind::Corrupt => LocalDiagnosticsKind::Missing,
+                            LocalDiagnosticsKind::Missing => LocalDiagnosticsKind::Duplicates,
+                            LocalDiagnosticsKind::Duplicates => LocalDiagnosticsKind::Corrupt,
+                        });
+                    }
+                    _ => {
+                        // 浮层打开期间吞掉其他按键，防止误触底层页面
                     }
                 }
                 needs_render = true;
@@ -1516,7 +1592,7 @@ fn run_app(
                     Action::GlobalCycleMode if !text_input_active => {
                         let mode = ctx.playlist.cycle_mode();
                         let save_result = {
-                            let mut config = ctx.config.write().unwrap();
+                            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                             config.player.play_mode = mode.as_config().to_string();
                             crate::config::loader::save(&config, &ctx.config_path)
                         };
@@ -1605,7 +1681,7 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalToggleFavorite if !text_input_active => {
-                        if let Some(song) = ctx.current_song.read().unwrap().as_ref() {
+                        if let Some(song) = ctx.current_song.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
                             if ctx.storage.is_favorite(song) {
                                 ctx.storage.remove_favorite(song);
                                 let _ = action_tx.send(AppAction::ShowNotification(
@@ -1700,7 +1776,7 @@ fn run_app(
             match active_tab {
                 NavTab::Search => {
                     let action = {
-                        let mut sp = search_page.lock().unwrap();
+                        let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
                         sp.handle_input(key, &kb_resolver)
                     };
                     if matches!(action, AppAction::GoBack) {
@@ -1817,7 +1893,7 @@ fn run_app(
                 }
                 NavTab::Settings => {
                     let action = {
-                        let mut sp = settings_page.lock().unwrap();
+                        let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
                         sp.handle_input(key, &ctx, &kb_resolver)
                     };
                     // BiliLogin/BiliLogout 需要发到 channel 让主循环处理（生成 QR 码等）
@@ -1827,9 +1903,10 @@ fn run_app(
                     ) {
                         let _ = action_tx.send(action);
                     } else {
-                        if matches!(key.code, KeyCode::Char('g' | 'w' | 'j' | 'K')) {
-                            let config = ctx.config.read().unwrap();
-                            search_page.lock().unwrap().set_preferences(
+                        // 'z' 切换滚动步长；'j' 在设置页无功能，属死键，移除
+                        if matches!(key.code, KeyCode::Char('g' | 'w' | 'z' | 'K')) {
+                            let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                            search_page.lock().unwrap_or_else(|e| e.into_inner()).set_preferences(
                                 config.ui.aggregate_search,
                                 config.source.default,
                                 config.ui.wrap_navigation,
@@ -1849,27 +1926,6 @@ fn run_app(
                     }
                 }
                 NavTab::LocalMusic => {
-                    if let Some(kind) = local_diagnostics {
-                        match (key.modifiers, key.code) {
-                            (KeyModifiers::NONE, KeyCode::Esc) => {
-                                local_diagnostics = None;
-                            }
-                            (KeyModifiers::NONE, KeyCode::Char('i' | 'I')) => {
-                                local_diagnostics = Some(match kind {
-                                    LocalDiagnosticsKind::Corrupt => LocalDiagnosticsKind::Missing,
-                                    LocalDiagnosticsKind::Missing => {
-                                        LocalDiagnosticsKind::Duplicates
-                                    }
-                                    LocalDiagnosticsKind::Duplicates => {
-                                        LocalDiagnosticsKind::Corrupt
-                                    }
-                                });
-                            }
-                            _ => {}
-                        }
-                        needs_render = true;
-                        continue;
-                    }
                     // 1. 过滤输入模式优先消耗按键
                     if local_filter.handle_input(&key) {
                         if !local_filter.is_active() {
@@ -1900,8 +1956,8 @@ fn run_app(
                                 )));
                             }
                             Action::LocalRescan => {
-                                let paths = ctx.config.read().unwrap().local_music.paths.clone();
-                                let max_depth = ctx.config.read().unwrap().local_music.max_depth;
+                                let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
+                                let max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
                                 execute_action(
                                     AppAction::ScanLocalMusic {
                                         paths,
@@ -1925,14 +1981,14 @@ fn run_app(
                                 local_state.selected = previous_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap().ui.wrap_navigation,
+                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
                                 );
                             }
                             Action::ListSelectDown => {
                                 local_state.selected = next_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap().ui.wrap_navigation,
+                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
                                 );
                             }
                             Action::ListSelectFirst => {
@@ -2046,8 +2102,8 @@ fn run_app(
                                 )));
                             }
                             (KeyModifiers::NONE, KeyCode::Char('r')) => {
-                                let paths = ctx.config.read().unwrap().local_music.paths.clone();
-                                let max_depth = ctx.config.read().unwrap().local_music.max_depth;
+                                let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
+                                let max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
                                 execute_action(
                                     AppAction::ScanLocalMusic {
                                         paths,
@@ -2068,14 +2124,14 @@ fn run_app(
                                 local_state.selected = previous_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap().ui.wrap_navigation,
+                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
                                 );
                             }
                             (KeyModifiers::NONE, KeyCode::Down) => {
                                 local_state.selected = next_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap().ui.wrap_navigation,
+                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
                                 );
                             }
                             (KeyModifiers::NONE, KeyCode::Home)
@@ -2217,12 +2273,26 @@ fn run_app(
                 continue;
             }
 
+            let activate = click_tracker.is_double_click(mouse);
+            if let Some(page) = ctx
+                .details_page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                let action = page.handle_mouse(mouse, ui_areas.content, &ctx, activate);
+                if let AppAction::GoBack = action {
+                    *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                needs_render = true;
+                continue;
+            }
+
             if active_tab == NavTab::Playlists && playlists.input_active() {
                 needs_render = true;
                 continue;
             }
 
-            let activate = click_tracker.is_double_click(mouse);
             let position = Position::new(mouse.column, mouse.row);
             if ui_areas.notification.contains(position)
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -2242,7 +2312,7 @@ fn run_app(
                 if let Some(tab) = pages::sidebar::hit_test(ui_areas.tabs, position) {
                     active_tab = tab;
                     if tab == NavTab::Search {
-                        search_page.lock().unwrap().input_mode = true;
+                        search_page.lock().unwrap_or_else(|e| e.into_inner()).input_mode = true;
                     }
                 }
             } else if ui_areas.progress.contains(position)
@@ -2374,7 +2444,7 @@ fn run_app(
                         &mut data_cache.history,
                         activate,
                     ),
-                    NavTab::Settings => settings_page.lock().unwrap().handle_mouse(
+                    NavTab::Settings => settings_page.lock().unwrap_or_else(|e| e.into_inner()).handle_mouse(
                         mouse,
                         ui_areas.content,
                         &ctx,
@@ -2515,7 +2585,7 @@ fn draw_app(
 
         match active_tab {
             NavTab::Search => {
-                let mut sp = search_page.lock().unwrap();
+                let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
                 sp.render(content_area, frame.buffer_mut(), ctx);
             }
             NavTab::Main => {
@@ -2541,7 +2611,7 @@ fn draw_app(
                 );
             }
             NavTab::Settings => {
-                let mut sp = settings_page.lock().unwrap();
+                let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
                 sp.render(content_area, frame.buffer_mut(), ctx);
             }
             NavTab::LocalMusic => {
@@ -2551,7 +2621,7 @@ fn draw_app(
 
                 'local_content: {
                     let local_src = ctx.source_manager.local_source();
-                    let paths = ctx.config.read().unwrap().local_music.paths.clone();
+                    let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
                     let all_songs =
                         pages::local_music::sorted_local_songs(ctx, local_state, data_cache_local);
                     let is_scanning = local_src.is_scanning();
@@ -2747,7 +2817,7 @@ fn draw_app(
                         .fg(crate::theme::text(ctx)),
                 )
                 .render(overlay_area, frame.buffer_mut());
-            let p = page.lock().unwrap();
+            let p = page.lock().unwrap_or_else(|e| e.into_inner());
             p.render(overlay_area, frame.buffer_mut());
         }
 
@@ -2763,6 +2833,11 @@ fn draw_app(
         components::notification::render(area, frame.buffer_mut(), ctx);
         if let Some(menu) = song_menu {
             menu.render(content_area, frame.buffer_mut(), ctx);
+        }
+        if let Some(page) = ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            use ratatui::widgets::{Clear, Widget};
+            Clear.render(area, frame.buffer_mut());
+            page.render(area, frame.buffer_mut(), ctx);
         }
     })?;
     Ok(())
@@ -2867,7 +2942,7 @@ fn calculate_bili_login_area(area: Rect) -> Rect {
 
 #[cfg(target_os = "linux")]
 fn current_mpris_snapshot(ctx: &AppContext) -> mpris::MprisSnapshot {
-    let song = ctx.current_song.read().unwrap();
+    let song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
     mpris::MprisSnapshot::new(
         *ctx.player_state.borrow(),
         song.as_ref(),
@@ -3004,17 +3079,14 @@ fn start_current_queue_entry(
 fn persist_volume(ctx: &AppContext, volume: u32) {
     let volume = volume.clamp(0, 100);
     ctx.player.set_volume(volume);
-    let save_result = {
-        let mut config = ctx.config.write().unwrap();
+    {
+        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
         if config.player.volume == volume {
             return;
         }
         config.player.volume = volume;
-        crate::config::loader::save(&config, &ctx.config_path)
-    };
-    if let Err(error) = save_result {
-        tracing::warn!("save volume failed: {error}");
     }
+    ctx.mark_config_dirty();
 }
 
 /// 执行一个 AppAction（简化版，不再处理 Navigate/GoBack）
@@ -3029,7 +3101,7 @@ fn execute_action(
 ) {
     match action {
         AppAction::Search { keyword, source } => {
-            let mut sp = search_page.lock().unwrap();
+            let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
             sp.begin_search(&keyword, false);
             drop(sp);
             let sp_clone = Arc::clone(search_page);
@@ -3050,7 +3122,7 @@ fn execute_action(
             page,
             source,
         } => {
-            let mut sp = search_page.lock().unwrap();
+            let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
             if sp.is_searching
                 || sp.result_keyword != keyword
                 || sp.source_filter != source
@@ -3153,19 +3225,33 @@ fn execute_action(
         } => {
             if let Some(song) = songs.get(index).cloned() {
                 ctx.playlist.set_playlist(songs, index);
-                ctx.play_attempted_sources.lock().unwrap().clear();
-                *ctx.play_js_source_index.lock().unwrap() = None;
+                ctx.play_attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 if start_playback {
                     start_song_playback(song, false, Some((position, paused)), ctx, rt, action_tx);
                 } else {
                     ctx.stop_player();
-                    *ctx.current_song.write().unwrap() = Some(song);
+                    *ctx.current_song.write().unwrap_or_else(|e| e.into_inner()) = Some(song);
                 }
             }
         }
         AppAction::AddToQueue { song, position } => {
             let song = *song;
+            let was_empty = ctx.playlist.borrow().is_empty();
             let inserted = ctx.playlist.insert(song.clone(), position);
+            // 空队列时插入即是开始播放，否则用户点了“下一首播放”却静默无反应
+            if was_empty {
+                let (songs, index) = ctx.playlist.snapshot();
+                if let Some(current) = songs.get(index).cloned() {
+                    begin_song_from_arc(std::sync::Arc::new(songs), index, false, ctx, rt, action_tx);
+                    ctx.notify(Notification::success(format!(
+                        "开始播放: {} - {}",
+                        current.name, current.singer
+                    )));
+                    let _ = inserted;
+                    return;
+                }
+            }
             let message = match (position, inserted) {
                 (InsertPosition::Next, 0) | (InsertPosition::End, _) => {
                     format!("已加入队列: {} - {}", song.name, song.singer)
@@ -3252,23 +3338,23 @@ fn execute_action(
                 return;
             }
             tracing::info!("JS source imported: {url}");
-            let mut sp = settings_page.lock().unwrap();
+            let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
             sp.selected_source = 0;
             sp.status_msg = Some("✓ 音源已加载并启用".to_string());
             drop(sp);
             let save_result = {
-                let mut config = ctx.config.write().unwrap();
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                 config.source.js_sources.retain(|item| item != &url);
                 config.source.js_sources.insert(0, url);
                 crate::config::loader::save(&config, &ctx.config_path)
             };
             if let Err(e) = save_result {
-                let mut sp = settings_page.lock().unwrap();
+                let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
                 sp.status_msg = Some(format!("✗ 音源已启用，但保存配置失败: {}", e));
                 ctx.notify(Notification::error(format!("保存 JS 音源配置失败: {}", e)));
             } else {
                 let (urls, default_source) = {
-                    let config = ctx.config.read().unwrap();
+                    let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
                     (
                         config.source.js_sources.clone(),
                         config.source.default.as_str().to_string(),
@@ -3291,7 +3377,7 @@ fn execute_action(
                 return;
             }
             tracing::warn!("JS source import failed: {error}");
-            let mut sp = settings_page.lock().unwrap();
+            let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
             sp.status_msg = Some(format!("✗ 音源加载失败: {}", error));
             ctx.notify(Notification::error(format!("JS 音源导入失败: {}", error)));
         }
@@ -3319,8 +3405,8 @@ fn execute_action(
                 .filter(|result| !result.ok)
                 .map(|result| format!("{}: {}", result.name, result.detail))
                 .collect::<Vec<_>>();
-            *ctx.source_health.write().unwrap() = results;
-            settings_page.lock().unwrap().status_msg = Some(if failures.is_empty() {
+            *ctx.source_health.write().unwrap_or_else(|e| e.into_inner()) = results;
+            settings_page.lock().unwrap_or_else(|e| e.into_inner()).status_msg = Some(if failures.is_empty() {
                 format!("音源检测完成：{healthy}/{total} 可用")
             } else {
                 format!(
@@ -3336,7 +3422,7 @@ fn execute_action(
             tracing::info!("removing JS source: {url}");
             let generation = ctx.source_manager.begin_js_source_request(true);
             let (remaining_urls, default_source) = {
-                let mut config = ctx.config.write().unwrap();
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                 config.source.js_sources.retain(|u| u != &url);
                 let remaining_urls = config.source.js_sources.clone();
                 let default_source = config.source.default.as_str().to_string();
@@ -3411,7 +3497,7 @@ fn execute_action(
                     Ok(result) => result,
                     Err(error) => (vec![format!("本地音乐扫描任务失败: {error}")], 0),
                 };
-                let mut settings = settings.lock().unwrap();
+                let mut settings = settings.lock().unwrap_or_else(|e| e.into_inner());
                 if errors.is_empty() {
                     settings.status_msg = Some(format!("本地音乐扫描完成，共 {} 首", count));
                     let _ = tx.send(AppAction::ShowNotification(Notification::success(format!(
@@ -3445,6 +3531,65 @@ fn execute_action(
                     Err(error) => Notification::error(format!("歌单导入任务失败: {error}")),
                 };
                 let _ = tx.send(AppAction::ShowNotification(notification));
+            });
+        }
+        AppAction::ShowArtistDetails(song) => {
+            let artist = lx_core::model::playlist::Artist {
+                id: String::new(),
+                name: song.singer.trim().to_string(),
+                source: song.source,
+                cover_url: song.cover_url.clone(),
+            };
+            *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) = Some(pages::details::DetailsPage::artist(artist.clone()));
+            let manager = Arc::clone(&ctx.source_manager);
+            let details = Arc::clone(&ctx.details_page);
+            rt.spawn(async move {
+                let albums = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    manager.artist_albums(&artist, 0, 100),
+                )
+                .await;
+                let songs = manager.artist_songs(&artist, 0, 100).await;
+                let mut guard = details.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(page) = guard.as_mut() else {
+                    return;
+                };
+                match (albums, songs) {
+                    (Ok(Ok(albums)), songs) => {
+                        page.update_artist(
+                            albums,
+                            songs.map(|r| r.items).map_err(|e| e.to_string()),
+                        );
+                    }
+                    (Ok(Err(error)), _) | (Err(_), Err(error)) => {
+                        page.update_error(format!("加载歌手详情失败: {error}"));
+                    }
+                    (Err(_), Ok(_)) => {
+                        page.update_error("加载歌手详情超时".to_string());
+                    }
+                }
+            });
+        }
+        AppAction::ShowAlbumDetails(album) => {
+                        *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(pages::details::DetailsPage::album(*album.clone()));
+            let manager = Arc::clone(&ctx.source_manager);
+            let details = Arc::clone(&ctx.details_page);
+            rt.spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    manager.album_songs(&album, 0, 200),
+                )
+                .await;
+                let mut guard = details.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(page) = guard.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(Ok(result)) => page.update_album(Ok(result.items)),
+                    Ok(Err(error)) => page.update_album(Err(error.to_string())),
+                    Err(_) => page.update_album(Err("加载专辑曲目超时".to_string())),
+                }
             });
         }
         AppAction::Navigate(_)
@@ -3551,8 +3696,8 @@ fn begin_song_from_list(
     } else {
         ctx.playlist.set_playlist(songs, index);
     }
-    ctx.play_attempted_sources.lock().unwrap().clear();
-    *ctx.play_js_source_index.lock().unwrap() = None;
+    ctx.play_attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
     start_song_playback(song, true, None, ctx, rt, action_tx);
 }
 
@@ -3580,8 +3725,8 @@ fn begin_song_from_arc(
     } else {
         ctx.playlist.set_playlist_arc(songs, index);
     }
-    ctx.play_attempted_sources.lock().unwrap().clear();
-    *ctx.play_js_source_index.lock().unwrap() = None;
+    ctx.play_attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
     start_song_playback(song, true, None, ctx, rt, action_tx);
 }
 
@@ -3605,7 +3750,7 @@ fn start_song_playback(
         return;
     }
     let (show_cover, album_cover_notification, track_change_notification) = {
-        let config = ctx.config.read().unwrap();
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (
             config.ui.show_cover,
             config.notification.album_cover,
@@ -3639,7 +3784,7 @@ fn start_song_playback(
     }
 
     if add_history {
-        let limit = ctx.config.read().unwrap().player.history_limit;
+        let limit = ctx.config.read().unwrap_or_else(|e| e.into_inner()).player.history_limit;
         ctx.storage.add_history(&song, limit);
     }
     if add_history {
@@ -3659,7 +3804,7 @@ fn start_song_playback(
     let attempted_sources = Arc::clone(&ctx.play_attempted_sources);
     let js_source_index = Arc::clone(&ctx.play_js_source_index);
     let (quality, auto_toggle, fade_in_ms) = {
-        let config = ctx.config.read().unwrap();
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (
             config.player.quality,
             config.source.auto_toggle,
@@ -3847,7 +3992,7 @@ fn start_song_playback(
 }
 
 fn next_play_request(ctx: &AppContext) -> u64 {
-    let _song_guard = ctx.current_song.write().unwrap();
+    let _song_guard = ctx.current_song.write().unwrap_or_else(|e| e.into_inner());
     ctx.play_request_id.fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -3857,7 +4002,7 @@ fn set_current_song_if_current(
     request_id: u64,
     song: SongInfo,
 ) -> bool {
-    let mut current = current_song.write().unwrap();
+    let mut current = current_song.write().unwrap_or_else(|e| e.into_inner());
     if play_request_id.load(Ordering::SeqCst) != request_id {
         return false;
     }
@@ -3915,7 +4060,7 @@ async fn resolve_playable_song(
                     if play_request_id.load(Ordering::SeqCst) != request_id {
                         return Ok(None);
                     }
-                    *js_source_index.lock().unwrap() = resolved_js_source_index;
+                    *js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = resolved_js_source_index;
                     return Ok(Some((song, url)));
                 }
                 Err(error) => error,
@@ -3945,7 +4090,7 @@ async fn resolve_playable_song(
                 if play_request_id.load(Ordering::SeqCst) != request_id {
                     return Ok(None);
                 }
-                *js_source_index.lock().unwrap() = resolved_js_source_index;
+                *js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = resolved_js_source_index;
                 return Ok(Some((candidate, url)));
             }
             Err(error) => {
@@ -3984,7 +4129,7 @@ fn mark_source_attempted(
     attempted_sources: &std::sync::Mutex<std::collections::HashSet<SourceId>>,
     source: SourceId,
 ) -> bool {
-    attempted_sources.lock().unwrap().insert(source)
+    attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).insert(source)
 }
 
 fn prepare_player(ctx: &AppContext) -> u64 {
@@ -4145,7 +4290,7 @@ fn spawn_search(
                 if seq.load(Ordering::SeqCst) != my_seq + 1 {
                     return;
                 }
-                let mut sp = search_page.lock().unwrap();
+                let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
                 sp.update_results(keyword, page, append, search_result, source);
                 let _ = tx.send(AppAction::None);
             }
@@ -4153,7 +4298,7 @@ fn spawn_search(
                 if seq.load(Ordering::SeqCst) != my_seq + 1 {
                     return;
                 }
-                let mut sp = search_page.lock().unwrap();
+                let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
                 sp.update_error(error.to_string());
                 let _ = tx.send(AppAction::ShowNotification(Notification::error(format!(
                     "搜索失败: {}",
@@ -4164,7 +4309,7 @@ fn spawn_search(
                 if seq.load(Ordering::SeqCst) != my_seq + 1 {
                     return;
                 }
-                let mut sp = search_page.lock().unwrap();
+                let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
                 sp.update_error("请求超时，请稍后重试".to_string());
                 let _ = tx.send(AppAction::ShowNotification(Notification::error(
                     "搜索超时，请稍后重试".to_string(),

@@ -88,7 +88,7 @@ impl FavoritesPage {
                     if !filtered.is_empty() {
                         if self.selected > 0 {
                             self.selected -= 1;
-                        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
                             self.selected = filtered.len().saturating_sub(1);
                         }
                     }
@@ -98,7 +98,7 @@ impl FavoritesPage {
                     if !filtered.is_empty() {
                         if self.selected + 1 < filtered.len() {
                             self.selected += 1;
-                        } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
                             self.selected = 0;
                         }
                     }
@@ -217,7 +217,7 @@ impl FavoritesPage {
                 if !filtered.is_empty() {
                     if self.selected > 0 {
                         self.selected -= 1;
-                    } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                    } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
                         self.selected = filtered.len().saturating_sub(1);
                     }
                 }
@@ -226,7 +226,7 @@ impl FavoritesPage {
                 if !filtered.is_empty() {
                     if self.selected + 1 < filtered.len() {
                         self.selected += 1;
-                    } else if ctx.config.read().unwrap().ui.wrap_navigation {
+                    } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
                         self.selected = 0;
                     }
                 }
@@ -420,7 +420,7 @@ impl FavoritesPage {
     ) -> AppAction {
         let favorites = self.sorted_favorites(ctx, cache);
         let filtered = self.filtered_song_indices(favorites);
-        let scroll_amount = ctx.config.read().unwrap().ui.scroll_amount.max(1);
+        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.selected = self.selected.saturating_sub(scroll_amount);

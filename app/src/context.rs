@@ -53,6 +53,10 @@ pub struct AppContext {
     pub play_attempted_sources: Arc<std::sync::Mutex<HashSet<lx_core::model::source::SourceId>>>,
     pub play_js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
     pub local_scan_request_id: Arc<AtomicU64>,
+    /// 配置延迟落盘：音量/播放控制等高频修改先标记，主循环稍后统一写盘
+    config_dirty_since: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// 打开中的歌手/专辑详情浮层；None 表示未打开。
+    pub details_page: Arc<std::sync::Mutex<Option<crate::pages::details::DetailsPage>>>,
     /// 当前进度所属的连续时间线，跳转会递增
     position_epoch: AtomicU64,
 
@@ -135,6 +139,8 @@ impl AppContext {
             play_attempted_sources: Arc::new(std::sync::Mutex::new(HashSet::new())),
             play_js_source_index: Arc::new(std::sync::Mutex::new(None)),
             local_scan_request_id: Arc::new(AtomicU64::new(0)),
+            config_dirty_since: Arc::new(std::sync::Mutex::new(None)),
+            details_page: Arc::new(std::sync::Mutex::new(None)),
             position_epoch: AtomicU64::new(0),
             config: std::sync::RwLock::new(config),
             config_path,
@@ -166,11 +172,11 @@ impl AppContext {
 
     pub fn notify(&self, notification: Notification) {
         let (in_app, desktop) = {
-            let config = self.config.read().unwrap();
+            let config = self.config.read().unwrap_or_else(|e| e.into_inner());
             (config.notification.in_app, config.notification.enable)
         };
         if in_app && notification.in_app {
-            let mut notifications = self.notifications.write().unwrap();
+            let mut notifications = self.notifications.write().unwrap_or_else(|e| e.into_inner());
             notifications.push_back(notification.clone());
             while notifications.len() > 8 {
                 notifications.pop_front();
@@ -182,7 +188,7 @@ impl AppContext {
     }
 
     pub fn dismiss_notification(&self) -> bool {
-        self.notifications.write().unwrap().pop_back().is_some()
+        self.notifications.write().unwrap_or_else(|e| e.into_inner()).pop_back().is_some()
     }
 
     pub fn notification_timeout(&self) -> Duration {
@@ -197,7 +203,7 @@ impl AppContext {
     }
 
     pub fn persist_playback_session(&self) -> Result<(), String> {
-        if !self.config.read().unwrap().player.remember_playback_state {
+        if !self.config.read().unwrap_or_else(|e| e.into_inner()).player.remember_playback_state {
             return self.storage.clear_playback_session();
         }
         let (playlist, current_index) = self.playlist.snapshot_arc();
@@ -219,7 +225,7 @@ impl AppContext {
 
     pub fn cycle_playback_speed(&self) -> String {
         let speed = {
-            let mut config = self.config.write().unwrap();
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
             config.player.playback_speed = next_playback_speed(config.player.playback_speed);
             config.player.playback_speed
         };
@@ -234,13 +240,13 @@ impl AppContext {
             device.trim()
         };
         self.player.set_audio_output_device(device);
-        self.config.write().unwrap().player.audio_device = device.to_string();
+        self.config.write().unwrap_or_else(|e| e.into_inner()).player.audio_device = device.to_string();
         self.persist_control_update(format!("音频设备: {device}"))
     }
 
     pub fn cycle_replaygain_mode(&self) -> String {
         let mode = {
-            let mut config = self.config.write().unwrap();
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
             config.player.replaygain_mode = match config.player.replaygain_mode.as_str() {
                 "off" => "track",
                 "track" => "album",
@@ -256,7 +262,7 @@ impl AppContext {
 
     pub fn cycle_replaygain_preamp(&self) -> String {
         let preamp = {
-            let mut config = self.config.write().unwrap();
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
             config.player.replaygain_preamp =
                 next_replaygain_preamp(config.player.replaygain_preamp);
             config.player.replaygain_preamp
@@ -267,7 +273,7 @@ impl AppContext {
 
     pub fn cycle_channel_mode(&self) -> String {
         let mode = {
-            let mut config = self.config.write().unwrap();
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
             config.player.channel_mode = match config.player.channel_mode.as_str() {
                 "auto" => "stereo",
                 "stereo" => "mono",
@@ -284,7 +290,7 @@ impl AppContext {
 
     pub fn cycle_balance(&self) -> String {
         let balance = {
-            let mut config = self.config.write().unwrap();
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
             config.player.balance = next_balance(config.player.balance);
             config.player.balance
         };
@@ -294,7 +300,7 @@ impl AppContext {
 
     pub fn toggle_replaygain_clip(&self) -> String {
         let enabled = {
-            let mut config = self.config.write().unwrap();
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
             config.player.replaygain_clip = !config.player.replaygain_clip;
             config.player.replaygain_clip
         };
@@ -307,7 +313,7 @@ impl AppContext {
 
     pub fn cycle_equalizer_preset(&self) -> String {
         let bands = {
-            let mut config = self.config.write().unwrap();
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
             config.player.equalizer_bands = next_equalizer_preset(&config.player.equalizer_bands);
             config.player.equalizer_bands.clone()
         };
@@ -316,13 +322,13 @@ impl AppContext {
     }
 
     pub fn fade_in_now(&self) -> String {
-        let duration = self.config.read().unwrap().player.fade_in_ms.max(250);
+        let duration = self.config.read().unwrap_or_else(|e| e.into_inner()).player.fade_in_ms.max(250);
         self.player.fade_in(Duration::from_millis(duration));
         format!("已开始淡入（{}）", fade_duration_label(duration))
     }
 
     pub fn fade_out_now(&self) -> String {
-        let duration = self.config.read().unwrap().player.fade_out_ms.max(250);
+        let duration = self.config.read().unwrap_or_else(|e| e.into_inner()).player.fade_out_ms.max(250);
         self.player.fade_out(Duration::from_millis(duration));
         format!("已开始淡出（{}）", fade_duration_label(duration))
     }
@@ -332,13 +338,13 @@ impl AppContext {
         if start >= *self.duration.borrow() {
             return "无法设置 A 点：当前没有可循环的播放位置".to_string();
         }
-        *self.pending_ab_loop_start.lock().unwrap() = Some(start);
+        *self.pending_ab_loop_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(start);
         format!("A 点: {}", format_duration(start))
     }
 
     pub fn set_ab_loop_end_now(&self) -> String {
         let end = *self.position.borrow();
-        let mut pending = self.pending_ab_loop_start.lock().unwrap();
+        let mut pending = self.pending_ab_loop_start.lock().unwrap_or_else(|e| e.into_inner());
         let Some(start) = *pending else {
             return "请先设置 A 点".to_string();
         };
@@ -355,16 +361,54 @@ impl AppContext {
     }
 
     pub fn clear_ab_loop(&self) -> String {
-        *self.pending_ab_loop_start.lock().unwrap() = None;
+        *self.pending_ab_loop_start.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.player.clear_ab_loop();
         "已清除 A-B 循环".to_string()
     }
 
     fn persist_control_update(&self, message: String) -> String {
-        match crate::config::loader::save(&self.config.read().unwrap(), &self.config_path) {
-            Ok(()) => message,
-            Err(error) => format!("{message}（配置保存失败: {error}）"),
+        // 播放控制键可能被连按，这里只标记脏状态，由主循环合并写盘
+        self.mark_config_dirty();
+        message
+    }
+
+    /// 标记配置有待落盘（首次标记时开始计时）
+    pub fn mark_config_dirty(&self) {
+        let mut since = self
+            .config_dirty_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if since.is_none() {
+            *since = Some(std::time::Instant::now());
         }
+    }
+
+    /// 距首次修改超过防抖窗口后统一写盘一次；返回是否实际写入。
+    pub fn flush_dirty_config(&self) -> bool {
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+        let due = {
+            let mut since = self
+                .config_dirty_since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match *since {
+                Some(t) if t.elapsed() >= DEBOUNCE => {
+                    *since = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !due {
+            return false;
+        }
+        if let Err(error) = crate::config::loader::save(
+            &self.config.read().unwrap_or_else(|e| e.into_inner()),
+            &self.config_path,
+        ) {
+            tracing::warn!("save config failed: {error}");
+        }
+        true
     }
 }
 

@@ -629,7 +629,7 @@ mod tests {
             },
         ));
 
-        let pending = pending.lock().unwrap();
+        let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
         let latest = pending.as_ref().unwrap();
         assert_eq!(latest.path, "latest.png");
         assert_eq!(latest.id, 2);

@@ -1,6 +1,6 @@
-//! HTTP 客户端封装 — TODO: Phase 2
+//! HTTP 客户端封装
 //!
-//! 职责：统一 UA、超时、重试逻辑、代理支持
+//! 职责：统一 UA、超时（连接 + 整体）、瞬时错误自动重试、代理支持
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -26,12 +26,12 @@ fn options() -> &'static RwLock<NetworkOptions> {
 
 pub(crate) fn configure(proxy_url: &str, timeout_secs: u64) {
     {
-        let mut options = options().write().unwrap();
+        let mut options = options().write().unwrap_or_else(|e| e.into_inner());
         options.proxy_url = proxy_url.trim().to_string();
         options.timeout = Duration::from_secs(timeout_secs.clamp(1, 300));
     }
     // 代理或超时变化后重建全局客户端。
-    *client_store().write().unwrap() = Arc::new(build_client(&options().read().unwrap().clone()));
+    *client_store().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(build_client(&options().read().unwrap_or_else(|e| e.into_inner()).clone()));
 }
 
 /// 全局复用的 HTTP 客户端。
@@ -40,17 +40,20 @@ pub(crate) fn configure(proxy_url: &str, timeout_secs: u64) {
 /// 聚合搜索并发多个音源时内存和 CPU 都会被顶高；这里全局共享一个
 /// 客户端，代理/超时变化时由 `configure` 重建。
 pub fn client() -> reqwest::Client {
-    (**client_store().read().unwrap()).clone()
+    (**client_store().read().unwrap_or_else(|e| e.into_inner())).clone()
 }
 
 fn client_store() -> &'static RwLock<Arc<reqwest::Client>> {
     static CLIENT: OnceLock<RwLock<Arc<reqwest::Client>>> = OnceLock::new();
-    CLIENT.get_or_init(|| RwLock::new(Arc::new(build_client(&options().read().unwrap().clone()))))
+    CLIENT.get_or_init(|| RwLock::new(Arc::new(build_client(&options().read().unwrap_or_else(|e| e.into_inner()).clone()))))
 }
 
 fn build_client(options: &NetworkOptions) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .timeout(options.timeout)
+        // TCP 连接挂起时快速失败，而不是吃满整个整体超时
+        .connect_timeout(Duration::from_secs(8))
+        .pool_idle_timeout(Duration::from_secs(90))
         .user_agent("Mozilla/5.0 (compatible; voicefox/0.1)");
     if !options.proxy_url.is_empty() {
         match reqwest::Proxy::all(&options.proxy_url) {
@@ -59,4 +62,27 @@ fn build_client(options: &NetworkOptions) -> reqwest::Client {
         }
     }
     builder.build().expect("failed to build HTTP client")
+}
+
+/// 对瞬时网络错误执行最多 `retries` 次重试的 GET 请求。
+///
+/// 仅重试连接层失败（超时、连接被拒等），4xx/5xx 响应由调用方自行判断。
+pub(crate) async fn get_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    retries: usize,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 0;
+    loop {
+        match client.get(url).send().await {
+            Ok(resp) => return Ok(resp),
+            Err(error) if attempt < retries && (error.is_connect() || error.is_timeout()) => {
+                attempt += 1;
+                let backoff = std::time::Duration::from_millis(200 * (1 << attempt.min(4)));
+                tracing::warn!("request failed (attempt {attempt}), retrying in {backoff:?}: {error}");
+                tokio::time::sleep(backoff).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }

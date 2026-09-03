@@ -106,13 +106,8 @@ async fn download_lyric(
 pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
     let client = http::client();
 
-    let (id, accesskey) = match search_lyric(&client, song).await {
-        Ok(result) => result,
-        Err(_) => {
-            // 任何搜索错误都返回空歌词，不 panic
-            return Ok(LyricData::default());
-        }
-    };
+    // 搜索失败（含网络错误）向上传播，调用方据此区分“确认无词”与“暂时不可用”
+    let (id, accesskey) = search_lyric(&client, song).await?;
 
     if let Ok(encrypted) = download_lyric(&client, &id, &accesskey, "krc").await
         && let Ok(krc) = super::crypto::decrypt_krc(&encrypted)

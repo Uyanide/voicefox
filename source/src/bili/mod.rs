@@ -126,15 +126,15 @@ impl BiliSource {
     }
 
     pub fn is_logged_in(&self) -> bool {
-        self.session.read().unwrap().has_login_cookie()
+        self.session.read().unwrap_or_else(|e| e.into_inner()).has_login_cookie()
     }
 
     pub fn session(&self) -> BiliSession {
-        self.session.read().unwrap().clone()
+        self.session.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn user(&self) -> Option<BiliUser> {
-        let session = self.session.read().unwrap();
+        let session = self.session.read().unwrap_or_else(|e| e.into_inner());
         match (
             session.user_name.clone(),
             session.user_id.clone(),
@@ -161,7 +161,7 @@ impl BiliSource {
 
     pub fn logout(&self) -> Result<(), String> {
         self.session_generation.fetch_add(1, Ordering::SeqCst);
-        *self.session.write().unwrap() = BiliSession::default();
+        *self.session.write().unwrap_or_else(|e| e.into_inner()) = BiliSession::default();
         remove_session_file()
     }
 
@@ -182,7 +182,7 @@ impl BiliSource {
         }
         let user = parse_user(&json)?;
         {
-            let mut session = self.session.write().unwrap();
+            let mut session = self.session.write().unwrap_or_else(|e| e.into_inner());
             if self.session_generation.load(Ordering::SeqCst) != generation {
                 drop(session);
                 return Ok(self.is_logged_in().then(|| self.user()).flatten());
@@ -275,7 +275,7 @@ impl BiliSource {
         headers: &reqwest::header::HeaderMap,
         data: &Value,
     ) -> Result<(), String> {
-        let mut session = self.session.write().unwrap().clone();
+        let mut session = self.session.write().unwrap_or_else(|e| e.into_inner()).clone();
         for value in headers.get_all(reqwest::header::SET_COOKIE) {
             if let Ok(value) = value.to_str() {
                 parse_cookie_pair(value, &mut session);
@@ -302,7 +302,7 @@ impl BiliSource {
             return Err("哔哩哔哩登录成功，但没有收到会话 cookie".to_string());
         }
         save_session(&session)?;
-        *self.session.write().unwrap() = session;
+        *self.session.write().unwrap_or_else(|e| e.into_inner()) = session;
         self.session_generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -344,7 +344,7 @@ impl BiliSource {
             .get(url)
             .header("User-Agent", USER_AGENT)
             .header("Referer", BILI_REFERER);
-        if let Some(cookie) = self.session.read().unwrap().cookie_header() {
+        if let Some(cookie) = self.session.read().unwrap_or_else(|e| e.into_inner()).cookie_header() {
             request = request.header("Cookie", cookie);
         }
         request
@@ -357,7 +357,7 @@ impl BiliSource {
     }
 
     async fn wbi_keys(&self) -> Result<WbiKeys, String> {
-        if let Some(keys) = self.wbi_keys.read().unwrap().clone() {
+        if let Some(keys) = self.wbi_keys.read().unwrap_or_else(|e| e.into_inner()).clone() {
             return Ok(keys);
         }
         let json = self
@@ -372,7 +372,7 @@ impl BiliSource {
             return Err("哔哩哔哩 WBI 密钥为空".to_string());
         }
         let keys = WbiKeys { img_key, sub_key };
-        *self.wbi_keys.write().unwrap() = Some(keys.clone());
+        *self.wbi_keys.write().unwrap_or_else(|e| e.into_inner()) = Some(keys.clone());
         Ok(keys)
     }
 
@@ -395,7 +395,7 @@ impl BiliSource {
         if b3.is_none() && b4.is_none() {
             return Ok(());
         }
-        let mut session = self.session.write().unwrap();
+        let mut session = self.session.write().unwrap_or_else(|e| e.into_inner());
         session.buvid3 = b3;
         session.buvid4 = b4;
         save_session(&session)?;
@@ -414,7 +414,7 @@ impl BiliSource {
             return Ok(json);
         }
 
-        *self.wbi_keys.write().unwrap() = None;
+        *self.wbi_keys.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.get_json(endpoint, params, true).await
     }
 }

@@ -248,7 +248,7 @@ impl MpvEngine {
     }
 
     fn play_inner(&self, url: &str, generation: u64, headers: &[(String, String)]) -> bool {
-        let _play_guard = self.play_lock.lock().unwrap();
+        let _play_guard = self.play_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.generation.load(Ordering::SeqCst) != generation {
             return false;
         }
@@ -288,7 +288,7 @@ impl MpvEngine {
         if let Err(error) = result {
             warn!("libmpv clear A-B loop failed: {error}");
         }
-        *self.ab_loop.lock().unwrap() = None;
+        *self.ab_loop.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn cancel_fade_internal(&self) {
@@ -537,7 +537,7 @@ fn apply_pending_seek(
         && let Err(error) = event_client.set_property("time-pos", position.as_secs_f64())
     {
         warn!("libmpv deferred seek failed: {error}");
-        *pending_seek.lock().unwrap() = Some((generation, position));
+        *pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = Some((generation, position));
     }
 }
 
@@ -545,7 +545,7 @@ fn take_pending_seek(
     pending_seek: &Mutex<Option<(u64, Duration)>>,
     generation: u64,
 ) -> Option<Duration> {
-    let mut pending = pending_seek.lock().unwrap();
+    let mut pending = pending_seek.lock().unwrap_or_else(|e| e.into_inner());
     match *pending {
         Some((pending_generation, position)) if pending_generation == generation => {
             pending.take();
@@ -708,11 +708,11 @@ fn normalize_ab_loop(loop_points: AbLoop) -> Option<AbLoop> {
 
 impl Player for MpvEngine {
     fn prepare(&self) -> u64 {
-        let _play_guard = self.play_lock.lock().unwrap();
+        let _play_guard = self.play_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.cancel_fade_internal();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.paused.store(false, Ordering::SeqCst);
-        *self.pending_seek.lock().unwrap() = None;
+        *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.clear_ab_loop_locked();
         let _ = self.state_tx.send(PlayerState::Loading);
         let _ = self.position_tx.send(Duration::ZERO);
@@ -757,11 +757,11 @@ impl Player for MpvEngine {
     }
 
     fn stop(&self) {
-        let _play_guard = self.play_lock.lock().unwrap();
+        let _play_guard = self.play_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.cancel_fade_internal();
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
-        *self.pending_seek.lock().unwrap() = None;
+        *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.clear_ab_loop_locked();
         if let Err(error) = self.mpv.command("stop", &[]) {
             warn!("libmpv stop failed: {error}");
@@ -791,7 +791,7 @@ impl Player for MpvEngine {
         if *self.state_rx.borrow() == PlayerState::Loading {
             // 文件尚未加载完成：只记录待定 seek，进度条先行展示目标位置
             let generation = self.generation.load(Ordering::SeqCst);
-            *self.pending_seek.lock().unwrap() = Some((generation, position));
+            *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = Some((generation, position));
             let _ = self.position_tx.send(position);
             let _ = self.audible_position_tx.send(position);
             return;
@@ -828,7 +828,7 @@ impl Player for MpvEngine {
     }
 
     fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<PlayerEvent>> {
-        self.event_rx.lock().unwrap().take()
+        self.event_rx.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn volume(&self) -> u32 {
@@ -873,7 +873,7 @@ impl Player for MpvEngine {
     }
 
     fn audio_output_device(&self) -> String {
-        self.audio_device.lock().unwrap().clone()
+        self.audio_device.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set_audio_output_device(&self, device: &str) {
@@ -889,12 +889,12 @@ impl Player for MpvEngine {
         } else {
             device
         };
-        let _play_guard = self.play_lock.lock().unwrap();
+        let _play_guard = self.play_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(error) = self.mpv.set_property("audio-device", device) {
             warn!("libmpv set_audio_output_device failed: {error}");
             return;
         }
-        *self.audio_device.lock().unwrap() = device.to_string();
+        *self.audio_device.lock().unwrap_or_else(|e| e.into_inner()) = device.to_string();
     }
 
     fn replaygain_mode(&self) -> ReplayGainMode {
@@ -968,7 +968,7 @@ impl Player for MpvEngine {
             return;
         };
 
-        let _play_guard = self.play_lock.lock().unwrap();
+        let _play_guard = self.play_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Adding an existing label replaces that filter atomically. Clearing
         // removes only Voicefox's filter and leaves other filters untouched.
         let result = match format_balance_filter(balance) {
@@ -983,7 +983,7 @@ impl Player for MpvEngine {
     }
 
     fn ab_loop(&self) -> Option<AbLoop> {
-        *self.ab_loop.lock().unwrap()
+        *self.ab_loop.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn set_ab_loop(&self, loop_points: Option<AbLoop>) {
@@ -998,7 +998,7 @@ impl Player for MpvEngine {
             None => None,
         };
 
-        let _play_guard = self.play_lock.lock().unwrap();
+        let _play_guard = self.play_lock.lock().unwrap_or_else(|e| e.into_inner());
         let result = match loop_points {
             Some(points) => self
                 .mpv
@@ -1014,11 +1014,11 @@ impl Player for MpvEngine {
             warn!("libmpv set_ab_loop failed: {error}");
             return;
         }
-        *self.ab_loop.lock().unwrap() = loop_points;
+        *self.ab_loop.lock().unwrap_or_else(|e| e.into_inner()) = loop_points;
     }
 
     fn equalizer_bands(&self) -> Vec<EqualizerBand> {
-        self.equalizer_bands.lock().unwrap().clone()
+        self.equalizer_bands.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set_equalizer_bands(&self, bands: &[EqualizerBand]) {
@@ -1027,7 +1027,7 @@ impl Player for MpvEngine {
             return;
         }
 
-        let _play_guard = self.play_lock.lock().unwrap();
+        let _play_guard = self.play_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Adding an existing label replaces that filter atomically in mpv.
         // Clearing removes only our label and leaves caller/automatic filters.
         let result = match format_equalizer_filter(bands) {
@@ -1038,7 +1038,7 @@ impl Player for MpvEngine {
             warn!("libmpv set_equalizer_bands failed: {error}");
             return;
         }
-        *self.equalizer_bands.lock().unwrap() = bands.to_vec();
+        *self.equalizer_bands.lock().unwrap_or_else(|e| e.into_inner()) = bands.to_vec();
     }
 
     fn fade_in(&self, duration: Duration) {
@@ -1061,7 +1061,7 @@ impl Drop for MpvEngine {
         self.shutdown.store(true, Ordering::SeqCst);
         self.cancel_fade_internal();
         let _ = self.mpv.command("stop", &[]);
-        if let Some(event_thread) = self.event_thread.lock().unwrap().take()
+        if let Some(event_thread) = self.event_thread.lock().unwrap_or_else(|e| e.into_inner()).take()
             && event_thread.join().is_err()
         {
             warn!("libmpv event thread panicked");
@@ -1144,7 +1144,7 @@ mod tests {
         let pending = Mutex::new(Some((4, Duration::from_secs(12))));
 
         assert_eq!(take_pending_seek(&pending, 5), None);
-        assert!(pending.lock().unwrap().is_none());
+        assert!(pending.lock().unwrap_or_else(|e| e.into_inner()).is_none());
     }
 
     #[test]

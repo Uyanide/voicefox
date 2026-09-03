@@ -87,7 +87,7 @@ pub fn selection_fg(ctx: &AppContext) -> Color {
 }
 
 fn configured(ctx: &AppContext, value: fn(&ThemeConfig) -> &String, fallback: Color) -> Color {
-    let config = ctx.config.read().unwrap();
+    let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
     parse(value(&config.theme), fallback)
 }
 

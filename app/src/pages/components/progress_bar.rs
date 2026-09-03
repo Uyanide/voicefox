@@ -38,7 +38,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         .render(area, buf);
         return;
     }
-    let bar_width = area.width.saturating_sub(16) as usize;
+    let bar_width = area.width.saturating_sub(13) as usize;
     let filled = (bar_width as f64 * ratio) as usize;
     let empty = bar_width.saturating_sub(filled);
 
@@ -75,7 +75,7 @@ pub fn seek_position(area: Rect, column: u16, duration: Duration) -> Option<Dura
     }
 
     let bar_x = area.x.saturating_add(7);
-    let bar_width = area.width.saturating_sub(16).max(1);
+    let bar_width = area.width.saturating_sub(13).max(1);
     let offset = column
         .saturating_sub(bar_x)
         .min(bar_width.saturating_sub(1));
@@ -110,10 +110,11 @@ mod tests {
             Some(Duration::from_secs(0))
         );
         assert_eq!(
-            seek_position(area, 100, duration),
+            seek_position(area, 103, duration),
             Some(Duration::from_secs(200))
         );
-        let middle = seek_position(area, 58, duration).unwrap();
+        // 进度条从 x=17 起、宽 87 列（覆盖 17..=103），真实中点在 60 列附近
+        let middle = seek_position(area, 60, duration).unwrap();
         assert!((middle.as_secs_f64() - 100.0).abs() < 2.0);
     }
 

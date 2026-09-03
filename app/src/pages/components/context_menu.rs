@@ -37,6 +37,8 @@ pub enum SongMenuAction {
     ClearHistory,
     DeleteLocal,
     RemoveFromCustomPlaylist(String),
+    ViewArtist,
+    ViewAlbum,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +162,19 @@ impl SongContextMenu {
             },
             action: SongMenuAction::ToggleFavorite,
         });
+        let song = &songs[index];
+        if !song.singer.trim().is_empty() {
+            root_items.push(MenuItem {
+                label: "查看歌手".to_string(),
+                action: SongMenuAction::ViewArtist,
+            });
+        }
+        if !song.album_name.trim().is_empty() {
+            root_items.push(MenuItem {
+                label: "查看专辑".to_string(),
+                action: SongMenuAction::ViewAlbum,
+            });
+        }
         if playback.is_some() {
             root_items.push(MenuItem {
                 label: "播放控制...".to_string(),

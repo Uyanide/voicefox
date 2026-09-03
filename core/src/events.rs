@@ -116,6 +116,10 @@ pub enum AppAction {
     BiliLogin,
     BiliLogout,
     BiliLoginSuccess,
+    /// 打开歌手详情页（从歌曲右键菜单进入）。
+    ShowArtistDetails(Box<SongInfo>),
+    /// 打开专辑详情页（从歌曲右键菜单或歌手页专辑列表进入）。
+    ShowAlbumDetails(Box<crate::model::playlist::Album>),
     None,
 }
 

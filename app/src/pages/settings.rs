@@ -335,7 +335,7 @@ impl SettingsPage {
                 return action;
             }
 
-            let sources = ctx.config.read().unwrap().source.js_sources.clone();
+            let sources = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.clone();
 
             if let Some(action) = bound_action {
                 match action {
@@ -419,13 +419,13 @@ impl SettingsPage {
                     self.update_config(ctx, |config| {
                         config.ui.show_cover = !config.ui.show_cover;
                     });
-                    if !ctx.config.read().unwrap().ui.show_cover {
+                    if !ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.show_cover {
                         ctx.cover_service.clear();
                     }
                 }
                 (KeyModifiers::NONE, KeyCode::Char('e')) => {
                     let enabled = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         config.player.remember_playback_state =
                             !config.player.remember_playback_state;
                         let enabled = config.player.remember_playback_state;
@@ -455,7 +455,7 @@ impl SettingsPage {
                 (KeyModifiers::SHIFT, KeyCode::Char('H' | 'h'))
                 | (KeyModifiers::NONE, KeyCode::Char('H')) => {
                     let limit = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         config.player.history_limit =
                             next_history_limit(config.player.history_limit);
                         let limit = config.player.history_limit;
@@ -487,7 +487,7 @@ impl SettingsPage {
                 (KeyModifiers::SHIFT, KeyCode::Char('T' | 't'))
                 | (KeyModifiers::NONE, KeyCode::Char('T')) => {
                     let enabled = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         config.lyric.show_translation = !config.lyric.show_translation;
                         let enabled = config.lyric.show_translation;
                         self.status_msg =
@@ -499,7 +499,7 @@ impl SettingsPage {
                 (KeyModifiers::SHIFT, KeyCode::Char('Y' | 'y'))
                 | (KeyModifiers::NONE, KeyCode::Char('Y')) => {
                     let enabled = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         config.lyric.show_yrc = !config.lyric.show_yrc;
                         let enabled = config.lyric.show_yrc;
                         self.status_msg =
@@ -515,14 +515,14 @@ impl SettingsPage {
                     self.adjust_lyric_offset(ctx, 100);
                 }
                 (KeyModifiers::NONE, KeyCode::Char('n')) => {
-                    self.proxy_input = ctx.config.read().unwrap().network.proxy_url.clone();
+                    self.proxy_input = ctx.config.read().unwrap_or_else(|e| e.into_inner()).network.proxy_url.clone();
                     self.proxy_input_mode = true;
                     self.status_msg = None;
                 }
                 (KeyModifiers::SHIFT, KeyCode::Char('N' | 'n'))
                 | (KeyModifiers::NONE, KeyCode::Char('N')) => {
                     let (proxy, timeout) = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         config.network.timeout = next_network_timeout(config.network.timeout);
                         let values = (config.network.proxy_url.clone(), config.network.timeout);
                         self.status_msg =
@@ -599,7 +599,7 @@ impl SettingsPage {
                 (KeyModifiers::NONE, KeyCode::Char('m')) => {
                     let mode = ctx.playlist.cycle_mode();
                     let result = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         config.player.play_mode = mode.as_config().to_string();
                         crate::config::loader::save(&config, &ctx.config_path)
                     };
@@ -653,7 +653,7 @@ impl SettingsPage {
                 self.status_msg = Some(ctx.cycle_playback_speed());
             }
             Action::SettingsEditAudioDevice => {
-                self.audio_device_input = ctx.config.read().unwrap().player.audio_device.clone();
+                self.audio_device_input = ctx.config.read().unwrap_or_else(|e| e.into_inner()).player.audio_device.clone();
                 self.audio_device_input_mode = true;
                 self.status_msg = Some("输入 libmpv 音频设备名，Enter 保存".to_string());
             }
@@ -674,7 +674,7 @@ impl SettingsPage {
             }
             Action::SettingsCycleFadeInDuration => {
                 let duration = {
-                    let mut config = ctx.config.write().unwrap();
+                    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.player.fade_in_ms = next_fade_duration(config.player.fade_in_ms);
                     let value = config.player.fade_in_ms;
                     self.status_msg =
@@ -685,7 +685,7 @@ impl SettingsPage {
             }
             Action::SettingsCycleFadeOutDuration => {
                 let duration = {
-                    let mut config = ctx.config.write().unwrap();
+                    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.player.fade_out_ms = next_fade_duration(config.player.fade_out_ms);
                     let value = config.player.fade_out_ms;
                     self.status_msg =
@@ -743,7 +743,7 @@ impl SettingsPage {
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 let proxy = self.proxy_input.trim().to_string();
                 let timeout = {
-                    let mut config = ctx.config.write().unwrap();
+                    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.network.proxy_url = proxy.clone();
                     let timeout = config.network.timeout;
                     self.status_msg =
@@ -827,7 +827,7 @@ impl SettingsPage {
 
     fn cycle_default_source(&mut self, ctx: &AppContext) {
         let (default, enabled) = {
-            let config = ctx.config.read().unwrap();
+            let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
             (config.source.default, config.source.enabled.clone())
         };
         if enabled.is_empty() {
@@ -840,7 +840,7 @@ impl SettingsPage {
             .unwrap_or(0);
         let default = enabled[(current + 1) % enabled.len()];
         let save_result = {
-            let mut config = ctx.config.write().unwrap();
+            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             config.source.default = default;
             crate::config::loader::save(&config, &ctx.config_path)
         };
@@ -853,9 +853,12 @@ impl SettingsPage {
     }
 
     fn toggle_selected_source(&mut self, ctx: &AppContext) {
-        let source = SourceId::all_online()[self.enabled_source_index];
+        // 与渲染处一致对列表长度取模，防止索引越界 panic
+        let sources = SourceId::all_online();
+        self.enabled_source_index %= sources.len();
+        let source = sources[self.enabled_source_index];
         let (default, enabled, save_result) = {
-            let mut config = ctx.config.write().unwrap();
+            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             if config.source.enabled.contains(&source) {
                 if config.source.enabled.len() == 1 {
                     self.status_msg = Some("至少需要保留一个在线音源".to_string());
@@ -897,7 +900,7 @@ impl SettingsPage {
 
     fn adjust_lyric_offset(&mut self, ctx: &AppContext, delta: i32) {
         let offset = {
-            let mut config = ctx.config.write().unwrap();
+            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             config.lyric.offset = config
                 .lyric
                 .offset
@@ -922,7 +925,7 @@ impl SettingsPage {
                 if !self.local_path_input.trim().is_empty() {
                     let path = self.local_path_input.trim().to_string();
                     let save_result = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         if !config.local_music.paths.contains(&path) {
                             config.local_music.paths.push(path.clone());
                             config.local_music.enabled = true;
@@ -930,7 +933,7 @@ impl SettingsPage {
                         crate::config::loader::save(&config, &ctx.config_path)
                     };
                     let (paths, max_depth) = {
-                        let config = ctx.config.read().unwrap();
+                        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
                         (
                             config.local_music.paths.clone(),
                             config.local_music.max_depth,
@@ -972,7 +975,7 @@ impl SettingsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> Option<AppAction> {
-        let paths = ctx.config.read().unwrap().local_music.paths.clone();
+        let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
 
         if let Some(action) = resolver.resolve_page("settings", &key) {
             match action {
@@ -1028,7 +1031,7 @@ impl SettingsPage {
                     self.delete_local_path_armed = None;
                     let removed = paths[self.selected_local_path].clone();
                     let save_result = {
-                        let mut config = ctx.config.write().unwrap();
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                         config.local_music.paths.retain(|p| p != &removed);
                         config.local_music.enabled = !config.local_music.paths.is_empty();
                         crate::config::loader::save(&config, &ctx.config_path)
@@ -1037,7 +1040,7 @@ impl SettingsPage {
                         self.selected_local_path = self.selected_local_path.saturating_sub(1);
                     }
                     let (remaining, max_depth) = {
-                        let config = ctx.config.read().unwrap();
+                        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
                         (
                             config.local_music.paths.clone(),
                             config.local_music.max_depth,
@@ -1056,7 +1059,7 @@ impl SettingsPage {
                 Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Char('r')) => {
-                let max_depth = ctx.config.read().unwrap().local_music.max_depth;
+                let max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
                 self.status_msg = Some("正在扫描本地音乐...".to_string());
                 Some(AppAction::ScanLocalMusic {
                     paths,
@@ -1123,7 +1126,7 @@ impl SettingsPage {
     fn toggle_status_bar_item(&mut self, ctx: &AppContext) {
         let item = StatusBarItem::ALL[self.selected_status_item % StatusBarItem::ALL.len()];
         let (enabled, result) = {
-            let mut config = ctx.config.write().unwrap();
+            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             if config.ui.status_bar_items.contains(&item) {
                 config
                     .ui
@@ -1150,7 +1153,7 @@ impl SettingsPage {
     fn move_status_bar_item(&mut self, ctx: &AppContext, direction: isize) {
         let item = StatusBarItem::ALL[self.selected_status_item % StatusBarItem::ALL.len()];
         let (position, result) = {
-            let mut config = ctx.config.write().unwrap();
+            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             let Some(index) = config
                 .ui
                 .status_bar_items
@@ -1191,7 +1194,7 @@ impl SettingsPage {
         }
 
         let (position, result) = {
-            let mut config = ctx.config.write().unwrap();
+            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             if !config.ui.status_bar_items.contains(&item) {
                 self.status_msg = Some("请先启用这个状态栏字段".to_string());
                 return;
@@ -1220,7 +1223,7 @@ impl SettingsPage {
         update: impl FnOnce(&mut lx_core::model::config::Config),
     ) {
         let result = {
-            let mut config = ctx.config.write().unwrap();
+            let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             update(&mut config);
             crate::config::loader::save(&config, &ctx.config_path)
         };
@@ -1231,7 +1234,7 @@ impl SettingsPage {
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-        let config = ctx.config.read().unwrap();
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         let sources = &config.source.js_sources;
         let local_paths = &config.local_music.paths;
         let accent = crate::theme::accent(ctx);
@@ -1614,7 +1617,7 @@ impl SettingsPage {
                 .source_health_checking
                 .load(std::sync::atomic::Ordering::Relaxed);
             let health_line = {
-                let health = ctx.source_health.read().unwrap();
+                let health = ctx.source_health.read().unwrap_or_else(|e| e.into_inner());
                 if checking {
                     " 音源检测中…".to_string()
                 } else if health.is_empty() {
@@ -2025,12 +2028,12 @@ impl SettingsPage {
                         .min(StatusBarItem::ALL.len().saturating_sub(1));
                     self.focus = SettingsFocus::StatusBar;
                 } else if chunks[2].contains(position) {
-                    let len = ctx.config.read().unwrap().local_music.paths.len();
+                    let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.len();
                     self.selected_local_path =
                         (self.selected_local_path + 1).min(len.saturating_sub(1));
                     self.focus = SettingsFocus::LocalPaths;
                 } else if chunks[1].contains(position) {
-                    let len = ctx.config.read().unwrap().source.js_sources.len();
+                    let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.len();
                     self.selected_source = (self.selected_source + 1).min(len.saturating_sub(1));
                     self.focus = SettingsFocus::JsSources;
                 }
@@ -2113,7 +2116,7 @@ impl SettingsPage {
                     }
                     let rows = source_inner.height.saturating_sub(3) as usize;
                     if let Some(row) = list_row_at(source_inner, position, rows) {
-                        let len = ctx.config.read().unwrap().source.js_sources.len();
+                        let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.len();
                         let start = list_window_start(self.selected_source, len, rows);
                         let index = start + row;
                         if index < len {
@@ -2154,7 +2157,7 @@ impl SettingsPage {
                     }
                     let rows = local_inner.height.saturating_sub(3) as usize;
                     if let Some(row) = list_row_at(local_inner, position, rows) {
-                        let len = ctx.config.read().unwrap().local_music.paths.len();
+                        let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.len();
                         let start = list_window_start(self.selected_local_path, len, rows);
                         let index = start + row;
                         if index < len {

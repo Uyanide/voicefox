@@ -51,7 +51,7 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     ])
     .render(columns[0], buf);
 
-    let song = ctx.current_song.read().unwrap();
+    let song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
     let (title, detail) = song.as_ref().map_or_else(
         || ("暂无播放".to_string(), "使用搜索添加歌曲".to_string()),
         |song| {
