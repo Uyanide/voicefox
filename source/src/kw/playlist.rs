@@ -7,6 +7,7 @@ use lx_core::traits::source::FetchError;
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 const PLAYLIST_PAGE_SIZE: usize = 36;
 const MAX_PLAYLIST_REQUESTS: u32 = 4;
@@ -44,7 +45,7 @@ async fn fetch_list_page(page: u32) -> Result<Vec<Value>, FetchError> {
     );
     let json: Value = http::client()
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()
@@ -109,7 +110,7 @@ async fn fetch_detail_page(id: &str, page: u32, page_size: u32) -> Result<Value,
     let json: Value = http::client()
         .get(url)
         .header("Referer", "http://www.kuwo.cn/")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()
@@ -164,7 +165,7 @@ async fn resolve_digest_five_id(id: &str) -> Result<String, FetchError> {
     );
     let json: Value = http::client()
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()

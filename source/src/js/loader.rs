@@ -3,6 +3,7 @@
 //! 从 URL 下载 JS 脚本，缓存到 `~/.config/lx-tui/sources/` 目录
 
 use std::path::Path;
+use crate::http::SendWithRetry;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -175,7 +176,7 @@ async fn download_source_with_policy(
 
     let response = client
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| format!("下载 JS 音源失败（网络错误）: {e}"));
 

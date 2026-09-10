@@ -4,6 +4,7 @@
 //! 使用 eapi 加密，form-urlencoded body
 
 use std::collections::BTreeSet;
+use crate::http::SendWithRetry;
 use std::time::Duration;
 
 use lx_core::model::song::SongInfo;
@@ -54,7 +55,7 @@ pub async fn search(keyword: &str, page: u32, limit: u32) -> Result<SearchResult
         .header("origin", "https://music.163.com")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!("params={}", encrypted))
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| SearchError::Network(e.to_string()))?;
 

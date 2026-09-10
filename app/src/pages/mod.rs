@@ -4,6 +4,7 @@ pub mod bili_login;
 pub mod details;
 pub mod components;
 pub mod favorites;
+pub mod help;
 pub mod history;
 pub mod leaderboard;
 pub mod local_music;

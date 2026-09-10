@@ -4,11 +4,12 @@ use lx_core::traits::source::{SearchError, SearchResult};
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub async fn get_boards() -> Result<Vec<LeaderboardInfo>, SearchError> {
     let json: Value = http::client()
         .get("https://music.163.com/api/toplist")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()
@@ -48,7 +49,7 @@ pub async fn get_list(board_id: &str, page: u32, limit: u32) -> Result<SearchRes
         format!("https://music.163.com/api/v3/playlist/detail?id={board_id}&n={requested}&s=0");
     let json: Value = http::client()
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()

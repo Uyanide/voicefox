@@ -8,11 +8,12 @@ use lx_core::traits::source::{SearchError, SearchResult};
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub async fn get_boards() -> Result<Vec<LeaderboardInfo>, SearchError> {
     let json: Value = http::client()
         .get("http://qukudata.kuwo.cn/q.k?op=query&cont=tree&node=2&pn=0&rn=1000&fmt=json&level=2")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()
@@ -53,7 +54,7 @@ pub async fn get_list(board_id: &str, page: u32, limit: u32) -> Result<SearchRes
     );
     let json: Value = http::client()
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()

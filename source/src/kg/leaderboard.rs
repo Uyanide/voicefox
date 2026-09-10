@@ -10,11 +10,12 @@ use lx_core::traits::source::{SearchError, SearchResult};
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub async fn get_boards() -> Result<Vec<LeaderboardInfo>, SearchError> {
     let json: Value = http::client()
         .get("http://mobilecdnbj.kugou.com/api/v5/rank/list?version=9108&plat=0&showtype=2&parentid=0&apiver=6&area_code=1&withsong=1")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()
@@ -65,7 +66,7 @@ pub async fn get_list(rank_id: &str, page: u32, limit: u32) -> Result<SearchResu
     );
     let json: Value = http::client()
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()

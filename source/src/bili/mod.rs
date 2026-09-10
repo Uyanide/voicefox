@@ -23,6 +23,7 @@ use lx_core::model::source::{Quality, SourceId};
 use lx_core::traits::source::{FetchError, MusicSource, SearchError, SearchResult, SongUrl};
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub(crate) fn looks_like_video_reference(input: &str) -> bool {
     search::looks_like_video_reference(input)
@@ -200,7 +201,7 @@ impl BiliSource {
             .get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
             .header("User-Agent", USER_AGENT)
             .header("Referer", BILI_REFERER)
-            .send()
+            .send_with_retry(crate::http::RETRY_ATTEMPTS)
             .await
             .map_err(|error| error.to_string())?
             .json::<Value>()
@@ -233,7 +234,7 @@ impl BiliSource {
             .get(url)
             .header("User-Agent", USER_AGENT)
             .header("Referer", BILI_REFERER)
-            .send()
+            .send_with_retry(crate::http::RETRY_ATTEMPTS)
             .await
             .map_err(|error| error.to_string())?;
         let headers = response.headers().clone();
@@ -348,7 +349,7 @@ impl BiliSource {
             request = request.header("Cookie", cookie);
         }
         request
-            .send()
+            .send_with_retry(crate::http::RETRY_ATTEMPTS)
             .await
             .map_err(|error| error.to_string())?
             .json::<Value>()

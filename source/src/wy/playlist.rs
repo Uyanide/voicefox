@@ -5,6 +5,7 @@ use lx_core::traits::source::{FetchError, SearchError};
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
     let offset = 30 * page.saturating_sub(1);
@@ -15,7 +16,7 @@ pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
     let json: Value = http::client()
         .get(url)
         .header("Referer", "https://music.163.com/")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()
@@ -36,7 +37,7 @@ pub async fn get_detail(id: &str, page: u32) -> Result<Vec<SongInfo>, FetchError
     let json: Value = http::client()
         .get(url)
         .header("Referer", "https://music.163.com/")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()
@@ -60,7 +61,7 @@ pub async fn search_list(keyword: &str, page: u32) -> Result<Vec<Playlist>, Sear
     let json: Value = http::client()
         .get(url)
         .header("Referer", "https://music.163.com/")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| SearchError::Network(e.to_string()))?
         .json()

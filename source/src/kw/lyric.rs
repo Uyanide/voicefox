@@ -7,6 +7,7 @@
 //!   - 逐字歌词 (lrcx=1):   zlib 解压 → base64 解码 → XOR 解密
 
 use lx_core::model::lyric::LyricData;
+use crate::http::SendWithRetry;
 use lx_core::model::song::SongInfo;
 use lx_core::traits::source::FetchError;
 
@@ -40,7 +41,7 @@ async fn fetch_raw_lyric(song_id: &str, with_lrcx: bool) -> Result<String, Fetch
     let client = http::client();
     let resp = client
         .get(&url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 

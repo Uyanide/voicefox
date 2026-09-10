@@ -4,6 +4,7 @@
 //! Step 2: GET http://lyrics.kugou.com/download → base64 解码 → KRC/LRC 文本
 
 use std::sync::OnceLock;
+use crate::http::SendWithRetry;
 
 use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
@@ -39,7 +40,7 @@ async fn search_lyric(
         .header("KG-RC", "1")
         .header("KG-THash", "expand_search_manager.cpp:852736169:451")
         .header("User-Agent", "KuGou2012-9020-ExpandSearchManager")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?
         .error_for_status()
@@ -83,7 +84,7 @@ async fn download_lyric(
 
     let resp = client
         .get(&url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?
         .error_for_status()

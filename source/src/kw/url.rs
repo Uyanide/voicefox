@@ -5,6 +5,7 @@
 //! 2. 调用 url API 获取播放地址，并校验响应为 http(s) 直链
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::http::SendWithRetry;
 
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::Quality;
@@ -46,7 +47,7 @@ async fn fetch_cover_url(client: &reqwest::Client, song_id: &str) -> Option<Stri
         .header("Referer", "http://www.kuwo.cn/")
         .header("csrf", song_id)
         .header("Cookie", format!("kw_token={}", song_id))
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .ok()?;
 
@@ -71,7 +72,11 @@ async fn fetch_artist_pic_url(client: &reqwest::Client, song_id: &str) -> Option
         song_id
     );
 
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = client
+        .get(&url)
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -142,7 +147,9 @@ fn truncate_chars(text: &str, max: usize) -> &str {
 
 /// 请求播放地址响应文本（不校验内容，由调用方判断是否为直链）
 async fn fetch_play_url(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
-    let resp = crate::http::get_with_retry(client, url, 2)
+    let resp = client
+        .get(url)
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 

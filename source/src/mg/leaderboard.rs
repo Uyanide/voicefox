@@ -6,6 +6,7 @@ use lx_core::traits::source::{SearchError, SearchResult};
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 5.1.1; Nexus 6 Build/LYZ28E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.115 Mobile Safari/537.36";
 
@@ -15,7 +16,7 @@ pub async fn get_boards() -> Result<Vec<LeaderboardInfo>, SearchError> {
         .header("Referer", "https://app.c.nf.migu.cn/")
         .header("channel", "0146921")
         .header("User-Agent", USER_AGENT)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()
@@ -48,7 +49,7 @@ pub async fn get_list(board_id: &str, page: u32, limit: u32) -> Result<SearchRes
         .header("Referer", "https://app.c.nf.migu.cn/")
         .header("channel", "0146921")
         .header("User-Agent", USER_AGENT)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()

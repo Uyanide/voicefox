@@ -6,6 +6,7 @@
 //! 3. 封面从 albumImgs[0] 取
 
 use lx_core::model::song::SongInfo;
+use crate::http::SendWithRetry;
 use lx_core::model::source::Quality;
 use lx_core::traits::source::{FetchError, SongUrl};
 
@@ -32,7 +33,7 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         .post(url)
         .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
         .form(&[("resourceId", copyright_id.as_str())])
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 

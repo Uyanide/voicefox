@@ -5,6 +5,7 @@ use lx_core::traits::source::FetchError;
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
     let body = serde_json::json!({
@@ -25,7 +26,7 @@ pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
         .post("https://u.y.qq.com/cgi-bin/musicu.fcg")
         .header("Referer", "https://y.qq.com/")
         .json(&body)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()
@@ -66,7 +67,7 @@ pub async fn get_detail(id: &str) -> Result<Vec<SongInfo>, FetchError> {
         .post("https://u.y.qq.com/cgi-bin/musicu.fcg")
         .header("Referer", "https://y.qq.com/")
         .json(&body)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()

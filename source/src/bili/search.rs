@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use super::{BILI_REFERER, BiliSource, USER_AGENT};
 use crate::http;
+use crate::http::SendWithRetry;
 
 const SEARCH_ENDPOINT: &str = "https://api.bilibili.com/x/web-interface/wbi/search/type";
 const VIEW_ENDPOINT: &str = "https://api.bilibili.com/x/web-interface/view";
@@ -68,7 +69,7 @@ async fn resolve_video_reference(input: &str) -> Result<Option<VideoReference>, 
         .get(short_url)
         .header("User-Agent", USER_AGENT)
         .header("Referer", BILI_REFERER)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(format!("哔哩哔哩短链展开失败: {error}")))?;
     let final_url = response.url().to_string();

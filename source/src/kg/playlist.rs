@@ -9,6 +9,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
     let url = format!(
@@ -16,7 +17,7 @@ pub async fn get_list(page: u32) -> Result<Vec<Playlist>, FetchError> {
     );
     let json: Value = http::client()
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()
@@ -36,7 +37,7 @@ pub async fn get_detail(raw_id: &str) -> Result<Vec<SongInfo>, FetchError> {
     let url = format!("http://www2.kugou.kugou.com/yueku/v9/special/single/{id}-5-9999.html");
     let html = http::client()
         .get(url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .text()

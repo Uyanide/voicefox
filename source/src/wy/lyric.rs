@@ -4,6 +4,7 @@
 //! 使用 eapi 加密
 
 use std::sync::OnceLock;
+use crate::http::SendWithRetry;
 
 use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
@@ -59,7 +60,7 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
         .header("origin", "https://music.163.com")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!("params={}", encrypted))
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 

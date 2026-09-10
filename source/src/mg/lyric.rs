@@ -1,6 +1,7 @@
 //! mg 歌词获取（MRC 逐字歌词 + LRC + TRC）
 
 use std::sync::OnceLock;
+use crate::http::SendWithRetry;
 
 use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
@@ -19,7 +20,7 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Fet
         .header("Referer", REFERER)
         .header("User-Agent", USER_AGENT)
         .header("channel", "0146921")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?
         .error_for_status()
@@ -37,7 +38,7 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, Fetch
         .header("Referer", REFERER)
         .header("User-Agent", USER_AGENT)
         .header("channel", "0146921")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?
         .error_for_status()

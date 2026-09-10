@@ -4,6 +4,7 @@
 //! 返回 base64 编码的歌词，需要解码
 
 use lx_core::model::lyric::LyricData;
+use crate::http::SendWithRetry;
 use lx_core::model::song::SongInfo;
 use lx_core::traits::source::FetchError;
 use serde_json::Value;
@@ -67,7 +68,7 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
         .header("User-Agent", "QQMusic 14090508(android 12)")
         .header("Content-Type", "application/json")
         .body(body_str)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 

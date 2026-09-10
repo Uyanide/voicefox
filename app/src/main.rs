@@ -629,6 +629,8 @@ fn run_app(
     let mut ui_areas = UiAreas::default();
     let mut click_tracker = ClickTracker::default();
     let mut bili_login_page: Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>> = None;
+    // 快捷键说明浮层（? / F1 开关）
+    let mut help_page: Option<pages::help::HelpPage> = None;
     let mut bili_poll_deadline: Instant = Instant::now();
     let mut bili_generate_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut bili_poll_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1282,6 +1284,64 @@ fn run_app(
         // 高频配置修改（音量/播放控制）合并落盘
         ctx.flush_dirty_config();
 
+        // 歌手详情页滚动接近末尾时自动追加下一页
+        let spawn_more = {
+            let guard = ctx
+                .details_page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().and_then(|page| {
+                if page.wants_more_songs() {
+                    page.artist_target()
+                        .map(|artist| (artist.clone(), page.songs_page() + 1))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((artist, next_page)) = spawn_more {
+            if let Some(page) = ctx
+                .details_page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                page.mark_loading_more();
+            }
+            let manager = Arc::clone(&ctx.source_manager);
+            let details = Arc::clone(&ctx.details_page);
+            rt.spawn(async move {
+                let albums = manager
+                    .artist_albums(&artist, next_page, 100)
+                    .await
+                    .unwrap_or_default();
+                let songs = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    manager.artist_songs(&artist, next_page, 100),
+                )
+                .await;
+                let mut guard = details.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(page) = guard.as_mut() else {
+                    return;
+                };
+                // 用户可能已切换到其他歌手/专辑，追加前校验目标
+                if page.artist_target().map(|a| a.name != artist.name).unwrap_or(true) {
+                    return;
+                }
+                match songs {
+                    Ok(Ok(result)) => page.append_page(albums, result.items, result.has_more),
+                    Ok(Err(error)) => {
+                        page.set_no_more_songs();
+                        tracing::warn!("加载歌手歌曲下一页失败: {error}");
+                    }
+                    Err(_) => {
+                        page.set_no_more_songs();
+                        tracing::warn!("加载歌手歌曲下一页超时");
+                    }
+                }
+            });
+        }
+
         // 封面的解码与编码在后台线程进行，完成后才有内容可以绘制
         needs_render |= main_page.poll_cover();
 
@@ -1310,6 +1370,7 @@ fn run_app(
                 &local_diagnostics,
                 &song_menu,
                 &bili_login_page,
+                &mut help_page,
             )?;
             needs_render = false;
         }
@@ -1464,6 +1525,31 @@ fn run_app(
                         );
                     }
                 }
+                needs_render = true;
+                continue;
+            }
+
+            // 快捷键说明浮层：? / F1 开关；打开时独占按键
+            if help_page.is_some() {
+                let keep = help_page
+                    .as_mut()
+                    .expect("help page checked above")
+                    .handle_input(&key);
+                if !keep {
+                    help_page = None;
+                }
+                needs_render = true;
+                continue;
+            }
+            if !text_input_active
+                && matches!(
+                    (key.modifiers, key.code),
+                    (KeyModifiers::SHIFT, KeyCode::Char('?')) | (KeyModifiers::NONE, KeyCode::F(1))
+                )
+            {
+                help_page = Some(pages::help::HelpPage::from_config(
+                    &ctx.config.read().unwrap_or_else(|e| e.into_inner()).keybindings,
+                ));
                 needs_render = true;
                 continue;
             }
@@ -2274,6 +2360,16 @@ fn run_app(
             }
 
             let activate = click_tracker.is_double_click(mouse);
+            if let Some(help) = help_page.as_mut() {
+                // 点击浮层外或滚动都会进入处理；返回 false 表示关闭
+                let keep = help.handle_mouse(mouse);
+                let outside = !keep && mouse.kind == MouseEventKind::Down(MouseButton::Left);
+                if outside {
+                    help_page = None;
+                }
+                needs_render = true;
+                continue;
+            }
             if let Some(page) = ctx
                 .details_page
                 .lock()
@@ -2522,6 +2618,7 @@ fn run_app(
                 &local_diagnostics,
                 &song_menu,
                 &bili_login_page,
+                &mut help_page,
             )?;
             needs_render = false;
         }
@@ -2551,6 +2648,7 @@ fn draw_app(
     local_diagnostics: &Option<LocalDiagnosticsKind>,
     song_menu: &Option<SongContextMenu>,
     bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
+    help_page: &mut Option<pages::help::HelpPage>,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
@@ -2838,6 +2936,11 @@ fn draw_app(
             use ratatui::widgets::{Clear, Widget};
             Clear.render(area, frame.buffer_mut());
             page.render(area, frame.buffer_mut(), ctx);
+        }
+        if let Some(help) = help_page.as_mut() {
+            use ratatui::widgets::{Clear, Widget};
+            Clear.render(area, frame.buffer_mut());
+            help.render(area, frame.buffer_mut(), ctx);
         }
     })?;
     Ok(())
@@ -3248,7 +3351,6 @@ fn execute_action(
                         "开始播放: {} - {}",
                         current.name, current.singer
                     )));
-                    let _ = inserted;
                     return;
                 }
             }
@@ -3555,17 +3657,14 @@ fn execute_action(
                     return;
                 };
                 match (albums, songs) {
-                    (Ok(Ok(albums)), songs) => {
-                        page.update_artist(
-                            albums,
-                            songs.map(|r| r.items).map_err(|e| e.to_string()),
-                        );
+                    (Ok(Ok(albums)), Ok(songs)) => {
+                        page.set_artist_page(albums, songs.items, songs.has_more);
+                    }
+                    (Ok(Ok(_)), Err(_)) | (Err(_), Ok(_)) => {
+                        page.update_error("加载歌手详情超时".to_string());
                     }
                     (Ok(Err(error)), _) | (Err(_), Err(error)) => {
                         page.update_error(format!("加载歌手详情失败: {error}"));
-                    }
-                    (Err(_), Ok(_)) => {
-                        page.update_error("加载歌手详情超时".to_string());
                     }
                 }
             });

@@ -36,6 +36,12 @@ pub struct DetailsPage {
     song_scroll: usize,
     loading: bool,
     error: Option<String>,
+    /// 歌手歌曲当前已加载的页码（从 0 开始）
+    songs_page: u32,
+    /// 歌手歌曲是否还有下一页
+    has_more: bool,
+    /// 下一页是否正在加载，防止重复触发
+    loading_more: bool,
 }
 
 impl DetailsPage {
@@ -51,6 +57,9 @@ impl DetailsPage {
             song_scroll: 0,
             loading: true,
             error: None,
+            songs_page: 0,
+            has_more: false,
+            loading_more: false,
         }
     }
 
@@ -66,22 +75,83 @@ impl DetailsPage {
             song_scroll: 0,
             loading: true,
             error: None,
+            songs_page: 0,
+            has_more: false,
+            loading_more: false,
         }
     }
 
-    pub fn update_artist(
-        &mut self,
-        albums: Vec<Album>,
-        songs: Result<Vec<SongInfo>, String>,
-    ) {
+    /// 歌手目标（仅歌手详情页返回 Some），供分页加载任务使用。
+    pub fn artist_target(&self) -> Option<&Artist> {
+        match &self.target {
+            DetailsTarget::Artist(artist) => Some(artist),
+            DetailsTarget::Album(_) => None,
+        }
+    }
+
+    /// 当前歌手歌曲页码。
+    pub fn songs_page(&self) -> u32 {
+        self.songs_page
+    }
+
+    /// 滚动位置接近末尾且还有下一页时返回 true，由主循环触发追加加载。
+    pub fn wants_more_songs(&self) -> bool {
+        !self.loading
+            && !self.loading_more
+            && self.has_more
+            && self.selected_song + 20 >= self.songs.len()
+    }
+
+    /// 首屏数据写入（第 0 页）。
+    pub fn set_artist_page(&mut self, albums: Vec<Album>, songs: Vec<SongInfo>, has_more: bool) {
         self.albums = albums;
-        self.songs = songs.unwrap_or_default();
+        self.songs = songs;
+        self.has_more = has_more;
         self.loading = false;
         self.error = if self.songs.is_empty() && self.albums.is_empty() {
             Some("未找到该歌手的歌曲".to_string())
         } else {
             None
         };
+        self.clamp_selection();
+    }
+
+    /// 下一页加载失败时停止自动分页，避免主循环高频重试。
+    pub fn set_no_more_songs(&mut self) {
+        self.loading_more = false;
+        self.has_more = false;
+    }
+
+    /// 标记下一页正在加载，防止主循环重复触发。
+    pub fn mark_loading_more(&mut self) {
+        self.loading_more = true;
+    }
+
+    /// 追加下一页歌曲（按 音源+ID 去重）与专辑（按 ID 去重）。
+    pub fn append_page(&mut self, albums: Vec<Album>, songs: Vec<SongInfo>, has_more: bool) {
+        self.loading_more = false;
+        self.songs_page += 1;
+        self.has_more = has_more;
+        let mut seen: std::collections::HashSet<(String, _)> = self
+            .songs
+            .iter()
+            .map(|song| (song.id.clone(), song.source))
+            .collect();
+        for song in songs {
+            if seen.insert((song.id.clone(), song.source)) {
+                self.songs.push(song);
+            }
+        }
+        let mut album_keys: std::collections::HashSet<String> = self
+            .albums
+            .iter()
+            .map(|album| album.id.clone())
+            .collect();
+        for album in albums {
+            if album_keys.insert(album.id.clone()) {
+                self.albums.push(album);
+            }
+        }
         self.clamp_selection();
     }
 

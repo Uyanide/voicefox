@@ -7,6 +7,7 @@ use lx_core::traits::source::FetchError;
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 const USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1";
 
@@ -56,7 +57,7 @@ async fn request(url: String) -> Result<Value, FetchError> {
         .header("Referer", "https://m.music.migu.cn/")
         .header("channel", "0146921")
         .header("User-Agent", USER_AGENT)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?
         .json()

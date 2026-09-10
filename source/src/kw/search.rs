@@ -3,6 +3,7 @@
 //! GET http://search.kuwo.cn/r.s?client=kt&all={keyword}&pn={page-1}&rn={limit}&...
 
 use std::collections::BTreeSet;
+use crate::http::SendWithRetry;
 use std::time::Duration;
 
 use lx_core::model::song::SongInfo;
@@ -69,7 +70,7 @@ pub async fn search(keyword: &str, page: u32, limit: u32) -> Result<SearchResult
     let client = http::client();
     let resp = client
         .get(&url)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| SearchError::Network(e.to_string()))?;
 

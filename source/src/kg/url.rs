@@ -5,6 +5,7 @@
 //! 2. 从响应中提取 play_url
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::http::SendWithRetry;
 
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::Quality;
@@ -75,7 +76,7 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         )
         .header("x-router", "kmr.service.kugou.com")
         .json(&body)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 

@@ -451,7 +451,6 @@ impl Storage {
         for (temp, target) in temp_files {
             if let Err(error) = commit_staged(&temp, &target) {
                 let _ = fs::remove_file(&temp);
-                let _ = target;
                 return Err(error);
             }
         }

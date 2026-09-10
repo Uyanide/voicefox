@@ -8,6 +8,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::http;
+use crate::http::SendWithRetry;
 
 pub async fn get_boards() -> Result<Vec<LeaderboardInfo>, SearchError> {
     match get_periods().await {
@@ -55,7 +56,7 @@ pub async fn get_list(board_id: &str, page: u32, limit: u32) -> Result<SearchRes
             "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; WOW64; Trident/5.0)",
         )
         .json(&body)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()
@@ -100,7 +101,7 @@ struct PeriodInfo {
 async fn get_periods() -> Result<Vec<PeriodInfo>, SearchError> {
     let html = http::client()
         .get("https://c.y.qq.com/node/pc/wk_v15/top.html")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .text()
@@ -135,7 +136,7 @@ async fn get_periods() -> Result<Vec<PeriodInfo>, SearchError> {
 async fn get_boards_fallback() -> Result<Vec<LeaderboardInfo>, SearchError> {
     let json: Value = http::client()
         .get("https://c.y.qq.com/v8/fcg-bin/fcg_myqq_toplist.fcg?g_tk=1928093487&inCharset=utf-8&outCharset=utf-8&notice=0&format=json&uin=0&needNewCode=1&platform=h5")
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|error| SearchError::Network(error.to_string()))?
         .json()

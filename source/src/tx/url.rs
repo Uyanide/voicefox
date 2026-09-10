@@ -5,6 +5,7 @@
 //! 2. 拼接: http://dl.stream.qqmusic.qq.com/{purl}
 
 use lx_core::model::song::SongInfo;
+use crate::http::SendWithRetry;
 use lx_core::model::source::Quality;
 use lx_core::traits::source::{FetchError, SongUrl};
 use serde_json::Value;
@@ -49,7 +50,7 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         .header("User-Agent", "QQMusic 14090508(android 12)")
         .header("Content-Type", "application/json")
         .body(body_str)
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
 

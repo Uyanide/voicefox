@@ -1,6 +1,7 @@
 //! HTTP 客户端封装
 //!
 //! 职责：统一 UA、超时（连接 + 整体）、瞬时错误自动重试、代理支持
+use std::future::Future;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -64,25 +65,34 @@ fn build_client(options: &NetworkOptions) -> reqwest::Client {
     builder.build().expect("failed to build HTTP client")
 }
 
-/// 对瞬时网络错误执行最多 `retries` 次重试的 GET 请求。
+/// 默认重试次数：仅连接/超时类瞬时错误，最多再试 1 次。
+pub(crate) const RETRY_ATTEMPTS: usize = 1;
+
+/// [`reqwest::RequestBuilder`] 的重试扩展。
 ///
-/// 仅重试连接层失败（超时、连接被拒等），4xx/5xx 响应由调用方自行判断。
-pub(crate) async fn get_with_retry(
-    client: &reqwest::Client,
-    url: &str,
-    retries: usize,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let mut attempt = 0;
-    loop {
-        match client.get(url).send().await {
-            Ok(resp) => return Ok(resp),
-            Err(error) if attempt < retries && (error.is_connect() || error.is_timeout()) => {
-                attempt += 1;
-                let backoff = std::time::Duration::from_millis(200 * (1 << attempt.min(4)));
-                tracing::warn!("request failed (attempt {attempt}), retrying in {backoff:?}: {error}");
-                tokio::time::sleep(backoff).await;
+/// 仅对连接失败/超时这类瞬时网络错误做有限次重试，4xx/5xx 响应不重试，
+/// 由调用方自行判断业务语义。
+pub(crate) trait SendWithRetry {
+    fn send_with_retry(self, retries: usize) -> impl Future<Output = Result<reqwest::Response, reqwest::Error>>;
+}
+
+impl SendWithRetry for reqwest::RequestBuilder {
+    async fn send_with_retry(self, retries: usize) -> Result<reqwest::Response, reqwest::Error> {
+        let mut attempt = 0;
+        loop {
+            let request = self
+                .try_clone()
+                .expect("request builder must be cloneable (GET/JSON/form bodies are)");
+            match request.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(error) if attempt < retries && (error.is_connect() || error.is_timeout()) => {
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_millis(300 * (1 << attempt.min(3)));
+                    tracing::warn!("request failed (attempt {attempt}), retrying in {backoff:?}: {error}");
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
     }
 }

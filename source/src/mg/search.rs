@@ -4,6 +4,7 @@
 //! 需要签名参数 sign 和 timestamp
 
 use lx_core::traits::source::{SearchError, SearchResult};
+use crate::http::SendWithRetry;
 use serde_json::Value;
 
 use super::super::http;
@@ -36,7 +37,7 @@ pub async fn search(keyword: &str, page: u32, limit: u32) -> Result<SearchResult
             "User-Agent",
             "Mozilla/5.0 (Linux; U; Android 11.0.0; zh-cn; MI 11 Build/OPR1.170623.032) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30",
         )
-        .send()
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
         .await
         .map_err(|e| SearchError::Network(e.to_string()))?;
 
