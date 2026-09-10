@@ -1544,7 +1544,7 @@ fn run_app(
             if !text_input_active
                 && matches!(
                     (key.modifiers, key.code),
-                    (KeyModifiers::SHIFT, KeyCode::Char('?')) | (KeyModifiers::NONE, KeyCode::F(1))
+                    (KeyModifiers::NONE, KeyCode::Char('\\'))
                 )
             {
                 help_page = Some(pages::help::HelpPage::from_config(

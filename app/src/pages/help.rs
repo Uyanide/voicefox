@@ -67,8 +67,7 @@ impl HelpPage {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc)
             | (KeyModifiers::NONE, KeyCode::Char('q'))
-            | (KeyModifiers::NONE, KeyCode::Char('?'))
-            | (KeyModifiers::NONE, KeyCode::F(1)) => return false,
+            | (KeyModifiers::NONE, KeyCode::Char('\\')) => return false,
             (KeyModifiers::NONE, KeyCode::Char('j' | 'J'))
             | (KeyModifiers::NONE, KeyCode::Down) => {
                 self.scroll = self.scroll.saturating_add(1);
