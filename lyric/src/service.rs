@@ -137,7 +137,7 @@ impl LyricService {
         let yrc_words = if *self.show_yrc.read().unwrap_or_else(|e| e.into_inner()) {
             self.yrc_lines
                 .read()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .rev()
                 .find(|line| line.timestamp <= pos_ms)

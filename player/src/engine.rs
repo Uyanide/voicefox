@@ -49,6 +49,9 @@ struct EventLoopContext {
     /// 旧文件的 StartFile 错记到新代次上）。
     load_generation: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
+    /// 当前 loadfile 是否已到达 FileLoaded；事件线程与控制线程共享，
+    /// 供 seek 判断“加载中暂停”场景（mpv 还不能接受 time-pos）。
+    media_loaded: Arc<AtomicBool>,
     pending_seek: Arc<Mutex<Option<(u64, Duration)>>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -82,6 +85,7 @@ pub struct MpvEngine {
     generation: Arc<AtomicU64>,
     load_generation: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
+    media_loaded: Arc<AtomicBool>,
     pending_seek: Arc<Mutex<Option<(u64, Duration)>>>,
     shutdown: Arc<AtomicBool>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
@@ -189,6 +193,7 @@ impl MpvEngine {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let generation = Arc::new(AtomicU64::new(0));
         let paused = Arc::new(AtomicBool::new(false));
+        let media_loaded = Arc::new(AtomicBool::new(false));
         let pending_seek = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
         let fade_generation = Arc::new(AtomicU64::new(0));
@@ -204,6 +209,7 @@ impl MpvEngine {
             generation: Arc::clone(&generation),
             load_generation: Arc::clone(&load_generation),
             paused: Arc::clone(&paused),
+            media_loaded: Arc::clone(&media_loaded),
             pending_seek: Arc::clone(&pending_seek),
             shutdown: Arc::clone(&shutdown),
         };
@@ -241,6 +247,7 @@ impl MpvEngine {
             generation,
             load_generation,
             paused,
+            media_loaded,
             pending_seek,
             shutdown,
             event_thread: Mutex::new(Some(event_thread)),
@@ -361,6 +368,7 @@ fn run_event_loop(event_client: Arc<Mpv>, context: EventLoopContext) {
                 current_file_generation = Some(generation);
                 last_media_position = None;
                 has_audio_position = false;
+                context.media_loaded.store(false, Ordering::SeqCst);
                 let _ = context.audio_info_tx.send(AudioInfo::default());
                 if generation != 0 {
                     let _ = context.state_tx.send(loading_state(&context.paused));
@@ -370,6 +378,7 @@ fn run_event_loop(event_client: Arc<Mpv>, context: EventLoopContext) {
                 if let Some(generation) =
                     current_generation(current_file_generation, &context.generation)
                 {
+                    context.media_loaded.store(true, Ordering::SeqCst);
                     apply_pending_seek(&event_client, generation, &context.pending_seek);
                     let _ = context.state_tx.send(loading_state(&context.paused));
                 }
@@ -712,6 +721,7 @@ impl Player for MpvEngine {
         self.cancel_fade_internal();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.paused.store(false, Ordering::SeqCst);
+        self.media_loaded.store(false, Ordering::SeqCst);
         *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.clear_ab_loop_locked();
         let _ = self.state_tx.send(PlayerState::Loading);
@@ -761,6 +771,7 @@ impl Player for MpvEngine {
         self.cancel_fade_internal();
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
+        self.media_loaded.store(false, Ordering::SeqCst);
         *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.clear_ab_loop_locked();
         if let Err(error) = self.mpv.command("stop", &[]) {
@@ -788,8 +799,15 @@ impl Player for MpvEngine {
         } else {
             position.min(duration)
         };
-        if *self.state_rx.borrow() == PlayerState::Loading {
-            // 文件尚未加载完成：只记录待定 seek，进度条先行展示目标位置
+        let state = *self.state_rx.borrow();
+        if state == PlayerState::Loading
+            || (state == PlayerState::Paused
+                && self.paused.load(Ordering::SeqCst)
+                && !self.media_loaded.load(Ordering::SeqCst))
+        {
+            // 文件尚未加载完成（含“加载中已暂停”，此时状态是 Paused 但
+            // mpv 还没 FileLoaded）：只记录待定 seek，进度条先行展示目标
+            // 位置，加载完成后由事件循环应用。
             let generation = self.generation.load(Ordering::SeqCst);
             *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = Some((generation, position));
             let _ = self.position_tx.send(position);

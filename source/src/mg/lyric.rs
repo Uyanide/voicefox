@@ -58,20 +58,26 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
                     Some((lyric, lxlyric)) => (lyric, Some(lxlyric), Some(mrc)),
                     None => {
                         tracing::warn!("Migu MRC did not contain timed lyric lines");
-                        fetch_lrc(&client, song).await
+                        fetch_lrc(&client, song).await?
                     }
                 },
                 Err(error) => {
                     tracing::warn!("decode Migu MRC failed: {error}");
-                    fetch_lrc(&client, song).await
+                    fetch_lrc(&client, song).await?
                 }
             },
             Err(error) => {
                 tracing::warn!("fetch Migu MRC failed: {error}");
-                fetch_lrc(&client, song).await
+                // 网络类失败不能吞成空歌词（会被负缓存误标为无词）；
+                // 没有 LRC 兜底链接时直接把错误传出去。
+                if has_lrc_url(song) {
+                    fetch_lrc(&client, song).await?
+                } else {
+                    return Err(error);
+                }
             }
         },
-        _ => fetch_lrc(&client, song).await,
+        _ => fetch_lrc(&client, song).await?,
     };
 
     // TRC 翻译歌词
@@ -92,14 +98,17 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
 async fn fetch_lrc(
     client: &reqwest::Client,
     song: &SongInfo,
-) -> (String, Option<String>, Option<String>) {
+) -> Result<(String, Option<String>, Option<String>), FetchError> {
     let lyric = match song.extra.get("lrcUrl") {
-        Some(lrc_url) if !lrc_url.is_empty() => {
-            fetch_text(client, lrc_url).await.unwrap_or_default()
-        }
+        // 网络失败向上传播，避免被 get_lyric_with_fallback 负缓存误标
+        Some(lrc_url) if !lrc_url.is_empty() => fetch_text(client, lrc_url).await?,
         _ => String::new(),
     };
-    (lyric, None, None)
+    Ok((lyric, None, None))
+}
+
+fn has_lrc_url(song: &SongInfo) -> bool {
+    song.extra.get("lrcUrl").is_some_and(|url| !url.is_empty())
 }
 
 fn parse_mrc(content: &str) -> Option<(String, String)> {

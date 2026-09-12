@@ -93,11 +93,12 @@ async fn fetch_raw_lyric(song_id: &str, with_lrcx: bool) -> Result<String, Fetch
 pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
     let song_id = &song.id;
 
-    // 先请求逐字歌词（lrcx=1），失败不阻断
+    // 先请求逐字歌词（lrcx=1），失败不阻断：部分歌曲没有逐字版本
     let lxlyric = fetch_raw_lyric(song_id, true).await.ok();
 
-    // 再请求普通歌词（不含 lrcx）
-    let lyric = fetch_raw_lyric(song_id, false).await.unwrap_or_default();
+    // 普通歌词的失败必须向上传播：吞成空歌词会让一次网络抖动被
+    // get_lyric_with_fallback 当成“确认无词”写入 10 分钟负缓存。
+    let lyric = fetch_raw_lyric(song_id, false).await?;
 
     Ok(LyricData {
         lyric,

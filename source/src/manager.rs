@@ -45,8 +45,9 @@ pub struct SourceManager {
     enabled: std::sync::RwLock<HashSet<SourceId>>,
     /// 歌词"确认无词"负缓存（上次确认时间），避免纯音乐/无词歌曲
     /// 每次播放都触发 JS 音源 + 全源聚合补全的长耗时请求。
+    /// 键为 (来源，JS 平台标记，歌曲 id)。
     lyric_negative_cache:
-        std::sync::Mutex<HashMap<(SourceId, String), Instant>>,
+        std::sync::Mutex<HashMap<(SourceId, Option<String>, String), Instant>>,
 }
 
 /// 判断是否为真本地文件歌曲：JS 音源的搜索结果同样标记为 `SourceId::Local`，
@@ -747,6 +748,14 @@ impl SourceManager {
     }
 
     async fn get_lyric_inner(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
+        // 真本地文件歌曲优先读外挂/内嵌歌词，不经过 JS 音源（拿文件路径当
+        // 平台歌曲 id 请求必然无效）。无词时返回空数据，由
+        // get_lyric_with_fallback 决定是否联网补全。
+        if is_local_file_song(song)
+            && let Some(local) = self.sources.get(&SourceId::Local)
+        {
+            return local.get_lyric(song).await;
+        }
         for js_source in self.js_sources() {
             if let Ok(data) = js_source.get_lyric(song).await
                 && lyric_has_content(&data)
@@ -768,7 +777,9 @@ impl SourceManager {
     pub async fn get_lyric_with_fallback(&self, song: &SongInfo) -> Result<LyricData, FetchError> {
         const NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
         const NEGATIVE_CACHE_LIMIT: usize = 1024;
-        let cache_key = (song.source, song.id.clone());
+        // JS 音源的搜索结果都标记为 Local，不同平台的数字 id 可能相同，
+        // 缓存键必须带上 extra["source"] 平台标记才能互相区分。
+        let cache_key = (song.source, song.extra.get("source").cloned(), song.id.clone());
         {
             let mut cache = self
                 .lyric_negative_cache
@@ -1206,5 +1217,78 @@ mod tests {
             manager.js_source_name_for_origin("https://example.com/grass.js"),
             Some("草原".to_string())
         );
+    }
+
+    /// JS 音源歌词接口一旦被调用就 panic，用于证明本地歌词路径没有触发请求。
+    struct LyricPanicSource;
+
+    #[async_trait]
+    impl MusicSource for LyricPanicSource {
+        fn id(&self) -> SourceId {
+            SourceId::Local
+        }
+
+        fn name(&self) -> &str {
+            "lyric-panic"
+        }
+
+        async fn search(
+            &self,
+            _keyword: &str,
+            _page: u32,
+            _limit: u32,
+        ) -> Result<SearchResult, SearchError> {
+            Err(SearchError::Other("unused".to_string()))
+        }
+
+        async fn get_song_url(
+            &self,
+            _song: &SongInfo,
+            _quality: Quality,
+        ) -> Result<SongUrl, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        async fn get_lyric(&self, _song: &SongInfo) -> Result<LyricData, FetchError> {
+            panic!("本地文件歌曲不应请求 JS 音源歌词");
+        }
+
+        async fn get_cover_url(&self, _song: &SongInfo) -> Result<String, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        fn supported_qualities(&self) -> Vec<Quality> {
+            vec![Quality::High320]
+        }
+    }
+
+    #[tokio::test]
+    async fn local_file_song_reads_sidecar_lyric_without_network() {
+        let dir = std::env::temp_dir().join("voicefox-manager-lyric-test");
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+        let audio_path = dir.join("song.flac");
+        std::fs::write(&audio_path, b"").expect("写入音频占位文件失败");
+        std::fs::write(dir.join("song.lrc"), "[00:01.00]本地外挂歌词").expect("写入歌词文件失败");
+
+        let manager = SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let generation = manager.begin_js_source_request(true);
+        assert!(manager.set_js_source_if_current(generation, Arc::new(LyricPanicSource)));
+
+        let mut song = SongInfo::new(
+            audio_path.to_string_lossy().to_string(),
+            SourceId::Local,
+            "不存在的本地测试歌曲voicefox".to_string(),
+            "测试歌手voicefox".to_string(),
+        );
+        song.file_path = Some(audio_path);
+
+        let data = manager
+            .get_lyric_with_fallback(&song)
+            .await
+            .expect("应读到外挂歌词而不是报错");
+
+        assert_eq!(data.lyric, "[00:01.00]本地外挂歌词");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

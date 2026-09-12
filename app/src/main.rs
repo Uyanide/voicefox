@@ -3331,7 +3331,7 @@ fn execute_action(
                 ctx.play_attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 if start_playback {
-                    start_song_playback(song, false, Some((position, paused)), ctx, rt, action_tx);
+                    start_song_playback(song, false, Some((position, paused)), true, ctx, rt, action_tx);
                 } else {
                     ctx.stop_player();
                     *ctx.current_song.write().unwrap_or_else(|e| e.into_inner()) = Some(song);
@@ -3376,7 +3376,7 @@ fn execute_action(
             ctx.notify(Notification::success(message));
         }
         AppAction::RetrySong { song } => {
-            start_song_playback(*song, false, None, ctx, rt, action_tx);
+            start_song_playback(*song, false, None, false, ctx, rt, action_tx);
         }
         AppAction::PlaybackFailed { request_id, error } => {
             if ctx.play_request_id.load(Ordering::SeqCst) != request_id {
@@ -3795,9 +3795,8 @@ fn begin_song_from_list(
     } else {
         ctx.playlist.set_playlist(songs, index);
     }
-    ctx.play_attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    start_song_playback(song, true, None, ctx, rt, action_tx);
+    // 已尝试音源集合与 JS 音源索引由 start_song_playback 在递增请求代次后清空
+    start_song_playback(song, true, None, true, ctx, rt, action_tx);
 }
 
 /// 从当前队列继续播放：歌曲列表以 `Arc` 共享，不深拷贝整张队列。
@@ -3824,20 +3823,31 @@ fn begin_song_from_arc(
     } else {
         ctx.playlist.set_playlist_arc(songs, index);
     }
-    ctx.play_attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    start_song_playback(song, true, None, ctx, rt, action_tx);
+    // 已尝试音源集合与 JS 音源索引由 start_song_playback 在递增请求代次后清空
+    start_song_playback(song, true, None, true, ctx, rt, action_tx);
 }
 
 fn start_song_playback(
     song: SongInfo,
     add_history: bool,
     restored_state: Option<(Duration, bool)>,
+    reset_source_state: bool,
     ctx: &AppContext,
     rt: &tokio::runtime::Runtime,
     action_tx: &mpsc::UnboundedSender<AppAction>,
 ) {
     let request_id = next_play_request(ctx);
+    // 新歌请求必须在递增请求代次之后清空“已尝试音源”与 JS 音源索引：
+    // mark_source_attempted 持锁校验代次，过期任务要么看到新代次而放弃
+    // 写入，要么写入发生在清空之前而被清掉，不会污染新请求。
+    // 同曲重试（RetrySong）传 false，保留重试进度以免反复尝试同一失效源。
+    if reset_source_state {
+        ctx.play_attempted_sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     let player_generation = prepare_player(ctx);
     let lyric_generation = ctx.lyric_service.prepare();
     if !set_current_song_if_current(
@@ -4145,8 +4155,13 @@ async fn resolve_playable_song(
         .unwrap()
         .and_then(|index| index.checked_add(1));
     let retrying_next_js_source = next_js_source_index.is_some();
+    if play_request_id.load(Ordering::SeqCst) != request_id {
+        return Ok(None);
+    }
     let direct_error =
-        if retrying_next_js_source || mark_source_attempted(&attempted_sources, song.source) {
+        if retrying_next_js_source
+            || mark_source_attempted(&attempted_sources, &play_request_id, request_id, song.source)
+        {
             match resolve_song_url(
                 Arc::clone(&source_manager),
                 &song,
@@ -4181,7 +4196,12 @@ async fn resolve_playable_song(
     }
 
     for candidate in candidates {
-        if !mark_source_attempted(&attempted_sources, candidate.source) {
+        if !mark_source_attempted(
+            &attempted_sources,
+            &play_request_id,
+            request_id,
+            candidate.source,
+        ) {
             continue;
         }
         match resolve_song_url(Arc::clone(&source_manager), &candidate, quality, 0).await {
@@ -4224,11 +4244,20 @@ async fn resolve_song_url(
         .map_err(|error| error.to_string())
 }
 
+/// 标记音源已尝试。持锁校验请求代次：换歌后旧任务不得把过期源写进
+/// 新请求的集合（否则新歌会“未试先败”）。对过期任务返回 true，让它
+/// 跳过无谓的解析并在随后的代次校验处终止。
 fn mark_source_attempted(
     attempted_sources: &std::sync::Mutex<std::collections::HashSet<SourceId>>,
+    play_request_id: &AtomicU64,
+    request_id: u64,
     source: SourceId,
 ) -> bool {
-    attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).insert(source)
+    let mut attempted = attempted_sources.lock().unwrap_or_else(|e| e.into_inner());
+    if play_request_id.load(Ordering::SeqCst) != request_id {
+        return true;
+    }
+    attempted.insert(source)
 }
 
 fn prepare_player(ctx: &AppContext) -> u64 {

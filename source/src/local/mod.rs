@@ -19,7 +19,8 @@ use lx_core::model::song::SongInfo;
 use lx_core::model::source::{QUALITY_ORDER, Quality, SourceId};
 use lx_core::traits::source::{FetchError, MusicSource, SearchError, SearchResult, SongUrl};
 
-/// 扫描到的本地歌曲（含文件路径）
+/// 扫描到的本地歌曲。`file_path` 是来源文件路径：普通歌曲为其音频文件，
+/// CUE 分轨为其 CUE 文件（播放用的音频路径在 `song.file_path`）。
 #[derive(Debug, Clone)]
 pub struct LocalSong {
     pub song: SongInfo,
@@ -182,9 +183,10 @@ impl LocalSource {
             }
 
             let root = path.canonicalize().unwrap_or(path);
-            // 无变化快路径：目录签名与上次一致时，整个子树必然没有
-            // 文件被创建/删除/重命名，直接沿用上次的歌曲与指纹，跳过
-            // 一次全目录遍历。
+            // 无变化快路径：目录签名一致且本次没有任何变化证据时，直接
+            // 沿用上次的歌曲与指纹，跳过全目录遍历。注意目录 mtime 只反映
+            // 增删/重命名，不反映文件原地修改，因此监听器等“已知有变化”
+            // 的调用方必须传 force 绕过此快路径。
             if !force
                 && let (Some(previous), Some(current)) = (
                     previous_signatures.get(&root),
@@ -204,12 +206,15 @@ impl LocalSource {
                 continue;
             }
 
-            let previous = previous_songs
-                .get(&root)
-                .into_iter()
-                .flatten()
-                .map(|local| (local.file_path.clone(), local.clone()))
-                .collect::<HashMap<_, _>>();
+            // 复用映射按来源文件分组：普通歌曲一对一，一个 CUE 文件对应
+            // 它的全部分轨。CUE 轨与整轨歌曲不再共用音频路径做 key。
+            let mut previous: HashMap<PathBuf, Vec<LocalSong>> = HashMap::new();
+            for local in previous_songs.get(&root).into_iter().flatten() {
+                previous
+                    .entry(local.file_path.clone())
+                    .or_default()
+                    .push(local.clone());
+            }
             let previous_root_fingerprints = previous
                 .keys()
                 .filter_map(|file| {
@@ -316,7 +321,14 @@ impl LocalSource {
         let mut removed = false;
         for songs in groups.values_mut() {
             let previous_len = songs.len();
-            songs.retain(|song| song.file_path != path && song.file_path != canonical);
+            // 除来源文件外，还按播放路径匹配：删除整轨音频时，引用它的
+            // CUE 分轨（来源是 CUE 文件）也必须一并移除。
+            songs.retain(|song| {
+                song.file_path != path
+                    && song.file_path != canonical
+                    && song.song.file_path.as_deref() != Some(path)
+                    && song.song.file_path != Some(canonical.clone())
+            });
             removed |= songs.len() != previous_len;
         }
         groups.retain(|_, songs| !songs.is_empty());
@@ -520,8 +532,11 @@ impl LocalSource {
                 let Some(source) = weak.upgrade() else {
                     break;
                 };
+                // 文件系统事件本身就是“有变化”的证据；目录签名探测不到
+                // 原地修改（不改变目录 mtime），必须强制重新遍历。未变化
+                // 的文件仍由指纹缓存复用，代价可控。
                 let generation = source.begin_scan();
-                let _ = source.scan_for_generation(&paths, max_depth, generation, false);
+                let _ = source.scan_for_generation(&paths, max_depth, generation, true);
                 source.watch_generation.fetch_add(1, Ordering::AcqRel);
             }
             drop(fs_watcher);
@@ -762,13 +777,14 @@ fn read_text_file(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
-    use super::{LocalSong, LocalSource, MissingLocalSong};
+    use super::{LocalSong, LocalSource, MissingLocalSong, scanner};
 
     #[test]
     fn stale_scan_cannot_replace_newer_paths() {
@@ -875,5 +891,108 @@ mod tests {
         // A refresh with no configured paths still keeps the diagnostic until the path returns.
         source.scan(&[], 0);
         assert_eq!(source.missing_files().len(), 1);
+    }
+
+    #[test]
+    fn incremental_reuse_keeps_every_song_from_the_same_source_file() {
+        // 整轨歌曲与其 CUE 分轨共用同一音频路径；复用映射必须按来源文件
+        // 分组保留全部条目，而不是互相顶替只剩一条。
+        let dir = std::env::temp_dir().join(format!(
+            "voicefox-reuse-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("album.flac");
+        std::fs::write(&audio, b"stub").unwrap();
+
+        let fingerprint = scanner::FileFingerprint::from_path(&audio).unwrap();
+        let make_song = |id: &str| {
+            let mut song = SongInfo::new(
+                id.to_string(),
+                SourceId::Local,
+                id.to_string(),
+                "artist".to_string(),
+            );
+            song.file_path = Some(audio.clone());
+            LocalSong {
+                song,
+                file_path: audio.clone(),
+            }
+        };
+        let previous = HashMap::from([(
+            audio.clone(),
+            vec![make_song("album.flac"), make_song("album.flac#01")],
+        )]);
+        let previous_fingerprints = HashMap::from([(audio.clone(), fingerprint)]);
+
+        let report = scanner::scan_directory_incremental(&dir, 0, &previous, &previous_fingerprints);
+
+        assert_eq!(report.reused, 2);
+        assert_eq!(report.songs.len(), 2);
+        assert!(report
+            .songs
+            .iter()
+            .any(|local| local.song.id == "album.flac#01"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_the_audio_file_also_removes_its_cue_tracks() {
+        let source = LocalSource::new();
+        let audio = PathBuf::from("/music/album.flac");
+        let cue = PathBuf::from("/music/album.cue");
+        let mut track = SongInfo::new(
+            "/music/album.cue#01".to_string(),
+            SourceId::Local,
+            "track".to_string(),
+            "artist".to_string(),
+        );
+        track.file_path = Some(audio.clone());
+        Arc::make_mut(&mut *source.songs.write().unwrap_or_else(|e| e.into_inner())).insert(
+            PathBuf::from("/music"),
+            vec![LocalSong {
+                song: track,
+                // CUE 轨的来源文件是 CUE 文件本身，播放路径在 song.file_path
+                file_path: cue,
+            }],
+        );
+
+        assert!(source.remove_by_path(&audio));
+        assert!(source.all_songs().is_empty());
+    }
+
+    #[test]
+    fn forced_scan_bypasses_the_unchanged_directory_fast_path() {
+        // 目录签名不反映文件原地修改；force 必须绕过快路径重新遍历，
+        // 否则修改后的文件状态（这里表现为解析失败清单）永远不会更新。
+        let dir = std::env::temp_dir().join(format!(
+            "voicefox-force-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("broken.flac");
+        std::fs::write(&audio, b"first version").unwrap();
+
+        let source = LocalSource::new();
+        let paths = vec![dir.to_string_lossy().into_owned()];
+        let generation = source.begin_scan();
+        source.scan_for_generation(&paths, 0, generation, false);
+        assert_eq!(source.scan_failures().len(), 1, "首次扫描应记录损坏文件");
+
+        // 原地修改文件内容：目录签名不变，快路径会整体沿用旧结果，
+        // 连失败清单都被跳过。
+        std::fs::write(&audio, b"second version with different size").unwrap();
+        let generation = source.begin_scan();
+        source.scan_for_generation(&paths, 0, generation, false);
+        assert!(source.scan_failures().is_empty(), "快路径应跳过遍历");
+
+        let generation = source.begin_scan();
+        source.scan_for_generation(&paths, 0, generation, true);
+        assert_eq!(source.scan_failures().len(), 1, "force 后应重新解析该文件");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

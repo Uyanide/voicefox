@@ -67,9 +67,10 @@ impl FileFingerprint {
 
 /// 目录级指纹：目录自身的大小与修改时间。
 ///
-/// 文件/子目录的创建、删除、重命名都会更新父目录的 mtime，因此目录
-/// 签名未变时整个子树不可能发生变化；用它做“无变化快路径”，可以完全
-/// 跳过一次全目录遍历。
+/// 文件/子目录的创建、删除、重命名都会更新父目录的 mtime；但**原地修改**
+/// 文件内容不会。因此目录签名只能证明“没有增删/重命名”，不能证明内容
+/// 未变，只适用于没有任何变化证据时的跳过遍历优化（监听器触发的重扫必须
+/// 强制遍历）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirSignature {
     pub size: u64,
@@ -139,12 +140,14 @@ pub fn scan_directory_report(path: &Path, max_depth: u32) -> ScanReport {
 
 /// 增量扫描目录。
 ///
-/// `previous` 和 `previous_fingerprints` 来自上一次扫描。指纹未变化的文件会
+/// `previous` 和 `previous_fingerprints` 来自上一次扫描，均以“来源文件”为
+/// key：普通歌曲是其音频文件，CUE 分轨是其 CUE 文件（一个 key 对应多条轨，
+/// 避免 CUE 轨与整轨歌曲因共用音频路径而互相顶替）。指纹未变化的文件会
 /// 直接复用旧的 `LocalSong`，因此不会重复解析标签或提取封面。
 pub fn scan_directory_incremental(
     path: &Path,
     max_depth: u32,
-    previous: &HashMap<PathBuf, LocalSong>,
+    previous: &HashMap<PathBuf, Vec<LocalSong>>,
     previous_fingerprints: &HashMap<PathBuf, FileFingerprint>,
 ) -> ScanReport {
     let mut report = ScanReport::default();
@@ -164,10 +167,10 @@ pub fn scan_directory_incremental(
         report.fingerprints.insert(absolute.clone(), fingerprint);
 
         if previous_fingerprints.get(&absolute) == Some(&fingerprint)
-            && let Some(song) = previous.get(&absolute)
+            && let Some(songs) = previous.get(&absolute)
         {
-            report.songs.push(song.clone());
-            report.reused += 1;
+            report.songs.extend(songs.iter().cloned());
+            report.reused += songs.len();
             continue;
         }
 
@@ -178,7 +181,13 @@ pub fn scan_directory_incremental(
         {
             match read_cue_tracks(&entry_path) {
                 Ok(tracks) => {
-                    report.songs.extend(tracks);
+                    // 复用 key 用 CUE 文件自身的路径：CUE 轨与其引用的整轨
+                    // 音频共用音频路径，按音频路径做 key 会互相顶替。播放
+                    // 用的 song.file_path 仍指向音频文件。
+                    report.songs.extend(tracks.into_iter().map(|mut track| {
+                        track.file_path = absolute.clone();
+                        track
+                    }));
                     report.parsed += 1;
                 }
                 Err(error) => report.failures.push(ScanFailure {
