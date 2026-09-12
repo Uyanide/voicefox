@@ -221,15 +221,22 @@ cp target/release/voicefox /usr/local/bin/
 
 ### Windows
 
-#### 方法一：GitHub Actions 下载（推荐，无需安装 Rust）
+#### 方法一：Scoop（推荐，自动跟随 Release 更新）
 
-1. 前往 [Actions](https://github.com/emoeem/voicefox/actions) 页面
-2. 选择最新的 CI 构建
-3. 下载 `voicefox-windows-x86_64` 制品
-4. 解压 `voicefox-windows-x86_64.zip`
-5. 保持 `voicefox.exe` 和 `libmpv-2.dll` 在同一目录并运行
+```powershell
+scoop bucket add voicefox https://github.com/emoeem/scoop-bucket
+scoop install voicefox/voicefox
+```
 
-#### 方法二：从 Linux 交叉编译
+安装包内已捆绑 `libmpv-2.dll`，无需其他依赖。
+
+#### 方法二：GitHub Release / Actions 下载（无需安装 Rust）
+
+1. 前往 [Releases](https://github.com/emoeem/voicefox/releases) 下载最新的 `voicefox-windows-x86_64.zip`（或从 [Actions](https://github.com/emoeem/voicefox/actions) 页面获取最新 CI 制品）
+2. 解压 `voicefox-windows-x86_64.zip`
+3. 保持 `voicefox.exe` 和 `libmpv-2.dll` 在同一目录并运行
+
+#### 方法三：从 Linux 交叉编译
 
 ```bash
 # 在 Linux 上交叉编译 Windows 版本
@@ -253,7 +260,7 @@ MPV_SOURCE="$PWD/.deps/mpv" cargo build --release \
 # 将 .deps/mpv/64/libmpv-2.dll 复制到 exe 同一目录
 ```
 
-#### 方法三：在 Windows 上本地编译
+#### 方法四：在 Windows 上本地编译
 
 ```powershell
 # 安装 Rust 和 MinGW-w64
