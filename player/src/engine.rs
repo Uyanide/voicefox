@@ -854,10 +854,9 @@ impl Player for MpvEngine {
     }
 
     fn set_volume(&self, volume: u32) {
-        self.cancel_fade_internal();
-        let volume = volume.clamp(0, 100);
         // 先取消进行中的淡入/淡出，避免淡出线程随后把音量改回去
         self.cancel_fade_internal();
+        let volume = volume.clamp(0, 100);
         if let Err(error) = self.mpv.set_property("volume", f64::from(volume)) {
             warn!("libmpv set_volume failed: {error}");
             return;

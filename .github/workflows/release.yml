@@ -28,13 +28,13 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             binary_path: target/x86_64-unknown-linux-gnu/release/voicefox
-            asset_name: voicefox-linux-x86_64
+            asset_name: voicefox-linux-x86_64.zip
 
           # ── Linux ARM64 ──
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             binary_path: target/aarch64-unknown-linux-gnu/release/voicefox
-            asset_name: voicefox-linux-aarch64
+            asset_name: voicefox-linux-aarch64.zip
 
           # ── Windows x86_64 ──
           - runner: windows-2022
@@ -46,13 +46,13 @@ jobs:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             binary_path: target/x86_64-apple-darwin/release/voicefox
-            asset_name: voicefox-macos-x86_64
+            asset_name: voicefox-macos-x86_64.zip
 
           # ── macOS ARM64 ──
           - runner: macos-15
             target: aarch64-apple-darwin
             binary_path: target/aarch64-apple-darwin/release/voicefox
-            asset_name: voicefox-macos-aarch64
+            asset_name: voicefox-macos-aarch64.zip
 
     steps:
       - name: Checkout
@@ -177,8 +177,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "${{ matrix.binary_path }}" \
-            "dist/${{ matrix.asset_name }}"
+          chmod +x "${{ matrix.binary_path }}"
+          cp "${{ matrix.binary_path }}" dist/voicefox
+          (cd dist && zip -j "${{ matrix.asset_name }}" voicefox)
 
       # ── Package Windows ──
       - name: Validate and build Windows release asset

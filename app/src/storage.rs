@@ -484,7 +484,7 @@ impl Storage {
     pub fn is_favorite(&self, song: &SongInfo) -> bool {
         self.favorites
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|favorite| songs_equivalent(favorite, song))
     }
@@ -519,7 +519,7 @@ impl Storage {
     pub fn is_favorite_playlist(&self, playlist: &Playlist) -> bool {
         self.favorite_playlists
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|favorite| favorite.id == playlist.id && favorite.source == playlist.source)
     }
@@ -533,7 +533,7 @@ impl Storage {
     pub fn custom_playlist_summaries(&self) -> Vec<CustomPlaylistSummary> {
         self.custom_playlists
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|playlist| CustomPlaylistSummary {
                 id: playlist.id.clone(),
