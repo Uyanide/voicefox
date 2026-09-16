@@ -195,6 +195,14 @@ impl LeaderboardPage {
                     self.enter_selected_board();
                     return AppAction::None;
                 }
+                Action::ListDownload => {
+                    if self.selected_board.is_some()
+                        && let Some(song) = self.songs.get(self.selected).cloned()
+                    {
+                        return AppAction::DownloadSong(Box::new(song));
+                    }
+                    return AppAction::None;
+                }
                 Action::ListAddToQueue => {
                     if self.selected_board.is_some()
                         && let Some(song) = self.songs.get(self.selected).cloned()

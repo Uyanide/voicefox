@@ -7,6 +7,7 @@ mod config;
 mod context;
 mod cover;
 mod data_cache;
+mod download;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod notification;
@@ -233,6 +234,7 @@ fn execute_song_menu_action(
             songs: menu.songs().to_vec(),
             index: menu.index(),
         },
+        SongMenuAction::Download => AppAction::DownloadSong(Box::new(menu.song().clone())),
         SongMenuAction::PlayNext => AppAction::AddToQueue {
             song: Box::new(menu.song().clone()),
             position: InsertPosition::Next,
@@ -462,12 +464,16 @@ fn main() -> anyhow::Result<()> {
     // 安装 crossterm panic hook，确保 panic 时 restore 终端。
     // 仅主线程 panic 时才恢复终端：后台任务（tokio worker、事件线程等）
     // panic 时进程仍会继续运行主循环，提前 restore 会让后续 draw 把
-    // 转义序列写进裸 shell，彻底打花终端。主线程名默认为 None，
-    // tokio worker 与项目内命名线程都有名字。
+    // 转义序列写进裸 shell，彻底打花终端。
+    //
+    // 注意：不能用“线程名是否为 None”来判断主线程 —— Rust 从 1.62 起
+    // 主线程名就是 Some("main")，那样判断会把主线程 panic 当成后台 panic，
+    // 终端留在鼠标上报模式，shell 里会不断冒出 `^[[<…M` 之类的转义序列。
+    let main_thread_id = std::thread::current().id();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("fatal panic: {info}");
-        if std::thread::current().name().is_none() {
+        if std::thread::current().id() == main_thread_id {
             if mouse_enabled {
                 let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
             }
@@ -631,6 +637,8 @@ fn run_app(
     let mut bili_login_page: Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>> = None;
     // 快捷键说明浮层（? / F1 开关）
     let mut help_page: Option<pages::help::HelpPage> = None;
+    // 下载面板浮层（Ctrl+o 开关）
+    let mut downloads_panel = pages::downloads::DownloadsPanel::new();
     let mut bili_poll_deadline: Instant = Instant::now();
     let mut bili_generate_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut bili_poll_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1371,6 +1379,7 @@ fn run_app(
                 &song_menu,
                 &bili_login_page,
                 &mut help_page,
+                &mut downloads_panel,
             )?;
             needs_render = false;
         }
@@ -1550,6 +1559,20 @@ fn run_app(
                 help_page = Some(pages::help::HelpPage::from_config(
                     &ctx.config.read().unwrap_or_else(|e| e.into_inner()).keybindings,
                 ));
+                needs_render = true;
+                continue;
+            }
+
+            // 下载面板：打开时独占按键（Esc / Ctrl+o 关闭，c 取消，x 清理）
+            if downloads_panel.is_open() {
+                let tasks = ctx.downloads.snapshot();
+                if downloads_panel.handle_key(&key, &ctx, &tasks)
+                    == pages::downloads::PanelOutcome::Close
+                {
+                    downloads_panel.close();
+                    // 关闭浮层后整屏重画，清掉面板压过的封面/边框残留。
+                    terminal.clear()?;
+                }
                 needs_render = true;
                 continue;
             }
@@ -1786,6 +1809,36 @@ fn run_app(
                     Action::GlobalRedraw if !text_input_active => {
                         last_cover_redraw = Instant::now();
                         retransmit_cover(terminal, &mut main_page)?;
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalDownloadCurrent if !text_input_active => {
+                        let song = ctx
+                            .current_song
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        match song {
+                            Some(song) => execute_action(
+                                AppAction::DownloadSong(Box::new(song)),
+                                &ctx,
+                                rt,
+                                &action_tx,
+                                &search_page,
+                                &settings_page,
+                                &search_seq,
+                            ),
+                            None => ctx.notify(Notification::info("当前没有正在播放的歌曲")),
+                        }
+                        needs_render = true;
+                        continue;
+                    }
+                    Action::GlobalDownloadsPanel if !text_input_active => {
+                        let count = ctx.downloads.snapshot().len();
+                        downloads_panel.toggle(count);
+                        // 浮层覆盖在内容区之上，且可能压住图形协议绘制的封面。
+                        // 开关时整屏重画一次，避免关闭后残留边框或旧内容。
+                        terminal.clear()?;
                         needs_render = true;
                         continue;
                     }
@@ -2322,7 +2375,7 @@ fn run_app(
             }
             needs_render = true;
         } else if let Some(Event::Mouse(mouse)) = terminal_event.as_ref() {
-            if confirm_delete.is_some() {
+            if confirm_delete.is_some() || downloads_panel.is_open() {
                 needs_render = true;
                 continue;
             }
@@ -2619,6 +2672,7 @@ fn run_app(
                 &song_menu,
                 &bili_login_page,
                 &mut help_page,
+                &mut downloads_panel,
             )?;
             needs_render = false;
         }
@@ -2649,6 +2703,7 @@ fn draw_app(
     song_menu: &Option<SongContextMenu>,
     bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
     help_page: &mut Option<pages::help::HelpPage>,
+    downloads_panel: &mut pages::downloads::DownloadsPanel,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
@@ -2941,6 +2996,10 @@ fn draw_app(
             use ratatui::widgets::{Clear, Widget};
             Clear.render(area, frame.buffer_mut());
             help.render(area, frame.buffer_mut(), ctx);
+        }
+        if downloads_panel.is_open() {
+            let tasks = ctx.downloads.snapshot();
+            downloads_panel.render(area, frame.buffer_mut(), ctx, &tasks);
         }
     })?;
     Ok(())
@@ -3374,6 +3433,14 @@ fn execute_action(
                 "已添加收藏"
             };
             ctx.notify(Notification::success(message));
+        }
+        AppAction::DownloadSong(song) => {
+            // 下载在后台任务里完成，主循环只负责入队并给出即时反馈。
+            let config = ctx.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+            ctx.downloads.sync_config(&config);
+            drop(config);
+            ctx.downloads
+                .enqueue(*song, Arc::clone(&ctx.source_manager), action_tx.clone());
         }
         AppAction::RetrySong { song } => {
             start_song_playback(*song, false, None, false, ctx, rt, action_tx);

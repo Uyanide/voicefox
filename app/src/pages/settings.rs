@@ -69,12 +69,22 @@ enum SettingsFocus {
     StatusBar,
 }
 
+/// 下载设置里的文本输入目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadInputTarget {
+    /// 下载目录
+    Dir,
+    /// 文件名模板
+    Template,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsCategory {
     Interface,
     Playback,
     Sources,
     Integration,
+    Download,
     Data,
 }
 
@@ -84,7 +94,8 @@ impl SettingsCategory {
             Self::Interface => Self::Playback,
             Self::Playback => Self::Sources,
             Self::Sources => Self::Integration,
-            Self::Integration => Self::Data,
+            Self::Integration => Self::Download,
+            Self::Download => Self::Data,
             Self::Data => Self::Interface,
         }
     }
@@ -95,7 +106,8 @@ impl SettingsCategory {
             Self::Playback => Self::Interface,
             Self::Sources => Self::Playback,
             Self::Integration => Self::Sources,
-            Self::Data => Self::Integration,
+            Self::Download => Self::Integration,
+            Self::Data => Self::Download,
         }
     }
 
@@ -105,6 +117,7 @@ impl SettingsCategory {
             Self::Playback => "播放",
             Self::Sources => "音源与歌词",
             Self::Integration => "通知与集成",
+            Self::Download => "下载",
             Self::Data => "数据与本地库",
         }
     }
@@ -117,6 +130,7 @@ impl SettingsCategory {
             ],
             Self::Sources => &[23, 24, 25, 26, 27, 28, 29, 30],
             Self::Integration => &[34, 35, 36, 37, 38, 44],
+            Self::Download => &[45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
             Self::Data => &[40, 41, 42, 43],
         }
     }
@@ -157,6 +171,9 @@ pub struct SettingsPage {
     /// 外部歌单文件输入模式。
     pub playlist_import_input: String,
     pub playlist_import_mode: bool,
+    /// 下载目录 / 文件名模板输入模式。
+    download_input: String,
+    download_input_target: Option<DownloadInputTarget>,
     /// 内置音源开关当前指向的音源
     pub enabled_source_index: usize,
     /// 状态栏字段列表的选中索引
@@ -182,6 +199,7 @@ impl SettingsPage {
             || self.proxy_input_mode
             || self.audio_device_input_mode
             || self.playlist_import_mode
+            || self.download_input_target.is_some()
     }
 
     /// 判断按键是否由设置页独占。设置页把整个字母表当作选项开关，
@@ -239,6 +257,8 @@ impl SettingsPage {
             audio_device_input_mode: false,
             playlist_import_input: String::new(),
             playlist_import_mode: false,
+            download_input: String::new(),
+            download_input_target: None,
             enabled_source_index: 0,
             selected_status_item: 0,
             status_item_scroll: 0,
@@ -264,6 +284,9 @@ impl SettingsPage {
         }
         if self.playlist_import_mode {
             return self.handle_playlist_import_input(key, ctx);
+        }
+        if self.download_input_target.is_some() {
+            return self.handle_download_input(key, ctx);
         }
         if self.local_path_mode {
             return self.handle_local_path_input(key, ctx);
@@ -596,6 +619,104 @@ impl SettingsPage {
                         config.notification.track_change = !config.notification.track_change;
                     });
                 }
+                // --- 下载设置 ---
+                (KeyModifiers::SHIFT, KeyCode::Char('S' | 's'))
+                | (KeyModifiers::NONE, KeyCode::Char('S')) => {
+                    self.download_input = ctx.downloads.download_dir().display().to_string();
+                    self.download_input_target = Some(DownloadInputTarget::Dir);
+                    self.status_msg = Some("输入下载目录，Enter 保存，Esc 取消".to_string());
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('M' | 'm'))
+                | (KeyModifiers::NONE, KeyCode::Char('M')) => {
+                    self.download_input = ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .download
+                        .filename_template
+                        .clone();
+                    self.download_input_target = Some(DownloadInputTarget::Template);
+                    self.status_msg = Some(
+                        "输入文件名模板，支持 {name} {singer} {album} {source} {quality}"
+                            .to_string(),
+                    );
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('F' | 'f'))
+                | (KeyModifiers::NONE, KeyCode::Char('F')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.quality = match config.download.quality {
+                            None => Some(config.player.quality),
+                            Some(Quality::Low128) => Some(Quality::High320),
+                            Some(Quality::High320) => Some(Quality::Flac),
+                            Some(Quality::Flac) => Some(Quality::Flac24),
+                            Some(Quality::Flac24) => None,
+                        };
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('B' | 'b'))
+                | (KeyModifiers::NONE, KeyCode::Char('B')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.multipart = !config.download.multipart;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('V' | 'v'))
+                | (KeyModifiers::NONE, KeyCode::Char('V')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.multipart_min_size_mb =
+                            next_step(&[1, 2, 5, 10, 20, 50], config.download.multipart_min_size_mb);
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('W' | 'w'))
+                | (KeyModifiers::NONE, KeyCode::Char('W')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.concurrency =
+                            next_step(&[1, 2, 4, 8, 16], config.download.concurrency as u64) as usize;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('A' | 'a'))
+                | (KeyModifiers::NONE, KeyCode::Char('A')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.concurrent_songs =
+                            next_step(&[1, 2, 3, 4], config.download.concurrent_songs as u64) as usize;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('E' | 'e'))
+                | (KeyModifiers::NONE, KeyCode::Char('E')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.max_retries =
+                            next_step(&[0, 1, 2, 3, 5], config.download.max_retries as u64) as u32;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('U' | 'u'))
+                | (KeyModifiers::NONE, KeyCode::Char('U')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.verify_size = !config.download.verify_size;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('L' | 'l'))
+                | (KeyModifiers::NONE, KeyCode::Char('L')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.skip_existing = !config.download.skip_existing;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('J' | 'j'))
+                | (KeyModifiers::NONE, KeyCode::Char('J')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.write_tags = !config.download.write_tags;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('G' | 'g'))
+                | (KeyModifiers::NONE, KeyCode::Char('G')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.embed_cover = !config.download.embed_cover;
+                    });
+                }
+                (KeyModifiers::SHIFT, KeyCode::Char('I' | 'i'))
+                | (KeyModifiers::NONE, KeyCode::Char('I')) => {
+                    self.update_config(ctx, |config| {
+                        config.download.save_lyric = !config.download.save_lyric;
+                    });
+                }
                 (KeyModifiers::NONE, KeyCode::Char('m')) => {
                     let mode = ctx.playlist.cycle_mode();
                     let result = {
@@ -789,6 +910,53 @@ impl SettingsPage {
                     && c != '\0' =>
             {
                 self.audio_device_input.push(c);
+            }
+            _ => {}
+        }
+        AppAction::None
+    }
+
+    /// 下载目录 / 文件名模板的文本输入。
+    fn handle_download_input(&mut self, key: KeyEvent, ctx: &AppContext) -> AppAction {
+        let Some(target) = self.download_input_target else {
+            return AppAction::None;
+        };
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.download_input_target = None;
+                self.download_input.clear();
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let value = self.download_input.trim().to_string();
+                self.download_input_target = None;
+                self.download_input.clear();
+                match target {
+                    DownloadInputTarget::Dir => {
+                        let dir = crate::download::naming::resolve_download_dir(&value);
+                        self.update_config(ctx, |config| {
+                            config.download.dir = value.clone();
+                        });
+                        self.status_msg = Some(format!("下载目录: {}", dir.display()));
+                    }
+                    DownloadInputTarget::Template => {
+                        if value.is_empty() {
+                            return AppAction::None;
+                        }
+                        self.update_config(ctx, |config| {
+                            config.download.filename_template = value.clone();
+                        });
+                        self.status_msg = Some(format!("文件名模板: {value}"));
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.download_input.pop();
+            }
+            (modifiers, KeyCode::Char(c))
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && c != '\0' =>
+            {
+                self.download_input.push(c);
             }
             _ => {}
         }
@@ -1225,6 +1393,8 @@ impl SettingsPage {
         let result = {
             let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             update(&mut config);
+            // 下载目录/分片等参数变化后立即生效，无需重启。
+            ctx.downloads.sync_config(&config);
             crate::config::loader::save(&config, &ctx.config_path)
         };
         self.status_msg = Some(match result {
@@ -1571,6 +1741,84 @@ impl SettingsPage {
                     muted,
                 )
             },
+            // --- 下载（索引 45 起，与 SETTING_OPTION_KEYS 保持一致）---
+            setting_value_line(
+                "下载目录",
+                &shorten_source(&ctx.downloads.download_dir().display().to_string(), 22),
+                "S",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "下载音质",
+                &config
+                    .download
+                    .quality
+                    .map(|quality| quality.label().to_string())
+                    .unwrap_or_else(|| format!("跟随播放 ({})", config.player.quality.label())),
+                "F",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "文件名模板",
+                &shorten_source(&config.download.filename_template, 22),
+                "M",
+                accent,
+                muted,
+            ),
+            setting_line(
+                "多线程分片",
+                config.download.multipart,
+                "B",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "分片阈值",
+                &format!("{} MB", config.download.multipart_min_size_mb),
+                "V",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "分片并发",
+                &config.download.concurrency.to_string(),
+                "W",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "同时下载",
+                &format!("{} 首", config.download.concurrent_songs),
+                "A",
+                accent,
+                muted,
+            ),
+            setting_value_line(
+                "失败重试",
+                &format!("{} 次", config.download.max_retries),
+                "E",
+                accent,
+                muted,
+            ),
+            setting_line(
+                "校验文件大小",
+                config.download.verify_size,
+                "U",
+                accent,
+                muted,
+            ),
+            setting_line(
+                "跳过已下载",
+                config.download.skip_existing,
+                "L",
+                accent,
+                muted,
+            ),
+            setting_line("写入标签", config.download.write_tags, "J", accent, muted),
+            setting_line("嵌入封面", config.download.embed_cover, "G", accent, muted),
+            setting_line("保存歌词", config.download.save_lyric, "I", accent, muted),
         ];
         let option_indices = self.category.option_indices();
         let options = options
@@ -1578,6 +1826,12 @@ impl SettingsPage {
             .enumerate()
             .filter_map(|(index, line)| option_indices.contains(&index).then_some(line))
             .collect();
+        // 选项个数必须与鼠标点击的键位表长度一致，否则新增设置项后点击会错位。
+        debug_assert_eq!(
+            SETTING_OPTION_KEYS.len(),
+            SETTING_OPTION_ACTIONS.len(),
+            "设置项键位表长度必须一致"
+        );
         render_setting_options(options, options_inner, buf);
 
         let source_block = Block::default()
@@ -2402,6 +2656,14 @@ fn next_quality(quality: Quality) -> Quality {
     }
 }
 
+/// 在一组候选值里循环取值；当前值不在候选里时回到第一个。
+fn next_step(values: &[u64], current: u64) -> u64 {
+    match values.iter().position(|value| *value == current) {
+        Some(index) => values[(index + 1) % values.len()],
+        None => values[0],
+    }
+}
+
 fn next_history_limit(limit: usize) -> usize {
     match limit {
         0..=25 => 50,
@@ -2489,12 +2751,13 @@ fn format_duration(value: std::time::Duration) -> String {
 /// 在更新配置项后更新这些常量!
 ///
 /// 鼠标点击时触发的按键，顺序必须与 render 中的选项列表一致
-const SETTING_OPTION_KEYS: [char; 45] = [
+const SETTING_OPTION_KEYS: [char; 58] = [
     't', 'g', 'w', 'c', 'e', 'Q', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0',
     '\0', '\0', '\0', '\0', 'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z', 'i',
-    'o', 'x', 'X', 'R', 'p', 'D', '\0', '\0', '\0', 'b',
+    'o', 'x', 'X', 'R', 'p', 'D', '\0', '\0', '\0', 'b', 'S', 'F', 'M', 'B', 'V', 'W', 'A', 'E',
+    'U', 'L', 'J', 'G', 'I',
 ];
-const SETTING_OPTION_ACTIONS: [Option<Action>; 45] = [
+const SETTING_OPTION_ACTIONS: [Option<Action>; 58] = [
     None,
     None,
     None,
@@ -2540,6 +2803,19 @@ const SETTING_OPTION_ACTIONS: [Option<Action>; 45] = [
     Some(Action::SettingsImportData),
     Some(Action::SettingsImportPlaylist),
     None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
 ];
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 const THREE_COLUMN_OPTIONS_MIN_WIDTH: u16 = 72;
@@ -2550,7 +2826,8 @@ const ALL_MANAGEMENT_PANELS_MIN_WIDTH: u16 = 108;
 /// 列表导航键来自页面级绑定，由 `consumes_key` 查表解析，不列在这里。
 const SETTINGS_PAGE_CHAR_KEYS: &[char] = &[
     'a', 'd', 'h', 'r', 's', 'y', '[', 'm', 'Q', 'v', 'p', 'b', 'n', 'o', 'c', 'e', 'f', 'g', 'i',
-    't', 'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']',
+    't', 'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']', 'S', 'F',
+    'M', 'B', 'V', 'W', 'A', 'E', 'U', 'L', 'J', 'G', 'I',
 ];
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
@@ -2665,6 +2942,47 @@ mod tests {
 
     /// 各设置项取值统一起始的列号
     const VALUE_COLUMN: usize = 1 + KEY_COLUMN_WIDTH + 1 + LABEL_COLUMN_WIDTH + 1;
+
+    #[test]
+    fn every_setting_option_belongs_to_exactly_one_category() {
+        assert_eq!(SETTING_OPTION_KEYS.len(), SETTING_OPTION_ACTIONS.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for category in [
+            SettingsCategory::Interface,
+            SettingsCategory::Playback,
+            SettingsCategory::Sources,
+            SettingsCategory::Integration,
+            SettingsCategory::Download,
+            SettingsCategory::Data,
+        ] {
+            for index in category.option_indices() {
+                assert!(
+                    *index < SETTING_OPTION_KEYS.len(),
+                    "设置项下标 {index} 超出键位表长度"
+                );
+                assert!(seen.insert(*index), "设置项下标 {index} 归属了多个分类");
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            SETTING_OPTION_KEYS.len(),
+            "每个设置项都应当出现在某个分类里"
+        );
+    }
+
+    #[test]
+    fn download_category_exposes_every_download_option() {
+        let indices = SettingsCategory::Download.option_indices();
+
+        assert_eq!(indices.len(), 13);
+        let keys: Vec<char> = indices.iter().map(|index| SETTING_OPTION_KEYS[*index]).collect();
+        assert_eq!(
+            keys,
+            vec![
+                'S', 'F', 'M', 'B', 'V', 'W', 'A', 'E', 'U', 'L', 'J', 'G', 'I'
+            ]
+        );
+    }
 
     #[test]
     fn shortens_unicode_source_path_on_character_boundaries() {

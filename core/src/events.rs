@@ -70,6 +70,8 @@ pub enum AppAction {
     /// application action lets pages without direct storage access (for
     /// example search) use the same behavior as the other song lists.
     ToggleFavoriteSong(Box<SongInfo>),
+    /// 下载一首歌到本地下载目录（后台任务，进度在下载面板查看）。
+    DownloadSong(Box<SongInfo>),
     RetrySong {
         song: Box<SongInfo>,
     },

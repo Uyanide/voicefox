@@ -4,7 +4,7 @@ use super::source::{Quality, SourceId};
 use crate::keybinding::KeybindingConfig;
 use crate::traits::player::EqualizerBand;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 9;
+pub const CURRENT_CONFIG_VERSION: u32 = 10;
 
 /// 可显示在底部状态栏中的内容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -368,6 +368,69 @@ impl Default for LocalMusicConfig {
     }
 }
 
+/// 音乐下载配置
+///
+/// 下载逻辑参考 MusicBot-Go 的 `bot/download`：探测源是否支持 Range，
+/// 大文件走多线程分片，落盘后校验字节数，网络类失败按指数退避重试。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DownloadConfig {
+    /// 下载目录。留空时使用 `~/Music/voicefox`（没有音乐目录则退回 `~/Downloads/voicefox`）。
+    pub dir: String,
+    /// 下载音质。`None` 表示跟随播放音质。
+    pub quality: Option<Quality>,
+    /// 文件名模板，支持 `{name}` `{singer}` `{album}` `{source}` `{quality}`；
+    /// 扩展名按实际音频格式自动追加。
+    pub filename_template: String,
+    /// 单个文件的分片并发数。
+    pub concurrency: usize,
+    /// 同时下载的歌曲数量。
+    pub concurrent_songs: usize,
+    /// 是否启用多线程分片下载。
+    pub multipart: bool,
+    /// 文件体积不小于该值（MB）时才分片下载。
+    pub multipart_min_size_mb: u64,
+    /// 网络类失败的最大重试次数。
+    pub max_retries: u32,
+    /// 校验实际落盘字节数与音源声明大小是否一致。
+    pub verify_size: bool,
+    /// 目标文件已存在时跳过下载。
+    pub skip_existing: bool,
+    /// 写入标题、歌手、专辑标签。
+    pub write_tags: bool,
+    /// 把封面嵌入音频标签。
+    pub embed_cover: bool,
+    /// 保存歌词：同时写出 `.lrc` 文件并内嵌到音频标签。
+    pub save_lyric: bool,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            quality: None,
+            filename_template: "{singer} - {name}".to_string(),
+            concurrency: 4,
+            concurrent_songs: 2,
+            multipart: true,
+            multipart_min_size_mb: 5,
+            max_retries: 3,
+            verify_size: true,
+            skip_existing: true,
+            write_tags: true,
+            embed_cover: true,
+            save_lyric: true,
+        }
+    }
+}
+
+impl DownloadConfig {
+    /// 分片最小体积（字节），供下载引擎直接使用。
+    pub fn multipart_min_size_bytes(&self) -> u64 {
+        self.multipart_min_size_mb.saturating_mul(1024 * 1024)
+    }
+}
+
 /// 应用完整配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -383,6 +446,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub local_music: LocalMusicConfig,
+    #[serde(default)]
+    pub download: DownloadConfig,
     #[serde(default)]
     pub keybindings: KeybindingConfig,
     #[serde(default)]
@@ -402,6 +467,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             ui: UiConfig::default(),
             local_music: LocalMusicConfig::default(),
+            download: DownloadConfig::default(),
             keybindings: KeybindingConfig::default(),
             notification: NotificationConfig::default(),
             integration: IntegrationConfig::default(),
@@ -415,7 +481,31 @@ fn legacy_config_version() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalMusicConfig, StatusBarItem, UiConfig};
+    use super::{DownloadConfig, LocalMusicConfig, StatusBarItem, UiConfig};
+
+    #[test]
+    fn missing_download_section_uses_defaults() {
+        let config: crate::model::config::Config =
+            serde_json::from_value(serde_json::json!({ "player": { "volume": 50 } })).unwrap();
+
+        assert_eq!(config.download, DownloadConfig::default());
+        assert_eq!(config.download.filename_template, "{singer} - {name}");
+        assert_eq!(config.download.multipart_min_size_bytes(), 5 * 1024 * 1024);
+        assert!(config.download.quality.is_none());
+    }
+
+    #[test]
+    fn partial_download_section_keeps_other_defaults() {
+        let config: crate::model::config::Config = serde_json::from_value(serde_json::json!({
+            "download": { "dir": "/music", "concurrency": 8 }
+        }))
+        .unwrap();
+
+        assert_eq!(config.download.dir, "/music");
+        assert_eq!(config.download.concurrency, 8);
+        assert_eq!(config.download.concurrent_songs, 2);
+        assert!(config.download.verify_size);
+    }
 
     #[test]
     fn legacy_local_music_config_remains_enabled() {

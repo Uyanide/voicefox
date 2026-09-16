@@ -135,6 +135,16 @@ impl FavoritesPage {
                     }
                     return AppAction::None;
                 }
+                Action::ListDownload => {
+                    if let Some(song) = filtered
+                        .get(self.selected)
+                        .and_then(|index| favorites.get(*index))
+                        .cloned()
+                    {
+                        return AppAction::DownloadSong(Box::new(song));
+                    }
+                    return AppAction::None;
+                }
                 Action::ListAddToQueue => {
                     if let Some(song) = filtered
                         .get(self.selected)

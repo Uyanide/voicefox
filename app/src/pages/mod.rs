@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub mod bili_login;
 pub mod details;
 pub mod components;
+pub mod downloads;
 pub mod favorites;
 pub mod help;
 pub mod history;

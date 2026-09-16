@@ -23,6 +23,7 @@ pub enum SongMenuKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SongMenuAction {
     Play,
+    Download,
     PlayNext,
     AddToQueue,
     OpenCustomPlaylists,
@@ -132,6 +133,13 @@ impl SongContextMenu {
             label: "播放".to_string(),
             action: SongMenuAction::Play,
         }];
+        // 本地文件已经在磁盘上，不提供下载入口。
+        if kind != SongMenuKind::Local {
+            root_items.push(MenuItem {
+                label: "下载歌曲".to_string(),
+                action: SongMenuAction::Download,
+            });
+        }
         if kind != SongMenuKind::Queue {
             root_items.extend([
                 MenuItem {

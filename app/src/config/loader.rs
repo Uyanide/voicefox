@@ -114,6 +114,11 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
         config.version = 9;
         changed = true;
     }
+    if config.version < 10 {
+        // 新增 [download] 下载配置，字段均有 serde 默认值，旧配置提升版本即可。
+        config.version = 10;
+        changed = true;
+    }
     if config.version > CURRENT_CONFIG_VERSION {
         // 用户可能带着更高版本的配置降级运行：只警告不 panic（debug_assert
         // 会在开发构建直接崩溃），字段由 serde default 兜底。

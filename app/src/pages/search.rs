@@ -301,6 +301,11 @@ impl SearchPage {
                 Action::SearchCycleSourceNext => {
                     return self.cycle_source(1);
                 }
+                Action::ListDownload => {
+                    if let Some(song) = self.results.get(self.selected).cloned() {
+                        return AppAction::DownloadSong(Box::new(song));
+                    }
+                }
                 Action::ListGoBack => {
                     // Search has no nested page to leave.  Esc is consumed by
                     // the input/variant overlays above; while idle it is a

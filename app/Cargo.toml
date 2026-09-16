@@ -19,6 +19,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
 image.workspace = true
+lofty.workspace = true
 reqwest.workspace = true
 clap.workspace = true
 toml.workspace = true
@@ -33,6 +34,7 @@ chrono.workspace = true
 dashmap.workspace = true
 ratatui-image.workspace = true
 qrcode = { version = "0.4", default-features = false }
+md-5.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }

@@ -74,6 +74,34 @@ paths = ["/home/user/Music"]
 # 扫描深度，0 为不限制
 max_depth = 0
 
+[download]
+# 下载目录；留空表示 ~/Music/voicefox（没有音乐目录时退回 ~/Downloads/voicefox）
+dir = "/home/user/Music/voicefox"
+# 下载音质：128k / 320k / flac / flac24bit；注释掉或删除表示跟随播放音质
+# quality = "flac"
+# 文件名模板，支持 {name} {singer} {album} {source} {quality}，扩展名自动追加
+filename_template = "{singer} - {name}"
+# 单个文件的分片并发数（1-16）
+concurrency = 4
+# 同时下载的歌曲数量（1-8）
+concurrent_songs = 2
+# 多线程分片下载：仅当音源支持 Range 且文件达到下面的阈值时启用
+multipart = true
+# 分片阈值（MB）
+multipart_min_size_mb = 5
+# 网络类失败的最大重试次数（完整性错误不重试）
+max_retries = 3
+# 校验落盘字节数与音源声明的大小是否一致
+verify_size = true
+# 目标文件已存在时跳过
+skip_existing = true
+# 写入标题 / 歌手 / 专辑标签
+write_tags = true
+# 嵌入封面
+embed_cover = true
+# 保存歌词：同时写出同名 .lrc 并内嵌到音频标签
+save_lyric = true
+
 # [theme] 主题（可选，默认 Catppuccin Mocha；省略该节即使用默认配色）
 # use_dark = true
 # accent = "#cba6f7"

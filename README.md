@@ -62,6 +62,7 @@ voicefox 对标 lx-music-desktop 与 go-musicfox，把完整的桌面音乐播�
 - **封面显示**：按终端能力自动选择 Kitty / Sixel / iTerm2 图片协议，都不支持时用 Unicode 半格块渲染
 - **tmux 封面**：在 tmux 中通过 passthrough 传递图形协议序列，封面照常显示；detach 后再 attach 自动重传，关掉终端、SSH 断线、换机器 attach 都能恢复，前提是这些终端支持同一种图形协议
 - **歌词支持**：支持 LRC、KRC、QRC、YRC 多种歌词格式，支持翻译歌词
+- **音乐下载**：把任意在线歌曲下载到本地，多线程分片、完整性校验、失败重试与换源；自动写入标签、封面和歌词，`Ctrl+O` 打开下载面板查看进度
 - **收藏管理**：添加/取消收藏歌曲和热门歌单
 - **播放历史**：自动记录播放记录，支持删除单条、清空和配置保留上限
 - **内容排序**：收藏、历史和本地音乐支持按最近时间、名称、歌手、专辑和时长排序；收藏与历史可按来源排序，本地音乐可按路径排序，当前模式显示在底部状态栏和右键菜单
@@ -303,6 +304,9 @@ voicefox
 | `q` | 退出 |
 | `f` | 收藏 / 取消收藏当前选中的歌曲或歌单 |
 | `Ctrl+L` | 收藏 / 取消收藏当前播放中的歌曲（所有页面一致） |
+| `Ctrl+S` | 下载当前播放中的歌曲（队列页下载选中的队列项） |
+| `D` | 下载选中歌曲（搜索、排行榜、歌单、收藏、历史、歌手/专辑详情） |
+| `Ctrl+O` | 打开 / 关闭下载面板（查看进度、取消任务、清理记录） |
 
 各页面（队列、搜索、排行榜、歌单、收藏、历史、本地音乐、设置）的完整键位表见 [KEYBINDINGS.md](KEYBINDINGS.md)；自定义键位见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 
@@ -332,6 +336,16 @@ js_sources = []         # JS 音源脚本 URL 或本地路径，数组顺序即�
 enabled = true
 paths = ["/home/user/Music"]
 max_depth = 0           # 扫描深度，0 为不限制
+
+[download]
+dir = "/home/user/Music/voicefox"  # 留空表示 ~/Music/voicefox
+filename_template = "{singer} - {name}"
+multipart = true        # 音源支持 Range 且文件超过阈值时多线程分片
+concurrent_songs = 2    # 同时下载的歌曲数
+verify_size = true      # 校验落盘字节数，防止 CDN 掉包
+write_tags = true       # 写入标题/歌手/专辑标签
+embed_cover = true      # 嵌入封面
+save_lyric = true       # 保存 .lrc 并内嵌歌词
 ```
 
 `quality` 是请求音质，不一定等于最终拿到的编码和码率。播放后状态栏会优先显示 libmpv 检测到的实际音频参数；在设置页的 JS 音源面板按 `h` 可运行音源健康检测。

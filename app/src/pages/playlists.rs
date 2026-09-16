@@ -554,6 +554,14 @@ impl PlaylistsPage {
                     self.enter_selected_playlist(ctx);
                     return AppAction::None;
                 }
+                Action::ListDownload => {
+                    if self.selected_playlist.is_some()
+                        && let Some(song) = self.songs.get(self.selected).cloned()
+                    {
+                        return AppAction::DownloadSong(Box::new(song));
+                    }
+                    return AppAction::None;
+                }
                 Action::ListAddToQueue => {
                     if self.selected_playlist.is_some()
                         && let Some(song) = self.songs.get(self.selected).cloned()

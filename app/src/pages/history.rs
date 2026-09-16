@@ -265,6 +265,12 @@ pub fn handle_input(
                 }
                 return AppAction::None;
             }
+            Action::ListDownload => {
+                if let Some(song) = song_at(state.selected) {
+                    return AppAction::DownloadSong(Box::new(song));
+                }
+                return AppAction::None;
+            }
             _ => {}
         }
     }

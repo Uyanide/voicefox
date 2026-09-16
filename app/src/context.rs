@@ -15,6 +15,7 @@ use lx_core::traits::player::{
 };
 
 use crate::cover::CoverService;
+use crate::download::DownloadManager;
 use crate::notification::DesktopNotifier;
 use crate::playlist::manager::PlaylistManager;
 use crate::storage::{SavedPlayerState, Storage};
@@ -45,6 +46,8 @@ pub struct AppContext {
 
     // --- 播放列表 ---
     pub playlist: Arc<PlaylistManager>,
+    /// 音乐下载队列（后台任务，界面只读取快照）。
+    pub downloads: Arc<DownloadManager>,
     pub current_song: Arc<std::sync::RwLock<Option<SongInfo>>>,
     pub play_request_id: Arc<AtomicU64>,
     pub active_player_generation: Arc<AtomicU64>,
@@ -109,6 +112,11 @@ impl AppContext {
         ));
         let play_mode = crate::playlist::mode::PlayMode::from_config(&config.player.play_mode);
         let playlist = Arc::new(PlaylistManager::new(play_mode));
+        // AppContext 在 runtime 内创建，这里取到的 handle 供下载任务跨线程使用。
+        let downloads = Arc::new(DownloadManager::new(
+            &config,
+            tokio::runtime::Handle::current(),
+        ));
         let storage = Arc::new(Storage::new());
         storage.trim_history(config.player.history_limit);
 
@@ -132,6 +140,7 @@ impl AppContext {
             lyric_service,
             cover_service,
             playlist,
+            downloads,
             current_song: Arc::new(std::sync::RwLock::new(None)),
             play_request_id: Arc::new(AtomicU64::new(0)),
             active_player_generation: Arc::new(AtomicU64::new(0)),

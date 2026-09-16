@@ -213,6 +213,12 @@ impl MainPage {
                     }
                     return AppAction::None;
                 }
+                Action::ListDownload => {
+                    if let Some(song) = ctx.playlist.borrow().get(self.selected).cloned() {
+                        return AppAction::DownloadSong(Box::new(song));
+                    }
+                    return AppAction::None;
+                }
                 _ => {}
             }
         }

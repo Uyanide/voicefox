@@ -94,6 +94,22 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext, sort_status: Optio
     let mut used_width = 0;
     let mut spans = Vec::new();
 
+    // 有下载任务时，把进度放在状态栏最前面，保证切换页面时也能看到。
+    if let Some(text) = download_indicator(ctx) {
+        append_segment(
+            &mut spans,
+            &mut used_width,
+            total_width,
+            text,
+            Style::new()
+                .fg(crate::theme::teal(ctx))
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+            ctx,
+            background,
+        );
+    }
+
     for item in status_bar_items {
         let remaining = remaining_segment_width(used_width, total_width, spans.is_empty());
         let segment = match item {
@@ -200,6 +216,29 @@ fn separator(ctx: &AppContext, background: ratatui::style::Color) -> Span<'stati
         "  ·  ",
         Style::new().fg(crate::theme::overlay0(ctx)).bg(background),
     )
+}
+
+/// 状态栏上的下载进度摘要；没有进行中的任务时返回 `None`。
+fn download_indicator(ctx: &AppContext) -> Option<String> {
+    let tasks = ctx.downloads.snapshot();
+    let active: Vec<_> = tasks.iter().filter(|task| task.state.is_active()).collect();
+    if active.is_empty() {
+        return None;
+    }
+    let ratios: Vec<f64> = active
+        .iter()
+        .filter_map(|task| task.progress.ratio())
+        .collect();
+    let percent = if ratios.is_empty() {
+        None
+    } else {
+        let average = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        Some((average * 100.0).round() as u32)
+    };
+    Some(match percent {
+        Some(percent) => format!("下载 {} 项 {percent}% (Ctrl+O)", active.len()),
+        None => format!("下载 {} 项 (Ctrl+O)", active.len()),
+    })
 }
 
 fn separator_width() -> usize {

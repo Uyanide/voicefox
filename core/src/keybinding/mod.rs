@@ -49,6 +49,10 @@ pub enum Action {
     GlobalGoToMain,
     /// 收藏/取消收藏当前歌曲（Ctrl+L）
     GlobalToggleFavorite,
+    /// 下载当前播放中的歌曲（Ctrl+S）
+    GlobalDownloadCurrent,
+    /// 打开下载面板（Ctrl+O）
+    GlobalDownloadsPanel,
     /// 强制重绘，并把封面重新传输给终端（Ctrl+R）
     GlobalRedraw,
 
@@ -75,6 +79,8 @@ pub enum Action {
     ListAddToQueue,
     /// 添加到队列下一首
     ListAddToQueueNext,
+    /// 下载当前选中的歌曲
+    ListDownload,
     /// 循环切换当前列表的排序方式
     ListCycleSort,
 
@@ -170,6 +176,8 @@ impl Action {
             Action::GlobalPrevTab => "上一个标签页",
             Action::GlobalGoToMain => "返回主页面",
             Action::GlobalToggleFavorite => "收藏 / 取消收藏当前歌曲",
+            Action::GlobalDownloadCurrent => "下载当前播放歌曲",
+            Action::GlobalDownloadsPanel => "打开 / 关闭下载面板",
             Action::GlobalRedraw => "强制重绘界面",
             Action::ListSelectUp => "选择上一项",
             Action::ListSelectDown => "选择下一项",
@@ -182,6 +190,7 @@ impl Action {
             Action::ListGoBack => "返回 / 退出",
             Action::ListAddToQueue => "添加到队列尾部",
             Action::ListAddToQueueNext => "添加到队列下一首",
+            Action::ListDownload => "下载选中歌曲",
             Action::ListCycleSort => "循环切换列表排序",
             Action::SearchInputMode => "进入搜索输入模式",
             Action::SearchStart => "开始搜索 / 播放结果",
@@ -217,7 +226,7 @@ impl Action {
     }
 
     /// 动作的规范展示顺序，帮助浮层按此排序。
-    pub const ALL: [Action; 56] = [
+    pub const ALL: [Action; 59] = [
         Action::GlobalQuit,
         Action::GlobalPlayPause,
         Action::GlobalNextTrack,
@@ -231,6 +240,8 @@ impl Action {
         Action::GlobalPrevTab,
         Action::GlobalGoToMain,
         Action::GlobalToggleFavorite,
+        Action::GlobalDownloadCurrent,
+        Action::GlobalDownloadsPanel,
         Action::GlobalRedraw,
         Action::ListSelectUp,
         Action::ListSelectDown,
@@ -243,6 +254,7 @@ impl Action {
         Action::ListGoBack,
         Action::ListAddToQueue,
         Action::ListAddToQueueNext,
+        Action::ListDownload,
         Action::ListCycleSort,
         Action::SearchInputMode,
         Action::SearchStart,
@@ -412,6 +424,9 @@ fn default_global_bindings() -> HashMap<Action, String> {
     m.insert(Action::GlobalPrevTab, "Shift+Tab".to_string());
     m.insert(Action::GlobalGoToMain, "Esc".to_string());
     m.insert(Action::GlobalToggleFavorite, "Ctrl+l".to_string());
+    // Ctrl+S / Ctrl+O 不与页面内的小写 s / o 冲突，也不占用列表翻页键。
+    m.insert(Action::GlobalDownloadCurrent, "Ctrl+s".to_string());
+    m.insert(Action::GlobalDownloadsPanel, "Ctrl+o".to_string());
     m.insert(Action::GlobalRedraw, "Ctrl+r".to_string());
     m
 }
@@ -435,6 +450,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     search.insert(Action::ListToggleFavorite, "f".to_string());
     search.insert(Action::ListAddToQueue, "a".to_string());
     search.insert(Action::ListAddToQueueNext, "A".to_string());
+    search.insert(Action::ListDownload, "D".to_string());
     search.insert(Action::SearchCycleSourcePrev, "Left".to_string());
     search.insert(Action::SearchCycleSourceNext, "Right".to_string());
     search.insert(Action::ListGoBack, "Esc".to_string());
@@ -450,6 +466,8 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     main.insert(Action::ListPageDown, "Ctrl+d".to_string());
     main.insert(Action::ListActivate, "Enter".to_string());
     main.insert(Action::ListToggleFavorite, "f".to_string());
+    // 队列页的 D 已经用于「清空队列」，下载沿用 Ctrl+S 的语义，落在选中的队列项上。
+    main.insert(Action::ListDownload, "Ctrl+s".to_string());
     pages.insert("main".to_string(), main);
 
     // --- 排行榜 ---
@@ -464,6 +482,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     leaderboard.insert(Action::ListToggleFavorite, "f".to_string());
     leaderboard.insert(Action::ListAddToQueue, "a".to_string());
     leaderboard.insert(Action::ListAddToQueueNext, "A".to_string());
+    leaderboard.insert(Action::ListDownload, "D".to_string());
     leaderboard.insert(Action::SearchCycleSourcePrev, "Left".to_string());
     leaderboard.insert(Action::SearchCycleSourceNext, "Right".to_string());
     leaderboard.insert(Action::ListGoBack, "Esc".to_string());
@@ -481,6 +500,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     playlists.insert(Action::ListToggleFavorite, "f".to_string());
     playlists.insert(Action::ListAddToQueue, "a".to_string());
     playlists.insert(Action::ListAddToQueueNext, "A".to_string());
+    playlists.insert(Action::ListDownload, "D".to_string());
     playlists.insert(Action::SearchCycleSourcePrev, "Left".to_string());
     playlists.insert(Action::SearchCycleSourceNext, "Right".to_string());
     playlists.insert(Action::ListGoBack, "Esc".to_string());
@@ -501,6 +521,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     favorites.insert(Action::ListAddToQueueNext, "A".to_string());
     favorites.insert(Action::ListCycleSort, "s".to_string());
     favorites.insert(Action::FavoritesRemove, "d".to_string());
+    favorites.insert(Action::ListDownload, "D".to_string());
     favorites.insert(Action::ListGoBack, "Esc".to_string());
     pages.insert("favorites".to_string(), favorites);
 
@@ -516,6 +537,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     history.insert(Action::ListToggleFavorite, "f".to_string());
     history.insert(Action::ListAddToQueue, "a".to_string());
     history.insert(Action::ListAddToQueueNext, "A".to_string());
+    history.insert(Action::ListDownload, "D".to_string());
     history.insert(Action::ListCycleSort, "s".to_string());
     history.insert(Action::HistoryFilter, "/".to_string());
     pages.insert("history".to_string(), history);
@@ -581,6 +603,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     details.insert(Action::ListToggleFavorite, "f".to_string());
     details.insert(Action::ListAddToQueue, "a".to_string());
     details.insert(Action::ListAddToQueueNext, "A".to_string());
+    details.insert(Action::ListDownload, "D".to_string());
     details.insert(Action::ListGoBack, "Esc".to_string());
     pages.insert("details".to_string(), details);
 
@@ -895,6 +918,41 @@ mod tests {
     #[test]
     fn default_config_contains_all_default_scopes() {
         let config = KeybindingConfig::default();
+
+        // 下载相关的默认键位：全局 Ctrl+S/Ctrl+O，列表页 D。
+        assert_eq!(
+            config.global.get(&Action::GlobalDownloadCurrent),
+            Some(&"Ctrl+s".to_string())
+        );
+        assert_eq!(
+            config.global.get(&Action::GlobalDownloadsPanel),
+            Some(&"Ctrl+o".to_string())
+        );
+        for page in [
+            "search",
+            "leaderboard",
+            "playlists",
+            "favorites",
+            "history",
+            "details",
+        ] {
+            assert_eq!(
+                config
+                    .pages
+                    .get(page)
+                    .and_then(|bindings| bindings.get(&Action::ListDownload)),
+                Some(&"D".to_string()),
+                "{page} 的下载键位应为 D"
+            );
+        }
+        // 队列页的 D 已用于清空队列，下载走 Ctrl+S。
+        assert_eq!(
+            config
+                .pages
+                .get("main")
+                .and_then(|bindings| bindings.get(&Action::ListDownload)),
+            Some(&"Ctrl+s".to_string())
+        );
 
         assert_eq!(
             config.global.get(&Action::GlobalQuit),

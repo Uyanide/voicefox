@@ -207,6 +207,9 @@ impl DetailsPage {
             Some(lx_core::keybinding::Action::ListAddToQueueNext) => {
                 return self.add_selected(InsertPosition::Next);
             }
+            Some(lx_core::keybinding::Action::ListDownload) => {
+                return self.download_selected();
+            }
             _ => {}
         }
 
@@ -408,6 +411,14 @@ impl DetailsPage {
                 position,
             })
             .unwrap_or_else(|| AppAction::ShowNotification(Notification::info("暂无可加入队列的歌曲")))
+    }
+
+    fn download_selected(&self) -> AppAction {
+        self.songs
+            .get(self.selected_song)
+            .cloned()
+            .map(|song| AppAction::DownloadSong(Box::new(song)))
+            .unwrap_or_else(|| AppAction::ShowNotification(Notification::info("暂无可下载的歌曲")))
     }
 
     fn toggle_favorite(&self, ctx: &AppContext) -> AppAction {

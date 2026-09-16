@@ -79,6 +79,21 @@ mpris = true                # Linux MPRIS / Waybar / 媒体键，修改后重启
 enabled = true
 paths = ["/home/user/Music"]  # 改成你的音乐目录，可配置多个
 max_depth = 0                 # 扫描深度，0 为不限制
+
+[download]
+dir = ""                     # 留空表示 ~/Music/voicefox
+# quality = "flac"           # 省略则跟随 player.quality
+filename_template = "{singer} - {name}"
+concurrency = 4              # 单个文件的分片并发数
+concurrent_songs = 2         # 同时下载的歌曲数
+multipart = true             # 支持 Range 且超过阈值时多线程分片
+multipart_min_size_mb = 5
+max_retries = 3              # 网络类失败重试次数，完整性错误不重试
+verify_size = true           # 校验落盘字节数
+skip_existing = true         # 已存在则跳过
+write_tags = true            # 写入标题/歌手/专辑
+embed_cover = true           # 嵌入封面
+save_lyric = true            # 保存 .lrc 并内嵌歌词
 ```
 
 ### 请求音质与实际音质
@@ -195,6 +210,41 @@ max_depth = 0                 # 扫描深度，0 为不限制
 | `enabled` | `true` | 是否启用本地音乐 |
 | `paths` | `[]` | 音乐目录列表，可多个 |
 | `max_depth` | `0` | 扫描深度，0 为不限制 |
+
+### `[download]` 音乐下载
+
+下载逻辑参考 [MusicBot-Go](https://github.com/liuran001/MusicBot-Go) 的下载服务：先探测音源是否支持
+Range，大文件走多线程分片，落盘后校验字节数，网络类失败按指数退避重试，完整性错误不重试。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `dir` | `""` | 下载目录；留空表示 `~/Music/voicefox`，没有音乐目录时退回 `~/Downloads/voicefox`，支持 `~/` |
+| `quality` | 跟随播放音质 | 下载音质：`128k` / `320k` / `flac` / `flac24bit` |
+| `filename_template` | `"{singer} - {name}"` | 文件名模板，支持 `{name}` `{singer}` `{album}` `{source}` `{quality}`；扩展名按实际音频格式追加 |
+| `concurrency` | `4` | 单个文件的分片并发数（1-16） |
+| `concurrent_songs` | `2` | 同时下载的歌曲数量（1-8） |
+| `multipart` | `true` | 是否启用多线程分片下载 |
+| `multipart_min_size_mb` | `5` | 达到该体积（MB）且音源支持 Range 时才分片 |
+| `max_retries` | `3` | 网络类失败的最大重试次数（0-10）；完整性错误直接失败 |
+| `verify_size` | `true` | 校验落盘字节数与音源声明大小是否一致 |
+| `skip_existing` | `true` | 目标文件已存在时跳过下载 |
+| `write_tags` | `true` | 写入标题、歌手、专辑标签 |
+| `embed_cover` | `true` | 把封面嵌入音频标签 |
+| `save_lyric` | `true` | 写出同名 `.lrc` 文件并内嵌歌词 |
+
+下载时的行为说明：
+
+- **换源**：解析播放地址失败时，若 `source.auto_toggle` 为 `true`，会自动尝试其它音源的同曲匹配。
+- **临时文件**：下载先写同目录下的 `.<文件名>.part`，校验通过后原子改名，中断不会留下半截成品文件。
+- **候选地址**：下载失败时先换同一个资源的备用地址（例如网易云 `m8/m801/m804/m704` 节点会被改写为 `m7/m701`），仍失败则从下一个 JS 音源/音源重新解析地址，最多尝试 3 次。
+- **格式校正**：落盘后按文件头魔数校正扩展名，避免 CDN 返回的扩展名与内容不符。
+- **完整性复核**：落盘后再校验一次内容确实是音频，且时长与音源信息（容差 3 秒或 5%，长的那侧再加 1.5 秒）一致，明显不符的下载会被删除并换源重试。
+- **封面压缩**：封面超过 2MB 时先缩到 640px 的 JPEG 再嵌入，避免音频文件被大图撑大。
+- **文件名**：模板渲染后替换 `/ \ ? * : | < > "` 等非法字符，截断到 180 字节（按 UTF-8 边界），重名时追加 ` (2)`。
+- **进度**：`Ctrl+O` 打开下载面板查看进度、取消任务或清理记录。
+- **入库**：下载目录若位于 `[local_music]` 的 `paths` 之内，新文件会被目录监听自动扫描入库（默认 `dir` 是 `~/Music/voicefox`，通常已在本地音乐目录内）。
+- **歌词**：只写入可识别的标准 LRC；某些音源返回的私有 JSON 格式会被跳过，逐字歌词会先转成 LRC。
+- **排查**：每条下载的最终路径都会写成 `download finished: 歌名 -> 路径` 记入 `~/.config/voicefox/voicefox.log`。
 
 ### `[theme]` 主题
 
