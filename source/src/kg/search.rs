@@ -83,6 +83,17 @@ fn parse_song(item: &Value) -> Option<SongInfo> {
             extra.insert(extra_key.to_string(), hash.to_string());
         }
     }
+    for (source_key, extra_key) in [
+        ("FileSize", "FileSize"),
+        ("HQFileSize", "HQFileSize"),
+        ("SQFileSize", "SQFileSize"),
+        ("ResFileSize", "ResFileSize"),
+    ] {
+        let size = json_i64(&item[source_key]);
+        if size > 0 {
+            extra.insert(extra_key.to_string(), size.to_string());
+        }
+    }
 
     let mut song = SongInfo::new(song_id, SourceId::Kg, name, singer);
     song.album_name = album_name;

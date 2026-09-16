@@ -1071,6 +1071,11 @@ mod tests {
                 cover_url: None,
                 qualities: vec![quality],
                 headers: vec![],
+                size: None,
+                size_is_advisory: false,
+                md5: None,
+                candidate_urls: vec![],
+                max_chunk_size: 0,
             })
         }
 

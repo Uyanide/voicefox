@@ -25,6 +25,8 @@ pub struct MetadataEdit {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub cover: Option<Vec<u8>>,
+    /// 内嵌歌词文本（LRC）。不支持的容器会忽略该字段。
+    pub lyrics: Option<String>,
 }
 
 /// 将标签和可选封面写回本地音频文件。
@@ -55,6 +57,11 @@ pub fn write_metadata(path: &Path, edit: &MetadataEdit) -> Result<(), String> {
         let picture = Picture::from_reader(&mut Cursor::new(cover))
             .map_err(|error| format!("封面格式无效: {error}"))?;
         tag.set_picture(0, picture);
+    }
+    if let Some(lyrics) = edit.lyrics.as_ref()
+        && !lyrics.trim().is_empty()
+    {
+        tag.insert_text(ItemKey::Lyrics, lyrics.clone());
     }
 
     tagged

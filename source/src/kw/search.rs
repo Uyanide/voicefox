@@ -2,8 +2,8 @@
 //!
 //! GET http://search.kuwo.cn/r.s?client=kt&all={keyword}&pn={page-1}&rn={limit}&...
 
-use std::collections::BTreeSet;
 use crate::http::SendWithRetry;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use lx_core::model::song::SongInfo;

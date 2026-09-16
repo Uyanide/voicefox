@@ -16,7 +16,13 @@ pub struct SearchResult {
 }
 
 /// 播放 URL 结果
-#[derive(Debug, Clone)]
+///
+/// 字段命名与 MusicBot-Go 的 `platform.DownloadInfo` 对齐：
+/// - `size` / `size_is_advisory`：完整性校验
+/// - `md5`：二次校验（部分平台 API 会返回）
+/// - `candidate_urls`：备用 CDN 地址，主地址失败时依次尝试
+/// - `max_chunk_size`：某些 CDN（如 googlevideo）要求严格有界 Range
+#[derive(Debug, Clone, Default)]
 pub struct SongUrl {
     pub url: String,
     pub quality: Quality,
@@ -24,6 +30,22 @@ pub struct SongUrl {
     pub cover_url: Option<String>,
     pub qualities: Vec<Quality>,
     pub headers: Vec<(String, String)>,
+    /// 音源声明的文件大小（字节）。`None` 表示音源未提供或不可靠。
+    pub size: Option<u64>,
+    /// 为 `true` 时，仅在实际大小**小于**声明值时视为完整性失败；
+    /// 音源经常少报字节（如 QQ 音乐 FLAC 少 15 字节）的场景用这个标志。
+    pub size_is_advisory: bool,
+    /// 音源提供的 MD5 校验值，用于下载后二次校验（目前仅网易云官方
+    /// `song/enhance/player/url/v1` 会返回）。
+    pub md5: Option<String>,
+    /// 备用 CDN 地址。下载引擎在主地址失败时按顺序尝试，并额外为每个地址
+    /// 补上网易云 CDN 的 m8/m801/m804/m704 → m7/m701 节点改写。
+    pub candidate_urls: Vec<String>,
+    /// 某些 CDN（如 googlevideo）拒绝 HEAD、plain GET、open-ended Range
+    /// 和超上限的单个 Range 请求，必须严格按此值分片。`0` 表示不启用。
+    /// 启用时下载引擎不会做 HEAD 探测，也不会回退到单连接下载，
+    /// 因此音源必须同时给出 `size`（否则无法推算有界 Range）。
+    pub max_chunk_size: u64,
 }
 
 /// 音源统一接口

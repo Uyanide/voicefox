@@ -32,7 +32,13 @@ pub(crate) fn configure(proxy_url: &str, timeout_secs: u64) {
         options.timeout = Duration::from_secs(timeout_secs.clamp(1, 300));
     }
     // 代理或超时变化后重建全局客户端。
-    *client_store().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(build_client(&options().read().unwrap_or_else(|e| e.into_inner()).clone()));
+    let snapshot = options().read().unwrap_or_else(|e| e.into_inner()).clone();
+    *client_store().write().unwrap_or_else(|e| e.into_inner()) =
+        Arc::new(build_client(&snapshot, RedirectMode::Follow));
+    *no_redirect_store()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) =
+        Arc::new(build_client(&snapshot, RedirectMode::Manual));
 }
 
 /// 全局复用的 HTTP 客户端。
@@ -46,16 +52,53 @@ pub fn client() -> reqwest::Client {
 
 fn client_store() -> &'static RwLock<Arc<reqwest::Client>> {
     static CLIENT: OnceLock<RwLock<Arc<reqwest::Client>>> = OnceLock::new();
-    CLIENT.get_or_init(|| RwLock::new(Arc::new(build_client(&options().read().unwrap_or_else(|e| e.into_inner()).clone()))))
+    CLIENT.get_or_init(|| {
+        RwLock::new(Arc::new(build_client(
+            &options().read().unwrap_or_else(|e| e.into_inner()).clone(),
+            RedirectMode::Follow,
+        )))
+    })
 }
 
-fn build_client(options: &NetworkOptions) -> reqwest::Client {
+/// 不自动跟随重定向的共享客户端。
+///
+/// 咪咕的 `listenSong.do` 用 302 的 `Location` 直接给出 CDN 直链，必须自己读
+/// 这个头；跟随重定向会真的去请求一次 CDN，还会丢掉原始 URL 信息。
+pub(crate) fn client_without_redirect() -> reqwest::Client {
+    (**no_redirect_store()
+        .read()
+        .unwrap_or_else(|e| e.into_inner()))
+    .clone()
+}
+
+fn no_redirect_store() -> &'static RwLock<Arc<reqwest::Client>> {
+    static CLIENT: OnceLock<RwLock<Arc<reqwest::Client>>> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        RwLock::new(Arc::new(build_client(
+            &options().read().unwrap_or_else(|e| e.into_inner()).clone(),
+            RedirectMode::Manual,
+        )))
+    })
+}
+
+/// 重定向策略：常规请求跟随 302，少数接口需要自己读 `Location`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectMode {
+    Follow,
+    Manual,
+}
+
+fn build_client(options: &NetworkOptions, redirect: RedirectMode) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .timeout(options.timeout)
-        // TCP 连接挂起时快速失败，而不是吃满整个整体超时
         .connect_timeout(Duration::from_secs(8))
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(Duration::from_secs(30))
         .user_agent("Mozilla/5.0 (compatible; voicefox/0.1)");
+    if redirect == RedirectMode::Manual {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
     if !options.proxy_url.is_empty() {
         match reqwest::Proxy::all(&options.proxy_url) {
             Ok(proxy) => builder = builder.proxy(proxy),
@@ -73,7 +116,10 @@ pub(crate) const RETRY_ATTEMPTS: usize = 1;
 /// 仅对连接失败/超时这类瞬时网络错误做有限次重试，4xx/5xx 响应不重试，
 /// 由调用方自行判断业务语义。
 pub(crate) trait SendWithRetry {
-    fn send_with_retry(self, retries: usize) -> impl Future<Output = Result<reqwest::Response, reqwest::Error>>;
+    fn send_with_retry(
+        self,
+        retries: usize,
+    ) -> impl Future<Output = Result<reqwest::Response, reqwest::Error>>;
 }
 
 impl SendWithRetry for reqwest::RequestBuilder {
@@ -88,7 +134,9 @@ impl SendWithRetry for reqwest::RequestBuilder {
                 Err(error) if attempt < retries && (error.is_connect() || error.is_timeout()) => {
                     attempt += 1;
                     let backoff = std::time::Duration::from_millis(300 * (1 << attempt.min(3)));
-                    tracing::warn!("request failed (attempt {attempt}), retrying in {backoff:?}: {error}");
+                    tracing::warn!(
+                        "request failed (attempt {attempt}), retrying in {backoff:?}: {error}"
+                    );
                     tokio::time::sleep(backoff).await;
                 }
                 Err(error) => return Err(error),

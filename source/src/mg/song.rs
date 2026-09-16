@@ -90,6 +90,7 @@ pub(crate) fn parse_song(value: &Value) -> Option<SongInfo> {
     let album_name = first_string(value, &["album", "albumName", "txt3"]);
     let album_id = value_string(&value["albumId"]);
     let copyright_id = value_string(&value["copyrightId"]);
+    let content_id = value_string(&value["contentId"]);
 
     let formats = value["audioFormats"]
         .as_array()
@@ -109,6 +110,10 @@ pub(crate) fn parse_song(value: &Value) -> Option<SongInfo> {
     let mut extra = HashMap::new();
     if !copyright_id.is_empty() {
         extra.insert("copyrightId".to_string(), copyright_id);
+    }
+    // resourceinfo.do 的 resourceId 需要 contentId（版权 id 查不到资源）。
+    if !content_id.is_empty() {
+        extra.insert("contentId".to_string(), content_id);
     }
     for (key, extra_key) in [
         ("lrcUrl", "lrcUrl"),

@@ -56,9 +56,10 @@ impl SourceId {
 }
 
 /// 音质
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub enum Quality {
     #[serde(rename = "128k")]
+    #[default]
     Low128,
     #[serde(rename = "320k")]
     High320,

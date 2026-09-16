@@ -7,6 +7,7 @@ pub mod leaderboard;
 pub mod lyric;
 pub mod playlist;
 pub mod search;
+pub(crate) mod session;
 pub mod url;
 
 use async_trait::async_trait;

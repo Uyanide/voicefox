@@ -675,6 +675,11 @@ impl MusicSource for LocalSource {
                 cover_url: song.cover_url.clone(),
                 qualities: song.qualities.iter().copied().collect(),
                 headers: vec![],
+                size: None,
+                size_is_advisory: false,
+                md5: None,
+                candidate_urls: vec![],
+                max_chunk_size: 0,
             });
         }
         let path = match song.file_path.as_ref() {
@@ -698,6 +703,11 @@ impl MusicSource for LocalSource {
             cover_url: song.cover_url.clone(),
             qualities,
             headers: vec![],
+            size: None,
+            size_is_advisory: false,
+            md5: None,
+            candidate_urls: vec![],
+            max_chunk_size: 0,
         })
     }
 

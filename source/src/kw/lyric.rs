@@ -6,8 +6,8 @@
 //!   - 普通歌词 (不含 lrcx): zlib 解压 → UTF-8
 //!   - 逐字歌词 (lrcx=1):   zlib 解压 → base64 解码 → XOR 解密
 
-use lx_core::model::lyric::LyricData;
 use crate::http::SendWithRetry;
+use lx_core::model::lyric::LyricData;
 use lx_core::model::song::SongInfo;
 use lx_core::traits::source::FetchError;
 

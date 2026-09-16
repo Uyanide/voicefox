@@ -80,6 +80,18 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
 
     let play_url = format!("https://dl.stream.qqmusic.qq.com/{}", purl);
 
+    let size_key = match quality {
+        Quality::Low128 => "size_128mp3",
+        Quality::High320 => "size_320mp3",
+        Quality::Flac => "size_flac",
+        Quality::Flac24 => "size_hires",
+    };
+    let size = song
+        .extra
+        .get(size_key)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0);
+
     let qualities: Vec<Quality> = song.qualities.iter().copied().collect();
 
     Ok(SongUrl {
@@ -89,5 +101,10 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         cover_url: song.cover_url.clone(),
         qualities,
         headers: vec![],
+        size,
+        size_is_advisory: matches!(quality, Quality::Flac | Quality::Flac24),
+        md5: None,
+        candidate_urls: vec![],
+        max_chunk_size: 0,
     })
 }

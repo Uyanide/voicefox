@@ -163,6 +163,17 @@ pub(crate) fn parse_song(item: &Value) -> Option<SongInfo> {
     if let Some(s) = item["file"]["media_mid"].as_str() {
         extra.insert("strMediaMid".to_string(), s.to_string());
     }
+    for (key, json_key) in [
+        ("size_128mp3", "size_128mp3"),
+        ("size_320mp3", "size_320mp3"),
+        ("size_flac", "size_flac"),
+        ("size_hires", "size_hires"),
+    ] {
+        let size = json_i64(&file[json_key]);
+        if size > 0 {
+            extra.insert(key.to_string(), size.to_string());
+        }
+    }
 
     let mut song = SongInfo::new(mid, SourceId::Tx, name, singer);
     song.album_name = album_name;

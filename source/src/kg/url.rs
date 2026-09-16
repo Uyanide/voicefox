@@ -103,6 +103,18 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         return Err(FetchError::NotFound);
     }
 
+    let size_key = match actual_quality {
+        Quality::Low128 => "FileSize",
+        Quality::High320 => "HQFileSize",
+        Quality::Flac => "SQFileSize",
+        Quality::Flac24 => "ResFileSize",
+    };
+    let size = song
+        .extra
+        .get(size_key)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0);
+
     let qualities: Vec<Quality> = song.qualities.iter().copied().collect();
 
     Ok(SongUrl {
@@ -112,5 +124,10 @@ pub async fn get_song_url(song: &SongInfo, quality: Quality) -> Result<SongUrl, 
         cover_url: None,
         qualities,
         headers: vec![],
+        size,
+        size_is_advisory: false,
+        md5: None,
+        candidate_urls: vec![],
+        max_chunk_size: 0,
     })
 }
