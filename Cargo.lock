@@ -786,9 +786,9 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.23.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
+checksum = "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
 dependencies = [
  "darling_core",
  "darling_macro",
@@ -796,26 +796,26 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
-version = "0.23.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9865a50f7c335f53564bb694ef660825eb8610e0a53d3e11bf1b0d3df31e03b0"
+checksum = "6837e2cf7485aaae18f86181d2f0e9a7ed297a025e220aeabf63fdebd3a2ddff"
 dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
  "strsim",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "darling_macro"
-version = "0.23.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
+checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
 dependencies = [
  "darling_core",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -1853,15 +1853,15 @@ dependencies = [
 
 [[package]]
 name = "instability"
-version = "0.3.14"
+version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb2d60ef19920a3a9193c3e371f726ec1dafc045dac788d0fb3704272458971"
+checksum = "2bf84e73fa6f27f299dec58e13223cf70db80da872eb921d4f6138342a0eabc8"
 dependencies = [
  "darling",
  "indoc",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2127,7 +2127,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lx-core"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "lx-lyric"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "lx-player"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "anyhow",
  "libmpv2",
@@ -2165,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "lx-source"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "aes",
  "anyhow",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "lx-test"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "lx-core",
  "lx-player",
@@ -4524,7 +4524,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voicefox-app"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "anyhow",
  "base64",
@@ -4557,7 +4557,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-application"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4572,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-ffi"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "flutter_rust_bridge",
@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-runtime"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "anyhow",
  "async-trait",
