@@ -5,3 +5,7 @@
 *.swo
 massif.out
 heaptrack.*
+
+# Flutter generated files
+flutter/.dart_tool/
+flutter/build/

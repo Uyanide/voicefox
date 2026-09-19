@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/emoeem/voicefox/actions/workflows/ci.yml/badge.svg)](https://github.com/emoeem/voicefox/actions/workflows/ci.yml)
 
-voicefox 将多音源音乐搜索、在线播放、本地音乐库、歌词、下载、收藏、历史和歌单管理整合进键盘优先的终端界面。当前 0.3.12 发布线使用稳定旧版 TUI，同时集成新的音源、下载、登录和跨平台能力。
+voicefox 将多音源音乐搜索、在线播放、本地音乐库、歌词、下载、收藏、历史和歌单管理整合进键盘优先的终端界面。当前 0.3.13 发布线使用稳定旧版 TUI，同时集成新的音源、下载、登录和跨平台能力。
 
 ## 主要功能
 
