@@ -9,8 +9,11 @@
 pub mod engine;
 pub mod manager;
 pub mod naming;
+pub mod records;
 pub mod tags;
+
 #[cfg(test)]
 pub mod test_support;
+pub mod webdav;
 
 pub use manager::{DownloadManager, DownloadState, DownloadTaskView};

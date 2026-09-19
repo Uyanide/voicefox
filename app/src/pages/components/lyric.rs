@@ -2,15 +2,13 @@
 //!
 //! 对标 go-musicfox internal/ui/lyric.go
 
+use crate::context::AppContext;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Alignment;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-use crate::context::AppContext;
 
 /// 歌词区最小可用高度（含边框）。
 ///
@@ -43,7 +41,10 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     }
 
     let current = state.current_line;
-    let visible_rows = inner.height as usize;
+    // 每句歌词至少预留两行：长句使用 ratatui 的 Wrap 自动折行，而不是
+    // 静默截断成省略号。这样 CJK/英文长歌词都能完整显示。
+    let row_height = 2usize;
+    let visible_rows = (inner.height as usize / row_height).max(1);
     if visible_rows == 0 {
         return;
     }
@@ -63,14 +64,14 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if row < 0 || row >= visible_rows as isize {
             continue;
         }
-        let y = inner.y + row as u16;
+        let y = inner.y + (row as usize * row_height) as u16;
 
         let line = &state.lines[line_idx];
         let distance = (line_idx as isize - current as isize).unsigned_abs();
 
         if line_idx == current && !state.yrc_words.is_empty() {
             render_karaoke_line(
-                Rect::new(inner.x, y, inner.width, 1),
+                Rect::new(inner.x, y, inner.width, row_height as u16),
                 buf,
                 ctx,
                 &state.yrc_words,
@@ -96,27 +97,24 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
             ("  ", Style::new().fg(color))
         };
 
-        let text = format!(
-            "{}{}",
-            prefix,
-            truncate(&line.text, inner.width.saturating_sub(2) as usize)
-        );
+        let text = format!("{}{}", prefix, line.text.trim());
         Paragraph::new(Line::from(Span::styled(text, style)))
             .alignment(Alignment::Center)
-            .render(Rect::new(inner.x, y, inner.width, 1), buf);
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .render(Rect::new(inner.x, y, inner.width, row_height as u16), buf);
     }
 
     if translation_visible && let Some(ref translation) = state.translation {
-        let y = inner.y + current_row as u16 + 1;
-        let text = truncate(translation, inner.width as usize);
+        let y = inner.y + ((current_row + 1) * row_height) as u16;
         Paragraph::new(Line::from(Span::styled(
-            text,
+            translation.trim(),
             Style::new()
                 .fg(crate::theme::teal(ctx))
                 .add_modifier(Modifier::ITALIC),
         )))
         .alignment(Alignment::Center)
-        .render(Rect::new(inner.x, y, inner.width, 1), buf);
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .render(Rect::new(inner.x, y, inner.width, row_height as u16), buf);
     }
 }
 
@@ -152,26 +150,4 @@ fn render_karaoke_line(
     Paragraph::new(Line::from(spans))
         .alignment(Alignment::Center)
         .render(area, buf);
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.trim();
-    if UnicodeWidthStr::width(s) <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".chars().take(max).collect();
-    }
-    let mut result = String::new();
-    let mut width = 0;
-    for ch in s.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + char_width > max - 1 {
-            break;
-        }
-        result.push(ch);
-        width += char_width;
-    }
-    result.push('…');
-    result
 }

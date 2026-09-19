@@ -112,8 +112,11 @@ pub enum PlayerEvent {
     Buffering { generation: u64, percent: f64 },
 }
 
-/// 播放器统一接口
-pub trait Player: Send + Sync {
+/// 跨平台播放器后端统一接口。
+///
+/// UI 和应用层只依赖这组能力，不依赖具体的播放引擎。桌面端目前由
+/// libmpv 实现，移动端将由 Android / iOS 原生音频后端实现。
+pub trait PlayerBackend: Send + Sync {
     /// 标记播放器即将加载新媒体，并返回本次播放的代次令牌。
     fn prepare(&self) -> u64;
     /// 仅当代次令牌仍有效时开始播放，返回是否接受了本次请求。
@@ -239,6 +242,10 @@ pub trait Player: Send + Sync {
     /// Cancel a pending fade operation.
     fn cancel_fade(&self) {}
 }
+
+/// Backward-compatible name for the existing TUI frontend.
+/// New code should depend on `PlayerBackend`.
+pub use PlayerBackend as Player;
 
 #[cfg(test)]
 mod tests {

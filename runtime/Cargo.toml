@@ -1,0 +1,29 @@
+[package]
+name = "voicefox-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lx-core = { path = "../core" }
+lx-source = { path = "../source" }
+lx-player = { path = "../player" }
+lx-lyric = { path = "../lyric" }
+voicefox-application = { path = "../application" }
+tokio.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+lofty.workspace = true
+image.workspace = true
+
+[features]
+default = ["desktop-mpv"]
+desktop-mpv = ["lx-player/desktop-mpv"]
+build-libmpv = ["desktop-mpv", "lx-player/build_libmpv"]

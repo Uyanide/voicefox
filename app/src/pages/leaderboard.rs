@@ -9,12 +9,13 @@ use lx_core::model::leaderboard::LeaderboardInfo;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaderboardLoadRequest {
@@ -22,9 +23,11 @@ pub enum LeaderboardLoadRequest {
     Songs { source: SourceId, board_id: String },
 }
 
+#[derive(Debug, Clone)]
 pub struct LeaderboardPage {
     sources: Vec<SourceId>,
     source_index: usize,
+    source_selector: Option<SourceSelector>,
     pub boards: Vec<LeaderboardInfo>,
     pub songs: Vec<SongInfo>,
     pub selected: usize,
@@ -43,8 +46,9 @@ pub struct LeaderboardPage {
 impl LeaderboardPage {
     pub fn new(sources: Vec<SourceId>) -> Self {
         Self {
-            sources,
+            sources: sources.clone(),
             source_index: 0,
+            source_selector: Some(SourceSelector::from_sources(&sources, false)),
             boards: Vec::new(),
             songs: Vec::new(),
             selected: 0,
@@ -158,6 +162,14 @@ impl LeaderboardPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
+        if self
+            .source_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            self.handle_source_selector(key);
+            return AppAction::None;
+        }
         if let Some(action) = resolver.resolve_page("leaderboard", key) {
             match action {
                 Action::ListSelectUp => {
@@ -252,6 +264,9 @@ impl LeaderboardPage {
         }
 
         match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('p' | 'P')) => {
+                self.open_source_selector();
+            }
             (KeyModifiers::CONTROL, KeyCode::Left)
             | (KeyModifiers::CONTROL, KeyCode::Char('h'))
             | (KeyModifiers::NONE, KeyCode::Char('[')) => self.select_previous_source(),
@@ -332,10 +347,15 @@ impl LeaderboardPage {
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-        let page = page_chunks(area, self.boards.len());
-        self.render_sources(page.sources, buf, ctx);
+        let shell = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        self.render_source_tabs(shell[0], buf, ctx);
+        let page = page_chunks(shell[1], self.boards.len());
         self.render_boards(page.boards, buf, ctx);
         self.render_songs(page.songs, buf, ctx);
+        self.render_source_selector(area, buf, ctx);
     }
 
     pub fn handle_mouse(
@@ -345,9 +365,39 @@ impl LeaderboardPage {
         activate: bool,
         ctx: &AppContext,
     ) -> AppAction {
-        let page = page_chunks(area, self.boards.len());
+        if self
+            .source_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            let result = self
+                .source_selector
+                .as_mut()
+                .and_then(|selector| selector.handle_mouse(event, area));
+            if let Some(SourceSelectorKey::Source(source)) = result {
+                if let Some(index) = self
+                    .sources
+                    .iter()
+                    .position(|candidate| *candidate == source)
+                {
+                    self.select_source(index);
+                }
+            }
+            return AppAction::None;
+        }
+        let shell = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        let page = page_chunks(shell[1], self.boards.len());
         let position = Position::new(event.column, event.row);
-        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
+        let scroll_amount = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .scroll_amount
+            .max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.selected = self.selected.saturating_sub(scroll_amount);
@@ -357,16 +407,6 @@ impl LeaderboardPage {
                     (self.selected + scroll_amount).min(self.current_list_len().saturating_sub(1));
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                for (index, tab) in source_tab_rects(page.sources, self.sources.len())
-                    .iter()
-                    .enumerate()
-                {
-                    if tab.contains(position) {
-                        self.select_source(index);
-                        return AppAction::None;
-                    }
-                }
-
                 let board_inner = Block::default().borders(Borders::ALL).inner(page.boards);
                 if board_inner.contains(position) {
                     let index =
@@ -404,7 +444,11 @@ impl LeaderboardPage {
         area: Rect,
     ) -> Option<(Vec<SongInfo>, usize)> {
         self.selected_board?;
-        let page = page_chunks(area, self.boards.len());
+        let shell = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        let page = page_chunks(shell[1], self.boards.len());
         let song_inner = Block::default().borders(Borders::ALL).inner(page.songs);
         let position = Position::new(event.column, event.row);
         let list_y = song_inner.y.saturating_add(1);
@@ -420,41 +464,60 @@ impl LeaderboardPage {
         Some((self.songs.clone(), index))
     }
 
-    fn render_sources(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+    #[allow(unreachable_code)]
+    fn render_source_tabs(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.source_selector.as_ref() {
+            selector.render_tabs(area, buf, ctx);
+        }
+        return;
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let accent = crate::theme::accent(ctx);
-        for (index, tab) in source_tab_rects(area, self.sources.len())
-            .iter()
-            .enumerate()
-        {
-            let source = self.sources[index];
-            let label = if area.width >= 48 {
-                source_label(source)
-            } else {
-                source.as_str()
-            };
-            let style = if index == self.source_index {
+        let current = self.current_source();
+        let mut spans = vec![Span::styled(
+            " 音源：",
+            Style::new().fg(crate::theme::muted(ctx)),
+        )];
+        let mut used = 4usize;
+        for (index, source) in self.sources.iter().enumerate() {
+            let label = source_name(*source);
+            let width = label.chars().count() + 3;
+            if used + width + 10 > area.width as usize {
+                break;
+            }
+            let style = if Some(*source) == current {
                 Style::new()
-                    .bg(accent)
                     .fg(crate::theme::selection_fg(ctx))
+                    .bg(crate::theme::accent(ctx))
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::new().fg(crate::theme::muted(ctx))
             };
-            Paragraph::new(label)
-                .alignment(Alignment::Center)
-                .style(style)
-                .render(*tab, buf);
+            if index > 0 {
+                spans.push(Span::raw("  "));
+                used += 2;
+            }
+            spans.push(Span::styled(format!(" {} ", label), style));
+            used += width;
         }
+        spans.push(Span::styled(
+            "  P 切换",
+            Style::new()
+                .fg(crate::theme::accent(ctx))
+                .add_modifier(Modifier::BOLD),
+        ));
+        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     fn render_boards(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(format!("榜单 ({})", self.boards.len()));
+            .title(format!(
+                "榜单 · {} · {} 个 · P 切换音源",
+                self.current_source().map(source_name).unwrap_or("无"),
+                self.boards.len()
+            ));
         let inner = block.inner(area);
         block.render(area, buf);
         if self.sources.is_empty() {
@@ -624,7 +687,13 @@ impl LeaderboardPage {
         }
         if self.selected > 0 {
             self.selected -= 1;
-        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+        } else if ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .wrap_navigation
+        {
             self.selected = len - 1;
         }
     }
@@ -636,7 +705,13 @@ impl LeaderboardPage {
         }
         if self.selected + 1 < len {
             self.selected += 1;
-        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+        } else if ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .wrap_navigation
+        {
             self.selected = 0;
         }
     }
@@ -741,6 +816,9 @@ impl LeaderboardPage {
             return;
         }
         self.source_index = index;
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.select(index);
+        }
         self.selected_board = None;
         self.songs.clear();
         self.songs_loaded = false;
@@ -760,19 +838,48 @@ impl LeaderboardPage {
             self.boards_loading = false;
         }
     }
+    fn open_source_selector(&mut self) {
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.select(self.source_index);
+            selector.open();
+        }
+    }
+
+    fn handle_source_selector(&mut self, key: &KeyEvent) {
+        let Some(selector) = self.source_selector.as_mut() else {
+            return;
+        };
+        if let Some(SourceSelectorKey::Source(source)) = selector.handle_key(*key) {
+            if let Some(index) = self
+                .sources
+                .iter()
+                .position(|candidate| *candidate == source)
+            {
+                self.select_source(index);
+            }
+            self.source_selector
+                .as_mut()
+                .map(|selector| selector.close());
+        } else if !selector.is_open() {
+            self.source_selector
+                .as_mut()
+                .map(|selector| selector.close());
+        }
+    }
+
+    fn render_source_selector(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.render_popup(area, buf, ctx, "选择音源");
+        }
+    }
 }
 
 struct PageChunks {
-    sources: Rect,
     boards: Rect,
     songs: Rect,
 }
 
 fn page_chunks(area: Rect, board_count: usize) -> PageChunks {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(area);
     let content = if area.width < 82 {
         Layout::default()
             .direction(Direction::Vertical)
@@ -780,28 +887,17 @@ fn page_chunks(area: Rect, board_count: usize) -> PageChunks {
                 Constraint::Length((board_count as u16 + 2).clamp(5, 11)),
                 Constraint::Min(0),
             ])
-            .split(vertical[1])
+            .split(area)
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(30), Constraint::Min(0)])
-            .split(vertical[1])
+            .split(area)
     };
     PageChunks {
-        sources: vertical[0],
         boards: content[0],
         songs: content[1],
     }
-}
-
-fn source_tab_rects(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
-    if count == 0 {
-        return std::rc::Rc::from([]);
-    }
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, count as u32); count])
-        .split(area)
 }
 
 fn ensure_visible(selected: usize, visible: usize, total: usize, offset: &mut usize) {
@@ -818,23 +914,11 @@ fn source_name(source: SourceId) -> &'static str {
         SourceId::Mg => "咪咕",
         SourceId::Bili => "哔哩哔哩",
         SourceId::Local => "本地",
-    }
-}
-
-fn source_label(source: SourceId) -> &'static str {
-    match source {
-        SourceId::Kw => "酷我 kw",
-        SourceId::Kg => "酷狗 kg",
-        SourceId::Tx => "QQ tx",
-        SourceId::Wy => "网易 wy",
-        SourceId::Mg => "咪咕 mg",
-        SourceId::Bili => "哔哩哔哩 bili",
-        SourceId::Local => "本地 local",
+        _ => "未知",
     }
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
-    // 按显示宽度截断（CJK 占 2 列），共享实现见 components::text
     super::components::text::truncate_width(value, max).into_owned()
 }
 

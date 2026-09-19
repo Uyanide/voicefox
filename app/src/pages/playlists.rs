@@ -10,13 +10,14 @@ use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use unicode_width::UnicodeWidthChar;
 
 use crate::context::AppContext;
+use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 use crate::storage::{CustomPlaylistSummary, local_song_matches_path, same_song_identity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,13 +97,30 @@ pub struct PlaylistsPage {
     name_input: Option<PlaylistNameInput>,
     name_input_value: String,
     pending_delete: Option<CustomDeleteTarget>,
+    scope_selector: Option<SourceSelector>,
 }
 
 impl PlaylistsPage {
     pub fn new(sources: Vec<SourceId>) -> Self {
-        let scopes = [PlaylistScope::Custom, PlaylistScope::Favorites]
+        let scopes: Vec<PlaylistScope> = [PlaylistScope::Custom, PlaylistScope::Favorites]
             .into_iter()
-            .chain(sources.into_iter().map(PlaylistScope::Source))
+            .chain(
+                sources
+                    .into_iter()
+                    .filter(|source| supports_playlist_browse(*source))
+                    .map(PlaylistScope::Source),
+            )
+            .collect();
+        let selector_items = scopes
+            .iter()
+            .map(|scope| {
+                let key = match scope {
+                    PlaylistScope::Custom => SourceSelectorKey::Custom,
+                    PlaylistScope::Favorites => SourceSelectorKey::Favorites,
+                    PlaylistScope::Source(source) => SourceSelectorKey::Source(*source),
+                };
+                (key, scope_label(*scope, true).to_string())
+            })
             .collect();
         Self {
             scopes,
@@ -128,6 +146,7 @@ impl PlaylistsPage {
             name_input: None,
             name_input_value: String::new(),
             pending_delete: None,
+            scope_selector: Some(SourceSelector::new(selector_items, 0)),
         }
     }
 
@@ -498,6 +517,14 @@ impl PlaylistsPage {
         if self.name_input.is_some() {
             return self.handle_name_input(key, ctx);
         }
+        if self
+            .scope_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            self.handle_scope_selector(key, ctx);
+            return AppAction::None;
+        }
         if self.pending_delete.is_some() {
             return self.handle_delete_confirmation(key, ctx);
         }
@@ -603,6 +630,9 @@ impl PlaylistsPage {
         }
 
         match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('p' | 'P')) => {
+                self.open_scope_selector();
+            }
             (KeyModifiers::CONTROL, KeyCode::Left)
             | (KeyModifiers::CONTROL, KeyCode::Char('h'))
             | (KeyModifiers::NONE, KeyCode::Char('[')) => self.select_previous_scope(ctx),
@@ -835,12 +865,44 @@ impl PlaylistsPage {
         activate: bool,
         ctx: &AppContext,
     ) -> AppAction {
+        if self
+            .scope_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            let result = self
+                .scope_selector
+                .as_mut()
+                .and_then(|selector| selector.handle_mouse(event, area));
+            if let Some(key) = result {
+                if let Some(index) = self.scopes.iter().position(|scope| match (scope, key) {
+                    (PlaylistScope::Custom, SourceSelectorKey::Custom)
+                    | (PlaylistScope::Favorites, SourceSelectorKey::Favorites) => true,
+                    (PlaylistScope::Source(source), SourceSelectorKey::Source(selected)) => {
+                        *source == selected
+                    }
+                    _ => false,
+                }) {
+                    self.scope_selector
+                        .as_mut()
+                        .map(|selector| selector.close());
+                    self.select_scope(index, ctx);
+                }
+            }
+            return AppAction::None;
+        }
         if self.input_active() {
             return AppAction::None;
         }
         let page = page_chunks(area, self.playlists.len());
         let position = Position::new(event.column, event.row);
-        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
+        let scroll_amount = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .scroll_amount
+            .max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
                 let scroll_area = if self.selected_playlist.is_some() {
@@ -954,24 +1016,45 @@ impl PlaylistsPage {
         self.render_playlists(page.playlists, buf, ctx);
         self.render_songs(page.songs, buf, ctx);
         self.render_dialog(area, buf, ctx);
+        self.render_scope_selector(area, buf, ctx);
     }
 
-    fn render_scopes(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-        for (index, tab) in scope_tab_rects(area, self.scopes.len()).iter().enumerate() {
-            let label = scope_label(self.scopes[index], area.width >= 66);
-            let style = if index == self.scope_index {
-                Style::new()
-                    .bg(crate::theme::accent(ctx))
-                    .fg(crate::theme::selection_fg(ctx))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(crate::theme::muted(ctx))
-            };
-            Paragraph::new(label)
-                .alignment(Alignment::Center)
-                .style(style)
-                .render(*tab, buf);
+    #[allow(unreachable_code)]
+    fn render_scopes(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.scope_selector.as_ref() {
+            selector.render_tabs(area, buf, ctx);
         }
+        return;
+        let current = scope_label(self.scopes[self.scope_index], true);
+        let total = self.scopes.len();
+        let text = format!(
+            " 音源：{}  ·  P 切换  ·  {}/{}",
+            current,
+            self.scope_index + 1,
+            total
+        );
+        let surface = crate::theme::surface0(ctx);
+        let accent = crate::theme::accent(ctx);
+        let spans = vec![
+            ratatui::text::Span::styled(
+                text,
+                ratatui::style::Style::new()
+                    .fg(ratatui::style::Color::White)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            ratatui::text::Span::styled(
+                if self.scope_selector.is_some() {
+                    " v"
+                } else {
+                    ""
+                },
+                ratatui::style::Style::new().fg(accent),
+            ),
+        ];
+        ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans))
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(ratatui::style::Style::new().bg(surface))
+            .render(area, buf);
     }
 
     fn render_playlists(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -1185,6 +1268,12 @@ impl PlaylistsPage {
                 ),
                 buf,
             );
+        }
+    }
+
+    fn render_scope_selector(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.scope_selector.as_mut() {
+            selector.render_popup(area, buf, ctx, "选择范围");
         }
     }
 
@@ -1404,6 +1493,9 @@ impl PlaylistsPage {
             return;
         }
         self.scope_index = index;
+        if let Some(selector) = self.scope_selector.as_mut() {
+            selector.select(index);
+        }
         self.selected_playlist = None;
         self.songs.clear();
         self.songs_loaded = false;
@@ -1453,7 +1545,13 @@ impl PlaylistsPage {
         }
         if self.selected > 0 {
             self.selected -= 1;
-        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+        } else if ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .wrap_navigation
+        {
             self.selected = len - 1;
         }
     }
@@ -1467,8 +1565,38 @@ impl PlaylistsPage {
             self.selected += 1;
         } else if self.selected_playlist.is_none() && self.list_has_more {
             // 保持末项选中，主循环会在下一轮请求下一页。
-        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+        } else if ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .wrap_navigation
+        {
             self.selected = 0;
+        }
+    }
+
+    fn open_scope_selector(&mut self) {
+        if let Some(selector) = self.scope_selector.as_mut() {
+            selector.select(self.scope_index);
+            selector.open();
+        }
+    }
+
+    fn handle_scope_selector(&mut self, key: &KeyEvent, ctx: &AppContext) {
+        let Some(selector) = self.scope_selector.as_mut() else {
+            return;
+        };
+        if selector.handle_key(*key).is_some() {
+            let index = selector.selected_index();
+            self.scope_selector
+                .as_mut()
+                .map(|selector| selector.close());
+            self.select_scope(index, ctx);
+        } else if !selector.is_open() {
+            self.scope_selector
+                .as_mut()
+                .map(|selector| selector.close());
         }
     }
 
@@ -1564,6 +1692,20 @@ fn render_muted(text: &str, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         .render(area, buf);
 }
 
+fn supports_playlist_browse(source: SourceId) -> bool {
+    matches!(
+        source,
+        SourceId::Kw
+            | SourceId::Kg
+            | SourceId::Tx
+            | SourceId::Wy
+            | SourceId::Mg
+            | SourceId::Bili
+            | SourceId::Qianqian
+            | SourceId::Apple
+    )
+}
+
 fn source_name(source: SourceId) -> &'static str {
     match source {
         SourceId::Kw => "酷我",
@@ -1573,6 +1715,7 @@ fn source_name(source: SourceId) -> &'static str {
         SourceId::Mg => "咪咕",
         SourceId::Bili => "哔哩哔哩",
         SourceId::Local => "本地",
+        _ => "未知",
     }
 }
 
@@ -1580,13 +1723,7 @@ fn scope_label(scope: PlaylistScope, full: bool) -> &'static str {
     match (scope, full) {
         (PlaylistScope::Custom, _) => "自建",
         (PlaylistScope::Favorites, _) => "已收藏",
-        (PlaylistScope::Source(SourceId::Kw), true) => "酷我 kw",
-        (PlaylistScope::Source(SourceId::Kg), true) => "酷狗 kg",
-        (PlaylistScope::Source(SourceId::Tx), true) => "QQ tx",
-        (PlaylistScope::Source(SourceId::Wy), true) => "网易 wy",
-        (PlaylistScope::Source(SourceId::Mg), true) => "咪咕 mg",
-        (PlaylistScope::Source(SourceId::Bili), true) => "哔哩哔哩 bili",
-        (PlaylistScope::Source(SourceId::Local), true) => "本地 local",
+        (PlaylistScope::Source(source), true) => source.display_label(),
         (PlaylistScope::Source(source), false) => source.as_str(),
     }
 }
@@ -1600,6 +1737,9 @@ fn custom_playlist_metadata(playlist: &CustomPlaylistSummary) -> Playlist {
         song_count: playlist.song_count,
         description: Some("voicefox-custom-playlist".to_string()),
         play_count: None,
+        creator: None,
+        link: None,
+        extra: HashMap::new(),
     }
 }
 
@@ -1617,6 +1757,7 @@ mod tests {
     use lx_core::model::playlist::Playlist;
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
+    use std::collections::HashMap;
 
     fn select_source_scope(page: &mut PlaylistsPage, source: SourceId) {
         page.scope_index = page
@@ -1635,6 +1776,9 @@ mod tests {
             song_count: 0,
             description: None,
             play_count: None,
+            creator: None,
+            link: None,
+            extra: HashMap::new(),
         }
     }
 
@@ -1729,6 +1873,9 @@ mod tests {
             song_count: 2,
             description: None,
             play_count: None,
+            creator: None,
+            link: None,
+            extra: HashMap::new(),
         }];
         page.selected_playlist = Some(0);
         let mut first = SongInfo::new(
@@ -1768,6 +1915,9 @@ mod tests {
             song_count: 0,
             description: None,
             play_count: None,
+            creator: None,
+            link: None,
+            extra: HashMap::new(),
         }];
         page.selected_playlist = Some(0);
         let mut song = SongInfo::new(

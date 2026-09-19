@@ -67,6 +67,7 @@ enum SettingsFocus {
     JsSources,
     LocalPaths,
     StatusBar,
+    QrLogin,
 }
 
 /// 下载设置里的文本输入目标。
@@ -83,6 +84,7 @@ enum SettingsCategory {
     Interface,
     Playback,
     Sources,
+    Accounts,
     Integration,
     Download,
     Data,
@@ -93,7 +95,8 @@ impl SettingsCategory {
         match self {
             Self::Interface => Self::Playback,
             Self::Playback => Self::Sources,
-            Self::Sources => Self::Integration,
+            Self::Sources => Self::Accounts,
+            Self::Accounts => Self::Integration,
             Self::Integration => Self::Download,
             Self::Download => Self::Data,
             Self::Data => Self::Interface,
@@ -105,7 +108,8 @@ impl SettingsCategory {
             Self::Interface => Self::Data,
             Self::Playback => Self::Interface,
             Self::Sources => Self::Playback,
-            Self::Integration => Self::Sources,
+            Self::Accounts => Self::Sources,
+            Self::Integration => Self::Accounts,
             Self::Download => Self::Integration,
             Self::Data => Self::Download,
         }
@@ -116,6 +120,7 @@ impl SettingsCategory {
             Self::Interface => "界面",
             Self::Playback => "播放",
             Self::Sources => "音源与歌词",
+            Self::Accounts => "账号与扫码",
             Self::Integration => "通知与集成",
             Self::Download => "下载",
             Self::Data => "数据与本地库",
@@ -129,7 +134,8 @@ impl SettingsCategory {
                 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
             ],
             Self::Sources => &[23, 24, 25, 26, 27, 28, 29, 30],
-            Self::Integration => &[34, 35, 36, 37, 38, 44],
+            Self::Accounts => &[44],
+            Self::Integration => &[34, 35, 36, 37, 38],
             Self::Download => &[45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
             Self::Data => &[40, 41, 42, 43],
         }
@@ -141,7 +147,8 @@ impl SettingsFocus {
         match self {
             Self::JsSources => Self::LocalPaths,
             Self::LocalPaths => Self::StatusBar,
-            Self::StatusBar => Self::JsSources,
+            Self::StatusBar => Self::QrLogin,
+            Self::QrLogin => Self::JsSources,
         }
     }
 }
@@ -176,6 +183,8 @@ pub struct SettingsPage {
     download_input_target: Option<DownloadInputTarget>,
     /// 内置音源开关当前指向的音源
     pub enabled_source_index: usize,
+    /// 扫码登录入口当前指向的音源
+    qr_login_source_index: usize,
     /// 状态栏字段列表的选中索引
     pub selected_status_item: usize,
     /// 状态栏字段列表的滚动位置
@@ -260,6 +269,7 @@ impl SettingsPage {
             download_input: String::new(),
             download_input_target: None,
             enabled_source_index: 0,
+            qr_login_source_index: 0,
             selected_status_item: 0,
             status_item_scroll: 0,
             status_drag_target: None,
@@ -268,6 +278,14 @@ impl SettingsPage {
             delete_source_armed: None,
             delete_local_path_armed: None,
         }
+    }
+
+    fn qr_login_sources(&self, ctx: &AppContext) -> Vec<SourceId> {
+        SourceId::all_online()
+            .iter()
+            .copied()
+            .filter(|source| ctx.source_manager.capabilities(*source).qr_login)
+            .collect()
     }
 
     pub fn handle_input(
@@ -321,18 +339,44 @@ impl SettingsPage {
         } else {
             // 同一次按键只解析一次页面级键位，两处共用结果
             let bound_action = resolver.resolve_page("settings", &key);
-            if let Some(action) = bound_action
-                && let Some(result) = self.handle_bound_action(action, ctx)
-            {
-                return result;
+            // P 在设置页统一进入“账号与扫码”面板；不要再与主题色等设置复用同一个键。
+            // 进入面板后 P 才执行当前选中音源的扫码登录。
+            if key.modifiers == KeyModifiers::NONE && matches!(key.code, KeyCode::Char('p' | 'P')) {
+                if self.category == SettingsCategory::Accounts {
+                    let login_sources = self.qr_login_sources(ctx);
+                    if login_sources.is_empty() {
+                        self.status_msg = Some("当前没有支持扫码登录的音源".to_string());
+                    } else {
+                        self.qr_login_source_index %= login_sources.len();
+                        let source = login_sources[self.qr_login_source_index];
+                        if ctx.source_manager.is_logged_in(source) {
+                            self.status_msg =
+                                Some(format!("{} 已登录，按 b 退出登录", source.display_name()));
+                        } else {
+                            return AppAction::QrLogin(source);
+                        }
+                    }
+                } else {
+                    self.category = SettingsCategory::Accounts;
+                    self.status_msg = None;
+                }
+                return AppAction::None;
             }
 
+            // s 是设置页管理区域焦点切换键，必须在全局/自定义绑定解析之前处理。
+            // 否则用户若在 keybindings 中把 s 绑定到了其他 Action，焦点切换会被吞掉。
             if matches!(
                 (key.modifiers, key.code),
                 (KeyModifiers::NONE, KeyCode::Char('s'))
             ) {
                 self.focus = self.focus.next();
                 return AppAction::None;
+            }
+
+            if let Some(action) = bound_action
+                && let Some(result) = self.handle_bound_action(action, ctx)
+            {
+                return result;
             }
 
             if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Left {
@@ -344,6 +388,27 @@ impl SettingsPage {
                 self.category = self.category.next();
                 self.status_msg = None;
                 return AppAction::None;
+            }
+
+            if self.category == SettingsCategory::Accounts {
+                let login_sources = self.qr_login_sources(ctx);
+                if !login_sources.is_empty() {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::NONE, KeyCode::Up) => {
+                            self.qr_login_source_index = self
+                                .qr_login_source_index
+                                .checked_sub(1)
+                                .unwrap_or(login_sources.len() - 1);
+                            return AppAction::None;
+                        }
+                        (KeyModifiers::NONE, KeyCode::Down) => {
+                            self.qr_login_source_index =
+                                (self.qr_login_source_index + 1) % login_sources.len();
+                            return AppAction::None;
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // 当前列表区域的按键优先处理。
@@ -358,7 +423,48 @@ impl SettingsPage {
                 return action;
             }
 
-            let sources = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.clone();
+            if self.focus == SettingsFocus::QrLogin {
+                let login_sources = self.qr_login_sources(ctx);
+                if !login_sources.is_empty() {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::NONE, KeyCode::Up) => {
+                            self.qr_login_source_index = self
+                                .qr_login_source_index
+                                .checked_sub(1)
+                                .unwrap_or(login_sources.len() - 1);
+                            return AppAction::None;
+                        }
+                        (KeyModifiers::NONE, KeyCode::Down) => {
+                            self.qr_login_source_index =
+                                (self.qr_login_source_index + 1) % login_sources.len();
+                            return AppAction::None;
+                        }
+                        (KeyModifiers::NONE, KeyCode::Enter)
+                        | (KeyModifiers::NONE, KeyCode::Char('p' | 'P')) => {
+                            let source =
+                                login_sources[self.qr_login_source_index % login_sources.len()];
+                            if ctx.source_manager.is_logged_in(source) {
+                                self.status_msg = Some(format!(
+                                    "{} 已登录，按 b 退出登录",
+                                    source.display_name()
+                                ));
+                            } else {
+                                return AppAction::QrLogin(source);
+                            }
+                            return AppAction::None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let sources = ctx
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .source
+                .js_sources
+                .clone();
 
             if let Some(action) = bound_action {
                 match action {
@@ -442,7 +548,13 @@ impl SettingsPage {
                     self.update_config(ctx, |config| {
                         config.ui.show_cover = !config.ui.show_cover;
                     });
-                    if !ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.show_cover {
+                    if !ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .ui
+                        .show_cover
+                    {
                         ctx.cover_service.clear();
                     }
                 }
@@ -538,7 +650,13 @@ impl SettingsPage {
                     self.adjust_lyric_offset(ctx, 100);
                 }
                 (KeyModifiers::NONE, KeyCode::Char('n')) => {
-                    self.proxy_input = ctx.config.read().unwrap_or_else(|e| e.into_inner()).network.proxy_url.clone();
+                    self.proxy_input = ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .network
+                        .proxy_url
+                        .clone();
                     self.proxy_input_mode = true;
                     self.status_msg = None;
                 }
@@ -662,22 +780,26 @@ impl SettingsPage {
                 (KeyModifiers::SHIFT, KeyCode::Char('V' | 'v'))
                 | (KeyModifiers::NONE, KeyCode::Char('V')) => {
                     self.update_config(ctx, |config| {
-                        config.download.multipart_min_size_mb =
-                            next_step(&[1, 2, 5, 10, 20, 50], config.download.multipart_min_size_mb);
+                        config.download.multipart_min_size_mb = next_step(
+                            &[1, 2, 5, 10, 20, 50],
+                            config.download.multipart_min_size_mb,
+                        );
                     });
                 }
                 (KeyModifiers::SHIFT, KeyCode::Char('W' | 'w'))
                 | (KeyModifiers::NONE, KeyCode::Char('W')) => {
                     self.update_config(ctx, |config| {
                         config.download.concurrency =
-                            next_step(&[1, 2, 4, 8, 16], config.download.concurrency as u64) as usize;
+                            next_step(&[1, 2, 4, 8, 16], config.download.concurrency as u64)
+                                as usize;
                     });
                 }
                 (KeyModifiers::SHIFT, KeyCode::Char('A' | 'a'))
                 | (KeyModifiers::NONE, KeyCode::Char('A')) => {
                     self.update_config(ctx, |config| {
                         config.download.concurrent_songs =
-                            next_step(&[1, 2, 3, 4], config.download.concurrent_songs as u64) as usize;
+                            next_step(&[1, 2, 3, 4], config.download.concurrent_songs as u64)
+                                as usize;
                     });
                 }
                 (KeyModifiers::SHIFT, KeyCode::Char('E' | 'e'))
@@ -729,18 +851,6 @@ impl SettingsPage {
                         Err(error) => format!("播放模式已切换，但保存失败: {}", error),
                     });
                 }
-                (KeyModifiers::NONE, KeyCode::Char('p')) => {
-                    self.update_config(ctx, |config| {
-                        config.theme.accent = match config.theme.accent.as_str() {
-                            "#cba6f7" => "#89b4fa",
-                            "#89b4fa" => "#94e2d5",
-                            "#94e2d5" => "#f5c2e7",
-                            "#f5c2e7" => "#fab387",
-                            _ => "#cba6f7",
-                        }
-                        .to_string();
-                    });
-                }
                 (KeyModifiers::SHIFT, KeyCode::Char('D' | 'd'))
                 | (KeyModifiers::NONE, KeyCode::Char('D')) => {
                     self.update_config(ctx, |config| {
@@ -749,10 +859,18 @@ impl SettingsPage {
                     });
                 }
                 (KeyModifiers::NONE, KeyCode::Char('b')) => {
-                    if ctx.bili_source.is_logged_in() {
-                        return AppAction::BiliLogout;
+                    let login_sources = self.qr_login_sources(ctx);
+                    if login_sources.is_empty() {
+                        self.status_msg = Some("当前没有可用的扫码登录音源".to_string());
                     } else {
-                        return AppAction::BiliLogin;
+                        self.qr_login_source_index %= login_sources.len();
+                        let source = login_sources[self.qr_login_source_index];
+                        self.qr_login_source_index =
+                            (self.qr_login_source_index + 1) % login_sources.len();
+                        if ctx.source_manager.is_logged_in(source) {
+                            return AppAction::QrLogout(source);
+                        }
+                        return AppAction::QrLogin(source);
                     }
                 }
                 (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -774,7 +892,13 @@ impl SettingsPage {
                 self.status_msg = Some(ctx.cycle_playback_speed());
             }
             Action::SettingsEditAudioDevice => {
-                self.audio_device_input = ctx.config.read().unwrap_or_else(|e| e.into_inner()).player.audio_device.clone();
+                self.audio_device_input = ctx
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .player
+                    .audio_device
+                    .clone();
                 self.audio_device_input_mode = true;
                 self.status_msg = Some("输入 libmpv 音频设备名，Enter 保存".to_string());
             }
@@ -1143,7 +1267,13 @@ impl SettingsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> Option<AppAction> {
-        let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
+        let paths = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .local_music
+            .paths
+            .clone();
 
         if let Some(action) = resolver.resolve_page("settings", &key) {
             match action {
@@ -1227,7 +1357,12 @@ impl SettingsPage {
                 Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Char('r')) => {
-                let max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
+                let max_depth = ctx
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .local_music
+                    .max_depth;
                 self.status_msg = Some("正在扫描本地音乐...".to_string());
                 Some(AppAction::ScanLocalMusic {
                     paths,
@@ -1383,6 +1518,81 @@ impl SettingsPage {
             ),
             Err(error) => format!("状态栏顺序已更新，但保存失败: {error}"),
         });
+    }
+
+    fn render_qr_login_panel(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        ctx: &AppContext,
+        accent: Color,
+        muted: Color,
+        sources: &[SourceId],
+    ) {
+        Clear.render(area, buf);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(if self.focus == SettingsFocus::QrLogin {
+                accent
+            } else {
+                crate::theme::border(ctx)
+            }))
+            .title(" 扫码登录状态 · ↑/↓选择 · P扫码 · B退出 ");
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        if inner.height == 0 {
+            return;
+        }
+        let all_qr = self.qr_login_sources(ctx);
+        let selected_qr = all_qr
+            .get(self.qr_login_source_index % all_qr.len().max(1))
+            .copied();
+        let mut row = inner.y;
+        let summary = format!(
+            " 支持扫码: {}  · 已登录: {}",
+            sources
+                .iter()
+                .filter(|source| ctx.source_manager.capabilities(**source).qr_login)
+                .count(),
+            sources
+                .iter()
+                .filter(|source| ctx.source_manager.is_logged_in(**source))
+                .count(),
+        );
+        Paragraph::new(Line::from(Span::styled(summary, Style::new().fg(muted))))
+            .render(Rect::new(inner.x, row, inner.width, 1), buf);
+        row = row.saturating_add(1);
+
+        for source in sources {
+            if row >= inner.bottom() {
+                break;
+            }
+            let capabilities = ctx.source_manager.capabilities(*source);
+            let logged_in = ctx.source_manager.is_logged_in(*source);
+            let qr_selected = selected_qr == Some(*source);
+            let (status, status_color) = if !capabilities.qr_login {
+                ("— 不支持扫码", muted)
+            } else if logged_in {
+                ("✓ 已登录", crate::theme::green(ctx))
+            } else {
+                ("○ 可扫码 / 未登录", crate::theme::yellow(ctx))
+            };
+            let style = if qr_selected {
+                Style::new()
+                    .fg(crate::theme::selection_fg(ctx))
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(crate::theme::text(ctx))
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {:<12} ", source.display_name()), style),
+                Span::styled(status, Style::new().fg(status_color)),
+            ]);
+            Paragraph::new(line).render(Rect::new(inner.x, row, inner.width, 1), buf);
+            row = row.saturating_add(1);
+        }
     }
 
     fn update_config(
@@ -1722,21 +1932,30 @@ impl SettingsPage {
                 muted,
             ),
             {
-                let logged_in = ctx.bili_source.is_logged_in();
-                let account = if logged_in {
-                    ctx.bili_source
-                        .user()
-                        .map(|user| user.name)
-                        .unwrap_or_else(|| "已登录".to_string())
+                let login_sources: Vec<SourceId> = SourceId::all_online()
+                    .iter()
+                    .copied()
+                    .filter(|source| ctx.source_manager.capabilities(*source).qr_login)
+                    .collect();
+                let login_label = if login_sources.is_empty() {
+                    "无可用音源".to_string()
                 } else {
-                    "未登录".to_string()
+                    login_sources
+                        .iter()
+                        .map(|source| {
+                            let status = if ctx.source_manager.is_logged_in(*source) {
+                                "✓"
+                            } else {
+                                "○"
+                            };
+                            format!("{}{}", status, source.display_name())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ")
                 };
                 setting_row(
-                    "哔哩哔哩",
-                    Span::styled(
-                        account,
-                        Style::new().fg(if logged_in { accent } else { muted }),
-                    ),
+                    "扫码登录",
+                    Span::styled(login_label, Style::new().fg(accent)),
                     "b",
                     muted,
                 )
@@ -1767,13 +1986,7 @@ impl SettingsPage {
                 accent,
                 muted,
             ),
-            setting_line(
-                "多线程分片",
-                config.download.multipart,
-                "B",
-                accent,
-                muted,
-            ),
+            setting_line("多线程分片", config.download.multipart, "B", accent, muted),
             setting_value_line(
                 "分片阈值",
                 &format!("{} MB", config.download.multipart_min_size_mb),
@@ -1960,6 +2173,22 @@ impl SettingsPage {
             }
         }
 
+        // 登录状态常驻在设置页右侧，不再要求按 P 才展开。
+        // Accounts 分类只是把焦点切到登录区域；实际登录面板始终可见。
+        let login_area = chunks[3];
+        let all = SourceId::all_online();
+        self.render_qr_login_panel(login_area, buf, ctx, accent, muted, &all);
+
+        // ── 本地目录 + 状态栏共享一个紧凑管理区 ──
+        let management_area = chunks[2];
+        let management = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .split(management_area);
+
+        let local_area = management[0];
+        let status_area = management[1];
+
         // ── 本地音乐目录列表 ──
         let local_block = Block::default()
             .borders(Borders::ALL)
@@ -1969,8 +2198,8 @@ impl SettingsPage {
                 crate::theme::border(ctx)
             }))
             .title(" 本地目录 [s/a/d/r] ");
-        let local_inner = local_block.inner(chunks[2]);
-        local_block.render(chunks[2], buf);
+        let local_inner = local_block.inner(local_area);
+        local_block.render(local_area, buf);
 
         if local_inner.height > 1 {
             Paragraph::new(Line::from(Span::styled(
@@ -2055,8 +2284,8 @@ impl SettingsPage {
                 crate::theme::border(ctx)
             }))
             .title(" 状态栏 [s/Space/Shift+方向键] ");
-        let status_inner = status_block.inner(chunks[3]);
-        status_block.render(chunks[3], buf);
+        let status_inner = status_block.inner(status_area);
+        status_block.render(status_area, buf);
         let status_rows = status_inner.height.saturating_sub(1) as usize;
         self.selected_status_item = self
             .selected_status_item
@@ -2115,6 +2344,7 @@ impl SettingsPage {
             SettingsFocus::JsSources => source_inner,
             SettingsFocus::LocalPaths => local_inner,
             SettingsFocus::StatusBar => status_inner,
+            SettingsFocus::QrLogin => Block::default().borders(Borders::ALL).inner(login_area),
         };
         if let Some(ref msg) = self.status_msg
             && focused_inner.height > 1
@@ -2282,12 +2512,24 @@ impl SettingsPage {
                         .min(StatusBarItem::ALL.len().saturating_sub(1));
                     self.focus = SettingsFocus::StatusBar;
                 } else if chunks[2].contains(position) {
-                    let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.len();
+                    let len = ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .local_music
+                        .paths
+                        .len();
                     self.selected_local_path =
                         (self.selected_local_path + 1).min(len.saturating_sub(1));
                     self.focus = SettingsFocus::LocalPaths;
                 } else if chunks[1].contains(position) {
-                    let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.len();
+                    let len = ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .source
+                        .js_sources
+                        .len();
                     self.selected_source = (self.selected_source + 1).min(len.saturating_sub(1));
                     self.focus = SettingsFocus::JsSources;
                 }
@@ -2311,8 +2553,8 @@ impl SettingsPage {
                 if !right_click && area.width < ALL_MANAGEMENT_PANELS_MIN_WIDTH {
                     let focused_panel = chunks[match self.focus {
                         SettingsFocus::JsSources => 1,
-                        SettingsFocus::LocalPaths => 2,
-                        SettingsFocus::StatusBar => 3,
+                        SettingsFocus::LocalPaths | SettingsFocus::StatusBar => 2,
+                        SettingsFocus::QrLogin => 3,
                     }];
                     // Narrow layouts show only one management panel. Its
                     // title already advertises `[s]`; clicking that title
@@ -2370,7 +2612,13 @@ impl SettingsPage {
                     }
                     let rows = source_inner.height.saturating_sub(3) as usize;
                     if let Some(row) = list_row_at(source_inner, position, rows) {
-                        let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.len();
+                        let len = ctx
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .source
+                            .js_sources
+                            .len();
                         let start = list_window_start(self.selected_source, len, rows);
                         let index = start + row;
                         if index < len {
@@ -2411,7 +2659,13 @@ impl SettingsPage {
                     }
                     let rows = local_inner.height.saturating_sub(3) as usize;
                     if let Some(row) = list_row_at(local_inner, position, rows) {
-                        let len = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.len();
+                        let len = ctx
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .local_music
+                            .paths
+                            .len();
                         let start = list_window_start(self.selected_local_path, len, rows);
                         let index = start + row;
                         if index < len {
@@ -2826,8 +3080,8 @@ const ALL_MANAGEMENT_PANELS_MIN_WIDTH: u16 = 108;
 /// 列表导航键来自页面级绑定，由 `consumes_key` 查表解析，不列在这里。
 const SETTINGS_PAGE_CHAR_KEYS: &[char] = &[
     'a', 'd', 'h', 'r', 's', 'y', '[', 'm', 'Q', 'v', 'p', 'b', 'n', 'o', 'c', 'e', 'f', 'g', 'i',
-    't', 'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']', 'S', 'F',
-    'M', 'B', 'V', 'W', 'A', 'E', 'U', 'L', 'J', 'G', 'I',
+    't', 'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']', 'S', 'F', 'M',
+    'B', 'V', 'W', 'A', 'E', 'U', 'L', 'J', 'G', 'I',
 ];
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {
@@ -2896,29 +3150,29 @@ fn settings_chunks(area: Rect, focus: SettingsFocus, category: SettingsCategory)
         .split(area);
 
     if area.width >= ALL_MANAGEMENT_PANELS_MIN_WIDTH {
-        // 宽屏：选项占满上排，三个管理区域共享下排。
+        // 宽屏：下排只保留两个真正有价值的区域：
+        // 左侧 JS 音源；中间本地目录 + 状态栏；右侧常驻扫码登录。
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Percentage(34),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
+                Constraint::Percentage(32),
+                Constraint::Percentage(34),
             ])
             .split(vertical[1]);
         [vertical[0], bottom[0], bottom[1], bottom[2]]
     } else {
-        // 窄屏只显示当前管理区域，避免列表被分割到无法使用。
-        let mut chunks = [
-            vertical[0],
-            Rect::default(),
-            Rect::default(),
-            Rect::default(),
-        ];
-        chunks[match focus {
-            SettingsFocus::JsSources => 1,
-            SettingsFocus::LocalPaths => 2,
-            SettingsFocus::StatusBar => 3,
-        }] = vertical[1];
+        // 窄屏也保留常驻登录区；左侧管理区根据焦点显示 JS 音源或本地+状态栏。
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(vertical[1]);
+        let mut chunks = [vertical[0], Rect::default(), Rect::default(), bottom[1]];
+        if matches!(focus, SettingsFocus::JsSources) {
+            chunks[1] = bottom[0];
+        } else {
+            chunks[2] = bottom[0];
+        }
         chunks
     }
 }
@@ -2951,6 +3205,7 @@ mod tests {
             SettingsCategory::Interface,
             SettingsCategory::Playback,
             SettingsCategory::Sources,
+            SettingsCategory::Accounts,
             SettingsCategory::Integration,
             SettingsCategory::Download,
             SettingsCategory::Data,
@@ -2975,7 +3230,10 @@ mod tests {
         let indices = SettingsCategory::Download.option_indices();
 
         assert_eq!(indices.len(), 13);
-        let keys: Vec<char> = indices.iter().map(|index| SETTING_OPTION_KEYS[*index]).collect();
+        let keys: Vec<char> = indices
+            .iter()
+            .map(|index| SETTING_OPTION_KEYS[*index])
+            .collect();
         assert_eq!(
             keys,
             vec![
@@ -3141,7 +3399,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_settings_show_only_the_focused_management_panel() {
+    fn narrow_settings_keep_login_panel_visible() {
         let chunks = settings_chunks(
             Rect::new(0, 0, 80, 24),
             SettingsFocus::StatusBar,
@@ -3150,8 +3408,10 @@ mod tests {
 
         assert_eq!(chunks[0].height, 5);
         assert_eq!(chunks[1], Rect::default());
-        assert_eq!(chunks[2], Rect::default());
-        assert!(chunks[3].height > 0);
+        assert!(chunks[2].width > 0);
+        assert!(chunks[3].width > 0);
+        assert_eq!(chunks[2].height, chunks[3].height);
+        assert_eq!(chunks[2].bottom(), 24);
         assert_eq!(chunks[3].bottom(), 24);
     }
 

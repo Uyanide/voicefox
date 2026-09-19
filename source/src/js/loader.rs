@@ -2,8 +2,8 @@
 //!
 //! 从 URL 下载 JS 脚本，缓存到 `~/.config/lx-tui/sources/` 目录
 
-use std::path::Path;
 use crate::http::SendWithRetry;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -230,7 +230,8 @@ async fn download_source_with_policy(
             return trusted_cache.ok_or_else(|| "下载的 JS 音源内容为空".to_string());
         }
         Err(_) => {
-            return trusted_cache.ok_or_else(|| "下载的 JS 音源内容不是有效 UTF-8 文本".to_string());
+            return trusted_cache
+                .ok_or_else(|| "下载的 JS 音源内容不是有效 UTF-8 文本".to_string());
         }
     };
 
@@ -421,5 +422,13 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_source_url_returns_error_without_panicking() {
+        let result = tokio::spawn(super::download_source("::::not-a-url::::"))
+            .await
+            .expect("loader task must not panic");
+        assert!(result.is_err());
     }
 }

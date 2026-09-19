@@ -54,7 +54,28 @@ fn spawn_desktop_worker(mut rx: tokio::sync::mpsc::UnboundedReceiver<Notificatio
     });
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn spawn_desktop_worker(mut rx: tokio::sync::mpsc::UnboundedReceiver<Notification>) {
+    tokio::spawn(async move {
+        while let Some(notification) = rx.recv().await {
+            let title = notification.title.as_deref().unwrap_or("voicefox");
+            let message = notification.message.clone();
+            let title = title.replace('"', "'");
+            let message = message.replace('"', "'");
+            // Windows 没有 Linux D-Bus；使用系统自带 msg.exe 将桌面通知送到
+            // 当前 Windows 会话，并用 MessageBeep 提供可听见的提示音。
+            let command = format!(
+                "Add-Type -AssemblyName PresentationFramework; [System.Media.SystemSounds]::Asterisk.Play(); & msg.exe * /TIME:5 \\\"{}\\\"",
+                format!("{title}: {message}")
+            );
+            let _ = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+                .spawn();
+        }
+    });
+}
+
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn spawn_desktop_worker(mut rx: tokio::sync::mpsc::UnboundedReceiver<Notification>) {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 }

@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use lx_core::events::{AppAction, InsertPosition};
 use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::song::SongInfo;
+use lx_core::model::source::SourceId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -11,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 use crate::pages::sort::{SortMode, SortTarget, SortedListCache};
 
 pub struct FavoritesPage {
@@ -19,16 +21,22 @@ pub struct FavoritesPage {
     filter: super::components::list_filter::ListFilter,
     viewport_height: usize,
     sort_mode: SortMode,
+    sources: Vec<SourceId>,
+    source_index: usize,
+    source_selector: Option<SourceSelector>,
 }
 
 impl FavoritesPage {
-    pub fn new() -> Self {
+    pub fn new(sources: Vec<SourceId>) -> Self {
         Self {
             selected: 0,
             scroll: 0,
             filter: super::components::list_filter::ListFilter::new(),
             viewport_height: 1,
             sort_mode: SortMode::Newest,
+            sources: sources.clone(),
+            source_index: 0,
+            source_selector: Some(SourceSelector::from_sources(&sources, true)),
         }
     }
 
@@ -58,6 +66,26 @@ impl FavoritesPage {
         resolver: &KeybindingResolver,
         cache: &mut SortedListCache,
     ) -> AppAction {
+        if self
+            .source_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            if matches!(
+                (key.modifiers, key.code),
+                (KeyModifiers::NONE, KeyCode::Enter)
+            ) {
+                if let Some(index) = self.source_selector.as_ref().map(|p| p.selected_index()) {
+                    if let Some(selector) = self.source_selector.as_mut() {
+                        selector.close();
+                    }
+                    self.select_source(index);
+                }
+            } else {
+                self.handle_source_selector(key);
+            }
+            return AppAction::None;
+        }
         let query_before = self.filter.query().to_string();
         if self.filter.handle_input(key) {
             if self.filter.query() != query_before {
@@ -88,7 +116,13 @@ impl FavoritesPage {
                     if !filtered.is_empty() {
                         if self.selected > 0 {
                             self.selected -= 1;
-                        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+                        } else if ctx
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .ui
+                            .wrap_navigation
+                        {
                             self.selected = filtered.len().saturating_sub(1);
                         }
                     }
@@ -98,7 +132,13 @@ impl FavoritesPage {
                     if !filtered.is_empty() {
                         if self.selected + 1 < filtered.len() {
                             self.selected += 1;
-                        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+                        } else if ctx
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .ui
+                            .wrap_navigation
+                        {
                             self.selected = 0;
                         }
                     }
@@ -206,8 +246,47 @@ impl FavoritesPage {
         }
 
         match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('p' | 'P')) => self.open_source_selector(),
             (KeyModifiers::NONE, KeyCode::Char('/')) => {
                 self.filter.activate();
+            }
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                if let Some(selector) = self.source_selector.as_mut() {
+                    if let Some(result) = selector.cycle(-1) {
+                        match result {
+                            SourceSelectorKey::All => self.select_source(0),
+                            SourceSelectorKey::Source(source) => {
+                                if let Some(index) = self
+                                    .sources
+                                    .iter()
+                                    .position(|candidate| *candidate == source)
+                                {
+                                    self.select_source(index + 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                if let Some(selector) = self.source_selector.as_mut() {
+                    if let Some(result) = selector.cycle(1) {
+                        match result {
+                            SourceSelectorKey::All => self.select_source(0),
+                            SourceSelectorKey::Source(source) => {
+                                if let Some(index) = self
+                                    .sources
+                                    .iter()
+                                    .position(|candidate| *candidate == source)
+                                {
+                                    self.select_source(index + 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             (KeyModifiers::NONE, KeyCode::Char('s')) => {
                 let mode = self.cycle_sort();
@@ -227,7 +306,13 @@ impl FavoritesPage {
                 if !filtered.is_empty() {
                     if self.selected > 0 {
                         self.selected -= 1;
-                    } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+                    } else if ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .ui
+                        .wrap_navigation
+                    {
                         self.selected = filtered.len().saturating_sub(1);
                     }
                 }
@@ -236,7 +321,13 @@ impl FavoritesPage {
                 if !filtered.is_empty() {
                     if self.selected + 1 < filtered.len() {
                         self.selected += 1;
-                    } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
+                    } else if ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .ui
+                        .wrap_navigation
+                    {
                         self.selected = 0;
                     }
                 }
@@ -334,9 +425,12 @@ impl FavoritesPage {
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(format!(
-                " 收藏 {}/{} · 排序 {} · s 切换 · / 筛选 ",
+                " 收藏 {}/{} · {} · 排序 {} · P 音源 · / 筛选 ",
                 filtered.len(),
                 favorites.len(),
+                self.current_source()
+                    .map(|s| s.display_name())
+                    .unwrap_or("全部音源"),
                 self.sort_label()
             ));
         let inner = block.inner(area);
@@ -350,6 +444,10 @@ impl FavoritesPage {
         if show_search {
             self.filter
                 .render(Rect::new(inner.x, cursor_y, inner.width, 1), buf, ctx);
+            cursor_y = cursor_y.saturating_add(1);
+        }
+        if cursor_y < inner.bottom() {
+            self.render_source_tabs(Rect::new(inner.x, cursor_y, inner.width, 1), buf, ctx);
             cursor_y = cursor_y.saturating_add(1);
         }
 
@@ -418,6 +516,52 @@ impl FavoritesPage {
             )))
             .render(Rect::new(list.x, list.y + row as u16, list.width, 1), buf);
         }
+        self.render_source_selector(area, buf, ctx);
+    }
+
+    #[allow(unreachable_code)]
+    fn render_source_tabs(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.source_selector.as_ref() {
+            selector.render_tabs(area, buf, ctx);
+        }
+        return;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let current = self.current_source();
+        let mut spans = vec![Span::styled(
+            " 音源：",
+            Style::new().fg(crate::theme::muted(ctx)),
+        )];
+        let mut used = 4usize;
+        for (index, source) in self.sources.iter().enumerate() {
+            let label = source.display_name();
+            let width = label.chars().count() + 3;
+            if used + width + 10 > area.width as usize {
+                break;
+            }
+            let style = if Some(*source) == current {
+                Style::new()
+                    .fg(crate::theme::selection_fg(ctx))
+                    .bg(crate::theme::accent(ctx))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(crate::theme::muted(ctx))
+            };
+            if index > 0 {
+                spans.push(Span::raw("  "));
+                used += 2;
+            }
+            spans.push(Span::styled(format!(" {} ", label), style));
+            used += width;
+        }
+        spans.push(Span::styled(
+            "  P 切换",
+            Style::new()
+                .fg(crate::theme::accent(ctx))
+                .add_modifier(Modifier::BOLD),
+        ));
+        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     pub fn handle_mouse(
@@ -428,9 +572,39 @@ impl FavoritesPage {
         cache: &mut SortedListCache,
         activate: bool,
     ) -> AppAction {
+        if self
+            .source_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            let result = self
+                .source_selector
+                .as_mut()
+                .and_then(|selector| selector.handle_mouse(event, area));
+            match result {
+                Some(SourceSelectorKey::All) => self.select_source(0),
+                Some(SourceSelectorKey::Source(source)) => {
+                    if let Some(index) = self
+                        .sources
+                        .iter()
+                        .position(|candidate| *candidate == source)
+                    {
+                        self.select_source(index + 1);
+                    }
+                }
+                _ => {}
+            }
+            return AppAction::None;
+        }
         let favorites = self.sorted_favorites(ctx, cache);
         let filtered = self.filtered_song_indices(favorites);
-        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
+        let scroll_amount = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .scroll_amount
+            .max(1);
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.selected = self.selected.saturating_sub(scroll_amount);
@@ -520,11 +694,13 @@ impl FavoritesPage {
         (0..favorites.len())
             .filter(|index| {
                 let song = &favorites[*index];
-                query.is_empty()
-                    || song.name.to_lowercase().contains(&query)
-                    || song.singer.to_lowercase().contains(&query)
-                    || song.album_name.to_lowercase().contains(&query)
-                    || song.source.as_str().contains(&query)
+                self.current_source()
+                    .is_none_or(|source| song.source == source)
+                    && (query.is_empty()
+                        || song.name.to_lowercase().contains(&query)
+                        || song.singer.to_lowercase().contains(&query)
+                        || song.album_name.to_lowercase().contains(&query)
+                        || song.source.as_str().contains(&query))
             })
             .collect()
     }
@@ -540,6 +716,57 @@ impl FavoritesPage {
         cache.get_or_build(version, mode, SortTarget::Favorites, || {
             ctx.storage.load_favorites()
         })
+    }
+
+    fn current_source(&self) -> Option<SourceId> {
+        self.source_index
+            .checked_sub(1)
+            .and_then(|index| self.sources.get(index).copied())
+    }
+
+    fn open_source_selector(&mut self) {
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.select(self.source_index);
+            selector.open();
+        }
+    }
+
+    fn select_source(&mut self, index: usize) {
+        if index > self.sources.len() {
+            return;
+        }
+        self.source_index = index;
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.select(index);
+        }
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    fn handle_source_selector(&mut self, key: &KeyEvent) {
+        let result = self
+            .source_selector
+            .as_mut()
+            .and_then(|selector| selector.handle_key(*key));
+        match result {
+            Some(SourceSelectorKey::All) => self.select_source(0),
+            Some(SourceSelectorKey::Source(source)) => {
+                if let Some(index) = self
+                    .sources
+                    .iter()
+                    .position(|candidate| *candidate == source)
+                {
+                    self.select_source(index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_source_selector(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.render_popup(area, buf, ctx, "选择音源");
+        }
     }
 
     fn clamp_selection(&mut self, len: usize) {
@@ -579,7 +806,7 @@ mod tests {
 
     #[test]
     fn filters_title_artist_album_and_source() {
-        let mut page = FavoritesPage::new();
+        let mut page = FavoritesPage::new(vec![SourceId::Kw, SourceId::Kg]);
         let mut song = SongInfo::new("1".into(), SourceId::Kw, "晴天".into(), "周杰伦".into());
         song.album_name = "叶惠美".into();
         let songs = vec![song];
@@ -592,7 +819,7 @@ mod tests {
 
     #[test]
     fn defaults_to_most_recent_favorite_and_cycles_sorting() {
-        let mut page = FavoritesPage::new();
+        let mut page = FavoritesPage::new(vec![SourceId::Kw, SourceId::Kg]);
         let songs = vec![
             SongInfo::new("1".into(), SourceId::Kw, "A".into(), "X".into()),
             SongInfo::new("2".into(), SourceId::Kw, "B".into(), "Y".into()),
@@ -606,8 +833,20 @@ mod tests {
     }
 
     #[test]
+    fn source_navigation_includes_all_and_supports_left_right() {
+        let mut page = FavoritesPage::new(vec![SourceId::Kw, SourceId::Kg]);
+        assert_eq!(page.source_index, 0);
+        page.select_source(1);
+        assert_eq!(page.current_source(), Some(SourceId::Kw));
+        page.select_source(2);
+        assert_eq!(page.current_source(), Some(SourceId::Kg));
+        page.select_source(0);
+        assert_eq!(page.current_source(), None);
+    }
+
+    #[test]
     fn keyboard_selection_indices_follow_the_sorted_favorites() {
-        let page = FavoritesPage::new();
+        let page = FavoritesPage::new(vec![SourceId::Kw, SourceId::Kg]);
         let stored = vec![
             SongInfo::new("1".into(), SourceId::Kw, "C".into(), "X".into()),
             SongInfo::new("2".into(), SourceId::Kw, "B".into(), "Y".into()),

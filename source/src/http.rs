@@ -126,9 +126,12 @@ impl SendWithRetry for reqwest::RequestBuilder {
     async fn send_with_retry(self, retries: usize) -> Result<reqwest::Response, reqwest::Error> {
         let mut attempt = 0;
         loop {
-            let request = self
-                .try_clone()
-                .expect("request builder must be cloneable (GET/JSON/form bodies are)");
+            let Some(request) = self.try_clone() else {
+                // reqwest 在 URL/请求构建阶段出错时可能无法克隆 RequestBuilder。
+                // 这里属于后台音源加载路径，不能因为重试准备失败而 panic。
+                // 直接发送一次，让 reqwest 返回原生错误。
+                return self.send().await;
+            };
             match request.send().await {
                 Ok(resp) => return Ok(resp),
                 Err(error) if attempt < retries && (error.is_connect() || error.is_timeout()) => {
@@ -142,5 +145,16 @@ impl SendWithRetry for reqwest::RequestBuilder {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SendWithRetry, client};
+
+    #[tokio::test]
+    async fn invalid_url_returns_error_instead_of_panicking() {
+        let result = client().get("::::not-a-url::::").send_with_retry(0).await;
+        assert!(result.is_err());
     }
 }

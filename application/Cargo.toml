@@ -1,0 +1,17 @@
+[package]
+name = "voicefox-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lx-core = { path = "../core" }
+lx-source = { path = "../source" }
+lx-player = { path = "../player", default-features = false }
+lx-lyric = { path = "../lyric" }
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true

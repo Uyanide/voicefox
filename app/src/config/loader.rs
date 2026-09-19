@@ -16,6 +16,58 @@ const VERSION_1_DEFAULT_SOURCES: &[SourceId] = &[
     SourceId::Mg,
 ];
 
+/// 接入 B 站之后的默认音源组合，供后续音源迁移判断。
+const VERSION_10_DEFAULT_SOURCES: &[SourceId] = &[
+    SourceId::Kw,
+    SourceId::Kg,
+    SourceId::Tx,
+    SourceId::Wy,
+    SourceId::Mg,
+    SourceId::Bili,
+];
+const VERSION_11_DEFAULT_SOURCES: &[SourceId] = &[
+    SourceId::Kw,
+    SourceId::Kg,
+    SourceId::Tx,
+    SourceId::Wy,
+    SourceId::Mg,
+    SourceId::Bili,
+    SourceId::Qianqian,
+];
+const VERSION_12_DEFAULT_SOURCES: &[SourceId] = &[
+    SourceId::Kw,
+    SourceId::Kg,
+    SourceId::Tx,
+    SourceId::Wy,
+    SourceId::Mg,
+    SourceId::Bili,
+    SourceId::Qianqian,
+    SourceId::Joox,
+];
+const VERSION_13_DEFAULT_SOURCES: &[SourceId] = &[
+    SourceId::Kw,
+    SourceId::Kg,
+    SourceId::Tx,
+    SourceId::Wy,
+    SourceId::Mg,
+    SourceId::Bili,
+    SourceId::Qianqian,
+    SourceId::Joox,
+    SourceId::Fivesing,
+];
+const VERSION_15_DEFAULT_SOURCES: &[SourceId] = &[
+    SourceId::Kw,
+    SourceId::Kg,
+    SourceId::Tx,
+    SourceId::Wy,
+    SourceId::Mg,
+    SourceId::Bili,
+    SourceId::Qianqian,
+    SourceId::Joox,
+    SourceId::Fivesing,
+    SourceId::Jamendo,
+];
+
 /// 加载配置：优先读用户配置文件，否则用默认值
 pub fn load(custom_path: &str) -> anyhow::Result<(Config, PathBuf)> {
     let config_path = resolve_config_path(custom_path);
@@ -117,6 +169,46 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
     if config.version < 10 {
         // 新增 [download] 下载配置，字段均有 serde 默认值，旧配置提升版本即可。
         config.version = 10;
+        changed = true;
+    }
+    if config.version < 11 {
+        if same_sources(&config.source.enabled, VERSION_10_DEFAULT_SOURCES) {
+            config.source.enabled.push(SourceId::Qianqian);
+        }
+        config.version = 11;
+        changed = true;
+    }
+    if config.version < 12 {
+        if same_sources(&config.source.enabled, VERSION_11_DEFAULT_SOURCES) {
+            config.source.enabled.push(SourceId::Joox);
+        }
+        config.version = 12;
+        changed = true;
+    }
+    if config.version < 13 {
+        if same_sources(&config.source.enabled, VERSION_12_DEFAULT_SOURCES) {
+            config.source.enabled.push(SourceId::Fivesing);
+        }
+        config.version = 13;
+        changed = true;
+    }
+    if config.version < 14 {
+        if same_sources(&config.source.enabled, VERSION_13_DEFAULT_SOURCES) {
+            config.source.enabled.push(SourceId::Jamendo);
+        }
+        config.version = 14;
+        changed = true;
+    }
+    if config.version < 15 {
+        // Apple Music 只有 30 秒试听，因此不自动加入默认音源。
+        config.version = 15;
+        changed = true;
+    }
+    if config.version < 16 {
+        if same_sources(&config.source.enabled, VERSION_15_DEFAULT_SOURCES) {
+            config.source.enabled.push(SourceId::Soda);
+        }
+        config.version = 16;
         changed = true;
     }
     if config.version > CURRENT_CONFIG_VERSION {
@@ -259,7 +351,7 @@ mod tests {
 
         assert!(migrate_legacy_config(&mut config));
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
-        assert_eq!(config.source.enabled, SourceId::all_online());
+        assert_eq!(config.source.enabled, SourceId::default_enabled());
 
         config.source.enabled = vec![SourceId::Kw];
         assert!(!migrate_legacy_config(&mut config));
@@ -397,7 +489,7 @@ mod tests {
         assert_eq!(config.player.history_limit, 100);
         assert_eq!(config.network.timeout, 15);
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
-        assert_eq!(config.source.enabled, SourceId::all_online());
+        assert_eq!(config.source.enabled, SourceId::default_enabled());
         let _ = std::fs::remove_file(path);
     }
 }

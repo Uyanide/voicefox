@@ -120,6 +120,33 @@ impl DownloadsPanel {
         PanelOutcome::Consumed
     }
 
+    /// 鼠标右键对当前下载项执行与 Delete 相同的移除/取消动作。
+    /// 右键不依赖终端是否能提供精确 panel 矩形，避免浮层尺寸变化导致操作失效。
+    pub fn handle_mouse(
+        &mut self,
+        mouse: &crossterm::event::MouseEvent,
+        ctx: &AppContext,
+        tasks: &[DownloadTaskView],
+    ) -> bool {
+        if !matches!(
+            mouse.kind,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right)
+        ) {
+            return false;
+        }
+        if let Some(task) = tasks.get(self.selected) {
+            let cancelling = task.state.is_active();
+            ctx.downloads.cancel(task.id);
+            ctx.notify(lx_core::events::Notification::info(if cancelling {
+                format!("已取消下载: {}", task.name)
+            } else {
+                format!("已移除下载记录: {}", task.name)
+            }));
+            self.selected = self.selected.min(tasks.len().saturating_sub(2));
+        }
+        true
+    }
+
     /// 把选中项保持在可视区域内。
     fn clamp_scroll(&mut self, len: usize, rows: usize) {
         self.selected = self.selected.min(len.saturating_sub(1));
@@ -140,7 +167,7 @@ impl DownloadsPanel {
         if !self.open || area.width < 20 || area.height < 5 {
             return;
         }
-        let width = area.width.saturating_sub(2).clamp(20, 96);
+        let width = area.width.saturating_sub(4).clamp(24, 100);
         let active = ctx.downloads.active_count();
         let rows_needed = if tasks.is_empty() { 1 } else { tasks.len() * 2 };
         // 上下边框 + 一行目录提示。
@@ -170,7 +197,12 @@ impl DownloadsPanel {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::accent(ctx)))
-            .title(title)
+            .title(Span::styled(
+                title,
+                Style::new()
+                    .fg(crate::theme::accent(ctx))
+                    .add_modifier(Modifier::BOLD),
+            ))
             .style(Style::new().bg(crate::theme::mantle(ctx)));
         let inner = block.inner(panel);
         block.render(panel, buf);
@@ -214,7 +246,7 @@ impl DownloadsPanel {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        let text = download_dir_footer(&ctx.downloads.download_dir());
+        let text = download_dir_footer(&ctx.downloads.download_dir(), ctx.downloads.record_count());
         Paragraph::new(Line::from(Span::styled(
             truncate_to_width(&text, area.width as usize),
             Style::new().fg(crate::theme::overlay1(ctx)),
@@ -224,8 +256,12 @@ impl DownloadsPanel {
 }
 
 /// 面板底部的固定提示：明确告诉用户文件会落在哪个目录。
-pub fn download_dir_footer(dir: &std::path::Path) -> String {
-    format!("下载目录 {}/", dir.display())
+pub fn download_dir_footer(dir: &std::path::Path, history_count: usize) -> String {
+    format!(
+        "下载目录 {}/ · 历史 {} 条 · ↑↓选择 · Del/右键删除 · Shift+X 清空",
+        dir.display(),
+        history_count
+    )
 }
 
 fn task_title_line(
@@ -239,24 +275,34 @@ fn task_title_line(
     let prefix = format!("{marker}{} [{}] ", task.state.label(), task.source.as_str());
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
     let name = truncate_to_width(&task.display_name(), width.saturating_sub(prefix_width + 8));
-    let mut style = Style::new().fg(state_color);
-    if selected {
-        style = style.add_modifier(Modifier::BOLD);
-    }
+    let selected_style = Style::new()
+        .fg(crate::theme::selection_fg(ctx))
+        .bg(crate::theme::accent(ctx))
+        .add_modifier(Modifier::BOLD);
+    let state_style = if selected {
+        selected_style
+    } else {
+        Style::new().fg(state_color)
+    };
+    let name_style = if selected {
+        selected_style
+    } else {
+        Style::new().fg(crate::theme::text(ctx))
+    };
     Line::from(vec![
         Span::styled(
             marker,
-            Style::new().fg(if selected {
-                crate::theme::accent(ctx)
+            if selected {
+                selected_style
             } else {
-                crate::theme::muted(ctx)
-            }),
+                Style::new().fg(crate::theme::muted(ctx))
+            },
         ),
         Span::styled(
             format!("{} [{}] ", task.state.label(), task.source.as_str()),
-            style,
+            state_style,
         ),
-        Span::styled(name, Style::new().fg(crate::theme::text(ctx))),
+        Span::styled(name, name_style),
     ])
 }
 
@@ -267,7 +313,9 @@ fn task_progress_line(
     ctx: &AppContext,
 ) -> Line<'static> {
     let style = if selected {
-        Style::new().fg(crate::theme::text(ctx))
+        Style::new()
+            .fg(crate::theme::selection_fg(ctx))
+            .bg(crate::theme::accent(ctx))
     } else {
         Style::new().fg(crate::theme::muted(ctx))
     };
@@ -386,6 +434,9 @@ mod tests {
             },
             elapsed: std::time::Duration::from_secs(3),
             bytes: 0,
+            expected_size: None,
+            bitrate_kbps: None,
+            trigger: crate::download::manager::DownloadTrigger::Manual,
         }
     }
 
@@ -405,9 +456,12 @@ mod tests {
 
     #[test]
     fn footer_names_the_download_directory() {
-        let footer = download_dir_footer(std::path::Path::new("/home/me/Music/voicefox"));
+        let footer = download_dir_footer(std::path::Path::new("/home/me/Music/voicefox"), 0);
 
-        assert_eq!(footer, "下载目录 /home/me/Music/voicefox/");
+        assert_eq!(
+            footer,
+            "下载目录 /home/me/Music/voicefox/ · 历史 0 条 · ↑↓选择 · Del/右键删除 · Shift+X 清空"
+        );
     }
 
     #[test]

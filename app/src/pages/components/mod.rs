@@ -13,5 +13,6 @@ pub mod notification;
 pub mod progress_bar;
 pub mod scroll;
 pub mod song_table;
+pub mod source_selector;
 pub mod status_bar;
 pub mod text;

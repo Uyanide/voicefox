@@ -315,7 +315,9 @@ fn execute_song_menu_action(
                 .playlist
                 .borrow()
                 .get(menu.index())
-                .is_some_and(|current| current.id == expected.id && current.source == expected.source);
+                .is_some_and(|current| {
+                    current.id == expected.id && current.source == expected.source
+                });
             if !unchanged {
                 ctx.notify(Notification::warning(
                     "队列已变化，请重新右键选择要移除的歌曲",
@@ -364,28 +366,26 @@ fn execute_song_menu_action(
             }
             AppAction::None
         }
-        SongMenuAction::ViewArtist => {
-            match menu.songs().get(menu.index()) {
-                Some(song) if !song.singer.trim().is_empty() => {
-                    AppAction::ShowArtistDetails(Box::new(song.clone()))
-                }
-                _ => AppAction::None,
+        SongMenuAction::ViewArtist(artist_name) => match menu.songs().get(menu.index()) {
+            Some(song) if !artist_name.trim().is_empty() => {
+                let mut artist_song = song.clone();
+                artist_song.singer = artist_name;
+                AppAction::ShowArtistDetails(Box::new(artist_song))
             }
-        }
-        SongMenuAction::ViewAlbum => {
-            match menu.songs().get(menu.index()) {
-                Some(song) if !song.album_name.trim().is_empty() => {
-                    AppAction::ShowAlbumDetails(Box::new(lx_core::model::playlist::Album {
-                        id: song.album_id.clone(),
-                        name: song.album_name.clone(),
-                        source: song.source,
-                        cover_url: song.cover_url.clone(),
-                        artist: song.singer.clone(),
-                    }))
-                }
-                _ => AppAction::None,
+            _ => AppAction::None,
+        },
+        SongMenuAction::ViewAlbum => match menu.songs().get(menu.index()) {
+            Some(song) if !song.album_name.trim().is_empty() => {
+                AppAction::ShowAlbumDetails(Box::new(lx_core::model::playlist::Album {
+                    id: song.album_id.clone(),
+                    name: song.album_name.clone(),
+                    source: song.source,
+                    cover_url: song.cover_url.clone(),
+                    artist: song.singer.clone(),
+                }))
             }
-        }
+            _ => AppAction::None,
+        },
     };
     execute_action(
         app_action,
@@ -456,7 +456,12 @@ fn main() -> anyhow::Result<()> {
 
     // 启动 TUI
     let mut terminal = ratatui::init();
-    let mouse_enabled = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.enable_mouse;
+    let mouse_enabled = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .ui
+        .enable_mouse;
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     }
@@ -565,7 +570,13 @@ fn run_app(
     let (playlist_tx, mut playlist_rx) = mpsc::unbounded_channel::<PlaylistResponse>();
     let mut player_event_rx = ctx.player.take_event_receiver();
     #[cfg(target_os = "linux")]
-    let (mpris_handle, mut mpris_command_rx) = if ctx.config.read().unwrap_or_else(|e| e.into_inner()).integration.mpris {
+    let (mpris_handle, mut mpris_command_rx) = if ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .integration
+        .mpris
+    {
         match rt.block_on(mpris::start()) {
             Ok((handle, receiver)) => (Some(handle), Some(receiver)),
             Err(error) => {
@@ -584,7 +595,12 @@ fn run_app(
     let mut playlist_request_id: u64 = 0;
 
     // 键位解析器（从配置加载自定义键位）
-    let keybindings = ctx.config.read().unwrap_or_else(|e| e.into_inner()).keybindings.clone();
+    let keybindings = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .keybindings
+        .clone();
     let kb_resolver = KeybindingResolver::from_config(&keybindings);
 
     // 导航状态
@@ -623,7 +639,8 @@ fn run_app(
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
-    let mut favorites_page = pages::favorites::FavoritesPage::new();
+    let mut favorites_page =
+        pages::favorites::FavoritesPage::new(ctx.source_manager.enabled_sources());
     let mut history_state = SortState::new(SortMode::Newest);
     let mut local_state = SortState::new(SortMode::TitleAsc);
     let mut data_cache = DataCache::default();
@@ -634,27 +651,39 @@ fn run_app(
     let mut song_menu: Option<SongContextMenu> = None;
     let mut ui_areas = UiAreas::default();
     let mut click_tracker = ClickTracker::default();
-    let mut bili_login_page: Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>> = None;
+    let mut qr_login_page: Option<Arc<std::sync::Mutex<pages::qr_login::QrLoginPage>>> = None;
     // 快捷键说明浮层（? / F1 开关）
     let mut help_page: Option<pages::help::HelpPage> = None;
     // 下载面板浮层（Ctrl+o 开关）
     let mut downloads_panel = pages::downloads::DownloadsPanel::new();
-    let mut bili_poll_deadline: Instant = Instant::now();
-    let mut bili_generate_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut bili_poll_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut qr_poll_deadline: Instant = Instant::now();
+    let mut qr_generate_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut qr_poll_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // 事件驱动渲染：借鉴 rmpc，只在有事件或需要渲染时才 draw()
     let mut needs_render = true;
     // 播放器状态由播放线程改写，没有事件通知，只能靠比对上一轮的值发现变化
     let mut last_player_state = *ctx.player_state.borrow();
-    let max_fps = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.max_fps.clamp(1, 60);
+    let max_fps = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .ui
+        .max_fps
+        .clamp(1, 60);
     let render_interval = Duration::from_millis(1_000 / u64::from(max_fps));
     let mut last_periodic_render = Instant::now();
     let mut last_notification_cleanup = Instant::now();
     let mut last_playback_session_save = Instant::now();
+    let mut last_auto_cache_check = Instant::now();
     let mut last_local_watch_generation = ctx.source_manager.local_source().watch_generation();
     let mut faded_generation = 0_u64;
-    let mut mouse_capture_enabled = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.enable_mouse;
+    let mut mouse_capture_enabled = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .ui
+        .enable_mouse;
     // 安装 tmux 的 client-attached hook，析构时自动卸载
     let attach_watcher = tmux::AttachWatcher::install();
     let mut last_cover_redraw = Instant::now() - COVER_REDRAW_THROTTLE;
@@ -666,7 +695,13 @@ fn run_app(
     let mut last_position_epoch = ctx.position_epoch();
 
     // === 后台异步加载 JS 音源（不阻塞启动） ===
-    let js_urls = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.js_sources.clone();
+    let js_urls = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .source
+        .js_sources
+        .clone();
     let default_source = ctx
         .config
         .read()
@@ -685,7 +720,12 @@ fn run_app(
         rt,
     );
 
-    if ctx.config.read().unwrap_or_else(|e| e.into_inner()).player.remember_playback_state
+    if ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .player
+        .remember_playback_state
         && let Some(session) = ctx.storage.load_playback_session()
     {
         let (start_playback, paused) = playback_restore_flags(session.state);
@@ -707,9 +747,27 @@ fn run_app(
     }
 
     // === 初始扫描本地音乐 ===
-    let local_music_paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
-    let local_music_max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
-    if !local_music_paths.is_empty() && ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.enabled {
+    let local_music_paths = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .local_music
+        .paths
+        .clone();
+    let local_music_max_depth = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .local_music
+        .max_depth;
+    if !local_music_paths.is_empty()
+        && ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .local_music
+            .enabled
+    {
         execute_action(
             AppAction::ScanLocalMusic {
                 paths: local_music_paths,
@@ -779,7 +837,12 @@ fn run_app(
             }
         }
 
-        let mouse_requested = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.enable_mouse;
+        let mouse_requested = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .enable_mouse;
         if mouse_requested != mouse_capture_enabled {
             if mouse_requested {
                 let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -789,7 +852,12 @@ fn run_app(
             mouse_capture_enabled = mouse_requested;
         }
 
-        let cover_requested = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.show_cover;
+        let cover_requested = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .show_cover;
         if cover_requested != cover_enabled {
             if cover_requested {
                 let cover_url = ctx
@@ -848,68 +916,66 @@ fn run_app(
 
         // === 0. 排空异步 action ===
         while let Ok(action) = action_rx.try_recv() {
-            // 拦截哔哩哔哩登录相关 action
+            // 拦截扫码登录相关 action
             match &action {
-                AppAction::BiliLogin => {
-                    if let Some(task) = bili_generate_task.take() {
+                AppAction::QrLogin(source) => {
+                    if let Some(task) = qr_generate_task.take() {
                         task.abort();
                     }
-                    if let Some(task) = bili_poll_task.take() {
+                    if let Some(task) = qr_poll_task.take() {
                         task.abort();
                     }
-                    let page = Arc::new(std::sync::Mutex::new(
-                        pages::bili_login::BiliLoginPage::new(Arc::clone(&ctx.bili_source)),
-                    ));
+                    let page = Arc::new(std::sync::Mutex::new(pages::qr_login::QrLoginPage::new(
+                        *source,
+                        source.display_name().to_string(),
+                    )));
                     let page_clone = Arc::clone(&page);
                     let wake_tx = action_tx.clone();
-                    bili_generate_task = Some(rt.spawn(async move {
-                        let result = {
-                            let source = Arc::clone(&page_clone.lock().unwrap_or_else(|e| e.into_inner()).source);
-                            source.generate_qr_code().await
-                        };
-                        let mut p = page_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    let manager = Arc::clone(&ctx.source_manager);
+                    let source_id = *source;
+                    qr_generate_task = Some(rt.spawn(async move {
+                        let result = manager.create_qr_login(source_id).await;
+                        let mut page = page_clone.lock().unwrap_or_else(|e| e.into_inner());
                         match result {
-                            Ok(qr) => {
-                                let qr_lines = pages::bili_login::render_qr_terminal(&qr.url, 1);
-                                p.set_waiting(qr.key, qr_lines, qr.expires_in);
-                            }
-                            Err(e) => p.set_error(format!("生成二维码失败: {e}")),
+                            Ok(session) => page.set_qr(session),
+                            Err(error) => page.set_error(format!("生成二维码失败: {error}")),
                         }
                         let _ = wake_tx.send(AppAction::None);
                     }));
-                    bili_login_page = Some(page);
-                    bili_poll_deadline = Instant::now();
+                    qr_login_page = Some(page);
+                    qr_poll_deadline = Instant::now();
                     needs_render = true;
                     continue;
                 }
-                AppAction::BiliLoginSuccess => {
-                    if let Some(task) = bili_generate_task.take() {
+                AppAction::QrLoginSuccess(source) => {
+                    if let Some(task) = qr_generate_task.take() {
                         task.abort();
                     }
-                    if let Some(task) = bili_poll_task.take() {
+                    if let Some(task) = qr_poll_task.take() {
                         task.abort();
                     }
-                    bili_login_page = None;
-                    let user = ctx.bili_source.user();
-                    let msg = if let Some(user) = user {
-                        format!("哔哩哔哩登录成功: {}", user.name)
+                    qr_login_page = None;
+                    let label = source.display_name();
+                    let message = if ctx.source_manager.is_logged_in(*source) {
+                        format!("{label}登录成功")
                     } else {
-                        "哔哩哔哩登录成功".to_string()
+                        format!("{label}登录状态未确认，请重新打开设置查看")
                     };
-                    ctx.notify(Notification::success(msg));
+                    ctx.notify(Notification::success(message));
                     needs_render = true;
                     continue;
                 }
-                AppAction::BiliLogout => {
-                    if let Some(task) = bili_generate_task.take() {
+                AppAction::QrLogout(source) => {
+                    if let Some(task) = qr_generate_task.take() {
                         task.abort();
                     }
-                    if let Some(task) = bili_poll_task.take() {
+                    if let Some(task) = qr_poll_task.take() {
                         task.abort();
                     }
-                    bili_login_page = None;
-                    let notification = match ctx.bili_source.logout() {
-                        Ok(()) => Notification::success("已退出哔哩哔哩登录"),
+                    qr_login_page = None;
+                    let label = source.display_name();
+                    let notification = match ctx.source_manager.logout(*source) {
+                        Ok(()) => Notification::success(format!("已退出{label}登录")),
                         Err(error) => Notification::error(error),
                     };
                     ctx.notify(notification);
@@ -948,8 +1014,17 @@ fn run_app(
                         generation,
                         message: error,
                     } if generation == ctx.active_player_generation.load(Ordering::SeqCst) => {
-                        let retry_song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner()).clone();
-                        let auto_toggle = ctx.config.read().unwrap_or_else(|e| e.into_inner()).source.auto_toggle;
+                        let retry_song = ctx
+                            .current_song
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let auto_toggle = ctx
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .source
+                            .auto_toggle;
                         if auto_toggle
                             && retry_song
                                 .as_ref()
@@ -1153,22 +1228,22 @@ fn run_app(
             }
         }
 
-        if bili_generate_task
+        if qr_generate_task
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
         {
-            bili_generate_task.take();
+            qr_generate_task.take();
         }
-        if bili_poll_task
+        if qr_poll_task
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
         {
-            bili_poll_task.take();
+            qr_poll_task.take();
         }
 
-        if let Some(ref page) = bili_login_page
-            && bili_poll_task.is_none()
-            && bili_poll_deadline.elapsed() >= Duration::from_secs(2)
+        if let Some(ref page) = qr_login_page
+            && qr_poll_task.is_none()
+            && qr_poll_deadline.elapsed() >= Duration::from_secs(2)
         {
             let params = {
                 let mut page = page.lock().unwrap_or_else(|e| e.into_inner());
@@ -1181,18 +1256,34 @@ fn run_app(
             if let Some((source, key)) = params {
                 let page = Arc::clone(page);
                 let wake_tx = action_tx.clone();
-                bili_poll_task = Some(rt.spawn(async move {
-                    let result = source.poll_qr_code(&key).await;
-                    page.lock().unwrap_or_else(|e| e.into_inner()).apply_check_result(result);
-                    let _ = wake_tx.send(AppAction::None);
+                let manager = Arc::clone(&ctx.source_manager);
+                qr_poll_task = Some(rt.spawn(async move {
+                    let result = manager
+                        .check_qr_login(source, &key)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let mut page = page.lock().unwrap_or_else(|e| e.into_inner());
+                    page.apply_check_result(result);
+                    let success = page.succeeded().is_some();
+                    drop(page);
+                    let _ = wake_tx.send(if success {
+                        AppAction::QrLoginSuccess(source)
+                    } else {
+                        AppAction::None
+                    });
                 }));
-                bili_poll_deadline = Instant::now();
+                qr_poll_deadline = Instant::now();
                 needs_render = true;
             }
         }
 
         if last_notification_cleanup.elapsed() >= Duration::from_millis(250) {
-            let notifications_enabled = ctx.config.read().unwrap_or_else(|e| e.into_inner()).notification.in_app;
+            let notifications_enabled = ctx
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .notification
+                .in_app;
             let lifetime = ctx.notification_timeout();
             let mut notifs = ctx.notifications.write().unwrap_or_else(|e| e.into_inner());
             let previous_len = notifs.len();
@@ -1211,6 +1302,24 @@ fn run_app(
                 tracing::warn!("save playback session failed: {error}");
             }
             last_playback_session_save = Instant::now();
+        }
+        // 播放自动缓存：按秒检查进度，达到配置阈值后入队一次；不改变现有 TUI。
+        if last_auto_cache_check.elapsed() >= Duration::from_secs(1) {
+            last_auto_cache_check = Instant::now();
+            let song = ctx
+                .current_song
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(song) = song {
+                let position = *ctx.position.borrow();
+                ctx.downloads.maybe_auto_cache(
+                    &song,
+                    position,
+                    Arc::clone(&ctx.source_manager),
+                    action_tx.clone(),
+                );
+            }
         }
 
         // 本地目录监听器在后台完成增量扫描后递增代次；让 TUI 及时显示新增、删除
@@ -1273,19 +1382,29 @@ fn run_app(
             ctx.lyric_service
                 .update_position(*ctx.lyric_position.borrow());
             let input_active = active_tab == NavTab::Search
-                && search_page.lock().unwrap_or_else(|e| e.into_inner()).input_mode
+                && search_page
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .input_mode
                 || active_tab == NavTab::Settings
-                    && settings_page.lock().unwrap_or_else(|e| e.into_inner()).any_input_active()
+                    && settings_page
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .any_input_active()
                 || active_tab == NavTab::Favorites && favorites_page.input_mode()
                 || active_tab == NavTab::Playlists && playlists.input_active();
-            let notification_active = !ctx.notifications.read().unwrap_or_else(|e| e.into_inner()).is_empty();
+            let notification_active = !ctx
+                .notifications
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
             needs_render |= matches!(
                 state,
                 lx_core::model::source::PlayerState::Playing
                     | lx_core::model::source::PlayerState::Loading
             ) || input_active
                 || notification_active
-                || bili_login_page.is_some();
+                || qr_login_page.is_some();
             last_periodic_render = Instant::now();
         }
 
@@ -1294,10 +1413,7 @@ fn run_app(
 
         // 歌手详情页滚动接近末尾时自动追加下一页
         let spawn_more = {
-            let guard = ctx
-                .details_page
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = ctx.details_page.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().and_then(|page| {
                 if page.wants_more_songs() {
                     page.artist_target()
@@ -1333,7 +1449,11 @@ fn run_app(
                     return;
                 };
                 // 用户可能已切换到其他歌手/专辑，追加前校验目标
-                if page.artist_target().map(|a| a.name != artist.name).unwrap_or(true) {
+                if page
+                    .artist_target()
+                    .map(|a| a.name != artist.name)
+                    .unwrap_or(true)
+                {
                     return;
                 }
                 match songs {
@@ -1377,7 +1497,7 @@ fn run_app(
                 &confirm_delete,
                 &local_diagnostics,
                 &song_menu,
-                &bili_login_page,
+                &qr_login_page,
                 &mut help_page,
                 &mut downloads_panel,
             )?;
@@ -1387,22 +1507,27 @@ fn run_app(
         // === 2. 事件驱动：轮询终端事件 ===
         // 轮询超时不能长于一帧：50ms 会让实际刷新率钳在 ~20fps，
         // max_fps 配置形同虚设。
-        let terminal_event = if event::poll(render_interval.min(Duration::from_millis(50)))
-            .unwrap_or(false)
-        {
-            event::read().ok()
-        } else {
-            None
-        };
+        let terminal_event =
+            if event::poll(render_interval.min(Duration::from_millis(50))).unwrap_or(false) {
+                event::read().ok()
+            } else {
+                None
+            };
         if let Some(Event::Key(key)) = terminal_event.as_ref()
             && key.kind == KeyEventKind::Press
         {
             let key = *key;
             // 1a. 侧边栏全局快捷键（1-8）—— 输入模式下跳过
-            let settings_input_mode =
-                active_tab == NavTab::Settings && settings_page.lock().unwrap_or_else(|e| e.into_inner()).any_input_active();
-            let search_input_mode =
-                active_tab == NavTab::Search && search_page.lock().unwrap_or_else(|e| e.into_inner()).input_mode;
+            let settings_input_mode = active_tab == NavTab::Settings
+                && settings_page
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .any_input_active();
+            let search_input_mode = active_tab == NavTab::Search
+                && search_page
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .input_mode;
             let favorites_input_mode =
                 active_tab == NavTab::Favorites && favorites_page.input_mode();
             let playlists_input_mode = active_tab == NavTab::Playlists && playlists.input_active();
@@ -1415,20 +1540,23 @@ fn run_app(
                 || local_input_mode
                 || history_input_mode;
 
-            if let Some(ref page) = bili_login_page {
-                let action = page.lock().unwrap_or_else(|e| e.into_inner()).handle_input(key, &kb_resolver);
+            if let Some(ref page) = qr_login_page {
+                let action = page
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle_input(key, &kb_resolver);
                 match action {
-                    AppAction::BiliLoginSuccess => {
-                        let _ = action_tx.send(AppAction::BiliLoginSuccess);
+                    AppAction::QrLoginSuccess(source) => {
+                        let _ = action_tx.send(AppAction::QrLoginSuccess(source));
                     }
                     AppAction::GoBack => {
-                        if let Some(task) = bili_generate_task.take() {
+                        if let Some(task) = qr_generate_task.take() {
                             task.abort();
                         }
-                        if let Some(task) = bili_poll_task.take() {
+                        if let Some(task) = qr_poll_task.take() {
                             task.abort();
                         }
-                        bili_login_page = None;
+                        qr_login_page = None;
                     }
                     _ => {}
                 }
@@ -1557,7 +1685,10 @@ fn run_app(
                 )
             {
                 help_page = Some(pages::help::HelpPage::from_config(
-                    &ctx.config.read().unwrap_or_else(|e| e.into_inner()).keybindings,
+                    &ctx.config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .keybindings,
                 ));
                 needs_render = true;
                 continue;
@@ -1578,7 +1709,12 @@ fn run_app(
             }
 
             // 歌手/专辑详情浮层：打开时独占按键
-            if ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            if ctx
+                .details_page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            {
                 let action = ctx
                     .details_page
                     .lock()
@@ -1790,7 +1926,12 @@ fn run_app(
                         continue;
                     }
                     Action::GlobalToggleFavorite if !text_input_active => {
-                        if let Some(song) = ctx.current_song.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        if let Some(song) = ctx
+                            .current_song
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                        {
                             if ctx.storage.is_favorite(song) {
                                 ctx.storage.remove_favorite(song);
                                 let _ = action_tx.send(AppAction::ShowNotification(
@@ -1898,12 +2039,14 @@ fn run_app(
                     needs_render = true;
                     continue;
                 }
-                (KeyModifiers::NONE, KeyCode::Up) if active_tab == NavTab::Main => {
+                // 队列页面保留裸 Up/Down 给列表导航；音量调整使用 Ctrl+Up/Down，
+                // 避免全局快捷键在路由前吞掉队列的方向键。
+                (KeyModifiers::CONTROL, KeyCode::Up) if active_tab == NavTab::Main => {
                     persist_volume(&ctx, ctx.player.volume().saturating_add(5));
                     needs_render = true;
                     continue;
                 }
-                (KeyModifiers::NONE, KeyCode::Down) if active_tab == NavTab::Main => {
+                (KeyModifiers::CONTROL, KeyCode::Down) if active_tab == NavTab::Main => {
                     persist_volume(&ctx, ctx.player.volume().saturating_sub(5));
                     needs_render = true;
                     continue;
@@ -2038,20 +2181,25 @@ fn run_app(
                     // BiliLogin/BiliLogout 需要发到 channel 让主循环处理（生成 QR 码等）
                     if matches!(
                         action,
-                        AppAction::BiliLogin | AppAction::BiliLogout | AppAction::BiliLoginSuccess
+                        AppAction::QrLogin(_)
+                            | AppAction::QrLogout(_)
+                            | AppAction::QrLoginSuccess(_)
                     ) {
                         let _ = action_tx.send(action);
                     } else {
                         // 'z' 切换滚动步长；'j' 在设置页无功能，属死键，移除
                         if matches!(key.code, KeyCode::Char('g' | 'w' | 'z' | 'K')) {
                             let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
-                            search_page.lock().unwrap_or_else(|e| e.into_inner()).set_preferences(
-                                config.ui.aggregate_search,
-                                config.source.default,
-                                config.ui.wrap_navigation,
-                                config.ui.scroll_amount,
-                                &config.source.enabled,
-                            );
+                            search_page
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .set_preferences(
+                                    config.ui.aggregate_search,
+                                    config.source.default,
+                                    config.ui.wrap_navigation,
+                                    config.ui.scroll_amount,
+                                    &config.source.enabled,
+                                );
                         }
                         execute_action(
                             action,
@@ -2080,10 +2228,8 @@ fn run_app(
                         &local_state,
                         &mut data_cache.local,
                     );
-                    let songs = pages::local_music::LocalSongView::build(
-                        all_songs,
-                        local_filter.query(),
-                    );
+                    let songs =
+                        pages::local_music::LocalSongView::build(all_songs, local_filter.query());
 
                     if let Some(action) = kb_resolver.resolve_page("local", &key) {
                         match action {
@@ -2095,8 +2241,19 @@ fn run_app(
                                 )));
                             }
                             Action::LocalRescan => {
-                                let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
-                                let max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
+                                let paths = ctx
+                                    .config
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .local_music
+                                    .paths
+                                    .clone();
+                                let max_depth = ctx
+                                    .config
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .local_music
+                                    .max_depth;
                                 execute_action(
                                     AppAction::ScanLocalMusic {
                                         paths,
@@ -2120,14 +2277,22 @@ fn run_app(
                                 local_state.selected = previous_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
+                                    ctx.config
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .ui
+                                        .wrap_navigation,
                                 );
                             }
                             Action::ListSelectDown => {
                                 local_state.selected = next_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
+                                    ctx.config
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .ui
+                                        .wrap_navigation,
                                 );
                             }
                             Action::ListSelectFirst => {
@@ -2241,8 +2406,19 @@ fn run_app(
                                 )));
                             }
                             (KeyModifiers::NONE, KeyCode::Char('r')) => {
-                                let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
-                                let max_depth = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.max_depth;
+                                let paths = ctx
+                                    .config
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .local_music
+                                    .paths
+                                    .clone();
+                                let max_depth = ctx
+                                    .config
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .local_music
+                                    .max_depth;
                                 execute_action(
                                     AppAction::ScanLocalMusic {
                                         paths,
@@ -2263,14 +2439,22 @@ fn run_app(
                                 local_state.selected = previous_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
+                                    ctx.config
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .ui
+                                        .wrap_navigation,
                                 );
                             }
                             (KeyModifiers::NONE, KeyCode::Down) => {
                                 local_state.selected = next_list_index(
                                     local_state.selected,
                                     songs.len(),
-                                    ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation,
+                                    ctx.config
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .ui
+                                        .wrap_navigation,
                                 );
                             }
                             (KeyModifiers::NONE, KeyCode::Home)
@@ -2375,11 +2559,17 @@ fn run_app(
             }
             needs_render = true;
         } else if let Some(Event::Mouse(mouse)) = terminal_event.as_ref() {
-            if confirm_delete.is_some() || downloads_panel.is_open() {
+            if confirm_delete.is_some() {
                 needs_render = true;
                 continue;
             }
             let mouse = *mouse;
+            if downloads_panel.is_open() {
+                let tasks = ctx.downloads.snapshot();
+                downloads_panel.handle_mouse(&mouse, &ctx, &tasks);
+                needs_render = true;
+                continue;
+            }
 
             if let Some(menu) = song_menu.as_mut() {
                 let outcome = menu.handle_mouse(mouse, ui_areas.content);
@@ -2461,7 +2651,10 @@ fn run_app(
                 if let Some(tab) = pages::sidebar::hit_test(ui_areas.tabs, position) {
                     active_tab = tab;
                     if tab == NavTab::Search {
-                        search_page.lock().unwrap_or_else(|e| e.into_inner()).input_mode = true;
+                        search_page
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .input_mode = true;
                     }
                 }
             } else if ui_areas.progress.contains(position)
@@ -2593,12 +2786,10 @@ fn run_app(
                         &mut data_cache.history,
                         activate,
                     ),
-                    NavTab::Settings => settings_page.lock().unwrap_or_else(|e| e.into_inner()).handle_mouse(
-                        mouse,
-                        ui_areas.content,
-                        &ctx,
-                        &kb_resolver,
-                    ),
+                    NavTab::Settings => settings_page
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .handle_mouse(mouse, ui_areas.content, &ctx, &kb_resolver),
                     NavTab::LocalMusic => pages::local_music::handle_mouse(
                         mouse,
                         ui_areas.content,
@@ -2670,7 +2861,7 @@ fn run_app(
                 &confirm_delete,
                 &local_diagnostics,
                 &song_menu,
-                &bili_login_page,
+                &qr_login_page,
                 &mut help_page,
                 &mut downloads_panel,
             )?;
@@ -2701,7 +2892,7 @@ fn draw_app(
     confirm_delete: &Option<LocalDeleteConfirmation>,
     local_diagnostics: &Option<LocalDiagnosticsKind>,
     song_menu: &Option<SongContextMenu>,
-    bili_login_page: &Option<Arc<std::sync::Mutex<pages::bili_login::BiliLoginPage>>>,
+    qr_login_page: &Option<Arc<std::sync::Mutex<pages::qr_login::QrLoginPage>>>,
     help_page: &mut Option<pages::help::HelpPage>,
     downloads_panel: &mut pages::downloads::DownloadsPanel,
 ) -> anyhow::Result<()> {
@@ -2774,17 +2965,21 @@ fn draw_app(
 
                 'local_content: {
                     let local_src = ctx.source_manager.local_source();
-                    let paths = ctx.config.read().unwrap_or_else(|e| e.into_inner()).local_music.paths.clone();
+                    let paths = ctx
+                        .config
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .local_music
+                        .paths
+                        .clone();
                     let all_songs =
                         pages::local_music::sorted_local_songs(ctx, local_state, data_cache_local);
                     let is_scanning = local_src.is_scanning();
                     let scan_stats = local_src.scan_stats();
                     let missing_count = local_src.missing_count();
 
-                    let songs = pages::local_music::LocalSongView::build(
-                        all_songs,
-                        local_filter.query(),
-                    );
+                    let songs =
+                        pages::local_music::LocalSongView::build(all_songs, local_filter.query());
 
                     local_state.selected = local_state.selected.min(songs.len().saturating_sub(1));
 
@@ -2901,12 +3096,8 @@ fn draw_app(
                         let text = pages::components::song_table::row(song, i, inner.width);
                         // 数据行紧跟在列头下方：过滤条可见时整体下移一行，
                         // 否则 row 0 会把列头覆盖掉。
-                        let line_area = Rect::new(
-                            inner.x,
-                            content_y + 1 + (row - sc) as u16,
-                            inner.width,
-                            1,
-                        );
+                        let line_area =
+                            Rect::new(inner.x, content_y + 1 + (row - sc) as u16, inner.width, 1);
                         let style = if i == sel {
                             Style::new()
                                 .bg(crate::theme::accent(ctx))
@@ -2958,10 +3149,10 @@ fn draw_app(
             render_local_diagnostics(content_area, frame.buffer_mut(), ctx, *kind);
         }
 
-        if let Some(page) = bili_login_page {
+        if let Some(page) = qr_login_page {
             use ratatui::widgets::{Clear, Widget};
 
-            let overlay_area = calculate_bili_login_area(area);
+            let overlay_area = calculate_qr_login_area(area);
             Clear.render(overlay_area, frame.buffer_mut());
             ratatui::widgets::Block::default()
                 .style(
@@ -2971,7 +3162,7 @@ fn draw_app(
                 )
                 .render(overlay_area, frame.buffer_mut());
             let p = page.lock().unwrap_or_else(|e| e.into_inner());
-            p.render(overlay_area, frame.buffer_mut());
+            p.render(overlay_area, frame.buffer_mut(), ctx);
         }
 
         components::progress_bar::render(main_chunks[3], frame.buffer_mut(), ctx);
@@ -2987,7 +3178,12 @@ fn draw_app(
         if let Some(menu) = song_menu {
             menu.render(content_area, frame.buffer_mut(), ctx);
         }
-        if let Some(page) = ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(page) = ctx
+            .details_page
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             use ratatui::widgets::{Clear, Widget};
             Clear.render(area, frame.buffer_mut());
             page.render(area, frame.buffer_mut(), ctx);
@@ -3092,7 +3288,7 @@ fn render_local_diagnostics(
         .render(inner, buf);
 }
 
-fn calculate_bili_login_area(area: Rect) -> Rect {
+fn calculate_qr_login_area(area: Rect) -> Rect {
     let qr_width = 66u16;
     let qr_height = 40u16;
     let w = qr_width.min(area.width.saturating_sub(4));
@@ -3387,10 +3583,23 @@ fn execute_action(
         } => {
             if let Some(song) = songs.get(index).cloned() {
                 ctx.playlist.set_playlist(songs, index);
-                ctx.play_attempted_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                ctx.play_attempted_sources
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *ctx.play_js_source_index
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
                 if start_playback {
-                    start_song_playback(song, false, Some((position, paused)), true, ctx, rt, action_tx);
+                    start_song_playback(
+                        song,
+                        false,
+                        Some((position, paused)),
+                        true,
+                        ctx,
+                        rt,
+                        action_tx,
+                    );
                 } else {
                     ctx.stop_player();
                     *ctx.current_song.write().unwrap_or_else(|e| e.into_inner()) = Some(song);
@@ -3405,7 +3614,14 @@ fn execute_action(
             if was_empty {
                 let (songs, index) = ctx.playlist.snapshot();
                 if let Some(current) = songs.get(index).cloned() {
-                    begin_song_from_arc(std::sync::Arc::new(songs), index, false, ctx, rt, action_tx);
+                    begin_song_from_arc(
+                        std::sync::Arc::new(songs),
+                        index,
+                        false,
+                        ctx,
+                        rt,
+                        action_tx,
+                    );
                     ctx.notify(Notification::success(format!(
                         "开始播放: {} - {}",
                         current.name, current.singer
@@ -3575,7 +3791,10 @@ fn execute_action(
                 .map(|result| format!("{}: {}", result.name, result.detail))
                 .collect::<Vec<_>>();
             *ctx.source_health.write().unwrap_or_else(|e| e.into_inner()) = results;
-            settings_page.lock().unwrap_or_else(|e| e.into_inner()).status_msg = Some(if failures.is_empty() {
+            settings_page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .status_msg = Some(if failures.is_empty() {
                 format!("音源检测完成：{healthy}/{total} 可用")
             } else {
                 format!(
@@ -3709,7 +3928,8 @@ fn execute_action(
                 source: song.source,
                 cover_url: song.cover_url.clone(),
             };
-            *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) = Some(pages::details::DetailsPage::artist(artist.clone()));
+            *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(pages::details::DetailsPage::artist(artist.clone()));
             let manager = Arc::clone(&ctx.source_manager);
             let details = Arc::clone(&ctx.details_page);
             rt.spawn(async move {
@@ -3737,7 +3957,7 @@ fn execute_action(
             });
         }
         AppAction::ShowAlbumDetails(album) => {
-                        *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) =
+            *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(pages::details::DetailsPage::album(*album.clone()));
             let manager = Arc::clone(&ctx.source_manager);
             let details = Arc::clone(&ctx.details_page);
@@ -3762,9 +3982,9 @@ fn execute_action(
         | AppAction::GoBack
         | AppAction::Quit
         | AppAction::None
-        | AppAction::BiliLogin
-        | AppAction::BiliLogout
-        | AppAction::BiliLoginSuccess => {
+        | AppAction::QrLogin(_)
+        | AppAction::QrLogout(_)
+        | AppAction::QrLoginSuccess(_) => {
             // handled elsewhere or ignored
         }
     }
@@ -3779,7 +3999,11 @@ fn begin_song_from_list(
     action_tx: &mpsc::UnboundedSender<AppAction>,
 ) {
     let Some(song) = songs.get(index).cloned() else {
-        tracing::debug!(index, song_count = songs.len(), "playback list index out of bounds");
+        tracing::debug!(
+            index,
+            song_count = songs.len(),
+            "playback list index out of bounds"
+        );
         return;
     };
     tracing::debug!(
@@ -3913,7 +4137,9 @@ fn start_song_playback(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        *ctx.play_js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ctx.play_js_source_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
     let player_generation = prepare_player(ctx);
     let lyric_generation = ctx.lyric_service.prepare();
@@ -3960,7 +4186,12 @@ fn start_song_playback(
     }
 
     if add_history {
-        let limit = ctx.config.read().unwrap_or_else(|e| e.into_inner()).player.history_limit;
+        let limit = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .player
+            .history_limit;
         ctx.storage.add_history(&song, limit);
     }
     if add_history {
@@ -4225,30 +4456,34 @@ async fn resolve_playable_song(
     if play_request_id.load(Ordering::SeqCst) != request_id {
         return Ok(None);
     }
-    let direct_error =
-        if retrying_next_js_source
-            || mark_source_attempted(&attempted_sources, &play_request_id, request_id, song.source)
+    let direct_error = if retrying_next_js_source
+        || mark_source_attempted(
+            &attempted_sources,
+            &play_request_id,
+            request_id,
+            song.source,
+        ) {
+        match resolve_song_url(
+            Arc::clone(&source_manager),
+            &song,
+            quality,
+            next_js_source_index.unwrap_or(0),
+        )
+        .await
         {
-            match resolve_song_url(
-                Arc::clone(&source_manager),
-                &song,
-                quality,
-                next_js_source_index.unwrap_or(0),
-            )
-            .await
-            {
-                Ok((url, resolved_js_source_index)) => {
-                    if play_request_id.load(Ordering::SeqCst) != request_id {
-                        return Ok(None);
-                    }
-                    *js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = resolved_js_source_index;
-                    return Ok(Some((song, url)));
+            Ok((url, resolved_js_source_index)) => {
+                if play_request_id.load(Ordering::SeqCst) != request_id {
+                    return Ok(None);
                 }
-                Err(error) => error,
+                *js_source_index.lock().unwrap_or_else(|e| e.into_inner()) =
+                    resolved_js_source_index;
+                return Ok(Some((song, url)));
             }
-        } else {
-            format!("音源 {} 已尝试", song.source.as_str())
-        };
+            Err(error) => error,
+        }
+    } else {
+        format!("音源 {} 已尝试", song.source.as_str())
+    };
 
     if play_request_id.load(Ordering::SeqCst) != request_id {
         return Ok(None);
@@ -4276,7 +4511,8 @@ async fn resolve_playable_song(
                 if play_request_id.load(Ordering::SeqCst) != request_id {
                     return Ok(None);
                 }
-                *js_source_index.lock().unwrap_or_else(|e| e.into_inner()) = resolved_js_source_index;
+                *js_source_index.lock().unwrap_or_else(|e| e.into_inner()) =
+                    resolved_js_source_index;
                 return Ok(Some((candidate, url)));
             }
             Err(error) => {
@@ -4608,7 +4844,7 @@ fn spawn_playlist_request(
             } => {
                 let result = tokio::time::timeout(
                     Duration::from_secs(12),
-                    source_manager.playlists(source, page),
+                    source_manager.playlists(source, "", page),
                 )
                 .await;
                 PlaylistResponse::List {

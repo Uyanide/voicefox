@@ -1,8 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-pub mod bili_login;
-pub mod details;
 pub mod components;
+pub mod details;
 pub mod downloads;
 pub mod favorites;
 pub mod help;
@@ -11,10 +10,12 @@ pub mod leaderboard;
 pub mod local_music;
 pub mod main_page;
 pub mod playlists;
+pub mod qr_login;
 pub mod search;
 pub mod settings;
 pub mod sidebar;
 pub mod sort;
+pub mod sources;
 
 pub(crate) fn is_song_activation_key(key: &KeyEvent) -> bool {
     key.modifiers == KeyModifiers::NONE

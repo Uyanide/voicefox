@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 
 const SEARCH_SCOPES: &[(Option<SourceId>, &str)] = &[
     (None, "全部"),
@@ -63,6 +64,7 @@ pub struct SearchPage {
     variant_viewport: usize,
     search_scopes: Vec<(Option<SourceId>, &'static str)>,
     part_picker: Option<BiliPartPicker>,
+    source_selector: Option<SourceSelector>,
     bili_parts_loading: Option<u64>,
     next_bili_parts_request_id: u64,
     wrap_navigation: bool,
@@ -82,6 +84,19 @@ impl SearchPage {
                 .iter()
                 .any(|(candidate, _)| *candidate == Some(*source))
         });
+        let selector_items = search_scopes
+            .iter()
+            .map(|(source, label)| {
+                let key = source
+                    .map(SourceSelectorKey::Source)
+                    .unwrap_or(SourceSelectorKey::All);
+                (key, (*label).to_string())
+            })
+            .collect();
+        let selector_index = search_scopes
+            .iter()
+            .position(|(source, _)| *source == source_filter)
+            .unwrap_or(0);
         Self {
             input: String::new(),
             results: vec![],
@@ -107,6 +122,7 @@ impl SearchPage {
             variant_viewport: 1,
             search_scopes,
             part_picker: None,
+            source_selector: Some(SourceSelector::new(selector_items, selector_index)),
             bili_parts_loading: None,
             next_bili_parts_request_id: 0,
             wrap_navigation,
@@ -126,6 +142,13 @@ impl SearchPage {
                 self.bili_parts_loading = None;
             }
             return AppAction::None;
+        }
+        if self
+            .source_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            return self.handle_source_selector(key);
         }
 
         // The variant picker is a modal overlay.  Route every key to it before
@@ -186,9 +209,16 @@ impl SearchPage {
             return AppAction::None;
         }
 
-        // Brackets are source selectors on the search page.  Keep them out
-        // of input mode so users can still type them in a query.
+        // P opens the full source chooser while the compact source row remains visible.
         match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('p' | 'P')) => {
+                if let Some(selector) = self.source_selector.as_mut() {
+                    selector.open();
+                }
+                return AppAction::None;
+            }
+            // Brackets are source selectors on the search page. Keep them out
+            // of input mode so users can still type them in a query.
             (KeyModifiers::NONE, KeyCode::Char('[')) => return self.cycle_source(-1),
             (KeyModifiers::NONE, KeyCode::Char(']')) => return self.cycle_source(1),
             _ => {}
@@ -553,6 +583,9 @@ impl SearchPage {
             return AppAction::None;
         }
         self.source_filter = source;
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.select(index);
+        }
         self.error_message = None;
         self.close_variants();
 
@@ -827,9 +860,15 @@ impl SearchPage {
 
         self.render_variant_picker(area, buf, ctx);
         self.render_bili_part_overlay(area, buf, ctx);
+        self.render_source_selector(area, buf, ctx);
     }
 
-    fn render_source_tabs(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+    #[allow(unreachable_code)]
+    fn render_source_tabs(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.source_selector.as_ref() {
+            selector.render_tabs(area, buf, ctx);
+        }
+        return;
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -838,19 +877,17 @@ impl SearchPage {
             .iter()
             .position(|(scope, _)| *scope == self.source_filter)
             .unwrap_or(0);
-        for (index, tab_area) in source_tab_areas(area, self.search_scopes.len())
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            let label = if area.width >= 66 {
-                self.search_scopes[index].1
-            } else {
-                self.search_scopes[index]
-                    .0
-                    .map(|source| source.as_str())
-                    .unwrap_or("all")
-            };
+        let mut spans = vec![Span::styled(
+            " 音源：",
+            Style::new().fg(crate::theme::muted(ctx)),
+        )];
+        let mut used = 4usize;
+        for (index, (source, _)) in self.search_scopes.iter().enumerate() {
+            let label = source.map(|s| s.display_name()).unwrap_or("全部");
+            let width = label.chars().count() + 3;
+            if used + width + 10 > area.width as usize {
+                break;
+            }
             let style = if index == selected {
                 Style::new()
                     .fg(crate::theme::selection_fg(ctx))
@@ -859,11 +896,118 @@ impl SearchPage {
             } else {
                 Style::new().fg(crate::theme::muted(ctx))
             };
-            Paragraph::new(Line::from(Span::styled(label, style)))
-                .alignment(ratatui::layout::Alignment::Center)
-                .style(style)
-                .render(tab_area, buf);
+            if index > 0 {
+                spans.push(Span::raw("  "));
+                used += 2;
+            }
+            spans.push(Span::styled(format!(" {} ", label), style));
+            used += width;
         }
+        spans.push(Span::styled(
+            "  P 切换",
+            Style::new()
+                .fg(crate::theme::accent(ctx))
+                .add_modifier(Modifier::BOLD),
+        ));
+        Paragraph::new(Line::from(spans)).render(area, buf);
+    }
+
+    fn handle_source_selector(&mut self, key: KeyEvent) -> AppAction {
+        let result = self
+            .source_selector
+            .as_mut()
+            .and_then(|selector| selector.handle_key(key));
+        if result.is_some() {
+            let index = self
+                .source_selector
+                .as_ref()
+                .map(|selector| selector.selected_index())
+                .unwrap_or(0);
+            return self.select_source(index);
+        }
+        AppAction::None
+    }
+
+    #[allow(unreachable_code)]
+    fn render_source_selector(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if let Some(selector) = self.source_selector.as_mut() {
+            selector.render_popup(area, buf, ctx, "选择音源");
+        }
+        return;
+        let Some(picker) = self.source_selector.as_ref() else {
+            return;
+        };
+        let len = self.search_scopes.len();
+        if len == 0 {
+            return;
+        }
+        let width = area.width.saturating_sub(4).clamp(30, 48);
+        let rows = len.min(area.height.saturating_sub(8) as usize).max(1);
+        let height = rows as u16 + 5;
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(crate::theme::accent(ctx)))
+            .style(Style::new().bg(crate::theme::surface0(ctx)))
+            .title(" 选择音源 · P ");
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+        let visible = inner.height.saturating_sub(1) as usize;
+        let selected = picker.selected;
+        let mut scroll = picker.scroll;
+        if selected < scroll {
+            scroll = selected;
+        }
+        if visible > 0 && selected >= scroll + visible {
+            scroll = selected + 1 - visible;
+        }
+        scroll = scroll.min(len.saturating_sub(visible.max(1)));
+        if let Some(p) = self.source_selector.as_mut() {
+            p.scroll = scroll;
+        }
+        for (row, (index, (_, label))) in self
+            .search_scopes
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible)
+            .enumerate()
+        {
+            let selected_row = index == selected;
+            let active = self.search_scopes[index].0 == self.source_filter;
+            let style = if selected_row {
+                Style::new()
+                    .bg(crate::theme::accent(ctx))
+                    .fg(crate::theme::selection_fg(ctx))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(crate::theme::text(ctx))
+            };
+            Paragraph::new(Line::from(vec![
+                Span::styled(if selected_row { "▶ " } else { "  " }, style),
+                Span::styled(
+                    if active { "● " } else { "○ " },
+                    Style::new().fg(crate::theme::accent(ctx)),
+                ),
+                Span::styled(*label, style),
+            ]))
+            .render(
+                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                buf,
+            );
+        }
+        Paragraph::new("↑/↓ 选择   Enter 应用   Esc 取消")
+            .style(Style::new().fg(crate::theme::muted(ctx)))
+            .render(
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+                buf,
+            );
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect, activate: bool) -> AppAction {
@@ -871,6 +1015,32 @@ impl SearchPage {
             return self.handle_bili_part_mouse(event, area, activate);
         }
         if self.bili_parts_loading.is_some() {
+            return AppAction::None;
+        }
+        if self
+            .source_selector
+            .as_ref()
+            .is_some_and(|selector| selector.is_open())
+        {
+            let result = self
+                .source_selector
+                .as_mut()
+                .and_then(|selector| selector.handle_mouse(event, area));
+            if let Some(source) = result {
+                match source {
+                    SourceSelectorKey::All => return self.select_source(0),
+                    SourceSelectorKey::Source(source) => {
+                        if let Some(index) = self
+                            .search_scopes
+                            .iter()
+                            .position(|(candidate, _)| *candidate == Some(source))
+                        {
+                            return self.select_source(index);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             return AppAction::None;
         }
         if !self.variant_indices.is_empty() {

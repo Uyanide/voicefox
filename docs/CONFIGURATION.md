@@ -411,3 +411,15 @@ settings_cycle_equalizer_preset = "Alt+e"
 ---
 
 返回 [README](../README.md)
+
+## 0.3.12 平台目录与快捷键补充
+
+voicefox 使用 `dirs` 提供的平台目录：数据使用 data directory，配置/会话使用 config directory。Windows 不再使用手写 `.config/voicefox` 路径。
+
+- Linux 数据：`$XDG_DATA_HOME/voicefox` 或系统默认数据目录
+- macOS 数据：`~/Library/Application Support/voicefox`
+- Windows 数据：`%LOCALAPPDATA%\voicefox`
+
+快捷键支持普通键、方向键、功能键以及 Ctrl/Shift/Alt 组合。完整默认绑定见 [`../KEYBINDINGS.md`](../KEYBINDINGS.md)。
+
+当前内置在线音源：酷我、酷狗、QQ、网易云、咪咕、哔哩哔哩、千千、JOOX、5sing、Jamendo、Apple Music、汽水；另有本地音源和可动态加载的 lx-music JS 音源。能力矩阵见 [`USER_GUIDE.md`](USER_GUIDE.md)。

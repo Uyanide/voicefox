@@ -47,6 +47,10 @@ pub struct MainPage {
     scroll: usize,
     dragging: Option<usize>,
     cover: CoverRenderer,
+    /// 队列内快速过滤；过滤只改变可见集合，不修改真实播放队列。
+    queue_filter: String,
+    queue_filter_active: bool,
+    lyric_fullscreen: bool,
     /// “D 清空整个队列”的武装时刻，确认窗口外或 Esc 后解除
     clear_armed: Option<Instant>,
 }
@@ -58,6 +62,9 @@ impl MainPage {
             scroll: 0,
             dragging: None,
             cover,
+            queue_filter: String::new(),
+            queue_filter_active: false,
+            lyric_fullscreen: false,
             clear_armed: None,
         }
     }
@@ -82,6 +89,22 @@ impl MainPage {
         self.cover.force_reload();
     }
 
+    fn filtered_indices(&self, songs: &[lx_core::model::song::SongInfo]) -> Vec<usize> {
+        let query = self.queue_filter.trim().to_lowercase();
+        if query.is_empty() {
+            return (0..songs.len()).collect();
+        }
+        songs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, song)| {
+                let haystack =
+                    format!("{} {} {}", song.name, song.singer, song.album_name).to_lowercase();
+                haystack.contains(&query).then_some(i)
+            })
+            .collect()
+    }
+
     pub fn handle_input(
         &mut self,
         key: &KeyEvent,
@@ -99,6 +122,58 @@ impl MainPage {
 
         if self.selected >= len {
             self.selected = len.saturating_sub(1);
+        }
+
+        if !self.queue_filter_active
+            && key.modifiers == KeyModifiers::NONE
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            self.lyric_fullscreen = !self.lyric_fullscreen;
+            return AppAction::None;
+        }
+
+        if self.queue_filter_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.queue_filter_active = false;
+                    self.queue_filter.clear();
+                    self.selected = 0;
+                    self.scroll = 0;
+                    return AppAction::None;
+                }
+                KeyCode::Enter => {
+                    self.queue_filter_active = false;
+                    return AppAction::None;
+                }
+                KeyCode::Backspace => {
+                    self.queue_filter.pop();
+                    self.selected = self
+                        .filtered_indices(&ctx.playlist.borrow())
+                        .first()
+                        .copied()
+                        .unwrap_or(0);
+                    self.scroll = 0;
+                    return AppAction::None;
+                }
+                KeyCode::Char(ch)
+                    if key.modifiers == KeyModifiers::NONE
+                        || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    self.queue_filter.push(ch);
+                    self.selected = self
+                        .filtered_indices(&ctx.playlist.borrow())
+                        .first()
+                        .copied()
+                        .unwrap_or(0);
+                    self.scroll = 0;
+                    return AppAction::None;
+                }
+                _ => {}
+            }
+        } else if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Char('/') {
+            self.queue_filter_active = true;
+            self.scroll = 0;
+            return AppAction::None;
         }
 
         if let Some(command) = queue_edit_command(key) {
@@ -155,27 +230,51 @@ impl MainPage {
         if let Some(action) = resolver.resolve_page("main", key) {
             match action {
                 Action::ListSelectUp => {
-                    if len != 0 {
-                        self.selected = if self.selected == 0 {
-                            if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
-                                len - 1
+                    let songs = ctx.playlist.borrow();
+                    let visible = self.filtered_indices(&songs);
+                    if !visible.is_empty() {
+                        let pos = visible
+                            .iter()
+                            .position(|&i| i == self.selected)
+                            .unwrap_or(0);
+                        self.selected = if pos == 0 {
+                            if ctx
+                                .config
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .ui
+                                .wrap_navigation
+                            {
+                                *visible.last().unwrap()
                             } else {
-                                0
+                                visible[0]
                             }
                         } else {
-                            self.selected - 1
+                            visible[pos - 1]
                         };
                     }
                     return AppAction::None;
                 }
                 Action::ListSelectDown => {
-                    if len != 0 {
-                        self.selected = if self.selected + 1 < len {
-                            self.selected + 1
-                        } else if ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.wrap_navigation {
-                            0
+                    let songs = ctx.playlist.borrow();
+                    let visible = self.filtered_indices(&songs);
+                    if !visible.is_empty() {
+                        let pos = visible
+                            .iter()
+                            .position(|&i| i == self.selected)
+                            .unwrap_or(0);
+                        self.selected = if pos + 1 < visible.len() {
+                            visible[pos + 1]
+                        } else if ctx
+                            .config
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .ui
+                            .wrap_navigation
+                        {
+                            visible[0]
                         } else {
-                            self.selected
+                            *visible.last().unwrap()
                         };
                     }
                     return AppAction::None;
@@ -260,6 +359,10 @@ impl MainPage {
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        if self.lyric_fullscreen {
+            super::components::lyric::render(area, buf, ctx);
+            return;
+        }
         if area.width >= 72 {
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
@@ -267,12 +370,18 @@ impl MainPage {
                 .split(area);
             // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_HEIGHT。
             // 关闭封面时左栏全部用于歌词
-            let geometry = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.show_cover.then(|| {
-                CoverGeometry::from_font_size(
-                    self.cover.font_size(),
-                    ctx.cover_service.image_aspect(),
-                )
-            });
+            let geometry = ctx
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .ui
+                .show_cover
+                .then(|| {
+                    CoverGeometry::from_font_size(
+                        self.cover.font_size(),
+                        ctx.cover_service.image_aspect(),
+                    )
+                });
             let cover_height = geometry.map_or(0, |geometry| {
                 geometry.box_height(
                     columns[0].width,
@@ -309,7 +418,13 @@ impl MainPage {
         ctx: &AppContext,
         activate: bool,
     ) -> AppAction {
-        let scroll_amount = ctx.config.read().unwrap_or_else(|e| e.into_inner()).ui.scroll_amount.max(1);
+        let scroll_amount = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .scroll_amount
+            .max(1);
         let mut play_songs = None;
         let mut drag_target = None;
         {
@@ -327,7 +442,17 @@ impl MainPage {
                         (self.selected + scroll_amount).min(songs.len().saturating_sub(1));
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) = queue_index_at(event, area, self.scroll, songs.len()) {
+                    let index = if self.queue_filter.is_empty() {
+                        queue_index_at(event, area, self.scroll, songs.len())
+                    } else {
+                        queue_index_at_filtered(
+                            event,
+                            area,
+                            self.scroll,
+                            &self.filtered_indices(&songs),
+                        )
+                    };
+                    if let Some(index) = index {
                         self.selected = index;
                         self.dragging = Some(index);
                         if activate {
@@ -340,8 +465,17 @@ impl MainPage {
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let Some(from) = self.dragging {
-                        drag_target = queue_index_at(event, area, self.scroll, songs.len())
-                            .filter(|&target| target != from);
+                        drag_target = if self.queue_filter.is_empty() {
+                            queue_index_at(event, area, self.scroll, songs.len())
+                        } else {
+                            queue_index_at_filtered(
+                                event,
+                                area,
+                                self.scroll,
+                                &self.filtered_indices(&songs),
+                            )
+                        }
+                        .filter(|&target| target != from);
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
@@ -416,7 +550,13 @@ impl MainPage {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
-            .title(format!(" 队列 · {} 歌曲 ", songs.len()));
+            .title(
+                if self.queue_filter_active || !self.queue_filter.is_empty() {
+                    format!(" 队列 · {} 歌曲 · /{} ", songs.len(), self.queue_filter)
+                } else {
+                    format!(" 队列 · {} 歌曲 · /筛选 ", songs.len())
+                },
+            );
         let inner = block.inner(area);
         block.render(area, buf);
         if songs.is_empty() {
@@ -452,9 +592,16 @@ impl MainPage {
         } else if self.selected < self.scroll {
             self.scroll = self.selected;
         }
-        self.scroll = self.scroll.min(songs.len().saturating_sub(visible));
+        let filtered = self.filtered_indices(&songs);
+        self.scroll = self.scroll.min(filtered.len().saturating_sub(visible));
 
-        for (row, index) in (self.scroll..songs.len().min(self.scroll + visible)).enumerate() {
+        for (row, index) in filtered
+            .iter()
+            .copied()
+            .skip(self.scroll)
+            .take(visible)
+            .enumerate()
+        {
             let mut style = if index == current {
                 Style::new().fg(accent).add_modifier(Modifier::BOLD)
             } else {
@@ -488,6 +635,26 @@ fn queue_index_at(event: MouseEvent, area: Rect, scroll: usize, len: usize) -> O
     }
     let index = scroll + event.row.saturating_sub(list_y) as usize;
     (index < len).then_some(index)
+}
+
+fn queue_index_at_filtered(
+    event: MouseEvent,
+    area: Rect,
+    scroll: usize,
+    indices: &[usize],
+) -> Option<usize> {
+    let queue_area = queue_area(area);
+    let inner = Block::default().borders(Borders::ALL).inner(queue_area);
+    let list_y = inner.y.saturating_add(1);
+    if event.column < inner.x
+        || event.column >= inner.right()
+        || event.row < list_y
+        || event.row >= inner.bottom()
+    {
+        return None;
+    }
+    let pos = scroll + event.row.saturating_sub(list_y) as usize;
+    indices.get(pos).copied()
 }
 
 fn queue_area(area: Rect) -> Rect {
@@ -585,7 +752,35 @@ fn render_cover_text(inner: Rect, buf: &mut Buffer, ctx: &AppContext) {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{QueueEditCommand, queue_edit_command};
+    use super::{QueueEditCommand, queue_edit_command, queue_index_at};
+
+    #[test]
+    fn queue_click_rows_align_with_rendered_rows() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        let area = Rect::new(0, 0, 100, 20);
+        let click = |row: u16, scroll: usize, len: usize| {
+            queue_index_at(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 50,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+                scroll,
+                len,
+            )
+        };
+
+        assert_eq!(click(0, 0, 100), None);
+        assert_eq!(click(1, 0, 100), None);
+        assert_eq!(click(2, 0, 100), Some(0));
+        assert_eq!(click(11, 0, 100), Some(9));
+        assert_eq!(click(2, 7, 100), Some(7));
+        assert_eq!(click(19, 0, 100), None);
+    }
 
     #[test]
     fn queue_reorder_shortcuts_accept_terminal_shift_variants() {

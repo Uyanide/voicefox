@@ -1,0 +1,5 @@
+rust_input: crate::api
+rust_root: ./ffi
+rust_output: ./ffi/src/frb_generated.rs
+dart_root: ./flutter
+dart_output: ./flutter/lib/src/bridge
