@@ -8,6 +8,9 @@ default-run = "voicefox"
 name = "voicefox"
 path = "src/main.rs"
 
+[build-dependencies]
+find-msvc-tools = "0.1.9"
+
 [dependencies]
 lx-core = { path = "../core" }
 lx-source = { path = "../source" }
@@ -39,3 +42,11 @@ base64.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
