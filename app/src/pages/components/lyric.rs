@@ -49,8 +49,14 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         return;
     }
 
-    let current_row = visible_rows / 2;
-    let translation_visible = state.translation.is_some() && current_row + 1 < visible_rows;
+    // 翻译属于当前歌词的核心信息：即使面板很矮，也优先保住“当前行 + 翻译”。
+    // 例如 inner 高度只有 4 行时，仍应使用前两行显示当前句和翻译，而不是直接隐藏翻译。
+    let translation_visible = state.translation.is_some() && visible_rows >= 2;
+    let current_row = if translation_visible {
+        (visible_rows / 2).min(visible_rows.saturating_sub(2))
+    } else {
+        visible_rows / 2
+    };
     let start = current.saturating_sub(current_row);
     let end = (current + visible_rows + 1).min(state.lines.len());
 

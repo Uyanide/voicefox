@@ -114,10 +114,14 @@ fn run_windows_worker(rx: std::sync::mpsc::Receiver<Notification>) {
 }
 
 #[cfg(windows)]
+const WINDOWS_AUMID: &str = "emoeem.voicefox";
+
+#[cfg(windows)]
 struct WindowsNotifier {
     hwnd: windows_sys::Win32::Foundation::HWND,
     data: windows_sys::Win32::UI::Shell::NOTIFYICONDATAW,
     has_notification: bool,
+    toast: Option<winrt_toast::ToastManager>,
 }
 
 #[cfg(windows)]
@@ -191,15 +195,49 @@ impl WindowsNotifier {
             return Err(std::io::Error::other("Shell_NotifyIconW(NIM_ADD) failed"));
         }
 
+        let toast = {
+            let icon_path =
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../icons/voicefox.ico");
+            if icon_path.is_file() {
+                match winrt_toast::register(WINDOWS_AUMID, "voicefox", Some(&icon_path)) {
+                    Ok(()) => Some(winrt_toast::ToastManager::new(WINDOWS_AUMID)),
+                    Err(error) => {
+                        tracing::debug!("Windows toast registration unavailable: {error}");
+                        None
+                    }
+                }
+            } else {
+                tracing::debug!("Windows toast icon not found at {icon_path:?}");
+                None
+            }
+        };
+
         Ok(Self {
             hwnd,
             data,
             has_notification: false,
+            toast,
         })
     }
 
     fn show(&mut self, notification: &Notification) -> std::io::Result<()> {
         use windows_sys::Win32::UI::Shell::{NIF_INFO, NIM_MODIFY, Shell_NotifyIconW};
+
+        if let Some(toast) = &self.toast {
+            let mut value = winrt_toast::Toast::new();
+            value
+                .text1(notification_title(notification))
+                .text2(&notification.message)
+                .tag("voicefox-current")
+                .group("voicefox");
+            if notification.replace_previous {
+                let _ = toast.remove("voicefox-current");
+            }
+            if toast.show(&value).is_ok() {
+                return Ok(());
+            }
+            tracing::debug!("Windows Toast failed; falling back to Shell_NotifyIconW");
+        }
 
         if self.has_notification {
             self.hide()?;

@@ -110,6 +110,17 @@ fn build_client(options: &NetworkOptions, redirect: RedirectMode) -> reqwest::Cl
 
 /// 默认重试次数：仅连接/超时类瞬时错误，最多再试 1 次。
 pub(crate) const RETRY_ATTEMPTS: usize = 1;
+const RETRY_BASE_DELAY_MS: u64 = 300;
+const RETRY_MAX_DELAY_MS: u64 = 2_000;
+
+fn retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(3) as u32;
+    Duration::from_millis((RETRY_BASE_DELAY_MS * (1_u64 << exponent)).min(RETRY_MAX_DELAY_MS))
+}
+
+fn retryable_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
 
 /// [`reqwest::RequestBuilder`] 的重试扩展。
 ///
@@ -134,9 +145,9 @@ impl SendWithRetry for reqwest::RequestBuilder {
             };
             match request.send().await {
                 Ok(resp) => return Ok(resp),
-                Err(error) if attempt < retries && (error.is_connect() || error.is_timeout()) => {
+                Err(error) if attempt < retries && retryable_error(&error) => {
                     attempt += 1;
-                    let backoff = std::time::Duration::from_millis(300 * (1 << attempt.min(3)));
+                    let backoff = retry_delay(attempt);
                     tracing::warn!(
                         "request failed (attempt {attempt}), retrying in {backoff:?}: {error}"
                     );
@@ -150,7 +161,18 @@ impl SendWithRetry for reqwest::RequestBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{SendWithRetry, client};
+    use std::time::Duration;
+
+    use super::{SendWithRetry, client, retry_delay};
+
+    #[test]
+    fn retry_backoff_is_bounded_and_exponential() {
+        assert_eq!(retry_delay(1), Duration::from_millis(300));
+        assert_eq!(retry_delay(2), Duration::from_millis(600));
+        assert_eq!(retry_delay(3), Duration::from_millis(1200));
+        assert_eq!(retry_delay(4), Duration::from_millis(2000));
+        assert_eq!(retry_delay(99), Duration::from_millis(2000));
+    }
 
     #[tokio::test]
     async fn invalid_url_returns_error_instead_of_panicking() {

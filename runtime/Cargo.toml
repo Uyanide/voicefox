@@ -17,6 +17,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
+directories.workspace = true
 toml.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

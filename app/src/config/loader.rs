@@ -241,9 +241,9 @@ fn migrate_legacy_theme(config: &mut Config) -> bool {
 
 /// 获取配置文件路径: ~/.config/voicefox/config.toml
 pub fn config_path() -> PathBuf {
-    let dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("voicefox");
+    let dir = directories::ProjectDirs::from("", "", "voicefox")
+        .map(|project| project.config_dir().to_path_buf())
+        .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")));
     dir.join("config.toml")
 }
 

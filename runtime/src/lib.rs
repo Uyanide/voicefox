@@ -11,7 +11,7 @@ use voicefox_application::{ApplicationService, PlaybackEffects};
 
 mod cover;
 pub mod storage;
-pub use cover::CoverService;
+pub use cover::{CoverService, CoverState, sweep_temp_files};
 pub use storage::{SavedPlayerState, Storage};
 
 struct RuntimePlaybackEffects {
@@ -176,9 +176,13 @@ impl ApplicationRuntime {
     }
 }
 pub fn default_config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("voicefox")
+    directories::ProjectDirs::from("", "", "voicefox")
+        .map(|project| project.config_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("voicefox")
+        })
         .join("config.toml")
 }
 pub fn load_config() -> anyhow::Result<(Config, PathBuf)> {

@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use lx_core::events::{AppAction, Notification};
 use lx_core::keybinding::{Action, KeybindingResolver};
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
@@ -23,6 +23,22 @@ enum QueueEditCommand {
     MoveDown,
     RemoveSelected,
     Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeTarget {
+    WideColumns,
+    WideCoverLyrics,
+    NarrowQueueLyrics,
+}
+
+const DEFAULT_WIDE_COLUMNS_RATIO: f32 = 0.36;
+const DEFAULT_WIDE_COVER_RATIO: f32 = 0.52;
+const DEFAULT_NARROW_QUEUE_RATIO: f32 = 0.62;
+const RESIZE_GRAB_RADIUS: u16 = 1;
+
+fn clamp_ratio(value: f32, min: f32, max: f32) -> f32 {
+    value.clamp(min, max)
 }
 
 fn queue_edit_command(key: &KeyEvent) -> Option<QueueEditCommand> {
@@ -42,6 +58,16 @@ fn queue_edit_command(key: &KeyEvent) -> Option<QueueEditCommand> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MainLayout {
+    wide: bool,
+    left: Rect,
+    queue: Rect,
+    cover: Rect,
+    lyric: Rect,
+    cover_geometry: Option<CoverGeometry>,
+}
+
 pub struct MainPage {
     selected: usize,
     scroll: usize,
@@ -51,6 +77,18 @@ pub struct MainPage {
     queue_filter: String,
     queue_filter_active: bool,
     lyric_fullscreen: bool,
+    /// 宽屏：左侧封面/歌词列占整个内容区的比例。
+    wide_columns_ratio: f32,
+    /// 宽屏：左侧封面占左栏高度的比例。
+    wide_cover_ratio: f32,
+    /// 窄屏：上方队列占整个内容区高度的比例。
+    narrow_queue_ratio: f32,
+    /// 当前鼠标正在拖动的布局分隔线。
+    resize_target: Option<ResizeTarget>,
+    /// 拖动期间只更新视觉预览，不立即提交到稳定布局状态。
+    resize_preview: Option<(ResizeTarget, f32)>,
+    /// 首次绘制前保持旧版封面高度策略；之后由用户拖拽接管。
+    layout_initialized: bool,
     /// “D 清空整个队列”的武装时刻，确认窗口外或 Esc 后解除
     clear_armed: Option<Instant>,
 }
@@ -65,6 +103,12 @@ impl MainPage {
             queue_filter: String::new(),
             queue_filter_active: false,
             lyric_fullscreen: false,
+            wide_columns_ratio: DEFAULT_WIDE_COLUMNS_RATIO,
+            wide_cover_ratio: DEFAULT_WIDE_COVER_RATIO,
+            narrow_queue_ratio: DEFAULT_NARROW_QUEUE_RATIO,
+            resize_target: None,
+            resize_preview: None,
+            layout_initialized: false,
             clear_armed: None,
         }
     }
@@ -111,6 +155,13 @@ impl MainPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
+        if self.resize_target.is_some() && key.code == KeyCode::Esc {
+            // Esc 取消本次视觉预览，不污染已提交布局。
+            self.resize_target = None;
+            self.resize_preview = None;
+            return AppAction::None;
+        }
+
         let len = {
             let songs = ctx.playlist.borrow();
             let current = ctx.playlist.current_index();
@@ -363,13 +414,41 @@ impl MainPage {
             super::components::lyric::render(area, buf, ctx);
             return;
         }
+        let layout = self.compute_layout(area, ctx);
+        if layout.wide {
+            if let Some(geometry) = layout.cover_geometry {
+                if layout.cover.height > 0 {
+                    self.render_cover(layout.cover, buf, ctx, geometry);
+                }
+            }
+            super::components::lyric::render(layout.lyric, buf, ctx);
+            self.render_queue(layout.queue, buf, ctx);
+        } else {
+            self.render_queue(layout.queue, buf, ctx);
+            super::components::lyric::render(layout.lyric, buf, ctx);
+        }
+        self.render_resize_dividers(&layout, buf, ctx);
+    }
+
+    fn compute_layout(&mut self, area: Rect, ctx: &AppContext) -> MainLayout {
+        let effective_ratio = |target: ResizeTarget, committed: f32| {
+            self.resize_preview
+                .filter(|(preview_target, _)| *preview_target == target)
+                .map(|(_, ratio)| ratio)
+                .unwrap_or(committed)
+        };
+
         if area.width >= 72 {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-                .split(area);
-            // 封面框高度由封面比例决定，歌词占满剩余高度，但至少保住 MIN_HEIGHT。
-            // 关闭封面时左栏全部用于歌词
+            let columns_ratio = effective_ratio(ResizeTarget::WideColumns, self.wide_columns_ratio);
+            let left_width = ((area.width as f32) * columns_ratio).round() as u16;
+            let left_width = left_width.clamp(24, area.width.saturating_sub(24).max(24));
+            let left = Rect::new(area.x, area.y, left_width.min(area.width), area.height);
+            let queue = Rect::new(
+                left.right().min(area.right()),
+                area.y,
+                area.right().saturating_sub(left.right()),
+                area.height,
+            );
             let geometry = ctx
                 .config
                 .read()
@@ -382,32 +461,91 @@ impl MainPage {
                         ctx.cover_service.image_aspect(),
                     )
                 });
-            let cover_height = geometry.map_or(0, |geometry| {
-                geometry.box_height(
-                    columns[0].width,
-                    columns[0]
+            if !self.layout_initialized {
+                if let Some(geometry) = geometry {
+                    let max_cover = left
                         .height
-                        .saturating_sub(super::components::lyric::MIN_HEIGHT),
-                )
-            });
-            let left = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(cover_height), Constraint::Min(0)])
-                .split(columns[0]);
-            if let Some(geometry) = geometry
-                && cover_height > 0
-            {
-                self.render_cover(left[0], buf, ctx, geometry);
+                        .saturating_sub(super::components::lyric::MIN_HEIGHT);
+                    let old_cover = geometry.box_height(left.width, max_cover);
+                    if left.height > 0 {
+                        self.wide_cover_ratio =
+                            clamp_ratio(old_cover as f32 / left.height as f32, 0.20, 0.85);
+                    }
+                }
+                self.layout_initialized = true;
             }
-            super::components::lyric::render(left[1], buf, ctx);
-            self.render_queue(columns[1], buf, ctx);
+            let max_cover = left
+                .height
+                .saturating_sub(super::components::lyric::MIN_HEIGHT);
+            let cover_ratio = effective_ratio(ResizeTarget::WideCoverLyrics, self.wide_cover_ratio);
+            let cover_height = if geometry.is_some() {
+                ((left.height as f32) * cover_ratio)
+                    .round()
+                    .clamp(0.0, f32::from(max_cover)) as u16
+            } else {
+                0
+            };
+            let cover = Rect::new(left.x, left.y, left.width, cover_height);
+            let lyric = Rect::new(
+                left.x,
+                cover.bottom().min(left.bottom()),
+                left.width,
+                left.height.saturating_sub(cover.height),
+            );
+            MainLayout {
+                wide: true,
+                left,
+                queue,
+                cover,
+                lyric,
+                cover_geometry: geometry,
+            }
         } else {
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                .split(area);
-            self.render_queue(rows[0], buf, ctx);
-            super::components::lyric::render(rows[1], buf, ctx);
+            let min_queue = 7.min(area.height);
+            let min_lyric = 5.min(area.height.saturating_sub(min_queue));
+            let queue_ratio =
+                effective_ratio(ResizeTarget::NarrowQueueLyrics, self.narrow_queue_ratio);
+            let queue_height = ((area.height as f32) * queue_ratio).round() as u16;
+            let max_queue = area.height.saturating_sub(min_lyric);
+            let queue_height = queue_height.clamp(min_queue, max_queue.max(min_queue));
+            let queue = Rect::new(area.x, area.y, area.width, queue_height.min(area.height));
+            let lyric = Rect::new(
+                area.x,
+                queue.bottom().min(area.bottom()),
+                area.width,
+                area.height.saturating_sub(queue.height),
+            );
+            MainLayout {
+                wide: false,
+                left: Rect::default(),
+                queue,
+                cover: Rect::default(),
+                lyric,
+                cover_geometry: None,
+            }
+        }
+    }
+
+    fn render_resize_dividers(&self, layout: &MainLayout, buf: &mut Buffer, ctx: &AppContext) {
+        let style = Style::new().fg(crate::theme::accent(ctx));
+        if layout.wide {
+            if layout.left.width > 0 && layout.queue.width > 0 {
+                let x = layout.left.right().saturating_sub(1);
+                for y in layout.left.y..layout.left.bottom() {
+                    buf.set_string(x, y, "│", style);
+                }
+            }
+            if layout.cover.height > 0 && layout.lyric.height > 0 {
+                let y = layout.cover.bottom().saturating_sub(1);
+                for x in layout.left.x..layout.left.right() {
+                    buf.set_string(x, y, "─", style);
+                }
+            }
+        } else if layout.queue.height > 0 && layout.lyric.height > 0 {
+            let y = layout.queue.bottom().saturating_sub(1);
+            for x in layout.queue.x..layout.queue.right() {
+                buf.set_string(x, y, "─", style);
+            }
         }
     }
 
@@ -418,6 +556,28 @@ impl MainPage {
         ctx: &AppContext,
         activate: bool,
     ) -> AppAction {
+        let layout = self.compute_layout(area, ctx);
+        if let Some(target) = self.resize_target {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.update_resize_preview(target, event, area, &layout);
+                    return AppAction::None;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.commit_resize();
+                    return AppAction::None;
+                }
+                // Resize 会话期间其它鼠标事件不能穿透到队列，避免拖动时误触。
+                _ => return AppAction::None,
+            }
+        } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(target) = self.resize_target_at(event, &layout) {
+                self.resize_target = Some(target);
+                self.resize_preview = Some((target, self.committed_ratio(target)));
+                return AppAction::None;
+            }
+        }
+
         let scroll_amount = ctx
             .config
             .read()
@@ -443,11 +603,11 @@ impl MainPage {
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     let index = if self.queue_filter.is_empty() {
-                        queue_index_at(event, area, self.scroll, songs.len())
+                        queue_index_at(event, layout.queue, self.scroll, songs.len())
                     } else {
                         queue_index_at_filtered(
                             event,
-                            area,
+                            layout.queue,
                             self.scroll,
                             &self.filtered_indices(&songs),
                         )
@@ -466,11 +626,11 @@ impl MainPage {
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let Some(from) = self.dragging {
                         drag_target = if self.queue_filter.is_empty() {
-                            queue_index_at(event, area, self.scroll, songs.len())
+                            queue_index_at(event, layout.queue, self.scroll, songs.len())
                         } else {
                             queue_index_at_filtered(
                                 event,
-                                area,
+                                layout.queue,
                                 self.scroll,
                                 &self.filtered_indices(&songs),
                             )
@@ -506,7 +666,8 @@ impl MainPage {
         ctx: &AppContext,
     ) -> Option<(Vec<lx_core::model::song::SongInfo>, usize)> {
         let songs = ctx.playlist.borrow();
-        let index = queue_index_at(event, area, self.scroll, songs.len())?;
+        let layout = self.compute_layout(area, ctx);
+        let index = queue_index_at(event, layout.queue, self.scroll, songs.len())?;
         self.selected = index;
         self.dragging = None;
         Some((songs.to_vec(), index))
@@ -540,6 +701,89 @@ impl MainPage {
                 index: next,
             }
         }
+    }
+
+    fn resize_target_at(&self, event: MouseEvent, layout: &MainLayout) -> Option<ResizeTarget> {
+        let x = event.column;
+        let y = event.row;
+        if layout.wide {
+            let vertical = layout.left.right().saturating_sub(1);
+            if x.abs_diff(vertical) <= RESIZE_GRAB_RADIUS
+                && y >= layout.left.y
+                && y < layout.left.bottom()
+            {
+                return Some(ResizeTarget::WideColumns);
+            }
+            let horizontal = layout.cover.bottom().saturating_sub(1);
+            if layout.cover.height > 0
+                && layout.lyric.height > 0
+                && y.abs_diff(horizontal) <= RESIZE_GRAB_RADIUS
+                && x >= layout.left.x
+                && x < layout.left.right()
+            {
+                return Some(ResizeTarget::WideCoverLyrics);
+            }
+        } else {
+            let horizontal = layout.queue.bottom().saturating_sub(1);
+            if layout.queue.height > 0
+                && layout.lyric.height > 0
+                && y.abs_diff(horizontal) <= RESIZE_GRAB_RADIUS
+                && x >= layout.queue.x
+                && x < layout.queue.right()
+            {
+                return Some(ResizeTarget::NarrowQueueLyrics);
+            }
+        }
+        None
+    }
+
+    fn committed_ratio(&self, target: ResizeTarget) -> f32 {
+        match target {
+            ResizeTarget::WideColumns => self.wide_columns_ratio,
+            ResizeTarget::WideCoverLyrics => self.wide_cover_ratio,
+            ResizeTarget::NarrowQueueLyrics => self.narrow_queue_ratio,
+        }
+    }
+
+    fn clamp_resize_ratio(target: ResizeTarget, ratio: f32) -> f32 {
+        match target {
+            ResizeTarget::WideColumns => clamp_ratio(ratio, 0.22, 0.78),
+            ResizeTarget::WideCoverLyrics => clamp_ratio(ratio, 0.15, 0.85),
+            ResizeTarget::NarrowQueueLyrics => clamp_ratio(ratio, 0.20, 0.80),
+        }
+    }
+
+    fn update_resize_preview(
+        &mut self,
+        target: ResizeTarget,
+        event: MouseEvent,
+        area: Rect,
+        layout: &MainLayout,
+    ) {
+        let raw_ratio = match target {
+            ResizeTarget::WideColumns if area.width > 0 => {
+                (event.column.saturating_sub(area.x) as f32) / area.width as f32
+            }
+            ResizeTarget::WideCoverLyrics if layout.left.height > 0 => {
+                (event.row.saturating_sub(layout.left.y) as f32) / layout.left.height as f32
+            }
+            ResizeTarget::NarrowQueueLyrics if area.height > 0 => {
+                (event.row.saturating_sub(area.y) as f32) / area.height as f32
+            }
+            _ => return,
+        };
+        self.resize_preview = Some((target, Self::clamp_resize_ratio(target, raw_ratio)));
+    }
+
+    fn commit_resize(&mut self) {
+        if let Some((target, ratio)) = self.resize_preview.take() {
+            match target {
+                ResizeTarget::WideColumns => self.wide_columns_ratio = ratio,
+                ResizeTarget::WideCoverLyrics => self.wide_cover_ratio = ratio,
+                ResizeTarget::NarrowQueueLyrics => self.narrow_queue_ratio = ratio,
+            }
+        }
+        self.resize_target = None;
     }
 
     fn render_queue(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -623,8 +867,7 @@ impl MainPage {
 }
 
 fn queue_index_at(event: MouseEvent, area: Rect, scroll: usize, len: usize) -> Option<usize> {
-    let queue_area = queue_area(area);
-    let inner = Block::default().borders(Borders::ALL).inner(queue_area);
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     let list_y = inner.y.saturating_add(1);
     if event.column < inner.x
         || event.column >= inner.right()
@@ -643,8 +886,7 @@ fn queue_index_at_filtered(
     scroll: usize,
     indices: &[usize],
 ) -> Option<usize> {
-    let queue_area = queue_area(area);
-    let inner = Block::default().borders(Borders::ALL).inner(queue_area);
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     let list_y = inner.y.saturating_add(1);
     if event.column < inner.x
         || event.column >= inner.right()
@@ -655,20 +897,6 @@ fn queue_index_at_filtered(
     }
     let pos = scroll + event.row.saturating_sub(list_y) as usize;
     indices.get(pos).copied()
-}
-
-fn queue_area(area: Rect) -> Rect {
-    if area.width >= 72 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-            .split(area)[1]
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(area)[0]
-    }
 }
 
 impl MainPage {

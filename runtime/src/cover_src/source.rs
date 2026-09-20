@@ -17,9 +17,13 @@ const TEMP_GRACE: Duration = Duration::from_secs(60);
 
 /// 封面缓存目录
 fn cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("voicefox")
+    directories::ProjectDirs::from("", "", "voicefox")
+        .map(|project| project.cache_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            dirs::cache_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("voicefox")
+        })
         .join("covers")
 }
 

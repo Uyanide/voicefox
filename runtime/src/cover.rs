@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use source::CoverImage;
+pub use source::sweep_temp_files;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoverState {
@@ -40,6 +41,10 @@ impl CoverService {
             request_id: AtomicU64::new(0),
         }
     }
+    pub fn state(&self) -> CoverState {
+        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub fn clear(&self) {
         self.request_id.fetch_add(1, Ordering::SeqCst);
         *self.image.write().unwrap_or_else(|e| e.into_inner()) = None;
@@ -99,5 +104,13 @@ impl CoverService {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|i| i.path.clone())
+    }
+
+    pub fn image_aspect(&self) -> f32 {
+        self.image
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(1.0, |image| image.aspect)
     }
 }

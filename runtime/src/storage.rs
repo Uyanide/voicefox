@@ -192,11 +192,33 @@ pub struct CustomPlaylistSummary {
 ///
 /// 收藏、历史、下载记录等持久化文件都落在这里；集中成一个函数，
 /// 避免各模块各写一份 `dirs::config_dir()` 拼接逻辑。
-pub fn default_data_dir() -> PathBuf {
-    dirs::config_dir()
+fn migrate_legacy_data_dir() -> PathBuf {
+    let target = default_data_dir();
+    let legacy = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("voicefox")
-        .join("data")
+        .join("data");
+    if target != legacy && !target.exists() && legacy.exists() {
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(error) = fs::rename(&legacy, &target) {
+            tracing::warn!("failed to migrate legacy voicefox data directory: {error}");
+            return legacy;
+        }
+    }
+    target
+}
+
+pub fn default_data_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "voicefox")
+        .map(|project| project.data_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("voicefox")
+                .join("data")
+        })
 }
 
 pub struct Storage {
@@ -214,7 +236,7 @@ pub struct Storage {
 
 impl Storage {
     pub fn new() -> Self {
-        let dir = default_data_dir();
+        let dir = migrate_legacy_data_dir();
         fs::create_dir_all(&dir).ok();
         let favorites = Self::load_file(&dir.join("favorites.json"));
         let favorite_playlists = Self::load_file(&dir.join("favorite_playlists.json"));
