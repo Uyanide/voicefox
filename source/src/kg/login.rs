@@ -174,6 +174,7 @@ async fn login_get(
 
 pub async fn create() -> Result<QrLoginSession, FetchError> {
     let device = device_cookies();
+
     let qr_text =
         format!("https://h5.kugou.com/apps/loginQRCode/html/index.html?appid={LITE_APP_ID}&");
     let json = login_get(
@@ -193,6 +194,7 @@ pub async fn create() -> Result<QrLoginSession, FetchError> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| FetchError::Other("酷狗二维码生成失败".to_string()))?;
+    session::save_pending(key, &device);
     Ok(QrLoginSession {
         source: SourceId::Kg,
         key: key.to_string(),
@@ -207,7 +209,7 @@ pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
     if key.is_empty() {
         return Err(FetchError::Other("酷狗二维码 key 为空".to_string()));
     }
-    let device = device_cookies();
+    let device = session::pending(key).unwrap_or_else(device_cookies);
     let json = login_get(
         QR_CHECK_API,
         &[
@@ -236,6 +238,7 @@ pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
             return Ok(result);
         }
         session::save_login(&device, token, &user_id).map_err(FetchError::Other)?;
+        session::clear_pending(key);
         let mut cookies = device;
         cookies.insert("token".to_string(), token.to_string());
         cookies.insert("userid".to_string(), user_id.clone());
@@ -269,6 +272,10 @@ fn message_for(status: QrLoginStatus, code: i64, json: &Value) -> String {
         QrLoginStatus::Success => "登录成功".to_string(),
         QrLoginStatus::Expired => "二维码已过期".to_string(),
         QrLoginStatus::Failed => format!("登录失败（status={code}）"),
+        QrLoginStatus::NetworkError => "网络错误，正在重试".to_string(),
+        QrLoginStatus::RiskControl => "触发验证/风控，正在重试".to_string(),
+        QrLoginStatus::ServerError => "服务端暂时异常，正在重试".to_string(),
+        QrLoginStatus::InvalidSession => "登录会话已失效".to_string(),
     }
 }
 

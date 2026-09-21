@@ -14,13 +14,13 @@ use crate::session::{SessionStore, SourceSession};
 const LOGIN_COOKIES: [&str; 2] = ["uin", "qqmusic_key"];
 
 static STORE: OnceLock<SessionStore> = OnceLock::new();
-static PENDING: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+static PENDING: OnceLock<Mutex<BTreeMap<String, BTreeMap<String, String>>>> = OnceLock::new();
 
 pub(super) fn store() -> &'static SessionStore {
     STORE.get_or_init(|| SessionStore::load(SourceId::Tx))
 }
 
-fn pending_store() -> &'static Mutex<BTreeMap<String, String>> {
+fn pending_store() -> &'static Mutex<BTreeMap<String, BTreeMap<String, String>>> {
     PENDING.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -49,19 +49,25 @@ pub(super) fn is_logged_in() -> bool {
 }
 
 /// 暂存登录过程中的预热 cookie。
-pub(super) fn save_pending(cookies: &BTreeMap<String, String>) -> Result<(), String> {
+pub(super) fn save_pending(key: &str, cookies: &BTreeMap<String, String>) -> Result<(), String> {
     let mut guard = pending_store()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    *guard = cookies.clone();
+    guard.insert(key.to_string(), cookies.clone());
     Ok(())
 }
 
-pub(super) fn pending() -> Option<BTreeMap<String, String>> {
+pub(super) fn pending(key: &str) -> Option<BTreeMap<String, String>> {
     let guard = pending_store()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    (!guard.is_empty()).then(|| guard.clone())
+    guard.get(key).cloned()
+}
+
+pub(super) fn clear_pending(key: &str) {
+    if let Ok(mut guard) = pending_store().lock() {
+        guard.remove(key);
+    }
 }
 
 pub(super) fn save_login(cookies: &BTreeMap<String, String>) -> Result<(), String> {
@@ -74,10 +80,6 @@ pub(super) fn save_login(cookies: &BTreeMap<String, String>) -> Result<(), Strin
             session.user_id = Some(user_id);
         }
     })?;
-    let mut guard = pending_store()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    guard.clear();
     Ok(())
 }
 
@@ -106,12 +108,14 @@ mod tests {
     fn pending_round_trips() {
         let mut cookies = BTreeMap::new();
         cookies.insert("pt_login_sig".to_string(), "sig".to_string());
-        save_pending(&cookies).unwrap();
+        save_pending("test-key", &cookies).unwrap();
         assert_eq!(
-            pending().and_then(|cookies| cookies.get("pt_login_sig").cloned()),
+            pending("test-key").and_then(|cookies| cookies.get("pt_login_sig").cloned()),
             Some("sig".to_string())
         );
-        save_pending(&BTreeMap::new()).unwrap();
-        assert!(pending().is_none());
+        save_pending("test-key", &BTreeMap::new()).unwrap();
+        assert!(pending("test-key").is_some());
+        clear_pending("test-key");
+        assert!(pending("test-key").is_none());
     }
 }

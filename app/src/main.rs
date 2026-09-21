@@ -34,6 +34,7 @@ use crossterm::event::{
 use lx_core::events::{AppAction, InsertPosition, Notification};
 use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::leaderboard::LeaderboardInfo;
+use lx_core::model::login::{QrLoginResult, QrLoginStatus};
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::{PlayerState, Quality, SourceId};
@@ -1258,10 +1259,13 @@ fn run_app(
                 let wake_tx = action_tx.clone();
                 let manager = Arc::clone(&ctx.source_manager);
                 qr_poll_task = Some(rt.spawn(async move {
-                    let result = manager
-                        .check_qr_login(source, &key)
-                        .await
-                        .map_err(|error| error.to_string());
+                    let result = match manager.check_qr_login(source, &key).await {
+                        Ok(result) => Ok(result),
+                        Err(error) => Ok(QrLoginResult::new(
+                            QrLoginStatus::NetworkError,
+                            format!("{}，正在重试", error),
+                        )),
+                    };
                     let mut page = page.lock().unwrap_or_else(|e| e.into_inner());
                     page.apply_check_result(result);
                     let success = page.succeeded().is_some();

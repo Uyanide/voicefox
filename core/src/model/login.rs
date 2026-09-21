@@ -24,9 +24,33 @@ pub enum QrLoginStatus {
     Expired,
     /// 登录失败。
     Failed,
+    /// 网络暂时不可用；二维码仍然有效，应继续轮询。
+    NetworkError,
+    /// 服务端触发风控/验证；二维码仍然有效，应继续轮询。
+    RiskControl,
+    /// 服务端暂时异常；二维码仍然有效，应继续轮询。
+    ServerError,
+    /// 本地会话失效，需要重新生成二维码。
+    InvalidSession,
 }
 
-/// 一次扫码登录会话。
+impl QrLoginStatus {
+    pub const fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::NetworkError | Self::RiskControl | Self::ServerError
+        )
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Expired | Self::Failed | Self::InvalidSession
+        )
+    }
+}
+
+/// 一次扫码登录会话.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QrLoginSession {
     pub source: SourceId,

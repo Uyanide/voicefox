@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use unicode_width::UnicodeWidthStr;
 
 use crate::context::AppContext;
 
@@ -138,6 +139,34 @@ impl SourceSelector {
         )
     }
 
+    pub fn tab_at(
+        &self,
+        area: Rect,
+        position: ratatui::layout::Position,
+    ) -> Option<SourceSelectorKey> {
+        if !area.contains(position) || area.height == 0 || self.items.is_empty() {
+            return None;
+        }
+        let mut x = area.x + 4;
+        let mut used = 4usize;
+        for (index, (key, label)) in self.items.iter().enumerate() {
+            if index > 0 {
+                x = x.saturating_add(2);
+                used = used.saturating_add(2);
+            }
+            let width = label.width() as u16 + 3;
+            if used + width as usize + 10 > area.width as usize {
+                break;
+            }
+            if position.x >= x && position.x < x.saturating_add(width) {
+                return Some(*key);
+            }
+            x = x.saturating_add(width);
+            used = used.saturating_add(width as usize);
+        }
+        None
+    }
+
     pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<SourceSelectorKey> {
         if !self.open || !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             return None;
@@ -174,7 +203,7 @@ impl SourceSelector {
         )];
         let mut used = 4usize;
         for (index, (_, label)) in self.items.iter().enumerate() {
-            let width = label.chars().count() + 3;
+            let width = label.width() + 3;
             if used + width + 10 > area.width as usize {
                 break;
             }
@@ -304,5 +333,40 @@ impl SourceSelector {
                 buf,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::{Position, Rect};
+
+    #[test]
+    fn tab_hit_test_uses_terminal_display_width_for_cjk_labels() {
+        let selector = SourceSelector::new(
+            vec![
+                (SourceSelectorKey::Custom, "自建".to_string()),
+                (SourceSelectorKey::Favorites, "已收藏".to_string()),
+                (
+                    SourceSelectorKey::Source(SourceId::Wy),
+                    "网易云".to_string(),
+                ),
+            ],
+            0,
+        );
+        let area = Rect::new(0, 0, 80, 1);
+        assert_eq!(
+            selector.tab_at(area, Position::new(5, 0)),
+            Some(SourceSelectorKey::Custom)
+        );
+        assert_eq!(
+            selector.tab_at(area, Position::new(14, 0)),
+            Some(SourceSelectorKey::Favorites)
+        );
+        assert_eq!(
+            selector.tab_at(area, Position::new(25, 0)),
+            Some(SourceSelectorKey::Source(SourceId::Wy))
+        );
+        assert_eq!(selector.tab_at(area, Position::new(79, 0)), None);
     }
 }

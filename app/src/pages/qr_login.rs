@@ -23,6 +23,7 @@ use crate::theme;
 
 /// 轮询间隔：平台侧状态变化不快，2 秒足够且不至于触发风控。
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// 页面状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,15 @@ pub enum QrLoginState {
     },
     /// 登录成功。
     Success { user: Option<String> },
-    /// 失败或过期。
+    /// 临时错误：二维码继续保留，后台会自动重试。
+    Retrying {
+        key: String,
+        qr_lines: Vec<String>,
+        started: Instant,
+        expires_in: u64,
+        message: String,
+    },
+    /// 不可恢复的失败或过期。
     Error { message: String },
 }
 
@@ -56,8 +65,10 @@ pub struct QrLoginPage {
     pub state: QrLoginState,
     /// 本轮轮询是否已经发出，避免主循环每个 tick 重复请求。
     polling: bool,
-    /// 上次轮询时间，用于节流。
-    last_poll: Instant,
+    /// 下一次允许轮询的时间；由统一状态机负责节流与退避。
+    next_poll_at: Instant,
+    /// 连续临时失败次数，用于指数退避。
+    retry_count: u32,
 }
 
 impl QrLoginPage {
@@ -67,7 +78,8 @@ impl QrLoginPage {
             display_name,
             state: QrLoginState::Generating,
             polling: false,
-            last_poll: Instant::now(),
+            next_poll_at: Instant::now(),
+            retry_count: 0,
         }
     }
 
@@ -78,6 +90,8 @@ impl QrLoginPage {
             Some(encoded) => render_png_qr(encoded, PNG_QR_MAX_WIDTH),
             None => render_qr_terminal(&session.url, 1),
         };
+        self.next_poll_at = Instant::now();
+        self.retry_count = 0;
         self.state = QrLoginState::Waiting {
             key: session.key,
             qr_lines,
@@ -88,6 +102,54 @@ impl QrLoginPage {
 
     pub fn set_error(&mut self, message: String) {
         self.state = QrLoginState::Error { message };
+    }
+
+    fn set_retrying(&mut self, message: String) {
+        let state = std::mem::replace(
+            &mut self.state,
+            QrLoginState::Error {
+                message: String::new(),
+            },
+        );
+        self.state = match state {
+            QrLoginState::Waiting {
+                key,
+                qr_lines,
+                started,
+                expires_in,
+            }
+            | QrLoginState::Scanned {
+                key,
+                qr_lines,
+                started,
+                expires_in,
+            }
+            | QrLoginState::Retrying {
+                key,
+                qr_lines,
+                started,
+                expires_in,
+                ..
+            } => QrLoginState::Retrying {
+                key,
+                qr_lines,
+                started,
+                expires_in,
+                message,
+            },
+            other => other,
+        };
+    }
+
+    fn schedule_poll(&mut self, delay: Duration) {
+        self.next_poll_at = Instant::now() + delay;
+    }
+
+    fn schedule_transient_retry(&mut self) {
+        let delay_secs = 2u64.saturating_pow(self.retry_count.min(3));
+        let delay = Duration::from_secs(delay_secs).min(MAX_RETRY_INTERVAL);
+        self.retry_count = self.retry_count.saturating_add(1);
+        self.schedule_poll(delay);
     }
 
     /// 是否还需要轮询：等待中或已扫码，且二维码尚未过期。
@@ -102,6 +164,11 @@ impl QrLoginPage {
                 started,
                 expires_in,
                 ..
+            }
+            | QrLoginState::Retrying {
+                started,
+                expires_in,
+                ..
             } => started.elapsed() < Duration::from_secs(*expires_in),
             _ => false,
         }
@@ -112,15 +179,16 @@ impl QrLoginPage {
     /// 返回 `Some` 时同时标记「轮询进行中」，直到 [`Self::apply_check_result`]
     /// 收到结果才复位——否则主循环会每个 tick 都发起一次请求。
     pub fn begin_poll(&mut self) -> Option<(SourceId, String)> {
-        if self.polling || self.last_poll.elapsed() < POLL_INTERVAL {
+        if self.polling || Instant::now() < self.next_poll_at {
             return None;
         }
         let key = match &self.state {
-            QrLoginState::Waiting { key, .. } | QrLoginState::Scanned { key, .. } => key.clone(),
+            QrLoginState::Waiting { key, .. }
+            | QrLoginState::Scanned { key, .. }
+            | QrLoginState::Retrying { key, .. } => key.clone(),
             _ => return None,
         };
         self.polling = true;
-        self.last_poll = Instant::now();
         Some((self.source, key))
     }
 
@@ -130,7 +198,8 @@ impl QrLoginPage {
         let result = match result {
             Ok(result) => result,
             Err(message) => {
-                self.set_error(message);
+                self.set_retrying(message);
+                self.schedule_transient_retry();
                 return;
             }
         };
@@ -141,6 +210,9 @@ impl QrLoginPage {
                 };
             }
             QrLoginStatus::Expired => self.set_error("二维码已过期，请重新打开登录".to_string()),
+            QrLoginStatus::InvalidSession => {
+                self.set_error("登录会话已失效，请重新打开登录".to_string())
+            }
             QrLoginStatus::Failed => {
                 let message = if result.message.trim().is_empty() {
                     "登录失败".to_string()
@@ -148,6 +220,16 @@ impl QrLoginPage {
                     result.message
                 };
                 self.set_error(message);
+            }
+            QrLoginStatus::NetworkError
+            | QrLoginStatus::RiskControl
+            | QrLoginStatus::ServerError => {
+                self.set_retrying(if result.message.trim().is_empty() {
+                    "正在重试，请保持二维码页面打开…".to_string()
+                } else {
+                    result.message
+                });
+                self.schedule_transient_retry();
             }
             // 等待/已扫码：保留二维码，只切换提示文案。
             QrLoginStatus::Waiting | QrLoginStatus::Scanned => {
@@ -167,6 +249,8 @@ impl QrLoginPage {
                     } => {
                         let (key, qr_lines, started, expires_in) =
                             (key.clone(), qr_lines.clone(), *started, *expires_in);
+                        self.retry_count = 0;
+                        self.schedule_poll(POLL_INTERVAL);
                         self.state = if scanned {
                             QrLoginState::Scanned {
                                 key,
@@ -261,12 +345,18 @@ impl QrLoginPage {
                 started,
                 expires_in,
                 ..
+            }
+            | QrLoginState::Retrying {
+                qr_lines,
+                started,
+                expires_in,
+                ..
             } => {
                 let remaining = expires_in.saturating_sub(started.elapsed().as_secs());
-                let status = if matches!(self.state, QrLoginState::Scanned { .. }) {
-                    "已扫码，请在手机上确认"
-                } else {
-                    "请使用手机 App 扫码登录"
+                let status = match &self.state {
+                    QrLoginState::Scanned { .. } => "已扫码，请在手机上确认".to_string(),
+                    QrLoginState::Retrying { message, .. } => message.clone(),
+                    _ => "请使用手机 App 扫码登录".to_string(),
                 };
                 let mut lines = Vec::new();
                 if qr_fits(body, qr_lines) {
@@ -454,15 +544,34 @@ mod tests {
             image_png: None,
             expires_in: 300,
         });
-        // 第一次轮询会被 2 秒节流挡住。
-        assert_eq!(page.begin_poll(), None);
-        page.last_poll = Instant::now() - POLL_INTERVAL;
+        // 二维码生成后第一次轮询可以立即发出；之后由统一调度器节流。
+        assert_eq!(page.begin_poll(), Some((SourceId::Wy, "key-1".to_string())));
+        page.apply_check_result(Ok(QrLoginResult::new(QrLoginStatus::Waiting, "等待扫码")));
+        page.next_poll_at = Instant::now() - POLL_INTERVAL;
         assert_eq!(page.begin_poll(), Some((SourceId::Wy, "key-1".to_string())));
         // 结果未回来之前不会重复发起。
         assert_eq!(page.begin_poll(), None);
         page.apply_check_result(Ok(QrLoginResult::new(QrLoginStatus::Waiting, "等待扫码")));
-        page.last_poll = Instant::now() - POLL_INTERVAL;
+        page.next_poll_at = Instant::now() - POLL_INTERVAL;
         assert!(page.begin_poll().is_some());
+    }
+
+    #[test]
+    fn transient_errors_use_exponential_backoff_without_expiring_the_qr() {
+        let mut page = test_page();
+        page.set_qr(QrLoginSession {
+            source: SourceId::Wy,
+            key: "k".to_string(),
+            url: "https://music.163.com/login?codekey=k".to_string(),
+            image_png: None,
+            expires_in: 300,
+        });
+        page.next_poll_at = Instant::now() - POLL_INTERVAL;
+        assert!(page.begin_poll().is_some());
+        page.apply_check_result(Err("network".to_string()));
+        assert!(page.next_poll_at > Instant::now());
+        assert_eq!(page.retry_count, 1);
+        assert!(page.should_poll());
     }
 
     #[test]
@@ -526,6 +635,28 @@ mod tests {
             expires_in: 300,
         });
         page.apply_check_result(Err("网络错误".to_string()));
-        assert!(matches!(page.state, QrLoginState::Error { .. }));
+        assert!(matches!(page.state, QrLoginState::Retrying { .. }));
+        assert!(page.should_poll());
+    }
+
+    #[test]
+    fn transient_statuses_keep_the_qr_alive() {
+        let mut page = test_page();
+        page.set_qr(QrLoginSession {
+            source: SourceId::Wy,
+            key: "k".to_string(),
+            url: "https://music.163.com/login?codekey=k".to_string(),
+            image_png: None,
+            expires_in: 300,
+        });
+        for status in [
+            QrLoginStatus::NetworkError,
+            QrLoginStatus::RiskControl,
+            QrLoginStatus::ServerError,
+        ] {
+            page.apply_check_result(Ok(QrLoginResult::new(status, "暂时异常")));
+            assert!(matches!(page.state, QrLoginState::Retrying { .. }));
+            assert!(page.should_poll());
+        }
     }
 }

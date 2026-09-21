@@ -407,28 +407,31 @@ impl LeaderboardPage {
                     (self.selected + scroll_amount).min(self.current_list_len().saturating_sub(1));
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let board_inner = Block::default().borders(Borders::ALL).inner(page.boards);
-                if board_inner.contains(position) {
-                    let index =
-                        self.board_scroll_offset + event.row.saturating_sub(board_inner.y) as usize;
+                if let Some(index) = crate::pages::components::hit_test::row_at(
+                    page.boards,
+                    position,
+                    self.board_scroll_offset,
+                    self.boards.len(),
+                    0,
+                ) {
                     self.handle_board_click(index, activate);
                     return AppAction::None;
                 }
 
                 if self.selected_board.is_some() {
-                    let song_inner = Block::default().borders(Borders::ALL).inner(page.songs);
-                    let list_y = song_inner.y.saturating_add(1);
-                    if event.row >= list_y && event.row < song_inner.bottom() {
-                        let index =
-                            self.song_scroll_offset + event.row.saturating_sub(list_y) as usize;
-                        if index < self.songs.len() {
-                            self.selected = index;
-                            if activate {
-                                return AppAction::PlaySong {
-                                    songs: self.songs.clone(),
-                                    index,
-                                };
-                            }
+                    if let Some(index) = crate::pages::components::hit_test::row_at(
+                        page.songs,
+                        position,
+                        self.song_scroll_offset,
+                        self.songs.len(),
+                        1,
+                    ) {
+                        self.selected = index;
+                        if activate {
+                            return AppAction::PlaySong {
+                                songs: self.songs.clone(),
+                                index,
+                            };
                         }
                     }
                 }
@@ -449,17 +452,14 @@ impl LeaderboardPage {
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
         let page = page_chunks(shell[1], self.boards.len());
-        let song_inner = Block::default().borders(Borders::ALL).inner(page.songs);
         let position = Position::new(event.column, event.row);
-        let list_y = song_inner.y.saturating_add(1);
-        if !song_inner.contains(position) || event.row < list_y || event.row >= song_inner.bottom()
-        {
-            return None;
-        }
-        let index = self.song_scroll_offset + event.row.saturating_sub(list_y) as usize;
-        if index >= self.songs.len() {
-            return None;
-        }
+        let index = crate::pages::components::hit_test::row_at(
+            page.songs,
+            position,
+            self.song_scroll_offset,
+            self.songs.len(),
+            1,
+        )?;
         self.selected = index;
         Some((self.songs.clone(), index))
     }

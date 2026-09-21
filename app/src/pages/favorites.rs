@@ -6,7 +6,7 @@ use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
@@ -621,21 +621,23 @@ impl FavoritesPage {
                     self.filter.activate();
                     return AppAction::None;
                 }
-                let list_y = inner.y.saturating_add(search_height).saturating_add(1);
-                if event.row >= list_y && event.row < inner.bottom() {
-                    let selected = self.scroll + event.row.saturating_sub(list_y) as usize;
-                    if selected < filtered.len() {
-                        self.selected = selected;
-                        if activate {
-                            let songs = filtered
-                                .iter()
-                                .filter_map(|index| favorites.get(*index).cloned())
-                                .collect();
-                            return AppAction::PlaySong {
-                                songs,
-                                index: selected,
-                            };
-                        }
+                if let Some(selected) = crate::pages::components::hit_test::row_at(
+                    area,
+                    Position::new(event.column, event.row),
+                    self.scroll,
+                    filtered.len(),
+                    search_height + 1,
+                ) {
+                    self.selected = selected;
+                    if activate {
+                        let songs = filtered
+                            .iter()
+                            .filter_map(|index| favorites.get(*index).cloned())
+                            .collect();
+                        return AppAction::PlaySong {
+                            songs,
+                            index: selected,
+                        };
                     }
                 }
             }
@@ -653,16 +655,14 @@ impl FavoritesPage {
     ) -> Option<(Vec<SongInfo>, usize)> {
         let favorites = self.sorted_favorites(ctx, cache);
         let filtered = self.filtered_song_indices(favorites);
-        let inner = Block::default().borders(Borders::ALL).inner(area);
         let search_height = u16::from(self.filter.is_active() || !self.filter.query().is_empty());
-        let list_y = inner.y.saturating_add(search_height).saturating_add(1);
-        if event.row < list_y || event.row >= inner.bottom() {
-            return None;
-        }
-        let index = self.scroll + event.row.saturating_sub(list_y) as usize;
-        if index >= filtered.len() {
-            return None;
-        }
+        let index = crate::pages::components::hit_test::row_at(
+            area,
+            Position::new(event.column, event.row),
+            self.scroll,
+            filtered.len(),
+            search_height + 1,
+        )?;
         let Some(original_index) = filtered.get(index).copied() else {
             return None;
         };

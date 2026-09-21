@@ -3,7 +3,8 @@
 //! 登录后拿到的是 `token` + `userid` 两个 cookie（外加一组设备标识），
 //! 统一存进通用 `SessionStore`；请求时把全部 cookie 拼进头部。
 
-use std::sync::OnceLock;
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 use lx_core::model::source::SourceId;
 
@@ -13,6 +14,32 @@ use crate::session::{SessionStore, SourceSession};
 const LOGIN_COOKIE: &str = "token";
 
 static STORE: OnceLock<SessionStore> = OnceLock::new();
+static PENDING_DEVICE: OnceLock<Mutex<BTreeMap<String, BTreeMap<String, String>>>> =
+    OnceLock::new();
+
+fn pending_device() -> &'static Mutex<BTreeMap<String, BTreeMap<String, String>>> {
+    PENDING_DEVICE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub(super) fn save_pending(key: &str, device: &BTreeMap<String, String>) {
+    let mut guard = pending_device()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    guard.insert(key.to_string(), device.clone());
+}
+
+pub(super) fn pending(key: &str) -> Option<BTreeMap<String, String>> {
+    let guard = pending_device()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    guard.get(key).cloned()
+}
+
+pub(super) fn clear_pending(key: &str) {
+    if let Ok(mut guard) = pending_device().lock() {
+        guard.remove(key);
+    }
+}
 
 pub(super) fn store() -> &'static SessionStore {
     STORE.get_or_init(|| SessionStore::load(SourceId::Kg))

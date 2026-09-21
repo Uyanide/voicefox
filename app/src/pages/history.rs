@@ -8,7 +8,7 @@ use lx_core::events::{AppAction, InsertPosition, Notification};
 use lx_core::keybinding::{Action, KeybindingResolver};
 use lx_core::model::song::SongInfo;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
@@ -430,18 +430,17 @@ pub fn handle_mouse(
             state.selected = (state.selected + scroll_amount).min(len.saturating_sub(1));
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let inner = Block::default().borders(Borders::ALL).inner(area);
-            // 与渲染布局对齐：过滤条可见时占 inner.y 一行、表头一行，
-            // 列表从 inner.y + search_height + 1 开始（参考 favorites.rs）。
             let search_height = u16::from(!filter_query.trim().is_empty());
-            let list_y = inner.y.saturating_add(search_height).saturating_add(1);
-            if event.row >= list_y && event.row < inner.bottom() {
-                let index = state.scroll + event.row.saturating_sub(list_y) as usize;
-                if index < len {
-                    state.selected = index;
-                    if activate {
-                        activate_index = Some(index);
-                    }
+            if let Some(index) = crate::pages::components::hit_test::row_at(
+                area,
+                Position::new(event.column, event.row),
+                state.scroll,
+                len,
+                search_height + 1,
+            ) {
+                state.selected = index;
+                if activate {
+                    activate_index = Some(index);
                 }
             }
         }
@@ -465,17 +464,14 @@ pub fn context_song_at(
     cache: &mut SortedListCache,
 ) -> Option<(Vec<SongInfo>, usize)> {
     let history = filtered_history(ctx, state, filter_query, cache);
-    let inner = Block::default().borders(Borders::ALL).inner(area);
-    // 与渲染布局对齐：过滤条可见时列表整体下移一行（参考 favorites.rs）。
     let search_height = u16::from(!filter_query.trim().is_empty());
-    let list_y = inner.y.saturating_add(search_height).saturating_add(1);
-    if event.row < list_y || event.row >= inner.bottom() {
-        return None;
-    }
-    let index = state.scroll + event.row.saturating_sub(list_y) as usize;
-    if index >= history.len() {
-        return None;
-    }
+    let index = crate::pages::components::hit_test::row_at(
+        area,
+        Position::new(event.column, event.row),
+        state.scroll,
+        history.len(),
+        search_height + 1,
+    )?;
     state.selected = index;
     Some((history, index))
 }

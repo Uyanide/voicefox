@@ -178,13 +178,31 @@ async fn qr_login_sessions_can_be_created() {
             continue;
         }
         match source.create_qr_login().await {
-            Ok(session) => println!(
-                "{}: 二维码已生成（key 长度 {}，图片 {} 字符，有效期 {}s）",
-                source_id.display_name(),
-                session.key.len(),
-                session.image_png.as_deref().map(str::len).unwrap_or(0),
-                session.expires_in
-            ),
+            Ok(session) => {
+                println!(
+                    "{}: 二维码已生成（key 长度 {}，图片 {} 字符，有效期 {}s）",
+                    source_id.display_name(),
+                    session.key.len(),
+                    session.image_png.as_deref().map(str::len).unwrap_or(0),
+                    session.expires_in
+                );
+                if matches!(
+                    source_id,
+                    SourceId::Tx | SourceId::Kg | SourceId::Wy | SourceId::Bili
+                ) {
+                    match source.check_qr_login(&session.key).await {
+                        Ok(result) => println!(
+                            "{}: 首次轮询状态 {:?}: {}",
+                            source_id.display_name(),
+                            result.status,
+                            result.message
+                        ),
+                        Err(error) => {
+                            println!("{}: 首次轮询失败: {error}", source_id.display_name())
+                        }
+                    }
+                }
+            }
             Err(error) => println!("{}: 生成二维码失败: {error}", source_id.display_name()),
         }
     }

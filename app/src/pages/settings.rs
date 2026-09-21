@@ -2635,8 +2635,15 @@ impl SettingsPage {
                     return AppAction::None;
                 }
 
-                let local_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
-                if chunks[2].contains(position) {
+                let management = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+                    .split(chunks[2]);
+                let local_area = management[0];
+                let status_area = management[1];
+
+                let local_inner = Block::default().borders(Borders::ALL).inner(local_area);
+                if local_area.contains(position) {
                     self.focus = SettingsFocus::LocalPaths;
                     let command_y = local_inner.y;
                     if event.row == command_y {
@@ -2682,18 +2689,27 @@ impl SettingsPage {
                     return AppAction::None;
                 }
 
-                let status_inner = Block::default().borders(Borders::ALL).inner(chunks[3]);
-                if let Some(index) = status_item_at(status_inner, position, self.status_item_scroll)
-                {
-                    self.selected_status_item = index;
-                    self.focus = SettingsFocus::StatusBar;
-                    let checkbox = event.column < status_inner.x.saturating_add(5);
-                    if !right_click && !checkbox {
-                        self.status_drag_target = Some(index);
+                let status_inner = Block::default().borders(Borders::ALL).inner(status_area);
+                if status_area.contains(position) {
+                    if let Some(index) =
+                        status_item_at(status_inner, position, self.status_item_scroll)
+                    {
+                        self.selected_status_item = index;
+                        self.focus = SettingsFocus::StatusBar;
+                        let checkbox = event.column < status_inner.x.saturating_add(5);
+                        if !right_click && !checkbox {
+                            self.status_drag_target = Some(index);
+                        }
+                        if right_click || checkbox {
+                            self.toggle_status_bar_item(ctx);
+                        }
                     }
-                    if right_click || checkbox {
-                        self.toggle_status_bar_item(ctx);
-                    }
+                    return AppAction::None;
+                }
+
+                if chunks[3].contains(position) {
+                    self.focus = SettingsFocus::QrLogin;
+                    return AppAction::None;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {

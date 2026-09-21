@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use lx_core::events::{AppAction, Notification};
 use lx_core::keybinding::{Action, KeybindingResolver};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
@@ -867,17 +867,13 @@ impl MainPage {
 }
 
 fn queue_index_at(event: MouseEvent, area: Rect, scroll: usize, len: usize) -> Option<usize> {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
-    let list_y = inner.y.saturating_add(1);
-    if event.column < inner.x
-        || event.column >= inner.right()
-        || event.row < list_y
-        || event.row >= inner.bottom()
-    {
-        return None;
-    }
-    let index = scroll + event.row.saturating_sub(list_y) as usize;
-    (index < len).then_some(index)
+    crate::pages::components::hit_test::row_at(
+        area,
+        Position::new(event.column, event.row),
+        scroll,
+        len,
+        1,
+    )
 }
 
 fn queue_index_at_filtered(
@@ -886,16 +882,13 @@ fn queue_index_at_filtered(
     scroll: usize,
     indices: &[usize],
 ) -> Option<usize> {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
-    let list_y = inner.y.saturating_add(1);
-    if event.column < inner.x
-        || event.column >= inner.right()
-        || event.row < list_y
-        || event.row >= inner.bottom()
-    {
-        return None;
-    }
-    let pos = scroll + event.row.saturating_sub(list_y) as usize;
+    let pos = crate::pages::components::hit_test::row_at(
+        area,
+        Position::new(event.column, event.row),
+        scroll,
+        indices.len(),
+        1,
+    )?;
     indices.get(pos).copied()
 }
 

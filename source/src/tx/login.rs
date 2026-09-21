@@ -152,7 +152,7 @@ pub async fn create() -> Result<QrLoginSession, FetchError> {
     // 轮询要用到预热阶段的 cookie，先暂存起来，随下次 check 一起带上。
     let mut carried = cookies;
     carried.remove("qrsig");
-    session::save_pending(&carried).map_err(FetchError::Other)?;
+    session::save_pending(&qrsig, &carried).map_err(FetchError::Other)?;
     Ok(QrLoginSession {
         source: SourceId::Tx,
         key: qrsig,
@@ -167,7 +167,7 @@ pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
     if qrsig.is_empty() {
         return Err(FetchError::Other("QQ 二维码 key 为空".to_string()));
     }
-    let mut cookies = session::pending().unwrap_or_default();
+    let mut cookies = session::pending(qrsig).unwrap_or_default();
     cookies.insert("qrsig".to_string(), qrsig.to_string());
     let action = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -217,6 +217,7 @@ pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
         return Ok(failed);
     }
     session::save_login(&collected).map_err(FetchError::Other)?;
+    session::clear_pending(qrsig);
     result.cookies = collected;
     result.user_name = (!nickname.trim().is_empty()).then_some(nickname);
     Ok(result)

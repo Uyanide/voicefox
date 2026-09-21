@@ -926,61 +926,71 @@ impl PlaylistsPage {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                for (index, tab) in scope_tab_rects(page.scopes, self.scopes.len())
-                    .iter()
-                    .enumerate()
+                if let Some(key) = self
+                    .scope_selector
+                    .as_ref()
+                    .and_then(|selector| selector.tab_at(page.scopes, position))
                 {
-                    if tab.contains(position) {
+                    if let Some(index) = self.scopes.iter().position(|scope| match (scope, key) {
+                        (PlaylistScope::Custom, SourceSelectorKey::Custom)
+                        | (PlaylistScope::Favorites, SourceSelectorKey::Favorites) => true,
+                        (PlaylistScope::Source(source), SourceSelectorKey::Source(selected)) => {
+                            *source == selected
+                        }
+                        _ => false,
+                    }) {
                         self.select_scope(index, ctx);
-                        return AppAction::None;
                     }
+                    return AppAction::None;
                 }
 
-                let playlist_inner = Block::default().borders(Borders::ALL).inner(page.playlists);
-                if playlist_inner.contains(position) {
-                    let index = self.playlist_scroll_offset
-                        + event.row.saturating_sub(playlist_inner.y) as usize;
-                    if index < self.playlists.len() {
-                        if activate {
-                            if self.selected_playlist.is_some() {
-                                self.leave_playlist();
-                            }
-                            self.selected = index;
-                            self.enter_selected_playlist(ctx);
-                        } else if self.selected_playlist.is_none() {
-                            self.selected = index;
+                if let Some(index) = crate::pages::components::hit_test::row_at(
+                    page.playlists,
+                    position,
+                    self.playlist_scroll_offset,
+                    self.playlists.len(),
+                    0,
+                ) {
+                    if activate {
+                        if self.selected_playlist.is_some() {
+                            self.leave_playlist();
                         }
+                        self.selected = index;
+                        self.enter_selected_playlist(ctx);
+                    } else if self.selected_playlist.is_none() {
+                        self.selected = index;
                     }
                     return AppAction::None;
                 }
 
                 if self.selected_playlist.is_some() {
-                    let song_inner = Block::default().borders(Borders::ALL).inner(page.songs);
-                    let list_y = song_inner.y.saturating_add(1);
-                    if event.row >= list_y && event.row < song_inner.bottom() {
-                        let index =
-                            self.song_scroll_offset + event.row.saturating_sub(list_y) as usize;
-                        if index < self.songs.len() {
-                            self.selected = index;
-                            if activate {
-                                return AppAction::PlaySong {
-                                    songs: self.songs.clone(),
-                                    index,
-                                };
-                            }
+                    if let Some(index) = crate::pages::components::hit_test::row_at(
+                        page.songs,
+                        position,
+                        self.song_scroll_offset,
+                        self.songs.len(),
+                        1,
+                    ) {
+                        self.selected = index;
+                        if activate {
+                            return AppAction::PlaySong {
+                                songs: self.songs.clone(),
+                                index,
+                            };
                         }
                     }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) if self.selected_playlist.is_none() => {
-                let playlist_inner = Block::default().borders(Borders::ALL).inner(page.playlists);
-                if playlist_inner.contains(position) {
-                    let index = self.playlist_scroll_offset
-                        + event.row.saturating_sub(playlist_inner.y) as usize;
-                    if index < self.playlists.len() {
-                        self.selected = index;
-                        return self.toggle_favorite(ctx);
-                    }
+                if let Some(index) = crate::pages::components::hit_test::row_at(
+                    page.playlists,
+                    position,
+                    self.playlist_scroll_offset,
+                    self.playlists.len(),
+                    0,
+                ) {
+                    self.selected = index;
+                    return self.toggle_favorite(ctx);
                 }
             }
             _ => {}
@@ -995,17 +1005,14 @@ impl PlaylistsPage {
     ) -> Option<(Vec<SongInfo>, usize)> {
         self.selected_playlist?;
         let page = page_chunks(area, self.playlists.len());
-        let song_inner = Block::default().borders(Borders::ALL).inner(page.songs);
         let position = Position::new(event.column, event.row);
-        let list_y = song_inner.y.saturating_add(1);
-        if !song_inner.contains(position) || event.row < list_y || event.row >= song_inner.bottom()
-        {
-            return None;
-        }
-        let index = self.song_scroll_offset + event.row.saturating_sub(list_y) as usize;
-        if index >= self.songs.len() {
-            return None;
-        }
+        let index = crate::pages::components::hit_test::row_at(
+            page.songs,
+            position,
+            self.song_scroll_offset,
+            self.songs.len(),
+            1,
+        )?;
         self.selected = index;
         Some((self.songs.clone(), index))
     }
@@ -1669,16 +1676,6 @@ fn name_input_with_cursor(value: &str, width: usize) -> String {
     }
     visible.reverse();
     visible.into_iter().chain(std::iter::once('█')).collect()
-}
-
-fn scope_tab_rects(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
-    if count == 0 {
-        return std::rc::Rc::from([]);
-    }
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, count as u32); count])
-        .split(area)
 }
 
 fn ensure_visible(selected: usize, visible: usize, total: usize, offset: &mut usize) {
