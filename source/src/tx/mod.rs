@@ -29,7 +29,7 @@ pub struct TxSource;
 /// 给请求带上登录 cookie；未登录时原样返回。
 ///
 /// QQ 音乐的 VIP / 无损地址依赖登录态。
-pub(super) fn with_cookie(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+pub(crate) fn with_cookie(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match session::cookie_header() {
         Some(cookie) => request.header("Cookie", cookie),
         None => request,
@@ -69,6 +69,7 @@ impl MusicSource for TxSource {
             link_parse: true,
             login: true,
             qr_login: true,
+            user_playlists: true,
             ..Default::default()
         }
     }

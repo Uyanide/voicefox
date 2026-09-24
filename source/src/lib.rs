@@ -4,8 +4,8 @@ pub mod js;
 pub mod local;
 pub mod manager;
 pub mod session;
+pub mod sync;
 
-// 音源模块
 pub mod fivesing;
 pub mod jamendo;
 pub mod joox;
@@ -17,7 +17,6 @@ pub mod soda;
 pub mod tx;
 pub mod wy;
 
-// 内部工具（不对外暴露细节）
 mod crypto;
 mod filter;
 mod http;

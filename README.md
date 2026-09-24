@@ -19,6 +19,7 @@ voicefox 将多音源音乐搜索、在线播放、本地音乐库、歌词、�
 - Linux D-Bus/MPRIS、Windows 桌面提示路径
 - lx-music 兼容 JS 自定义音源
 - 可配置快捷键与运行时帮助
+- 跨音源歌单/收藏同步：Diff 预览、双向增量、持久化歌单映射与未匹配提示
 
 ## 当前音源
 
@@ -38,7 +39,7 @@ voicefox 将多音源音乐搜索、在线播放、本地音乐库、歌词、�
 | 汽水 `soda` | 搜索、播放、歌词、封面、歌单、链接直解 |
 | 本地 `local` | 本地文件扫描、播放、标签、封面、歌词、CUE、诊断 |
 
-完整能力矩阵见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。
+完整能力矩阵见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。同步设计、使用原则与已知限制见 [`docs/SYNC.md`](docs/SYNC.md)。
 
 ## 快捷键速览
 
@@ -91,6 +92,7 @@ cargo run --release
 - [`KEYBINDINGS.md`](KEYBINDINGS.md) — 完整快捷键
 - [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) — 功能、音源与平台说明
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — 配置
+- [`docs/SYNC.md`](docs/SYNC.md) — 跨音源同步、Diff、匹配与登录限制
 - [`flutter/README.md`](flutter/README.md) — Flutter/Rust 新架构开发线
 
 ## 验证

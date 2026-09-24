@@ -14,6 +14,7 @@ mod notification;
 mod pages;
 mod playlist;
 mod storage;
+mod sync;
 
 mod theme;
 mod tmux;
@@ -653,6 +654,7 @@ fn run_app(
     let mut ui_areas = UiAreas::default();
     let mut click_tracker = ClickTracker::default();
     let mut qr_login_page: Option<Arc<std::sync::Mutex<pages::qr_login::QrLoginPage>>> = None;
+    let mut sync_overlay: Option<pages::sync_overlay::SyncOverlay> = None;
     // 快捷键说明浮层（? / F1 开关）
     let mut help_page: Option<pages::help::HelpPage> = None;
     // 下载面板浮层（Ctrl+o 开关）
@@ -963,6 +965,26 @@ fn run_app(
                         format!("{label}登录状态未确认，请重新打开设置查看")
                     };
                     ctx.notify(Notification::success(message));
+                    needs_render = true;
+                    continue;
+                }
+                AppAction::SyncNetease | AppAction::SyncQq => {
+                    let source = if matches!(action, AppAction::SyncNetease) {
+                        SourceId::Wy
+                    } else {
+                        SourceId::Tx
+                    };
+                    if !ctx.source_manager.is_logged_in(source) {
+                        ctx.notify(Notification::warning(format!(
+                            "请先登录{}",
+                            source.display_name()
+                        )));
+                        needs_render = true;
+                        continue;
+                    }
+                    let mut overlay = pages::sync_overlay::SyncOverlay::new();
+                    overlay.start_for(source, Arc::clone(&ctx.storage), rt);
+                    sync_overlay = Some(overlay);
                     needs_render = true;
                     continue;
                 }
@@ -1408,7 +1430,8 @@ fn run_app(
                     | lx_core::model::source::PlayerState::Loading
             ) || input_active
                 || notification_active
-                || qr_login_page.is_some();
+                || qr_login_page.is_some()
+                || sync_overlay.is_some();
             last_periodic_render = Instant::now();
         }
 
@@ -1502,6 +1525,7 @@ fn run_app(
                 &local_diagnostics,
                 &song_menu,
                 &qr_login_page,
+                &mut sync_overlay,
                 &mut help_page,
                 &mut downloads_panel,
             )?;
@@ -1543,6 +1567,41 @@ fn run_app(
                 || playlists_input_mode
                 || local_input_mode
                 || history_input_mode;
+
+            if let Some(ref mut sync) = sync_overlay {
+                let phase = sync.state.lock().unwrap_or_else(|e| e.into_inner()).phase;
+                match key.code {
+                    KeyCode::Esc
+                        if matches!(
+                            phase,
+                            pages::sync_overlay::SyncPhase::Preparing
+                                | pages::sync_overlay::SyncPhase::Running
+                        ) =>
+                    {
+                        sync.cancel();
+                    }
+                    KeyCode::Esc => {
+                        sync_overlay = None;
+                    }
+                    KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S')
+                        if phase == pages::sync_overlay::SyncPhase::Preview =>
+                    {
+                        sync.confirm(Arc::clone(&ctx.storage), rt);
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R')
+                        if matches!(
+                            phase,
+                            pages::sync_overlay::SyncPhase::Failed
+                                | pages::sync_overlay::SyncPhase::Cancelled
+                        ) =>
+                    {
+                        sync.retry(Arc::clone(&ctx.storage), rt);
+                    }
+                    _ => {}
+                }
+                needs_render = true;
+                continue;
+            }
 
             if let Some(ref page) = qr_login_page {
                 let action = page
@@ -1730,6 +1789,7 @@ fn run_app(
                     AppAction::GoBack => {
                         *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     }
+                    AppAction::SyncNetease | AppAction::SyncQq => {}
                     AppAction::None => {}
                     action => execute_action(
                         action,
@@ -2188,6 +2248,7 @@ fn run_app(
                         AppAction::QrLogin(_)
                             | AppAction::QrLogout(_)
                             | AppAction::QrLoginSuccess(_)
+                            | AppAction::SyncNetease
                     ) {
                         let _ = action_tx.send(action);
                     } else {
@@ -2866,6 +2927,7 @@ fn run_app(
                 &local_diagnostics,
                 &song_menu,
                 &qr_login_page,
+                &mut sync_overlay,
                 &mut help_page,
                 &mut downloads_panel,
             )?;
@@ -2897,6 +2959,7 @@ fn draw_app(
     local_diagnostics: &Option<LocalDiagnosticsKind>,
     song_menu: &Option<SongContextMenu>,
     qr_login_page: &Option<Arc<std::sync::Mutex<pages::qr_login::QrLoginPage>>>,
+    sync_overlay: &mut Option<pages::sync_overlay::SyncOverlay>,
     help_page: &mut Option<pages::help::HelpPage>,
     downloads_panel: &mut pages::downloads::DownloadsPanel,
 ) -> anyhow::Result<()> {
@@ -3167,6 +3230,16 @@ fn draw_app(
                 .render(overlay_area, frame.buffer_mut());
             let p = page.lock().unwrap_or_else(|e| e.into_inner());
             p.render(overlay_area, frame.buffer_mut(), ctx);
+        }
+
+        if let Some(sync) = sync_overlay.as_ref() {
+            let overlay_area = Rect::new(
+                area.x + 2,
+                area.y + 2,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(4),
+            );
+            sync.render(overlay_area, frame.buffer_mut(), ctx);
         }
 
         components::progress_bar::render(main_chunks[3], frame.buffer_mut(), ctx);
@@ -3988,7 +4061,9 @@ fn execute_action(
         | AppAction::None
         | AppAction::QrLogin(_)
         | AppAction::QrLogout(_)
-        | AppAction::QrLoginSuccess(_) => {
+        | AppAction::QrLoginSuccess(_)
+        | AppAction::SyncNetease
+        | AppAction::SyncQq => {
             // handled elsewhere or ignored
         }
     }

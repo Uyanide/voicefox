@@ -22,6 +22,8 @@ const QR_KEY_API: &str = "https://interface3.music.163.com/eapi/login/qrcode/uni
 const QR_CHECK_API: &str = "https://interface3.music.163.com/eapi/login/qrcode/client/login";
 const QR_KEY_PATH: &str = "/api/login/qrcode/unikey";
 const QR_CHECK_PATH: &str = "/api/login/qrcode/client/login";
+const REFRESH_API: &str = "https://interface3.music.163.com/eapi/login/refresh";
+const REFRESH_PATH: &str = "/api/login/refresh";
 const EAPI_USER_AGENT: &str = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
 const REFERER: &str = "https://music.163.com/";
 
@@ -91,6 +93,47 @@ pub async fn create() -> Result<QrLoginSession, FetchError> {
         image_png: None,
         expires_in: 300,
     })
+}
+
+/// 尝试刷新已有网易云登录会话；刷新失败不清除本地 cookie，由需要登录的接口负责最终失效判定。
+pub async fn refresh() -> Result<bool, FetchError> {
+    if !session::is_logged_in() {
+        return Ok(false);
+    }
+    let body = eapi_body(REFRESH_PATH, serde_json::json!({}));
+    let request = http::client()
+        .post(REFRESH_API)
+        .header("User-Agent", EAPI_USER_AGENT)
+        .header("Accept", "*/*")
+        .header("Origin", "https://music.163.com")
+        .header("Referer", REFERER)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!("params={body}"));
+    let response = request
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+        .await
+        .map_err(|error| FetchError::Network(error.to_string()))?;
+    let headers = response.headers().clone();
+    let json: Value = response
+        .json()
+        .await
+        .map_err(|error| FetchError::Parse(error.to_string()))?;
+    if json["code"].as_i64() != Some(200) {
+        return Ok(false);
+    }
+    save_set_cookies(&headers);
+    if let Some(raw) = json["cookie"].as_str() {
+        let mut cookies = BTreeMap::new();
+        for pair in raw.split(';') {
+            if let Some((name, value)) = pair.split_once('=') {
+                cookies.insert(name.trim().to_string(), value.trim().to_string());
+            }
+        }
+        if !cookies.is_empty() {
+            session::save_cookies(&cookies).map_err(FetchError::Other)?;
+        }
+    }
+    Ok(true)
 }
 
 pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
@@ -169,10 +212,10 @@ fn save_set_cookies(headers: &reqwest::header::HeaderMap) {
             cookies.insert(name.trim().to_string(), value.trim().to_string());
         }
     }
-    if !cookies.is_empty() {
-        if let Err(error) = session::save_cookies(&cookies) {
-            tracing::debug!("保存网易云匿名登录 cookie 失败: {error}");
-        }
+    if !cookies.is_empty()
+        && let Err(error) = session::save_cookies(&cookies)
+    {
+        tracing::debug!("保存网易云匿名登录 cookie 失败: {error}");
     }
 }
 

@@ -34,7 +34,7 @@ impl WySource {
 /// 给请求带上登录 cookie；未登录时原样返回。
 ///
 /// 网易云的 VIP / 无损地址依赖登录态，其它接口带上 cookie 也无副作用。
-pub(super) fn with_cookie(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+pub(crate) fn with_cookie(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match session::cookie_header() {
         Some(cookie) => request.header("Cookie", cookie),
         None => request,

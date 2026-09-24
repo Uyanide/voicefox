@@ -191,6 +191,163 @@ pub async fn get_user_playlists(page: u32, limit: u32) -> Result<Vec<Playlist>, 
     Ok(items.iter().filter_map(parse_user_playlist).collect())
 }
 
+/// 新建 QQ 音乐个人歌单。
+pub async fn create_user_playlist(name: &str) -> Result<Playlist, FetchError> {
+    let uin = super::session::snapshot().user_id.unwrap_or_default();
+    if uin.is_empty() {
+        return Err(FetchError::Other("QQ 登录缺少账号 ID".into()));
+    }
+    let url = "https://c.y.qq.com/splcloud/fcgi-bin/create_playlist.fcg?g_tk=5381";
+    let response: Value = super::with_cookie(http::client().post(url))
+        .header("Referer", "https://y.qq.com/n/yqq/playlist")
+        .form(&[
+            ("loginUin", uin.as_str()),
+            ("hostUin", "0"),
+            ("format", "json"),
+            ("inCharset", "utf8"),
+            ("outCharset", "utf8"),
+            ("notice", "0"),
+            ("platform", "yqq"),
+            ("needNewCode", "0"),
+            ("g_tk", "5381"),
+            ("uin", uin.as_str()),
+            ("name", name),
+            ("show", "1"),
+            ("formsender", "1"),
+            ("utf8", "1"),
+            ("qzreferrer", "https://y.qq.com/n/yqq/playlist"),
+        ])
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| FetchError::Parse(e.to_string()))?;
+    match response["code"].as_i64() {
+        Some(0) => {
+            let id = response["dirid"]
+                .as_i64()
+                .or_else(|| response["data"]["dirid"].as_i64())
+                .ok_or_else(|| FetchError::Other("QQ 创建歌单未返回 dirid".into()))?
+                .to_string();
+            Ok(Playlist::new(id, name, SourceId::Tx))
+        }
+        Some(21) => Err(FetchError::Other("QQ 歌单名称已存在".into())),
+        Some(1) | Some(1000) => Err(FetchError::Other("QQ 登录已失效".into())),
+        _ => Err(FetchError::Other(format!(
+            "QQ 创建歌单失败: {}",
+            response["msg"]
+        ))),
+    }
+}
+
+/// 向 QQ 歌单批量添加歌曲；QQ 接口使用 songmid。
+pub async fn add_songs_to_playlist(dirid: &str, songs: &[SongInfo]) -> Result<usize, FetchError> {
+    if songs.is_empty() {
+        return Ok(0);
+    }
+    let uin = super::session::snapshot().user_id.unwrap_or_default();
+    let mids = songs
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let typelist = std::iter::repeat_n("13", songs.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let url = "https://c.y.qq.com/splcloud/fcgi-bin/fcg_music_add2songdir.fcg?g_tk=5381";
+    let response: Value = super::with_cookie(http::client().get(url))
+        .header("Referer", "https://y.qq.com/n/yqq/playlist")
+        .query(&[
+            ("midlist", mids.as_str()),
+            ("typelist", typelist.as_str()),
+            ("dirid", dirid),
+            ("addtype", ""),
+            ("formsender", "4"),
+            ("r2", "0"),
+            ("r3", "1"),
+            ("utf8", "1"),
+            ("g_tk", "5381"),
+            ("uin", uin.as_str()),
+        ])
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| FetchError::Parse(e.to_string()))?;
+    match response["code"].as_i64() {
+        Some(0) => Ok(songs.len()),
+        Some(1000) | Some(301) => Err(FetchError::Other("QQ 登录已失效".into())),
+        _ => Err(FetchError::Other(format!(
+            "QQ 添加歌曲失败: {}",
+            response["msg"]
+        ))),
+    }
+}
+
+/// 从 QQ 歌单批量删除歌曲；接口要求 song id，而不是 songmid。
+pub async fn remove_songs_from_playlist(
+    dirid: &str,
+    songs: &[SongInfo],
+) -> Result<usize, FetchError> {
+    if songs.is_empty() {
+        return Ok(0);
+    }
+    let uin = super::session::snapshot().user_id.unwrap_or_default();
+    let ids = songs
+        .iter()
+        .filter_map(|s| s.extra.get("songId"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    if ids.is_empty() {
+        return Err(FetchError::Other("QQ 删除歌曲缺少 song id".into()));
+    }
+    let url = "https://c.y.qq.com/qzone/fcg-bin/fcg_music_delbatchsong.fcg?g_tk=5381";
+    let response: Value = super::with_cookie(http::client().get(url))
+        .header("Referer", "https://y.qq.com/n/yqq/playlist")
+        .query(&[
+            ("loginUin", uin.as_str()),
+            ("hostUin", "0"),
+            ("format", "json"),
+            ("inCharset", "utf8"),
+            ("outCharset", "utf-8"),
+            ("notice", "0"),
+            ("platform", "yqq.post"),
+            ("needNewCode", "0"),
+            ("uin", uin.as_str()),
+            ("dirid", dirid),
+            ("ids", ids.as_str()),
+            ("source", "103"),
+            (
+                "types",
+                std::iter::repeat_n("3", songs.len())
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .as_str(),
+            ),
+            ("formsender", "4"),
+            ("flag", "2"),
+            ("utf8", "1"),
+            ("from", "3"),
+        ])
+        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| FetchError::Parse(e.to_string()))?;
+    match response["code"].as_i64() {
+        Some(0) => Ok(songs.len()),
+        Some(1000) | Some(301) => Err(FetchError::Other("QQ 登录已失效".into())),
+        _ => Err(FetchError::Other(format!(
+            "QQ 删除歌曲失败: {}",
+            response["msg"]
+        ))),
+    }
+}
+
 fn parse_user_playlist(item: &Value) -> Option<Playlist> {
     let id = {
         let id = value_string(&item["dissid"]);
@@ -420,4 +577,47 @@ fn value_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+/// QQ“我喜欢”专用集合。QQ 将它作为 dirid=201 的特殊歌单处理。
+/// 这是读取接口；写入需要 QQ 当前版本的动态签名接口，统一留给 SyncProvider。
+pub async fn get_favorites() -> Result<(Playlist, Vec<SongInfo>), FetchError> {
+    let body = serde_json::json!({
+        "comm": { "ct": 20, "cv": 1859, "uin": 0, "format": "json" },
+        "music.srfDissInfo.DissInfo": {
+            "method": "CgiGetDiss",
+            "module": "music.srfDissInfo.DissInfo",
+            "param": {
+                "disstid": 0,
+                "dirid": 201,
+                "song_begin": 0,
+                "song_num": 1000,
+                "enc_host_uin": ""
+            }
+        }
+    });
+    let json: Value =
+        super::with_cookie(http::client().post("https://u.y.qq.com/cgi-bin/musicu.fcg"))
+            .header("Referer", "https://y.qq.com/")
+            .json(&body)
+            .send_with_retry(crate::http::RETRY_ATTEMPTS)
+            .await
+            .map_err(|error| FetchError::Network(error.to_string()))?
+            .json()
+            .await
+            .map_err(|error| FetchError::Parse(error.to_string()))?;
+    let data = &json["music.srfDissInfo.DissInfo"]["data"];
+    let items = data["songlist"]
+        .as_array()
+        .ok_or_else(|| FetchError::Parse("QQ 我喜欢歌曲列表为空".into()))?;
+    let songs = items
+        .iter()
+        .filter_map(super::search::parse_song)
+        .collect::<Vec<_>>();
+    let mut playlist = Playlist::new("profile:favorites", "我喜欢", SourceId::Tx);
+    playlist.song_count = data["total_song_num"]
+        .as_u64()
+        .unwrap_or(songs.len() as u64) as u32;
+    playlist.link = Some("https://y.qq.com/n/ryqq/songDetail/".into());
+    Ok((playlist, songs))
 }

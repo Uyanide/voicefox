@@ -118,6 +118,10 @@ pub enum AppAction {
     QrLogin(SourceId),
     QrLogout(SourceId),
     QrLoginSuccess(SourceId),
+    /// 与网易云账号进行双向增量同步（仅增加，不自动删除）。
+    SyncNetease,
+    /// 与 QQ 音乐账号进行双向增量同步（仅增加，不自动删除）。
+    SyncQq,
     /// 打开歌手详情页（从歌曲右键菜单进入）。
     ShowArtistDetails(Box<SongInfo>),
     /// 打开专辑详情页（从歌曲右键菜单或歌手页专辑列表进入）。

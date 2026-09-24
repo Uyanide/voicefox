@@ -134,7 +134,7 @@ impl SettingsCategory {
                 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
             ],
             Self::Sources => &[23, 24, 25, 26, 27, 28, 29, 30],
-            Self::Accounts => &[44],
+            Self::Accounts => &[44, 58, 59],
             Self::Integration => &[34, 35, 36, 37, 38],
             Self::Download => &[45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
             Self::Data => &[40, 41, 42, 43],
@@ -365,6 +365,18 @@ impl SettingsPage {
 
             // s 是设置页管理区域焦点切换键，必须在全局/自定义绑定解析之前处理。
             // 否则用户若在 keybindings 中把 s 绑定到了其他 Action，焦点切换会被吞掉。
+            if self.category == SettingsCategory::Accounts
+                && key.modifiers == KeyModifiers::SHIFT
+                && matches!(key.code, KeyCode::Char('S' | 's'))
+            {
+                return AppAction::SyncNetease;
+            }
+            if self.category == SettingsCategory::Accounts
+                && matches!(key.code, KeyCode::Char('Q' | 'q'))
+            {
+                return AppAction::SyncQq;
+            }
+
             if matches!(
                 (key.modifiers, key.code),
                 (KeyModifiers::NONE, KeyCode::Char('s'))
@@ -1644,7 +1656,7 @@ impl SettingsPage {
             .title(format!(" 设置 · {}  [←/→切换分类] ", self.category.label()));
         let options_inner = options_block.inner(chunks[0]);
         options_block.render(chunks[0], buf);
-        let options = vec![
+        let mut options = vec![
             setting_line("鼠标控制", config.ui.enable_mouse, "t", accent, muted),
             setting_line("聚合搜索", config.ui.aggregate_search, "g", accent, muted),
             setting_line("循环导航", config.ui.wrap_navigation, "w", accent, muted),
@@ -2033,6 +2045,21 @@ impl SettingsPage {
             setting_line("嵌入封面", config.download.embed_cover, "G", accent, muted),
             setting_line("保存歌词", config.download.save_lyric, "I", accent, muted),
         ];
+        options.push(setting_value_line(
+            "网易云同步",
+            "双向增量",
+            "S",
+            accent,
+            muted,
+        ));
+        options.push(setting_value_line(
+            "QQ 音乐同步",
+            "双向增量",
+            "Q",
+            accent,
+            muted,
+        ));
+
         let option_indices = self.category.option_indices();
         let options = options
             .into_iter()
@@ -3021,13 +3048,13 @@ fn format_duration(value: std::time::Duration) -> String {
 /// 在更新配置项后更新这些常量!
 ///
 /// 鼠标点击时触发的按键，顺序必须与 render 中的选项列表一致
-const SETTING_OPTION_KEYS: [char; 58] = [
+const SETTING_OPTION_KEYS: [char; 60] = [
     't', 'g', 'w', 'c', 'e', 'Q', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0',
     '\0', '\0', '\0', '\0', 'm', 'H', 'v', 'u', 'K', 'T', 'Y', ']', 'n', 'N', 'P', 'f', 'z', 'i',
     'o', 'x', 'X', 'R', 'p', 'D', '\0', '\0', '\0', 'b', 'S', 'F', 'M', 'B', 'V', 'W', 'A', 'E',
-    'U', 'L', 'J', 'G', 'I',
+    'U', 'L', 'J', 'G', 'I', 'S', 'Q',
 ];
-const SETTING_OPTION_ACTIONS: [Option<Action>; 58] = [
+const SETTING_OPTION_ACTIONS: [Option<Action>; 60] = [
     None,
     None,
     None,
@@ -3086,6 +3113,8 @@ const SETTING_OPTION_ACTIONS: [Option<Action>; 58] = [
     None,
     None,
     None,
+    None,
+    None,
 ];
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 const THREE_COLUMN_OPTIONS_MIN_WIDTH: u16 = 72;
@@ -3097,7 +3126,7 @@ const ALL_MANAGEMENT_PANELS_MIN_WIDTH: u16 = 108;
 const SETTINGS_PAGE_CHAR_KEYS: &[char] = &[
     'a', 'd', 'h', 'r', 's', 'y', '[', 'm', 'Q', 'v', 'p', 'b', 'n', 'o', 'c', 'e', 'f', 'g', 'i',
     't', 'u', 'w', 'x', 'z', 'D', 'H', 'K', 'N', 'O', 'P', 'R', 'T', 'X', 'Y', ']', 'S', 'F', 'M',
-    'B', 'V', 'W', 'A', 'E', 'U', 'L', 'J', 'G', 'I',
+    'B', 'V', 'W', 'A', 'E', 'U', 'L', 'J', 'G', 'I', 'S',
 ];
 
 fn render_setting_options<'a>(options: Vec<Line<'a>>, area: Rect, buf: &mut Buffer) {

@@ -620,6 +620,47 @@ impl Storage {
             .cloned()
     }
 
+    pub fn sync_playlist_mapping(
+        &self,
+        source: SourceId,
+        local_playlist_id: &str,
+    ) -> Option<String> {
+        let path = self.data_dir.join("sync_playlist_mappings.json");
+        let value: serde_json::Value = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+        value
+            .get(source.as_str())
+            .and_then(|items| items.get(local_playlist_id))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    pub fn set_sync_playlist_mapping(
+        &self,
+        source: SourceId,
+        local_playlist_id: &str,
+        remote_playlist_id: &str,
+    ) -> Result<(), String> {
+        let path = self.data_dir.join("sync_playlist_mappings.json");
+        let mut root: serde_json::Map<String, serde_json::Value> = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let entry = root
+            .entry(source.as_str().to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let object = entry
+            .as_object_mut()
+            .ok_or_else(|| "同步映射文件格式无效".to_string())?;
+        object.insert(
+            local_playlist_id.to_string(),
+            serde_json::Value::String(remote_playlist_id.to_string()),
+        );
+        let bytes = serde_json::to_vec_pretty(&root).map_err(|e| e.to_string())?;
+        save_atomic(&path, &bytes)
+    }
+
     pub fn create_custom_playlist(&self, name: &str) -> Result<CustomPlaylist, String> {
         let name = validate_custom_playlist_name(name)?;
         self.update_custom_playlists(|playlists| {
