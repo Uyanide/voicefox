@@ -786,36 +786,12 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
-dependencies = [
- "darling_core 0.21.3",
- "darling_macro 0.21.3",
-]
-
-[[package]]
-name = "darling"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
 dependencies = [
- "darling_core 0.24.1",
- "darling_macro 0.24.1",
-]
-
-[[package]]
-name = "darling_core"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
-dependencies = [
- "fnv",
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim",
- "syn 2.0.119",
+ "darling_core",
+ "darling_macro",
 ]
 
 [[package]]
@@ -833,22 +809,11 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
-dependencies = [
- "darling_core 0.21.3",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "darling_macro"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
 dependencies = [
- "darling_core 0.24.1",
+ "darling_core",
  "quote",
  "syn 3.0.3",
 ]
@@ -919,17 +884,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
-name = "derive-getters"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74ef43543e701c01ad77d3a5922755c6a1d71b22d942cb8042be4994b380caff"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -948,18 +902,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc_version",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "derive_setters"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7e6f6fa1f03c14ae082120b84b3c7fbd7b8588d924cf2d7c3daf9afd49df8b9"
-dependencies = [
- "darling 0.21.3",
- "proc-macro2",
- "quote",
  "syn 2.0.119",
 ]
 
@@ -1426,15 +1368,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fxhash"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
-dependencies = [
- "byteorder",
 ]
 
 [[package]]
@@ -1933,7 +1866,7 @@ version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf84e73fa6f27f299dec58e13223cf70db80da872eb921d4f6138342a0eabc8"
 dependencies = [
- "darling 0.24.1",
+ "darling",
  "indoc",
  "proc-macro2",
  "quote",
@@ -2203,7 +2136,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lx-core"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2217,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "lx-lyric"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2230,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "lx-player"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "anyhow",
  "libmpv2",
@@ -2241,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "lx-source"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "aes",
  "anyhow",
@@ -2274,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "lx-test"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "lx-core",
  "lx-player",
@@ -3215,80 +3148,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
 dependencies = [
  "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rat-cursor"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5e21530efd080def42674059771a7a9f10066f79bd0b67ed8a6ef9cbef78917"
-
-[[package]]
-name = "rat-event"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8791fc15b399e958369ce532e9bf2bc3588f364d1e508d0ae122d0fb76a3065"
-dependencies = [
- "log",
- "ratatui-core",
- "ratatui-crossterm",
-]
-
-[[package]]
-name = "rat-focus"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de995d0bfa85aa8a716997903487cf250a35159695cf576be220239bbe1e2bfb"
-dependencies = [
- "fxhash",
- "log",
- "rat-event",
- "ratatui-core",
- "ratatui-crossterm",
-]
-
-[[package]]
-name = "rat-menu"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c644bb5dd76f6b3f16dedd38e271ad44d4a68cfcd2b032707d1eeb1a92903cff"
-dependencies = [
- "log",
- "rat-cursor",
- "rat-event",
- "rat-focus",
- "rat-popup",
- "rat-reloc",
- "ratatui-core",
- "ratatui-crossterm",
- "ratatui-widgets",
- "unicode-display-width",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "rat-popup"
-version = "3.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4e217dd50d20a10739f62d41a81212e5b5e548d56bcdbdf457c91cc236efbf6"
-dependencies = [
- "log",
- "rat-cursor",
- "rat-event",
- "rat-focus",
- "rat-reloc",
- "ratatui-core",
- "ratatui-crossterm",
- "ratatui-widgets",
-]
-
-[[package]]
-name = "rat-reloc"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb74cb1c265b3a5160001211ed8becbc56ccd8b66855a6b094e097525d98b735"
-dependencies = [
- "ratatui-core",
 ]
 
 [[package]]
@@ -4553,19 +4412,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "tui-popup"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13c8c7b5e836607a39b397c2b43fd467fd2f0302dc42aceb1a93ee21467ac0b7"
-dependencies = [
- "derive-getters",
- "derive_setters",
- "document-features",
- "ratatui-core",
- "ratatui-widgets",
-]
-
-[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4586,15 +4432,6 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "unicode-display-width"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a43273b656140aa2bb8e65351fe87c255f0eca706b2538a9bd4a590a3490bf3"
-dependencies = [
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -4706,7 +4543,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voicefox-app"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "anyhow",
  "base64",
@@ -4726,7 +4563,6 @@ dependencies = [
  "md-5",
  "nucleo-matcher",
  "qrcode",
- "rat-menu",
  "ratatui",
  "ratatui-image",
  "reqwest",
@@ -4737,7 +4573,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "tui-popup",
  "unicode-width",
  "voicefox-runtime",
  "windows-sys 0.61.2",
@@ -4747,7 +4582,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-application"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4762,7 +4597,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-ffi"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "async-trait",
  "flutter_rust_bridge",
@@ -4774,7 +4609,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-runtime"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "anyhow",
  "async-trait",

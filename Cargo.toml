@@ -3,7 +3,7 @@ members = ["core", "source", "player", "lyric", "application", "runtime", "app",
 resolver = "2"
 
 [workspace.package]
-version = "0.3.18"
+version = "0.3.19"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/emoeem/voicefox"
@@ -30,8 +30,6 @@ ratatui-image = { version = "11", default-features = false, features = [
     "image-defaults",
     "crossterm",
 ] }
-rat-menu = "3.1.1"
-tui-popup = "0.7.6"
 nucleo-matcher = "0.3.1"
 
 # HTTP
