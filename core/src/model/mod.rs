@@ -1,5 +1,4 @@
 pub mod config;
-pub mod keybinding;
 pub mod leaderboard;
 pub mod login;
 pub mod lyric;

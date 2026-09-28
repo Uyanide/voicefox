@@ -23,6 +23,33 @@ pub enum SyncError {
     InvalidOptions(String),
 }
 
+/// 一次远端集合拉取的结果。
+///
+/// `failed` 记录逐个集合拉取失败的原因。调用方**必须**据此决定能否整体替换
+/// 本地缓存：只有 `is_complete()` 为真时才允许覆盖/删除旧数据，否则只能按 id
+/// 增量合并，不然一次频控就会把用户已有的歌单静默清空。
+#[derive(Debug, Clone, Default)]
+pub struct SyncCollectionSet {
+    pub playlists: Vec<SyncCollection>,
+    pub favorites: Vec<SyncCollection>,
+    /// 拉取失败的集合：(名称, 原因)。
+    pub failed: Vec<(String, String)>,
+}
+
+impl SyncCollectionSet {
+    /// 是否所有远端集合都成功拉取（可以安全地整体替换旧缓存）。
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// 普通歌单与收藏集合的全集。
+    pub fn into_all(self) -> Vec<SyncCollection> {
+        let mut all = self.playlists;
+        all.extend(self.favorites);
+        all
+    }
+}
+
 #[async_trait]
 pub trait SyncProvider: Send + Sync {
     fn source_id(&self) -> SourceId;
@@ -52,6 +79,18 @@ pub trait SyncProvider: Send + Sync {
         songs: &[SongInfo],
     ) -> Result<usize, SyncError>;
     async fn search_song(&self, song: &SongInfo) -> Result<Vec<SongInfo>, SyncError>;
+    /// 一次性取出全部远端集合（普通歌单 + 收藏），并带上逐个集合的失败信息。
+    ///
+    /// 默认实现退化为两次 `list_collections` 且不报告局部失败。像网易云这种
+    /// 「先取一份用户歌单再按 kind 过滤」的音源应当覆写：同一份远端数据拉两遍
+    /// 既慢，也会把网易云打到频控（HTTP 200 + `code=405 操作频繁`）上。
+    async fn collect_all(&self) -> Result<SyncCollectionSet, SyncError> {
+        Ok(SyncCollectionSet {
+            playlists: self.list_collections(SyncCollectionKind::Playlist).await?,
+            favorites: self.list_collections(SyncCollectionKind::Favorites).await?,
+            failed: Vec::new(),
+        })
+    }
     async fn supports_write(&self, _kind: SyncCollectionKind) -> bool {
         true
     }

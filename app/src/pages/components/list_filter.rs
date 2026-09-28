@@ -155,6 +155,17 @@ impl ListFilter {
         ]))
         .style(Style::new().bg(crate::theme::surface0(ctx)))
         .render(area, buf);
+
+        if self.active {
+            // 查询串末尾就是插入点；这既是输入框该有的光标，也是输入法候选框的
+            // 定位依据（见 ui_cursor 的说明）。两段文本连同各自的前后空格一起
+            // 传给 request_after，宽度才是实际绘制出来的宽度。
+            crate::ui_cursor::request_after(
+                area,
+                &format!(" / {mode} "),
+                &format!(" {} ", self.query),
+            );
+        }
     }
 }
 

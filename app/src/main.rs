@@ -13,8 +13,10 @@ mod mpris;
 mod notification;
 mod pages;
 mod playlist;
+mod remote_cache;
 mod storage;
 mod sync;
+mod ui_cursor;
 
 mod theme;
 mod tmux;
@@ -965,6 +967,10 @@ fn run_app(
                         format!("{label}登录状态未确认，请重新打开设置查看")
                     };
                     ctx.notify(Notification::success(message));
+                    if *source == SourceId::Wy && ctx.source_manager.is_logged_in(*source) {
+                        // 网易云登录成功后立即进入远程收藏刷新，不再要求用户猜测下一步。
+                        let _ = action_tx.send(AppAction::SyncNetease);
+                    }
                     needs_render = true;
                     continue;
                 }
@@ -2249,6 +2255,7 @@ fn run_app(
                             | AppAction::QrLogout(_)
                             | AppAction::QrLoginSuccess(_)
                             | AppAction::SyncNetease
+                            | AppAction::SyncQq
                     ) {
                         let _ = action_tx.send(action);
                     } else {
@@ -2698,6 +2705,21 @@ fn run_app(
             }
 
             let position = Position::new(mouse.column, mouse.row);
+            if active_tab == NavTab::Favorites && favorites_page.remote_menu_open() {
+                if let Some(action) = favorites_page.handle_remote_menu_mouse(mouse) {
+                    execute_action(
+                        action,
+                        &ctx,
+                        rt,
+                        &action_tx,
+                        &search_page,
+                        &settings_page,
+                        &search_seq,
+                    );
+                }
+                needs_render = true;
+                continue;
+            }
             if ui_areas.notification.contains(position)
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             {
@@ -2816,6 +2838,11 @@ fn run_app(
                                 playback: Some(playback_menu_state(&ctx)),
                             },
                         );
+                        needs_render = true;
+                        continue;
+                    }
+                    if active_tab == NavTab::Favorites {
+                        favorites_page.open_remote_menu(position);
                         needs_render = true;
                         continue;
                     }
@@ -2964,6 +2991,8 @@ fn draw_app(
     downloads_panel: &mut pages::downloads::DownloadsPanel,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
+        // 每帧重新收集文本插入点请求（见 ui_cursor 模块说明）。
+        crate::ui_cursor::clear();
         let area = frame.area();
         frame.render_widget(
             ratatui::widgets::Block::default().style(
@@ -3212,6 +3241,29 @@ fn draw_app(
             }
         }
 
+        // 页面里的文本输入已在渲染时登记了插入点。这里取出它并显式设置
+        // `Frame::cursor_position`：不设置的话 ratatui 只隐藏光标、不移动它，
+        // 光标会停在差分渲染最后一个变化的单元格上，输入法候选框就会在搜索框
+        // 和状态栏之间来回跳（issue #42）。
+        //
+        // 任何全屏浮层都会盖住输入区，此时不能再把光标留在页面上。
+        let overlay_covers_input = local_diagnostics.is_some()
+            || qr_login_page.is_some()
+            || sync_overlay.is_some()
+            || song_menu.is_some()
+            || help_page.is_some()
+            || downloads_panel.is_open()
+            || ctx
+                .details_page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+        let cursor_anchor = if overlay_covers_input {
+            None
+        } else {
+            crate::ui_cursor::take()
+        };
+
         if let Some(kind) = local_diagnostics {
             render_local_diagnostics(content_area, frame.buffer_mut(), ctx, *kind);
         }
@@ -3273,6 +3325,12 @@ fn draw_app(
         if downloads_panel.is_open() {
             let tasks = ctx.downloads.snapshot();
             downloads_panel.render(area, frame.buffer_mut(), ctx, &tasks);
+        }
+
+        // 有文本输入获得焦点时把终端光标钉在插入点：这既是输入框该有的光标，
+        // 也是输入法候选框的定位依据。没有输入时保持 ratatui 的默认隐藏行为。
+        if let Some(anchor) = cursor_anchor {
+            frame.set_cursor_position(anchor);
         }
     })?;
     Ok(())
@@ -4921,21 +4979,50 @@ fn spawn_playlist_request(
                 page,
                 append,
             } => {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(12),
-                    source_manager.playlists(source, "", page),
-                )
-                .await;
+                // 网易云远程缓存就绪时，歌单页以缓存为唯一数据源：缓存里已经是
+                // 全部用户歌单，既不该再翻页（会重复请求），也不该退回公开的
+                // 热门歌单接口 —— 那是别人的歌单，会把用户的歌单顶掉。
+                let cached = if source == SourceId::Wy {
+                    crate::remote_cache::with_netease(|collections| {
+                        collections
+                            .iter()
+                            .filter(|c| c.kind == lx_core::sync::SyncCollectionKind::Playlist)
+                            .map(|c| lx_core::model::playlist::Playlist {
+                                id: c.id.clone(),
+                                name: c.name.clone(),
+                                source: SourceId::Wy,
+                                cover_url: c.songs.first().and_then(|s| s.cover_url.clone()),
+                                song_count: c.songs.len() as u32,
+                                description: None,
+                                play_count: None,
+                                creator: None,
+                                link: None,
+                                extra: Default::default(),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                } else {
+                    Vec::new()
+                };
+                let result = if !cached.is_empty() {
+                    // 第 1 页给全量；后续页返回空列表表示「没有更多」，
+                    // 不再发一次注定重复的请求。
+                    Ok(if page <= 1 { cached } else { Vec::new() })
+                } else {
+                    tokio::time::timeout(
+                        Duration::from_secs(12),
+                        source_manager.playlists(source, "", page),
+                    )
+                    .await
+                    .map(|r| r.map_err(|e| e.to_string()))
+                    .unwrap_or_else(|_| Err("请求超时，请稍后重试".to_string()))
+                };
                 PlaylistResponse::List {
                     request_id,
                     source,
                     page,
                     append,
-                    result: match result {
-                        Ok(Ok(playlists)) => Ok(playlists),
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(_) => Err("请求超时，请稍后重试".to_string()),
-                    },
+                    result,
                 }
             }
             pages::playlists::PlaylistLoadRequest::Search {
@@ -4971,20 +5058,32 @@ fn spawn_playlist_request(
                 } else {
                     Duration::from_secs(15)
                 };
-                let result = tokio::time::timeout(
-                    timeout,
-                    source_manager.playlist_detail(source, &playlist_id, 1),
-                )
-                .await;
+                let result = if source == SourceId::Wy {
+                    if let Some(collection) = crate::remote_cache::playlist(&playlist_id) {
+                        Ok(collection.songs)
+                    } else {
+                        tokio::time::timeout(
+                            timeout,
+                            source_manager.playlist_detail(source, &playlist_id, 1),
+                        )
+                        .await
+                        .map(|r| r.map_err(|e| e.to_string()))
+                        .unwrap_or_else(|_| Err("请求超时，请稍后重试".to_string()))
+                    }
+                } else {
+                    tokio::time::timeout(
+                        timeout,
+                        source_manager.playlist_detail(source, &playlist_id, 1),
+                    )
+                    .await
+                    .map(|r| r.map_err(|e| e.to_string()))
+                    .unwrap_or_else(|_| Err("请求超时，请稍后重试".to_string()))
+                };
                 PlaylistResponse::Songs {
                     request_id,
                     source,
                     playlist_id,
-                    result: match result {
-                        Ok(Ok(songs)) => Ok(songs),
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(_) => Err("请求超时，请稍后重试".to_string()),
-                    },
+                    result,
                 }
             }
         };

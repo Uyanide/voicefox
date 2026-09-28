@@ -211,7 +211,7 @@ impl AppContext {
         let seconds = self
             .config
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .notification
             .in_app_timeout
             .clamp(1, 60);

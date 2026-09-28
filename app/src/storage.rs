@@ -507,24 +507,32 @@ impl Storage {
     // ── 收藏 ──────────────────────────────────────────
 
     pub fn add_favorite(&self, song: &SongInfo) -> bool {
-        let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
-        if favs.iter().any(|favorite| songs_equivalent(favorite, song)) {
-            return false;
-        }
-        favs.push(song.clone());
-        self.save_favorites(&favs);
+        // 变更与快照都在写锁内一次性完成，落盘放到锁外：
+        // 否则渲染路径的 is_favorite 等读锁要被整次序列化 + fsync + rename 阻塞。
+        let snapshot = {
+            let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
+            if favs.iter().any(|favorite| songs_equivalent(favorite, song)) {
+                return false;
+            }
+            favs.push(song.clone());
+            favs.clone()
+        };
+        self.save_favorites(&snapshot);
         true
     }
 
     pub fn remove_favorite(&self, song: &SongInfo) -> bool {
-        let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
-        let old_len = favs.len();
-        favs.retain(|favorite| !songs_equivalent(favorite, song));
-        if favs.len() != old_len {
-            self.save_favorites(&favs);
-            return true;
-        }
-        false
+        let snapshot = {
+            let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
+            let old_len = favs.len();
+            favs.retain(|favorite| !songs_equivalent(favorite, song));
+            if favs.len() == old_len {
+                return false;
+            }
+            favs.clone()
+        };
+        self.save_favorites(&snapshot);
+        true
     }
 
     pub fn is_favorite(&self, song: &SongInfo) -> bool {
@@ -538,33 +546,41 @@ impl Storage {
     // ── 歌单收藏 ──────────────────────────────────────
 
     pub fn add_favorite_playlist(&self, playlist: &Playlist) -> bool {
-        let mut favorites = self
-            .favorite_playlists
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if favorites
-            .iter()
-            .any(|favorite| favorite.id == playlist.id && favorite.source == playlist.source)
-        {
-            return false;
-        }
-        favorites.push(playlist.clone());
-        self.save_favorite_playlists(&favorites);
+        // 同 add_favorite：写锁内只做变更 + 快照，磁盘 I/O 在锁外。
+        let snapshot = {
+            let mut favorites = self
+                .favorite_playlists
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if favorites
+                .iter()
+                .any(|favorite| favorite.id == playlist.id && favorite.source == playlist.source)
+            {
+                return false;
+            }
+            favorites.push(playlist.clone());
+            favorites.clone()
+        };
+        self.save_favorite_playlists(&snapshot);
         true
     }
 
     pub fn remove_favorite_playlist(&self, playlist: &Playlist) -> bool {
-        let mut favorites = self
-            .favorite_playlists
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let old_len = favorites.len();
-        favorites
-            .retain(|favorite| favorite.id != playlist.id || favorite.source != playlist.source);
-        if favorites.len() == old_len {
-            return false;
-        }
-        self.save_favorite_playlists(&favorites);
+        let snapshot = {
+            let mut favorites = self
+                .favorite_playlists
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let old_len = favorites.len();
+            favorites.retain(|favorite| {
+                favorite.id != playlist.id || favorite.source != playlist.source
+            });
+            if favorites.len() == old_len {
+                return false;
+            }
+            favorites.clone()
+        };
+        self.save_favorite_playlists(&snapshot);
         true
     }
 
@@ -605,7 +621,7 @@ impl Storage {
     pub fn custom_playlist_choices(&self) -> Vec<(String, String)> {
         self.custom_playlists
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
             .collect()
@@ -614,51 +630,10 @@ impl Storage {
     pub fn custom_playlist(&self, playlist_id: &str) -> Option<CustomPlaylist> {
         self.custom_playlists
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|playlist| playlist.id == playlist_id)
             .cloned()
-    }
-
-    pub fn sync_playlist_mapping(
-        &self,
-        source: SourceId,
-        local_playlist_id: &str,
-    ) -> Option<String> {
-        let path = self.data_dir.join("sync_playlist_mappings.json");
-        let value: serde_json::Value = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
-        value
-            .get(source.as_str())
-            .and_then(|items| items.get(local_playlist_id))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    }
-
-    pub fn set_sync_playlist_mapping(
-        &self,
-        source: SourceId,
-        local_playlist_id: &str,
-        remote_playlist_id: &str,
-    ) -> Result<(), String> {
-        let path = self.data_dir.join("sync_playlist_mappings.json");
-        let mut root: serde_json::Map<String, serde_json::Value> = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        let entry = root
-            .entry(source.as_str().to_string())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        let object = entry
-            .as_object_mut()
-            .ok_or_else(|| "同步映射文件格式无效".to_string())?;
-        object.insert(
-            local_playlist_id.to_string(),
-            serde_json::Value::String(remote_playlist_id.to_string()),
-        );
-        let bytes = serde_json::to_vec_pretty(&root).map_err(|e| e.to_string())?;
-        save_atomic(&path, &bytes)
     }
 
     pub fn create_custom_playlist(&self, name: &str) -> Result<CustomPlaylist, String> {
@@ -833,42 +808,55 @@ impl Storage {
     // ── 播放历史 ──────────────────────────────────────
 
     pub fn add_history(&self, song: &SongInfo, limit: usize) {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        history.retain(|s| !(s.id == song.id && s.source == song.source));
-        history.insert(0, HistoryEntry::from_song(song));
-        history.truncate(limit.max(1));
-        self.save_history(&history);
+        // 同收藏：写锁内完成变更 + 取快照，落盘在锁外，避免读侧被磁盘 I/O 拖住。
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            history.retain(|s| !(s.id == song.id && s.source == song.source));
+            history.insert(0, HistoryEntry::from_song(song));
+            history.truncate(limit.max(1));
+            history.clone()
+        };
+        self.save_history(&snapshot);
     }
 
     pub fn remove_history(&self, song: &SongInfo) -> bool {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        let old_len = history.len();
-        history.retain(|item| !(item.id == song.id && item.source == song.source));
-        if history.len() == old_len {
-            return false;
-        }
-        self.save_history(&history);
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            let old_len = history.len();
+            history.retain(|item| !(item.id == song.id && item.source == song.source));
+            if history.len() == old_len {
+                return false;
+            }
+            history.clone()
+        };
+        self.save_history(&snapshot);
         true
     }
 
     pub fn clear_history(&self) -> bool {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        if history.is_empty() {
-            return false;
-        }
-        history.clear();
-        self.save_history(&history);
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            if history.is_empty() {
+                return false;
+            }
+            history.clear();
+            history.clone()
+        };
+        self.save_history(&snapshot);
         true
     }
 
     pub fn trim_history(&self, limit: usize) -> bool {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        let old_len = history.len();
-        history.truncate(limit.max(1));
-        if history.len() == old_len {
-            return false;
-        }
-        self.save_history(&history);
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            let old_len = history.len();
+            history.truncate(limit.max(1));
+            if history.len() == old_len {
+                return false;
+            }
+            history.clone()
+        };
+        self.save_history(&snapshot);
         true
     }
 
@@ -892,7 +880,7 @@ impl Storage {
     pub fn load_history(&self) -> Vec<SongInfo> {
         self.history
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
             .map(HistoryEntry::into_song)

@@ -371,7 +371,10 @@ impl SettingsPage {
             {
                 return AppAction::SyncNetease;
             }
+            // QQ 同步目前还没接入远程集合模式。这里必须要求 Shift：否则账号面板
+            // 里的小写 q（全局退出键）会被它吃掉，用户在这个面板里退不出程序。
             if self.category == SettingsCategory::Accounts
+                && key.modifiers == KeyModifiers::SHIFT
                 && matches!(key.code, KeyCode::Char('Q' | 'q'))
             {
                 return AppAction::SyncQq;
@@ -1549,7 +1552,7 @@ impl SettingsPage {
             } else {
                 crate::theme::border(ctx)
             }))
-            .title(" 扫码登录状态 · ↑/↓选择 · P扫码 · B退出 ");
+            .title(" 账号与网易云 · ↑/↓选择 · P扫码 · B退出 · Shift+S刷新远程歌单 ");
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -1604,6 +1607,67 @@ impl SettingsPage {
             ]);
             Paragraph::new(line).render(Rect::new(inner.x, row, inner.width, 1), buf);
             row = row.saturating_add(1);
+        }
+
+        // 网易云远程集合是播放数据，不写入本地歌单；必须在设置里明确可见。
+        // 渲染路径不拷贝整个缓存，只取计数与当前可见行的文本。
+        let (cached_total, cached_normal, cached_favorites) = crate::remote_cache::summary_counts();
+        if row < inner.bottom() {
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " 网易云远程歌单",
+                    Style::new().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  · 已缓存 {cached_total} 个（普通 {cached_normal} / 红心 {cached_favorites}）  · S 刷新"
+                    ),
+                    Style::new().fg(muted),
+                ),
+            ]))
+            .render(Rect::new(inner.x, row, inner.width, 1), buf);
+            row = row.saturating_add(1);
+        }
+
+        if row < inner.bottom() {
+            if cached_total == 0 {
+                Paragraph::new(" 尚未读取网易云远程歌单。登录后按 S 刷新。")
+                    .style(Style::new().fg(crate::theme::yellow(ctx)))
+                    .render(Rect::new(inner.x, row, inner.width, 1), buf);
+            } else {
+                let room = inner.bottom().saturating_sub(row) as usize;
+                let width = inner.width.saturating_sub(20) as usize;
+                let lines = crate::remote_cache::with_netease(|collections| {
+                    collections
+                        .iter()
+                        .take(room)
+                        .map(|collection| {
+                            let kind = if matches!(
+                                collection.kind,
+                                lx_core::sync::SyncCollectionKind::Favorites
+                            ) {
+                                "红心"
+                            } else {
+                                "歌单"
+                            };
+                            format!(
+                                " {}  {}  · {} 首",
+                                kind,
+                                truncate_display(&collection.name, width),
+                                collection.songs.len()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                for line in lines {
+                    Paragraph::new(Line::from(Span::styled(
+                        line,
+                        Style::new().fg(crate::theme::text(ctx)),
+                    )))
+                    .render(Rect::new(inner.x, row, inner.width, 1), buf);
+                    row = row.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -2391,120 +2455,68 @@ impl SettingsPage {
             );
         }
 
-        // ── 本地音乐路径输入弹窗 ──
+        // ── 输入浮层 ──
+        //
+        // 六个单行输入共用同一个渲染函数：既去掉重复代码，也保证光标（输入法
+        // 候选框的定位依据）在每一处都落在同一个位置——文本插入点。
         if self.local_path_mode {
-            let width = area.width.saturating_sub(4).min(74);
-            let input_area = Rect::new(
-                area.x + area.width.saturating_sub(width) / 2,
-                area.y + area.height.saturating_sub(3) / 2,
-                width,
-                3.min(area.height),
+            render_input_overlay(
+                area,
+                buf,
+                ctx,
+                "输入本地音乐目录路径",
+                &self.local_path_input,
             );
-            Clear.render(input_area, buf);
-            let input_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(crate::theme::green(ctx)))
-                .title("输入本地音乐目录路径");
-            let inner = input_block.inner(input_area);
-            input_block.render(input_area, buf);
-            let cursor = if (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                / 500)
-                .is_multiple_of(2)
-            {
-                "█"
-            } else {
-                " "
-            };
-            Paragraph::new(Line::from(format!("{}{}", self.local_path_input, cursor)))
-                .render(inner, buf);
         }
 
         if self.input_mode {
-            let width = area.width.saturating_sub(4).min(74);
-            let input_area = Rect::new(
-                area.x + area.width.saturating_sub(width) / 2,
-                area.y + area.height.saturating_sub(3) / 2,
-                width,
-                3.min(area.height),
+            render_input_overlay(
+                area,
+                buf,
+                ctx,
+                "输入 JS 音源 URL 或本地路径",
+                &self.input_url,
             );
-            Clear.render(input_area, buf);
-            let input_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(crate::theme::green(ctx)))
-                .title("输入 JS 音源 URL 或本地路径");
-
-            let inner = input_block.inner(input_area);
-            input_block.render(input_area, buf);
-            let cursor = if (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                / 500)
-                .is_multiple_of(2)
-            {
-                "█"
-            } else {
-                " "
-            };
-
-            Paragraph::new(Line::from(format!("{}{}", self.input_url, cursor))).render(inner, buf);
         }
 
         if self.proxy_input_mode {
-            let width = area.width.saturating_sub(4).min(74);
-            let input_area = Rect::new(
-                area.x + area.width.saturating_sub(width) / 2,
-                area.y + area.height.saturating_sub(3) / 2,
-                width,
-                3.min(area.height),
+            render_input_overlay(
+                area,
+                buf,
+                ctx,
+                "输入代理地址，留空表示关闭",
+                &self.proxy_input,
             );
-            Clear.render(input_area, buf);
-            let input_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(crate::theme::green(ctx)))
-                .title("输入代理地址，留空表示关闭");
-            let inner = input_block.inner(input_area);
-            input_block.render(input_area, buf);
-            Paragraph::new(Line::from(self.proxy_input.as_str())).render(inner, buf);
         }
 
         if self.audio_device_input_mode {
-            let width = area.width.saturating_sub(4).min(74);
-            let input_area = Rect::new(
-                area.x + area.width.saturating_sub(width) / 2,
-                area.y + area.height.saturating_sub(3) / 2,
-                width,
-                3.min(area.height),
+            render_input_overlay(
+                area,
+                buf,
+                ctx,
+                "输入 libmpv 音频设备名，Enter 保存",
+                &self.audio_device_input,
             );
-            Clear.render(input_area, buf);
-            let input_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(crate::theme::green(ctx)))
-                .title("输入 libmpv 音频设备名，Enter 保存");
-            let inner = input_block.inner(input_area);
-            input_block.render(input_area, buf);
-            Paragraph::new(Line::from(self.audio_device_input.as_str())).render(inner, buf);
         }
 
         if self.playlist_import_mode {
-            let width = area.width.saturating_sub(4).min(74);
-            let input_area = Rect::new(
-                area.x + area.width.saturating_sub(width) / 2,
-                area.y + area.height.saturating_sub(3) / 2,
-                width,
-                3.min(area.height),
+            render_input_overlay(
+                area,
+                buf,
+                ctx,
+                "输入 M3U/LX Music/网易云歌单路径，Enter 导入",
+                &self.playlist_import_input,
             );
-            Clear.render(input_area, buf);
-            let input_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(crate::theme::green(ctx)))
-                .title("输入 M3U/LX Music/网易云歌单路径，Enter 导入");
-            let inner = input_block.inner(input_area);
-            input_block.render(input_area, buf);
-            Paragraph::new(Line::from(self.playlist_import_input.as_str())).render(inner, buf);
+        }
+
+        // 下载目录 / 文件名模板此前只写 status_msg、没有可见输入框：
+        // 用户看不到自己打了什么，输入法的候选框也无处可依附。
+        if let Some(target) = self.download_input_target {
+            let title = match target {
+                DownloadInputTarget::Dir => "输入下载目录，Enter 保存",
+                DownloadInputTarget::Template => "输入文件名模板，Enter 保存",
+            };
+            render_input_overlay(area, buf, ctx, title, &self.download_input);
         }
     }
 
@@ -2746,6 +2758,40 @@ impl SettingsPage {
         }
         AppAction::None
     }
+}
+
+/// 渲染一个居中的单行输入浮层，并把终端光标钉在文本插入点。
+///
+/// 输入法的候选框跟随**终端光标**。ratatui 差分渲染下若不显式设置
+/// `Frame::cursor_position`，光标只会被隐藏、停在"本帧最后一个变化的单元格"上，
+/// 候选框就会在输入框和状态栏之间来回跳（issue #42）。所以每个输入浮层
+/// 都要登记插入点，主循环据此设置光标位置（见 `ui_cursor`）。
+fn render_input_overlay(
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    ctx: &AppContext,
+    title: &str,
+    text: &str,
+) {
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+
+    let width = area.width.saturating_sub(4).min(74);
+    let input_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(3) / 2,
+        width,
+        3.min(area.height),
+    );
+    Clear.render(input_area, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(crate::theme::green(ctx)))
+        .title(title);
+    let inner = block.inner(input_area);
+    block.render(input_area, buf);
+    Paragraph::new(Line::from(text)).render(inner, buf);
+    // 光标由终端绘制，因此这里不再拼软件光标字符。
+    crate::ui_cursor::request_after(inner, "", text);
 }
 
 fn list_window_start(selected: usize, len: usize, rows: usize) -> usize {

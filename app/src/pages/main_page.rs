@@ -587,6 +587,8 @@ impl MainPage {
             .max(1);
         let mut play_songs = None;
         let mut drag_target = None;
+        // 先记录拖拽起点：Up 事件会清掉 self.dragging，落点应用阶段仍需用到它。
+        let drag_source = self.dragging;
         {
             // 只读阶段：从队列快照中取出本次事件需要的少量信息。
             let songs = ctx.playlist.borrow();
@@ -645,7 +647,7 @@ impl MainPage {
             }
         }
         // 借用已释放，写操作不会与读锁互相等待。
-        if let (Some(from), Some(target)) = (self.dragging, drag_target) {
+        if let (Some(from), Some(target)) = (drag_source, drag_target) {
             ctx.playlist.move_item(from, target);
             self.selected = target;
             self.dragging = Some(target);
@@ -803,6 +805,15 @@ impl MainPage {
             );
         let inner = block.inner(area);
         block.render(area, buf);
+        if self.queue_filter_active {
+            // 筛选串画在边框标题里，插入点跟着标题文本走（去掉左右边框各一列）。
+            // 这是输入法候选框的定位依据，见 ui_cursor 的说明。
+            crate::ui_cursor::request_after(
+                Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
+                &format!(" 队列 · {} 歌曲 · /", songs.len()),
+                &self.queue_filter,
+            );
+        }
         if songs.is_empty() {
             Paragraph::new("队列为空")
                 .style(Style::new().fg(crate::theme::muted(ctx)))

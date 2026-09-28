@@ -140,6 +140,9 @@ impl LeaderboardPage {
                 self.boards_loading = false;
                 self.boards_loaded = true;
                 self.error_message = Some(message);
+                // 只有真正应用了错误的请求才能重置光标；
+                // 否则已切走的过期响应会把用户正在浏览的列表拉回顶部。
+                self.selected = 0;
             }
             LeaderboardLoadRequest::Songs { source, board_id }
                 if self.current_source() == Some(*source)
@@ -150,10 +153,10 @@ impl LeaderboardPage {
                 self.songs_loading = false;
                 self.songs_loaded = true;
                 self.error_message = Some(message);
+                self.selected = 0;
             }
             _ => {}
         }
-        self.selected = 0;
     }
 
     pub fn handle_input(

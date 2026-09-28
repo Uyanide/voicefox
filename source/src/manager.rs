@@ -989,16 +989,39 @@ impl SourceManager {
         let mut found: Option<LyricData> = None;
         attempts(self.get_lyric(song).await, &mut found);
         if found.is_none() {
-            for candidate in self.find_music(song).await {
-                attempts(self.get_lyric(&candidate).await, &mut found);
-                if found.is_some() {
-                    tracing::debug!(
-                        "lyrics for {} matched from {}",
-                        song.name,
-                        candidate.source.as_str()
-                    );
-                    break;
+            // find_music 最多返回上百个候选，而单个 get_lyric 自带 20s 超时：串行
+            // 逐个 await 会让「确实无词」的歌曲长时间阻塞播放路径。这里限制候选
+            // 数量，并给整段回退（搜索 + 取词）设一个总预算；预算内没找到就按
+            // 未命中处理，继续走下方的负缓存逻辑。
+            const FALLBACK_CANDIDATE_LIMIT: usize = 8;
+            const FALLBACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+            let fallback = async {
+                for candidate in self
+                    .find_music(song)
+                    .await
+                    .into_iter()
+                    .take(FALLBACK_CANDIDATE_LIMIT)
+                {
+                    attempts(self.get_lyric(&candidate).await, &mut found);
+                    if found.is_some() {
+                        tracing::debug!(
+                            "lyrics for {} matched from {}",
+                            song.name,
+                            candidate.source.as_str()
+                        );
+                        break;
+                    }
                 }
+            };
+            if tokio::time::timeout(FALLBACK_BUDGET, fallback)
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    "lyrics for {} fallback exceeded {:?}",
+                    song.name,
+                    FALLBACK_BUDGET
+                );
             }
         }
 

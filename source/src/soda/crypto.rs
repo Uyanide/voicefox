@@ -173,15 +173,24 @@ fn box_child_start(data: &[u8], offset: usize, header: usize) -> Option<usize> {
 }
 
 /// `stsz`：固定样本长度或逐样本长度表。
-fn parse_stsz(data: &[u8]) -> Vec<u32> {
+///
+/// `max_samples` 是调用方给出的样本数上限（这里用整个输入文件的字节数：
+/// mdat 里每个样本至少占 1 字节），只用于钳制固定长度形式里的样本数。
+fn parse_stsz(data: &[u8], max_samples: usize) -> Vec<u32> {
     if data.len() < 12 {
         return Vec::new();
     }
     let fixed = u32::from_be_bytes(data[4..8].try_into().unwrap_or_default());
+    // count 直接来自下载到的文件，必须先按缓冲区容量钳制：0xFFFFFFFF 会申请
+    // 数 GB 内存，分配失败不可捕获，会直接终止进程。
     let count = u32::from_be_bytes(data[8..12].try_into().unwrap_or_default()) as usize;
     if fixed != 0 {
-        return vec![fixed; count];
+        // 固定长度形式没有逐样本表，count 合理地大于盒子自身长度，因此用整个
+        // 输入文件的大小兜底（样本总数不可能超过文件字节数）。
+        return vec![fixed; count.min(max_samples)];
     }
+    // 逐样本表最多只能放下缓冲区里剩余的字数。
+    let count = count.min(data.len().saturating_sub(12) / 4);
     (0..count)
         .map(|index| read_u32(data, 12 + index * 4).unwrap_or_default())
         .collect()
@@ -209,7 +218,9 @@ fn parse_senc(data: &[u8], iv_size: usize) -> Vec<SencSample> {
         8
     };
     let flags = read_u32(data, 0).unwrap_or_default() & 0x00FF_FFFF;
-    let count = read_u32(data, 4).unwrap_or_default() as usize;
+    // count 来自下载到的文件，先按缓冲区能容纳的样本数（每个样本至少一个 IV）
+    // 钳制预分配，避免被超大值触发巨额分配导致进程 abort。
+    let count = (read_u32(data, 4).unwrap_or_default() as usize).min(data.len() / iv_size.max(1));
     let has_subsamples = flags & 0x02 != 0;
     let mut samples = Vec::with_capacity(count);
     let mut ptr = 8usize;
@@ -368,7 +379,7 @@ pub(super) fn decrypt_audio(file_data: &[u8], play_auth: &str) -> Result<Vec<u8>
 
     let stsz = find_box(file_data, b"stsz", stbl.data_start, stbl.offset + stbl.size)
         .ok_or_else(|| "未找到 stsz 盒子".to_string())?;
-    let sample_sizes = parse_stsz(stsz.data(file_data));
+    let sample_sizes = parse_stsz(stsz.data(file_data), file_data.len());
 
     let senc = find_box(file_data, b"senc", moov.data_start, moov.offset + moov.size)
         .or_else(|| find_box(file_data, b"senc", stbl.data_start, stbl.offset + stbl.size))
@@ -514,9 +525,15 @@ mod tests {
     fn stsz_supports_fixed_and_per_sample_sizes() {
         // 固定长度：size=0, sample_size=100, count=3
         let fixed = hex::decode("000000000000006400000003").unwrap();
-        assert_eq!(parse_stsz(&fixed), vec![100, 100, 100]);
+        assert_eq!(parse_stsz(&fixed, 1024), vec![100, 100, 100]);
         // 逐样本：size=0, sample_size=0, count=2, [11, 22]
         let per_sample = hex::decode("0000000000000000000000020000000b00000016").unwrap();
-        assert_eq!(parse_stsz(&per_sample), vec![11, 22]);
+        assert_eq!(parse_stsz(&per_sample, 1024), vec![11, 22]);
+        // 文件里的 count 不可信：固定长度形式按 max_samples 钳制，
+        // 逐样本形式按缓冲区剩余字数钳制。
+        let fixed_huge = hex::decode("0000000000000064ffffffff").unwrap();
+        assert_eq!(parse_stsz(&fixed_huge, 8).len(), 8);
+        let per_sample_huge = hex::decode("0000000000000000ffffffff").unwrap();
+        assert!(parse_stsz(&per_sample_huge, usize::MAX).is_empty());
     }
 }

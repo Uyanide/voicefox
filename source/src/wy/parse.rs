@@ -170,7 +170,7 @@ pub async fn fetch_song(id: &str) -> Result<SongInfo, FetchError> {
 
 /// 歌单元数据 + 曲目，用于链接直解与「查看歌单」。
 pub async fn fetch_playlist(id: &str) -> Result<(Playlist, Vec<SongInfo>), FetchError> {
-    let url = format!("{REFERER}api/v3/playlist/detail?id={id}&n=1000&s=0");
+    let url = format!("{REFERER}api/v3/playlist/detail?id={id}&n=0&s=0");
     let json = get_json(&url).await?;
     let detail = &json["playlist"];
     let name = detail["name"]
@@ -181,12 +181,9 @@ pub async fn fetch_playlist(id: &str) -> Result<(Playlist, Vec<SongInfo>), Fetch
     if name.is_empty() {
         return Err(FetchError::NotFound);
     }
-    let songs = detail["tracks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(search::parse_song)
-        .collect::<Vec<_>>();
+    // 曲目走 playlist::songs_from_detail：`playlist.tracks` 对收藏来的歌单只给
+    // 前 20 首，完整列表在 `trackIds`。复用同一条路径，链接直解才不会少歌。
+    let songs = super::playlist::songs_from_detail(detail).await?;
     let mut playlist = Playlist::new(id, name, SourceId::Wy);
     playlist.cover_url = non_empty_string(&detail["coverImgUrl"]);
     playlist.description = non_empty_string(&detail["description"]);

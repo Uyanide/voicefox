@@ -1,45 +1,56 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::storage::{CustomPlaylist, Storage};
+use crate::storage::Storage;
 
 use lx_core::model::source::SourceId;
-use lx_core::sync::{SyncCollection, SyncCollectionKind, SyncEngine, SyncOptions};
+use lx_core::sync::{SyncCollection, SyncCollectionKind, SyncCollectionSet};
 use lx_source::sync::provider;
 
+/// 一次远程集合刷新的结果。
+///
+/// 网易云歌单现在是「只读镜像进远程缓存」，不再往本地建歌单、也不再往远端
+/// 推送，所以这里只描述读到了什么、相对缓存变了多少。
 #[derive(Debug, Default, Clone)]
 pub struct NeteaseSyncReport {
-    pub playlists_created: usize,
-    pub playlists_pulled: usize,
-    pub songs_pulled: usize,
-    pub songs_pushed: usize,
-    pub favorites_pulled: usize,
-    pub favorites_pushed: usize,
-    pub unmatched: usize,
-    pub failed: usize,
+    pub playlists: usize,
+    pub favorites: usize,
+    pub songs: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    /// 本次未取到、保留旧缓存的歌单：(名称, 原因)。
+    pub failed: Vec<(String, String)>,
 }
+
+/// 预览里的单个歌单。
 #[derive(Debug, Clone, Default)]
 pub struct PlaylistDiff {
     pub name: String,
-    pub upload: usize,
-    pub download: usize,
-    pub matched: usize,
-    pub unmatched: usize,
-    pub mapping: String,
+    /// "歌单" 或 "红心"。
+    pub kind: String,
+    /// 缓存里已有的歌曲数（没有则为 0）。
+    pub cached: usize,
+    /// 本次远端返回的歌曲数。
+    pub remote: usize,
+    /// "新增" / "更新" / "相同"。
+    pub status: String,
 }
+
 #[derive(Debug, Clone, Default)]
 pub struct NeteaseSyncPreview {
-    pub playlists: Vec<PlaylistDiff>,
-    pub upload: usize,
-    pub download: usize,
-    pub matched: usize,
-    pub unmatched: usize,
-    pub favorites_upload: usize,
-    pub favorites_download: usize,
-    pub remote_only: usize,
-    pub local_only: usize,
-    pub unmatched_songs: Vec<(String, String)>,
+    pub playlists: usize,
+    pub favorites: usize,
+    pub songs: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    /// 本次未取到、将保留旧缓存的歌单：(名称, 原因)。
+    pub failed: Vec<(String, String)>,
+    pub rows: Vec<PlaylistDiff>,
 }
+
 #[derive(Debug, Clone, Default)]
 pub struct SyncControl {
     pub cancelled: Arc<AtomicBool>,
@@ -66,261 +77,169 @@ impl SyncControl {
         )
     }
 }
-fn local_collection(p: &CustomPlaylist) -> SyncCollection {
-    SyncCollection {
-        kind: SyncCollectionKind::Playlist,
-        id: p.id.clone(),
-        name: p.name.clone(),
-        source: SourceId::Local,
-        songs: p.songs.clone(),
+
+/// 远端集合相对当前缓存的差异统计。
+fn diff_against_cache(remote: &[SyncCollection]) -> (usize, usize, usize) {
+    crate::remote_cache::with_netease(|cached| {
+        let cached_by_id: HashMap<&str, &SyncCollection> =
+            cached.iter().map(|item| (item.id.as_str(), item)).collect();
+        let mut added = 0;
+        let mut updated = 0;
+        for collection in remote {
+            match cached_by_id.get(collection.id.as_str()) {
+                None => added += 1,
+                Some(existing)
+                    if existing.songs.len() != collection.songs.len()
+                        || existing.name != collection.name =>
+                {
+                    updated += 1
+                }
+                Some(_) => {}
+            }
+        }
+        let removed = cached
+            .iter()
+            .filter(|existing| !remote.iter().any(|collection| collection.id == existing.id))
+            .count();
+        (added, updated, removed)
+    })
+}
+
+fn kind_label(kind: SyncCollectionKind) -> &'static str {
+    match kind {
+        SyncCollectionKind::Favorites => "红心",
+        SyncCollectionKind::Playlist => "歌单",
     }
 }
 
+fn diff_rows(set: &SyncCollectionSet) -> Vec<PlaylistDiff> {
+    crate::remote_cache::with_netease(|cached| {
+        set.playlists
+            .iter()
+            .chain(set.favorites.iter())
+            .map(|collection| {
+                let existing = cached.iter().find(|item| item.id == collection.id);
+                let status = match existing {
+                    None => "新增",
+                    Some(item)
+                        if item.songs.len() != collection.songs.len()
+                            || item.name != collection.name =>
+                    {
+                        "更新"
+                    }
+                    Some(_) => "相同",
+                };
+                PlaylistDiff {
+                    name: collection.name.clone(),
+                    kind: kind_label(collection.kind).to_string(),
+                    cached: existing.map(|item| item.songs.len()).unwrap_or_default(),
+                    remote: collection.songs.len(),
+                    status: status.to_string(),
+                }
+            })
+            .collect()
+    })
+}
+
+/// 只读预览：从远端读一次，和缓存比对，说明「确认」之后会发生什么。
+///
+/// 注意这里**不写任何远端数据**，也不再像旧版那样声称会把本地歌单上传到网易云。
 pub async fn preview_source(
-    storage: &Storage,
+    _storage: &Storage,
     source: SourceId,
 ) -> Result<NeteaseSyncPreview, String> {
-    if source == SourceId::Wy {
-        let _ = lx_source::wy::login::refresh().await;
-    }
     let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
-    let remote = provider
-        .list_collections(SyncCollectionKind::Playlist)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut remote_by_id = std::collections::HashMap::new();
-    let mut remote_by_name = std::collections::HashMap::new();
-    for p in remote {
-        remote_by_name.insert(p.name.clone(), p.clone());
-        remote_by_id.insert(p.id.clone(), p);
+    if source != SourceId::Wy {
+        return Err(format!(
+            "{}暂不支持远程歌单同步，当前仅支持网易云音乐",
+            source.display_name()
+        ));
     }
-    let locals = storage
-        .custom_playlist_summaries()
-        .into_iter()
-        .filter_map(|s| storage.custom_playlist(&s.id))
-        .collect::<Vec<_>>();
-    let mut out = NeteaseSyncPreview::default();
-    for local in &locals {
-        let mapped = storage.sync_playlist_mapping(source, &local.id);
-        let target = mapped
-            .as_deref()
-            .and_then(|id| remote_by_id.get(id))
-            .or_else(|| remote_by_name.get(&local.name));
-        match target {
-            Some(target) => {
-                let a = SyncEngine::plan(
-                    local_collection(local),
-                    target.clone(),
-                    &SyncOptions::default(),
-                )
-                .map_err(|e| e.to_string())?;
-                let b = SyncEngine::plan(
-                    target.clone(),
-                    local_collection(local),
-                    &SyncOptions::default(),
-                )
-                .map_err(|e| e.to_string())?;
-                let upload = a.additions_count();
-                let download = b.additions_count();
-                let unmatched = a.unmatched.len() + b.unmatched.len();
-                out.upload += upload;
-                out.download += download;
-                out.matched += a.matched_count();
-                out.unmatched += unmatched;
-                for song in a.unmatched.iter().chain(b.unmatched.iter()) {
-                    if out.unmatched_songs.len() < 100 {
-                        out.unmatched_songs
-                            .push((song.name.clone(), song.singer.clone()));
-                    }
-                }
-                out.playlists.push(PlaylistDiff {
-                    name: local.name.clone(),
-                    upload,
-                    download,
-                    matched: a.matched_count(),
-                    unmatched,
-                    mapping: if mapped.is_some() {
-                        "已绑定".into()
-                    } else {
-                        "名称匹配".into()
-                    },
-                });
-            }
-            None => {
-                out.local_only += 1;
-                out.upload += local.songs.len();
-                out.playlists.push(PlaylistDiff {
-                    name: local.name.clone(),
-                    upload: local.songs.len(),
-                    ..Default::default()
-                });
-            }
-        }
+    // 会话有效性预检：已失效时立刻给出可操作的提示，不必等几十次请求跑完。
+    // 网络错误无法判定失效（`refresh` 返回 Err），交给后续接口报真正的错误。
+    if let Ok(false) = lx_source::wy::login::refresh().await {
+        return Err("网易云登录已失效，请重新扫码登录".into());
     }
-    for remote in remote_by_name.values() {
-        if remote.name != "我喜欢"
-            && !locals.iter().any(|p| {
-                p.name == remote.name
-                    || storage.sync_playlist_mapping(source, &p.id).as_deref() == Some(&remote.id)
-            })
-        {
-            out.remote_only += 1;
-            out.download += remote.songs.len();
-        }
-    }
-    let rf = provider
-        .list_collections(SyncCollectionKind::Favorites)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "网易云未找到“我喜欢”".to_string())?;
-    let lf = SyncCollection {
-        kind: SyncCollectionKind::Favorites,
-        id: "local:favorites".into(),
-        name: "本地收藏".into(),
-        source: SourceId::Local,
-        songs: storage.load_favorites(),
-    };
-    let a = SyncEngine::plan(lf.clone(), rf.clone(), &SyncOptions::default())
-        .map_err(|e| e.to_string())?;
-    let b = SyncEngine::plan(rf, lf, &SyncOptions::default()).map_err(|e| e.to_string())?;
-    out.favorites_upload = a.additions_count();
-    out.favorites_download = b.additions_count();
-    out.unmatched += a.unmatched.len() + b.unmatched.len();
-    for song in a.unmatched.iter().chain(b.unmatched.iter()) {
-        if out.unmatched_songs.len() < 100 {
-            out.unmatched_songs
-                .push((song.name.clone(), song.singer.clone()));
-        }
-    }
-    Ok(out)
+    let set = provider.collect_all().await.map_err(|e| e.to_string())?;
+    let songs = set
+        .playlists
+        .iter()
+        .chain(set.favorites.iter())
+        .map(|collection| collection.songs.len())
+        .sum();
+    let (added, updated, removed) = diff_against_cache(&set.playlists);
+    Ok(NeteaseSyncPreview {
+        playlists: set.playlists.len(),
+        favorites: set.favorites.len(),
+        songs,
+        added,
+        updated,
+        removed,
+        failed: set.failed.clone(),
+        rows: diff_rows(&set),
+    })
 }
+
+/// 执行刷新：把远端歌单写入远程缓存。
+///
+/// 完整性约定：只有全部歌单都拉取成功时才整体替换缓存（这样远端删掉的歌单会
+/// 跟着消失）；只要有一个歌单失败就退化为按 id 增量合并，失败歌单保留缓存里的
+/// 旧数据 —— 绝不能因为一次频控就把用户已缓存的歌单清空。
 pub async fn sync_source_with_control(
-    storage: &Storage,
+    _storage: &Storage,
     source: SourceId,
     control: &SyncControl,
 ) -> Result<NeteaseSyncReport, String> {
     let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
-    let remote = provider
-        .list_collections(SyncCollectionKind::Playlist)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut by_id = std::collections::HashMap::new();
-    let mut by_name = std::collections::HashMap::new();
-    for p in remote {
-        by_name.insert(p.name.clone(), p.clone());
-        by_id.insert(p.id.clone(), p);
+    if source != SourceId::Wy {
+        return Err(format!(
+            "{}暂不支持远程歌单同步，当前仅支持网易云音乐",
+            source.display_name()
+        ));
     }
-    let locals = storage
-        .custom_playlist_summaries()
-        .into_iter()
-        .filter_map(|s| storage.custom_playlist(&s.id))
-        .collect::<Vec<_>>();
-    control.set_total(
-        locals.iter().map(|p| p.songs.len()).sum::<usize>()
-            + by_name
-                .values()
-                .filter(|p| p.name != "我喜欢")
-                .map(|p| p.songs.len())
-                .sum::<usize>(),
-    );
-    let mut report = NeteaseSyncReport::default();
-    for remote in by_name.values() {
+
+    let set = provider.collect_all().await.map_err(|e| e.to_string())?;
+    let complete = set.is_complete();
+    let failed = set.failed.clone();
+    let playlists = set.playlists.len();
+    let favorites = set.favorites.len();
+    let songs = set
+        .playlists
+        .iter()
+        .chain(set.favorites.iter())
+        .map(|collection| collection.songs.len())
+        .sum();
+    let (added, updated, removed) = diff_against_cache(&set.playlists);
+
+    control.set_total(songs);
+    if control.is_cancelled() {
+        return Err("同步已取消".into());
+    }
+
+    let all = set.into_all();
+    if complete {
+        crate::remote_cache::replace_netease(all);
+    } else {
+        crate::remote_cache::merge_netease(all);
+    }
+
+    for collection in crate::remote_cache::all_netease() {
         if control.is_cancelled() {
             return Err("同步已取消".into());
         }
-        if remote.name == "我喜欢" {
-            continue;
-        }
-        let local = locals
-            .iter()
-            .find(|p| storage.sync_playlist_mapping(source, &p.id).as_deref() == Some(&remote.id))
-            .cloned()
-            .or_else(|| locals.iter().find(|p| p.name == remote.name).cloned());
-        let local = match local {
-            Some(p) => p,
-            None => {
-                report.playlists_created += 1;
-                storage
-                    .create_custom_playlist(&remote.name)
-                    .map_err(|e| e.to_string())?
-            }
-        };
-        let (added, _) = storage
-            .add_songs_to_custom_playlist(&local.id, &remote.songs)
-            .map_err(|e| e.to_string())?;
-        report.songs_pulled += added;
-        report.playlists_pulled += 1;
-        storage
-            .set_sync_playlist_mapping(source, &local.id, &remote.id)
-            .map_err(|e| e.to_string())?;
-        for _ in &remote.songs {
+        for _ in &collection.songs {
             control.inc();
         }
     }
-    for local in locals {
-        if control.is_cancelled() {
-            return Err("同步已取消".into());
-        }
-        let target = storage
-            .sync_playlist_mapping(source, &local.id)
-            .and_then(|id| by_id.get(&id).cloned())
-            .or_else(|| by_name.get(&local.name).cloned());
-        let target = match target {
-            Some(p) => p,
-            None => {
-                report.playlists_created += 1;
-                provider
-                    .create_collection(SyncCollectionKind::Playlist, &local.name)
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
-        };
-        storage
-            .set_sync_playlist_mapping(source, &local.id, &target.id)
-            .map_err(|e| e.to_string())?;
-        let plan = SyncEngine::plan(local_collection(&local), target, &SyncOptions::default())
-            .map_err(|e| e.to_string())?;
-        report.unmatched += plan.unmatched.len();
-        let result = SyncEngine::execute(provider.as_ref(), &plan, &SyncOptions::default(), false)
-            .await
-            .map_err(|e| e.to_string())?;
-        report.songs_pushed += result.added;
-        report.failed += result.failed.len();
-        for _ in &local.songs {
-            control.inc();
-        }
-    }
-    let rf = provider
-        .list_collections(SyncCollectionKind::Favorites)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "网易云未找到“我喜欢”".to_string())?;
-    for song in &rf.songs {
-        if control.is_cancelled() {
-            return Err("同步已取消".into());
-        }
-        if storage.add_favorite(song) {
-            report.favorites_pulled += 1
-        }
-        control.inc();
-    }
-    let lf = SyncCollection {
-        kind: SyncCollectionKind::Favorites,
-        id: "local:favorites".into(),
-        name: "本地收藏".into(),
-        source: SourceId::Local,
-        songs: storage.load_favorites(),
-    };
-    let plan = SyncEngine::plan(lf, rf, &SyncOptions::default()).map_err(|e| e.to_string())?;
-    report.unmatched += plan.unmatched.len();
-    report.favorites_pushed =
-        SyncEngine::execute(provider.as_ref(), &plan, &SyncOptions::default(), false)
-            .await
-            .map_err(|e| e.to_string())?
-            .added;
-    Ok(report)
+
+    Ok(NeteaseSyncReport {
+        playlists,
+        favorites,
+        songs,
+        added,
+        // 增量合并时远端已删除的歌单不会被移除，所以不能报告 removed。
+        updated,
+        removed: if complete { removed } else { 0 },
+        failed,
+    })
 }

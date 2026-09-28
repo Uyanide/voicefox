@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
-use lx_core::sync::{SyncCollection, SyncCollectionKind, SyncError, SyncProvider};
+use lx_core::sync::{
+    SyncCollection, SyncCollectionKind, SyncCollectionSet, SyncError, SyncProvider,
+};
 use lx_core::traits::source::MusicSource;
 
 use crate::http;
@@ -18,6 +20,13 @@ pub struct WySyncProvider {
 }
 pub struct TxSyncProvider {
     source: tx::TxSource,
+}
+
+/// 网易云一次拉取的结果：普通歌单、红心歌单，以及逐个失败的歌单。
+struct WyCollections {
+    playlists: Vec<SyncCollection>,
+    favorites: Vec<SyncCollection>,
+    failed: Vec<(String, String)>,
 }
 
 impl Default for WySyncProvider {
@@ -32,7 +41,57 @@ impl WySyncProvider {
             source: wy::WySource::new(),
         }
     }
+
+    /// 拉取全部用户歌单及其歌曲，并按「红心 / 普通」分类。
+    ///
+    /// 一次拉取同时喂给 `list_collections` 与 `collect_all`：网易云的红心歌单
+    /// 本来就是同一份 `api/user/playlist` 里 `specialType=5` 的那一条，按 kind
+    /// 各拉一遍等于把整份歌单 + 全部详情重复请求一次。
+    ///
+    /// 单个歌单详情失败（例如已被删除、区域限制、或退避后仍被频控）只跳过该
+    /// 歌单并记进 `failed`，不影响其余歌单：调用方拿到 `failed` 后会走增量合并，
+    /// 这些歌单在缓存里的旧数据得以保留。
+    async fn fetch_user_collections(&self) -> Result<WyCollections, SyncError> {
+        if !self.source.is_logged_in() {
+            return Err(SyncError::NotLoggedIn(self.source_name().into()));
+        }
+        let playlists = wy::playlist::get_all_user_playlists()
+            .await
+            .map_err(map_error)?;
+        let mut normal = Vec::with_capacity(playlists.len());
+        let mut favorites = Vec::new();
+        let mut failed = Vec::new();
+        for playlist in playlists {
+            // 红心歌单不能再当成普通歌单返回，否则它会同时以两种 kind 进入缓存。
+            let is_favorites = wy::playlist::is_favorites(&playlist);
+            match wy::playlist::get_detail(&playlist.id, 0).await {
+                Ok(songs) => {
+                    let kind = if is_favorites {
+                        SyncCollectionKind::Favorites
+                    } else {
+                        SyncCollectionKind::Playlist
+                    };
+                    let collection = collection_from(kind, playlist, songs);
+                    if is_favorites {
+                        favorites.push(collection);
+                    } else {
+                        normal.push(collection);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("网易云歌单「{}」拉取失败: {error}", playlist.name);
+                    failed.push((playlist.name, error.to_string()));
+                }
+            }
+        }
+        Ok(WyCollections {
+            playlists: normal,
+            favorites,
+            failed,
+        })
+    }
 }
+
 impl Default for TxSyncProvider {
     fn default() -> Self {
         Self::new()
@@ -78,27 +137,21 @@ impl SyncProvider for WySyncProvider {
         &self,
         kind: SyncCollectionKind,
     ) -> Result<Vec<SyncCollection>, SyncError> {
-        if !self.source.is_logged_in() {
-            return Err(SyncError::NotLoggedIn(self.source_name().into()));
-        }
-        let playlists = wy::playlist::get_user_playlists(1, 100)
-            .await
-            .map_err(map_error)?;
-        let selected = match kind {
-            SyncCollectionKind::Playlist => playlists,
-            SyncCollectionKind::Favorites => playlists
-                .into_iter()
-                .filter(|p| p.name == "我喜欢")
-                .collect(),
-        };
-        let mut result = Vec::with_capacity(selected.len());
-        for playlist in selected {
-            let songs = wy::playlist::get_detail(&playlist.id, 0)
-                .await
-                .unwrap_or_default();
-            result.push(collection_from(kind, playlist, songs));
-        }
-        Ok(result)
+        let mut collections = self.fetch_user_collections().await?;
+        Ok(match kind {
+            SyncCollectionKind::Playlist => std::mem::take(&mut collections.playlists),
+            SyncCollectionKind::Favorites => std::mem::take(&mut collections.favorites),
+        })
+    }
+
+    /// 覆写默认实现，避免把用户歌单与全部详情拉两遍（会触发网易云频控）。
+    async fn collect_all(&self) -> Result<SyncCollectionSet, SyncError> {
+        let collections = self.fetch_user_collections().await?;
+        Ok(SyncCollectionSet {
+            playlists: collections.playlists,
+            favorites: collections.favorites,
+            failed: collections.failed,
+        })
     }
 
     async fn get_collection(

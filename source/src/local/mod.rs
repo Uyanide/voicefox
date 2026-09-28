@@ -148,8 +148,10 @@ impl LocalSource {
             source: self,
             generation,
         };
-        // Clone the previous snapshot before metadata I/O. Unchanged files can then reuse
-        // their parsed tags and embedded-cover path instead of being parsed again.
+        // 快照只克隆 Arc 句柄（廉价）。旧代码在这里把整库深拷贝成 all_songs，
+        // 但循环里被重扫的根目录会整组覆盖，监听器触发的重扫等于白白复制整个
+        // 曲库。现在只把本次真正重扫的根目录写进新快照，其余条目在循环结束后
+        // 才按需搬入（见下方补全逻辑），未变化的条目因此只复制一次。
         let previous_songs = self.songs.read().unwrap_or_else(|e| e.into_inner()).clone();
         let previous_fingerprints = self
             .fingerprints
@@ -166,10 +168,10 @@ impl LocalSource {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut all_songs: HashMap<PathBuf, Vec<LocalSong>> = previous_songs.as_ref().clone();
-        let mut all_fingerprints = previous_fingerprints.as_ref().clone();
+        let mut all_songs: HashMap<PathBuf, Vec<LocalSong>> = HashMap::new();
+        let mut all_fingerprints: HashMap<PathBuf, scanner::FileFingerprint> = HashMap::new();
         let mut failures = Vec::new();
-        let mut signatures = previous_signatures.clone();
+        let mut signatures: HashMap<PathBuf, scanner::DirSignature> = HashMap::new();
         let mut missing = previous_missing
             .iter()
             .filter(|item| !item.path.exists())
@@ -207,13 +209,9 @@ impl LocalSource {
                 && *previous == current
                 && previous_songs.contains_key(&root)
             {
+                // 歌曲与指纹都不在这里复制：它们未变化，交给循环结束后的补全
+                // 逻辑从快照里各搬一次（旧代码会先把整库深拷贝一遍）。
                 reused += previous_songs[&root].len();
-                all_fingerprints.extend(
-                    previous_fingerprints
-                        .iter()
-                        .filter(|(file, _)| file.starts_with(&root))
-                        .map(|(file, fingerprint)| (file.clone(), *fingerprint)),
-                );
                 signatures.insert(root, current);
                 continue;
             }
@@ -282,6 +280,22 @@ impl LocalSource {
 
         if self.scan_generation.load(Ordering::SeqCst) != generation {
             return errors;
+        }
+        // 补全本次没有重扫的根目录（未纳入 paths 的旧目录、命中快路径的目录、
+        // 以及临时不可用的目录）与它们的指纹、目录签名，保持快照内容与旧实现
+        // 完全一致；只有这里会复制未变化的条目，且每个条目只复制一次。
+        for (root, songs) in previous_songs.iter() {
+            if !all_songs.contains_key(root) {
+                all_songs.insert(root.clone(), songs.clone());
+            }
+        }
+        for (file, fingerprint) in previous_fingerprints.iter() {
+            if !all_fingerprints.contains_key(file) {
+                all_fingerprints.insert(file.clone(), *fingerprint);
+            }
+        }
+        for (root, signature) in previous_signatures {
+            signatures.entry(root).or_insert(signature);
         }
         let present = all_fingerprints
             .keys()

@@ -176,14 +176,14 @@ impl SourceSelector {
             self.close();
             return None;
         }
-        let inner = Rect::new(
-            popup.x + 1,
-            popup.y + 1,
-            popup.width.saturating_sub(2),
-            popup.height.saturating_sub(3),
-        );
-        if inner.contains((event.column, event.row).into()) {
-            let index = event.row.saturating_sub(inner.y) as usize;
+        let inner = Block::default().borders(Borders::ALL).inner(popup);
+        let visible = inner.height.saturating_sub(1) as usize;
+        // 与 render_popup 用同一套窗口推导：列表首行下标 = selected 反向滚动出的 start。
+        // 少了这个偏移，start > 0 时点中的行会和实际行错位。
+        let start = self.selected.saturating_sub(visible.saturating_sub(1));
+        let list = Rect::new(inner.x, inner.y, inner.width, visible as u16);
+        if list.contains((event.column, event.row).into()) {
+            let index = start + event.row.saturating_sub(inner.y) as usize;
             if index < self.items.len() {
                 self.selected = index;
                 self.close();

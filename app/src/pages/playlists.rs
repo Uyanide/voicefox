@@ -1065,6 +1065,9 @@ impl PlaylistsPage {
     }
 
     fn render_playlists(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        // 正在输入的关键字也要显示出来，否则用户看不到自己打了什么，
+        // 输入法候选框也没有可依附的位置。
+        let search_prefix = "歌单搜索：";
         let title = if self.is_custom_scope() {
             format!("自建歌单 ({}) [c/e/d]", self.playlists.len())
         } else if self.is_favorites_scope() {
@@ -1079,8 +1082,13 @@ impl PlaylistsPage {
             } else {
                 ""
             };
-            if let Some(keyword) = &self.search_keyword {
-                format!("歌单搜索：{} ({}){}", keyword, self.playlists.len(), suffix)
+            if let Some(input) = &self.search_input {
+                format!("{search_prefix}{input} ({}){suffix}", self.playlists.len())
+            } else if let Some(keyword) = &self.search_keyword {
+                format!(
+                    "{search_prefix}{keyword} ({}){suffix}",
+                    self.playlists.len()
+                )
             } else {
                 format!(
                     "热门歌单 ({}，第 {} 页){}",
@@ -1096,6 +1104,14 @@ impl PlaylistsPage {
             .title(title);
         let inner = block.inner(area);
         block.render(area, buf);
+        if let Some(input) = &self.search_input {
+            // 插入点 = 标题内 + "歌单搜索：" + 已输入文本（去掉左右边框各一列）。
+            crate::ui_cursor::request_after(
+                Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
+                search_prefix,
+                input,
+            );
+        }
 
         if self.selected_playlist.is_none() {
             if let Some(error) = &self.error_message
@@ -1306,16 +1322,16 @@ impl PlaylistsPage {
                 .title(title);
             let inner = block.inner(dialog);
             block.render(dialog, buf);
-            Paragraph::new(name_input_with_cursor(
-                &self.name_input_value,
-                inner.width as usize,
-            ))
-            .style(
-                Style::new()
-                    .bg(crate::theme::surface0(ctx))
-                    .fg(crate::theme::text(ctx)),
-            )
-            .render(inner, buf);
+            let shown = name_input_display(&self.name_input_value, inner.width as usize);
+            Paragraph::new(shown.clone())
+                .style(
+                    Style::new()
+                        .bg(crate::theme::surface0(ctx))
+                        .fg(crate::theme::text(ctx)),
+                )
+                .render(inner, buf);
+            // 宽度不足时显示的是文本尾部，插入点就在显示出来的尾部之后。
+            crate::ui_cursor::request_after(inner, "", &shown);
             return;
         }
 
@@ -1659,7 +1675,12 @@ fn centered_dialog(area: Rect, max_width: u16, height: u16) -> Rect {
     )
 }
 
-fn name_input_with_cursor(value: &str, width: usize) -> String {
+/// 输入框宽度不足时，从尾部开始显示能放下的文本。
+///
+/// 只返回文本本身：光标由终端绘制（见 `ui_cursor`），这样输入法候选框才会跟着
+/// 插入点走；以前这里额外拼一个 `█` 当软件光标，会和终端光标重影。
+/// 仍然保留最后一列不用，避免插入点落在最右侧列上。
+fn name_input_display(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
@@ -1675,7 +1696,7 @@ fn name_input_with_cursor(value: &str, width: usize) -> String {
         visible.push(character);
     }
     visible.reverse();
-    visible.into_iter().chain(std::iter::once('█')).collect()
+    visible.into_iter().collect()
 }
 
 fn ensure_visible(selected: usize, visible: usize, total: usize, offset: &mut usize) {
@@ -1994,9 +2015,11 @@ mod tests {
     }
 
     #[test]
-    fn long_playlist_names_keep_the_cursor_visible() {
-        assert_eq!(super::name_input_with_cursor("abcdefgh", 7), "cdefgh█");
-        assert_eq!(super::name_input_with_cursor("一二三四五", 7), "三四五█");
-        assert_eq!(super::name_input_with_cursor("name", 0), "");
+    fn long_playlist_names_show_their_tail() {
+        // 宽度不足时保留尾部，并留出最后一列给终端光标（光标由 ui_cursor 定位）。
+        assert_eq!(super::name_input_display("abcdefgh", 7), "cdefgh");
+        assert_eq!(super::name_input_display("一二三四五", 7), "三四五");
+        assert_eq!(super::name_input_display("name", 0), "");
+        assert_eq!(super::name_input_display("abc", 10), "abc");
     }
 }

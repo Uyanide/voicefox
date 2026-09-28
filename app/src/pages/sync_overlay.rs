@@ -152,65 +152,57 @@ impl SyncOverlay {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut lines = Vec::new();
         match s.phase {
-            SyncPhase::Preparing => {
-                lines.push(Line::from("正在读取网易云与本地歌单并计算 Diff..."))
-            }
+            SyncPhase::Preparing => lines.push(Line::from("正在读取网易云远程歌单并与缓存比对...")),
             SyncPhase::Preview => {
                 if let Some(p) = s.preview {
                     lines.push(Line::from(Span::styled(
-                        "本次不会修改任何数据。确认后才执行。",
+                        "本次只把网易云歌单读进远程缓存，不会修改任何远端或本地数据。",
                         Style::new().add_modifier(Modifier::BOLD),
                     )));
                     lines.push(Line::from(""));
                     lines.push(Line::from(format!(
-                        "↑ 上传到{}  {} 首",
-                        self.source.display_name(),
-                        p.upload
+                        "远程歌单   {} 个 · 红心 {} 个",
+                        p.playlists, p.favorites
                     )));
-                    lines.push(Line::from(format!("↓ 下载到本地      {} 首", p.download)));
-                    lines.push(Line::from(format!("= 已匹配          {} 首", p.matched)));
-                    lines.push(Line::from(format!("? 未匹配          {} 首", p.unmatched)));
+                    lines.push(Line::from(format!("歌曲合计   {} 首", p.songs)));
                     lines.push(Line::from(format!(
-                        "收藏：↑ {} / ↓ {}",
-                        p.favorites_upload, p.favorites_download
+                        "缓存变化   新增 {} · 更新 {} · 移除 {}",
+                        p.added, p.updated, p.removed
                     )));
-                    lines.push(Line::from(format!(
-                        "歌单：名称映射 {} 个，本地独有 {}，网易云独有 {}",
-                        p.playlists.len().saturating_sub(p.local_only),
-                        p.local_only,
-                        p.remote_only
-                    )));
-                    lines.push(Line::from(""));
-                    for d in p
-                        .playlists
-                        .iter()
-                        .take(inner.height.saturating_sub(10) as usize)
-                    {
-                        lines.push(Line::from(format!(
-                            "  {}  ↑{} ↓{} ={} ?{} [{}]",
-                            d.name, d.upload, d.download, d.matched, d.unmatched, d.mapping
+                    if !p.failed.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            format!("未取到 {} 个歌单，将保留缓存里的旧数据", p.failed.len()),
+                            Style::new().fg(crate::theme::yellow(ctx)),
                         )));
                     }
-                    if !p.unmatched_songs.is_empty() {
+                    lines.push(Line::from(""));
+                    let room = inner
+                        .height
+                        .saturating_sub(8 + p.failed.len().min(5) as u16)
+                        as usize;
+                    for d in p.rows.iter().take(room) {
+                        lines.push(Line::from(format!(
+                            "  {} {}  {}→{}  [{}]",
+                            d.kind, d.name, d.cached, d.remote, d.status
+                        )));
+                    }
+                    if !p.failed.is_empty() {
                         lines.push(Line::from(""));
-                        lines.push(Line::from("未匹配歌曲："));
-                        for (name, singer) in p.unmatched_songs.iter().take(5) {
-                            lines.push(Line::from(format!("  ? {} — {}", name, singer)));
+                        lines.push(Line::from("未取到的歌单："));
+                        for (name, reason) in p.failed.iter().take(5) {
+                            lines.push(Line::from(format!("  ? {name} — {reason}")));
                         }
-                        if p.unmatched_songs.len() > 5 {
-                            lines.push(Line::from(format!(
-                                "  ... 还有 {} 首",
-                                p.unmatched_songs.len() - 5
-                            )));
+                        if p.failed.len() > 5 {
+                            lines.push(Line::from(format!("  ... 还有 {} 个", p.failed.len() - 5)));
                         }
                     }
                     lines.push(Line::from(""));
-                    lines.push(Line::from("[Enter/S] 确认执行    [Esc] 取消"));
+                    lines.push(Line::from("[Enter/S] 确认刷新    [Esc] 取消"));
                 }
             }
             SyncPhase::Running => {
                 let (done, total) = self.control.progress();
-                lines.push(Line::from("正在同步，不会自动删除歌曲。"));
+                lines.push(Line::from("正在从网易云读取远程歌单，不会写入本地歌单。"));
                 lines.push(Line::from(format!("进度  {done}/{total}")));
                 let width = inner.width.saturating_sub(4) as usize;
                 let filled = if total == 0 {
@@ -227,15 +219,24 @@ impl SyncOverlay {
             }
             SyncPhase::Done => {
                 if let Some(r) = s.report {
-                    lines.push(Line::from("网易云同步完成"));
+                    lines.push(Line::from("网易云远程歌单已刷新"));
                     lines.push(Line::from(format!(
-                        "歌单创建 {} · 拉取 {} · 推送 {}",
-                        r.playlists_created, r.songs_pulled, r.songs_pushed
+                        "歌单 {} 个 · 红心 {} 个 · 歌曲 {} 首",
+                        r.playlists, r.favorites, r.songs
                     )));
                     lines.push(Line::from(format!(
-                        "收藏拉取 {} · 收藏推送 {} · 未匹配 {}",
-                        r.favorites_pulled, r.favorites_pushed, r.unmatched
+                        "新增 {} · 更新 {} · 移除 {}",
+                        r.added, r.updated, r.removed
                     )));
+                    if !r.failed.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            format!("{} 个歌单未取到，已保留缓存里的旧数据", r.failed.len()),
+                            Style::new().fg(crate::theme::yellow(ctx)),
+                        )));
+                        for (name, reason) in r.failed.iter().take(5) {
+                            lines.push(Line::from(format!("  ? {name} — {reason}")));
+                        }
+                    }
                     lines.push(Line::from("[Enter/Esc] 返回"));
                 }
             }

@@ -78,6 +78,9 @@ pub fn load(custom_path: &str) -> anyhow::Result<(Config, PathBuf)> {
             if migrate_legacy_config(&mut config) {
                 save(&config, &config_path)?;
             }
+            // 认不出来的主题色值会在渲染时静默回退，这里集中提示一次，
+            // 免得用户以为"改了配置却没生效"。
+            crate::theme::warn_unrecognized(&config.theme);
             Ok((config, config_path))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

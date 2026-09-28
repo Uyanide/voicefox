@@ -9,7 +9,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
@@ -24,10 +24,26 @@ pub struct FavoritesPage {
     sources: Vec<SourceId>,
     source_index: usize,
     source_selector: Option<SourceSelector>,
+    remote_menu: Option<(Position, usize)>,
+    /// 上一次渲染时的页面区域；右键菜单的定位与命中判定共用它，
+    /// 否则「渲染时贴边内缩、点击时用原始坐标」会让点中的条目错位。
+    last_area: Rect,
 }
+
+/// 网易云收藏右键菜单的条目。渲染与命中判定共用这一份，
+/// 避免两边各写一套行偏移（曾经因此点「登录」却触发了「刷新」）。
+const REMOTE_MENU_ITEMS: [&str; 3] = ["登录 / 重新登录网易云", "刷新网易云收藏", "关闭"];
+const REMOTE_MENU_WIDTH: u16 = 28;
+/// 上下边框各 1 行 + 3 个条目。
+const REMOTE_MENU_HEIGHT: u16 = 5;
 
 impl FavoritesPage {
     pub fn new(sources: Vec<SourceId>) -> Self {
+        let source_index = sources
+            .iter()
+            .position(|source| *source == SourceId::Wy)
+            .map(|index| index + 1)
+            .unwrap_or(0);
         Self {
             selected: 0,
             scroll: 0,
@@ -35,8 +51,11 @@ impl FavoritesPage {
             viewport_height: 1,
             sort_mode: SortMode::Newest,
             sources: sources.clone(),
-            source_index: 0,
+            // 收藏页默认展示网易云收藏；其他音源仍可通过 P 切换。
+            source_index,
             source_selector: Some(SourceSelector::from_sources(&sources, true)),
+            remote_menu: None,
+            last_area: Rect::default(),
         }
     }
 
@@ -57,6 +76,99 @@ impl FavoritesPage {
         self.selected = 0;
         self.scroll = 0;
         self.sort_mode
+    }
+
+    /// 打开右键菜单。
+    ///
+    /// 这里就把菜单左上角夹进页面范围内并记下来，渲染和命中判定都直接用这个
+    /// 坐标：之前渲染会贴边内缩、而点击用的是原始右键坐标，靠边一点就会错位。
+    pub fn open_remote_menu(&mut self, origin: Position) {
+        let area = self.last_area;
+        let (x, y) = if area.width >= REMOTE_MENU_WIDTH && area.height >= REMOTE_MENU_HEIGHT {
+            (
+                origin.x.min(area.right().saturating_sub(REMOTE_MENU_WIDTH)),
+                origin
+                    .y
+                    .min(area.bottom().saturating_sub(REMOTE_MENU_HEIGHT)),
+            )
+        } else {
+            (origin.x, origin.y)
+        };
+        self.remote_menu = Some((Position::new(x, y), 0));
+    }
+
+    pub fn remote_menu_open(&self) -> bool {
+        self.remote_menu.is_some()
+    }
+
+    pub fn handle_remote_menu_mouse(&mut self, event: MouseEvent) -> Option<AppAction> {
+        let Some((origin, selected)) = self.remote_menu else {
+            return None;
+        };
+        let rect = Rect::new(origin.x, origin.y, REMOTE_MENU_WIDTH, REMOTE_MENU_HEIGHT);
+        // 条目区 = 去掉边框后的内部区域。渲染与命中判定共用它，
+        // 就不会再出现「渲染多一行 / 点击少一行」这类错位。
+        let inner = Block::default().borders(Borders::ALL).inner(rect);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if inner.contains(Position::new(event.column, event.row)) =>
+            {
+                let item = event.row.saturating_sub(inner.y) as usize;
+                self.remote_menu = None;
+                if item >= REMOTE_MENU_ITEMS.len() {
+                    return None;
+                }
+                return match REMOTE_MENU_ITEMS[item] {
+                    // 「关闭」：只关菜单（上面已关），不派发动作。
+                    "关闭" => None,
+                    _ if item == 0 => Some(AppAction::QrLogin(SourceId::Wy)),
+                    _ => Some(AppAction::SyncNetease),
+                };
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
+                self.remote_menu = None;
+            }
+            MouseEventKind::ScrollUp => {
+                self.remote_menu = Some((origin, selected.saturating_sub(1)))
+            }
+            MouseEventKind::ScrollDown => {
+                self.remote_menu = Some((origin, (selected + 1).min(REMOTE_MENU_ITEMS.len() - 1)))
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn render_remote_menu(&self, buf: &mut Buffer, ctx: &AppContext) {
+        let Some((origin, selected)) = self.remote_menu else {
+            return;
+        };
+        // 坐标已在 open_remote_menu 里夹好，这里不再二次内缩。
+        let rect = Rect::new(origin.x, origin.y, REMOTE_MENU_WIDTH, REMOTE_MENU_HEIGHT);
+        Clear.render(rect, buf);
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(crate::theme::accent(ctx)))
+            .title(" 网易云收藏 ")
+            .render(rect, buf);
+        for (index, label) in REMOTE_MENU_ITEMS.iter().enumerate() {
+            let style = if index == selected {
+                Style::new()
+                    .bg(crate::theme::accent(ctx))
+                    .fg(crate::theme::selection_fg(ctx))
+            } else {
+                Style::new().fg(crate::theme::text(ctx))
+            };
+            Paragraph::new(Line::from(Span::styled(format!(" {}", label), style))).render(
+                Rect::new(
+                    rect.x + 1,
+                    rect.y + 1 + index as u16,
+                    rect.width.saturating_sub(2),
+                    1,
+                ),
+                buf,
+            );
+        }
     }
 
     pub fn handle_input(
@@ -420,12 +532,19 @@ impl FavoritesPage {
         let favorites = self.sorted_favorites(ctx, cache);
         let filtered = self.filtered_song_indices(favorites);
         self.clamp_selection(filtered.len());
+        // 记下页面区域：右键菜单的定位与命中判定都要按它夹取，两边必须同源。
+        self.last_area = area;
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(format!(
-                " 收藏 {}/{} · {} · 排序 {} · P 音源 · / 筛选 ",
+                " {}收藏 {}/{} · {} · 排序 {} · P 音源 · 右键管理网易云 · / 筛选 ",
+                if self.current_source() == Some(SourceId::Wy) {
+                    "网易云 "
+                } else {
+                    ""
+                },
                 filtered.len(),
                 favorites.len(),
                 self.current_source()
@@ -472,9 +591,20 @@ impl FavoritesPage {
         self.viewport_height = list.height.max(1) as usize;
 
         if favorites.is_empty() {
-            Paragraph::new("暂无收藏，播放时按 Ctrl+L 或列表中按 f 添加")
+            let message = if self.current_source() == Some(SourceId::Wy) {
+                // 用计数判断而不是克隆整份缓存：这是每帧都会走的渲染路径。
+                if crate::remote_cache::summary_counts().0 == 0 {
+                    "暂无网易云收藏。右键打开菜单：登录 / 重新登录网易云，或刷新网易云收藏。"
+                } else {
+                    "网易云红心歌曲为空。右键刷新网易云收藏。"
+                }
+            } else {
+                "暂无收藏，播放时按 Ctrl+L 或列表中按 f 添加"
+            };
+            Paragraph::new(message)
                 .style(Style::new().fg(crate::theme::muted(ctx)))
                 .render(list, buf);
+            self.render_remote_menu(buf, ctx);
             return;
         }
         if filtered.is_empty() {
@@ -517,6 +647,7 @@ impl FavoritesPage {
             .render(Rect::new(list.x, list.y + row as u16, list.width, 1), buf);
         }
         self.render_source_selector(area, buf, ctx);
+        self.render_remote_menu(buf, ctx);
     }
 
     #[allow(unreachable_code)]
@@ -711,8 +842,15 @@ impl FavoritesPage {
         ctx: &AppContext,
         cache: &'a mut SortedListCache,
     ) -> &'a [SongInfo] {
-        let version = ctx.storage.generation();
         let mode = self.sort_mode;
+        if self.current_source() == Some(SourceId::Wy) {
+            // 网易云收藏不是本地收藏库：直接把远程缓存作为收藏页数据源。
+            let version = crate::remote_cache::generation();
+            return cache.get_or_build(version, mode, SortTarget::Favorites, || {
+                crate::remote_cache::favorites_songs()
+            });
+        }
+        let version = ctx.storage.generation();
         cache.get_or_build(version, mode, SortTarget::Favorites, || {
             ctx.storage.load_favorites()
         })
@@ -801,8 +939,76 @@ impl FavoritesPage {
 mod tests {
     use super::FavoritesPage;
     use crate::pages::sort::{SortMode, SortTarget, sorted_songs};
+    use lx_core::events::AppAction;
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::{Position, Rect};
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// 右键菜单的行命中必须和渲染行一致：曾经点「登录」会触发「刷新」，
+    /// 而「刷新」点了没反应（第一项被当成 0，实际从 origin.y+1 才开始）。
+    #[test]
+    fn remote_menu_maps_each_row_to_its_own_action() {
+        let mut page = FavoritesPage::new(vec![SourceId::Wy, SourceId::Kw]);
+        page.last_area = Rect::new(0, 0, 80, 24);
+        page.open_remote_menu(Position::new(10, 5));
+
+        // 第 1 行（origin.y + 1）= 登录
+        let action = page.handle_remote_menu_mouse(click(12, 6));
+        assert!(
+            matches!(action, Some(AppAction::QrLogin(_))),
+            "第 1 行应当是登录, 实际 {action:?}"
+        );
+        assert!(!page.remote_menu_open(), "点中条目后菜单应关闭");
+
+        // 第 2 行 = 刷新远程歌单
+        page.open_remote_menu(Position::new(10, 5));
+        let action = page.handle_remote_menu_mouse(click(12, 7));
+        assert!(
+            matches!(action, Some(AppAction::SyncNetease)),
+            "第 2 行应当是刷新, 实际 {action:?}"
+        );
+        assert!(!page.remote_menu_open());
+
+        // 第 3 行 = 关闭：只关菜单，不派发动作
+        page.open_remote_menu(Position::new(10, 5));
+        let action = page.handle_remote_menu_mouse(click(12, 8));
+        assert!(action.is_none());
+        assert!(!page.remote_menu_open());
+
+        // 边框行（origin.y）不应被当成任何条目
+        page.open_remote_menu(Position::new(10, 5));
+        let action = page.handle_remote_menu_mouse(click(12, 5));
+        assert!(action.is_none());
+        assert!(!page.remote_menu_open());
+    }
+
+    #[test]
+    fn remote_menu_is_clamped_into_the_page_and_still_hits_correctly() {
+        let mut page = FavoritesPage::new(vec![SourceId::Wy]);
+        page.last_area = Rect::new(0, 0, 80, 24);
+        // 在右下角右键：菜单必须被内缩进页面，点击命中的仍是同样的行。
+        page.open_remote_menu(Position::new(79, 23));
+        let (origin, _) = page.remote_menu.expect("menu open");
+        assert!(
+            origin.y + super::REMOTE_MENU_HEIGHT <= 24,
+            "菜单不能被放到页面外: {origin:?}"
+        );
+        assert!(origin.x + super::REMOTE_MENU_WIDTH <= 80, "{origin:?}");
+
+        // 按内缩后的坐标点第 2 行，仍应拿到 SyncNetease。
+        let action = page.handle_remote_menu_mouse(click(origin.x + 1, origin.y + 2));
+        assert!(matches!(action, Some(AppAction::SyncNetease)));
+    }
 
     #[test]
     fn filters_title_artist_album_and_source() {

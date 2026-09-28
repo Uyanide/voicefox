@@ -103,7 +103,18 @@ embed_cover = true
 save_lyric = true
 
 # [theme] 主题（可选，默认 Catppuccin Mocha；省略该节即使用默认配色）
-# use_dark = true
+#
+# 颜色值支持四种写法：
+#   - 跟随终端： "default"（也接受 reset / terminal / none / transparent / -）
+#                映射到终端自己的默认前景/背景色，配合透明终端可透出壁纸
+#   - 16 色名：  "red"、"light_blue"、"dark_gray" …
+#   - 十六进制： "#cba6f7" 或三位缩写 "#abc"
+#   - 256 色号： "236" 或 "color236"（引用终端调色板）
+#
+# 想让背景跟随终端（透明），把 base 设成 default 即可；面板仍使用各自的
+# surface / mantle 底色，所以透明只作用于最底层：
+# base = "default"
+#
 # accent = "#cba6f7"
 # text = "#cdd6f4"
 # ...

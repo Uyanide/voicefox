@@ -247,14 +247,27 @@ pub async fn add_songs_to_playlist(dirid: &str, songs: &[SongInfo]) -> Result<us
         return Ok(0);
     }
     let uin = super::session::snapshot().user_id.unwrap_or_default();
-    let mids = songs
+    // QQ 按位置配对 midlist 与 typelist：先筛出真正带 songmid 的歌曲，再从同一份
+    // 列表派生两个参数，否则空 id 会让两个列表错位、加错歌曲。
+    let usable = songs
         .iter()
-        .map(|s| s.id.as_str())
+        .filter(|s| !s.id.is_empty())
+        .map(|s| (s.id.as_str(), "13"))
+        .collect::<Vec<_>>();
+    if usable.is_empty() {
+        return Err(FetchError::Other("QQ 添加歌曲缺少 song mid".into()));
+    }
+    let mids = usable
+        .iter()
+        .map(|(mid, _)| *mid)
         .collect::<Vec<_>>()
         .join(",");
-    let typelist = std::iter::repeat_n("13", songs.len())
+    let typelist = usable
+        .iter()
+        .map(|(_, ty)| *ty)
         .collect::<Vec<_>>()
         .join(",");
+    let submitted = usable.len();
     let url = "https://c.y.qq.com/splcloud/fcgi-bin/fcg_music_add2songdir.fcg?g_tk=5381";
     let response: Value = super::with_cookie(http::client().get(url))
         .header("Referer", "https://y.qq.com/n/yqq/playlist")
@@ -277,7 +290,7 @@ pub async fn add_songs_to_playlist(dirid: &str, songs: &[SongInfo]) -> Result<us
         .await
         .map_err(|e| FetchError::Parse(e.to_string()))?;
     match response["code"].as_i64() {
-        Some(0) => Ok(songs.len()),
+        Some(0) => Ok(submitted),
         Some(1000) | Some(301) => Err(FetchError::Other("QQ 登录已失效".into())),
         _ => Err(FetchError::Other(format!(
             "QQ 添加歌曲失败: {}",
@@ -295,15 +308,26 @@ pub async fn remove_songs_from_playlist(
         return Ok(0);
     }
     let uin = super::session::snapshot().user_id.unwrap_or_default();
-    let ids = songs
+    // QQ 按位置配对 ids 与 types：先筛出真正带 songId 的歌曲，再从同一份列表
+    // 派生两个参数，否则缺一条 songId 就会让后续位置错位、删错歌曲。
+    let usable = songs
         .iter()
-        .filter_map(|s| s.extra.get("songId"))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(",");
-    if ids.is_empty() {
+        .filter_map(|s| s.extra.get("songId").map(|id| (id.as_str(), "3")))
+        .collect::<Vec<_>>();
+    if usable.is_empty() {
         return Err(FetchError::Other("QQ 删除歌曲缺少 song id".into()));
     }
+    let ids = usable
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>()
+        .join(",");
+    let types = usable
+        .iter()
+        .map(|(_, ty)| *ty)
+        .collect::<Vec<_>>()
+        .join(",");
+    let submitted = usable.len();
     let url = "https://c.y.qq.com/qzone/fcg-bin/fcg_music_delbatchsong.fcg?g_tk=5381";
     let response: Value = super::with_cookie(http::client().get(url))
         .header("Referer", "https://y.qq.com/n/yqq/playlist")
@@ -320,13 +344,7 @@ pub async fn remove_songs_from_playlist(
             ("dirid", dirid),
             ("ids", ids.as_str()),
             ("source", "103"),
-            (
-                "types",
-                std::iter::repeat_n("3", songs.len())
-                    .collect::<Vec<_>>()
-                    .join(",")
-                    .as_str(),
-            ),
+            ("types", types.as_str()),
             ("formsender", "4"),
             ("flag", "2"),
             ("utf8", "1"),
@@ -339,7 +357,7 @@ pub async fn remove_songs_from_playlist(
         .await
         .map_err(|e| FetchError::Parse(e.to_string()))?;
     match response["code"].as_i64() {
-        Some(0) => Ok(songs.len()),
+        Some(0) => Ok(submitted),
         Some(1000) | Some(301) => Err(FetchError::Other("QQ 登录已失效".into())),
         _ => Err(FetchError::Other(format!(
             "QQ 删除歌曲失败: {}",

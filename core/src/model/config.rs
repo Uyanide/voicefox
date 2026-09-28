@@ -224,7 +224,6 @@ impl Default for NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
-    pub use_dark: bool,
     /// 兼容旧配置的主强调色。
     pub accent: String,
     pub text: String,
@@ -262,7 +261,6 @@ pub struct ThemeConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            use_dark: true,
             accent: "#cba6f7".to_string(),
             text: "#cdd6f4".to_string(),
             muted: "#a6adc8".to_string(),

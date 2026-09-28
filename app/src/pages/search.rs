@@ -729,28 +729,21 @@ impl SearchPage {
             }))
             .title(format!("搜索 · {} · {}", scope, mode));
 
-        let cursor = if self.input_mode
-            && (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                / 500)
-                .is_multiple_of(2)
-        {
-            "█"
-        } else {
-            ""
-        };
-
+        let caret_area = input_block.inner(chunks[0]);
         let input_line = Line::from(vec![
             Span::styled(" / ", Style::new().fg(accent)),
             Span::raw(&self.input),
-            Span::styled(cursor, Style::new().fg(accent)),
         ]);
 
         Paragraph::new(input_line)
             .block(input_block)
             .render(chunks[0], buf);
+
+        if self.input_mode {
+            // 插入点交给终端光标：软件光标字符会和终端光标重影，而输入法候选框
+            // 必须跟着终端光标走（见 ui_cursor 的说明）。
+            crate::ui_cursor::request_after(caret_area, " / ", &self.input);
+        }
 
         self.render_source_tabs(chunks[1], buf, ctx);
 
