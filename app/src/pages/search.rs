@@ -13,7 +13,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::song_table::{self, ColumnResizeState};
 use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
+use lx_core::model::config::TableColumnConfig;
 
 const SEARCH_SCOPES: &[(Option<SourceId>, &str)] = &[
     (None, "全部"),
@@ -69,6 +72,8 @@ pub struct SearchPage {
     next_bili_parts_request_id: u64,
     wrap_navigation: bool,
     scroll_amount: usize,
+    column_resize: Option<ColumnResizeState>,
+    columns: Vec<TableColumnConfig>,
 }
 
 impl SearchPage {
@@ -127,6 +132,8 @@ impl SearchPage {
             next_bili_parts_request_id: 0,
             wrap_navigation,
             scroll_amount: scroll_amount.max(1),
+            column_resize: None,
+            columns: Vec::new(),
         }
     }
 
@@ -800,12 +807,22 @@ impl SearchPage {
         }
 
         let header_area = Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
-        Paragraph::new(Line::from(Span::styled(
-            super::components::song_table::header(inner_area.width),
-            Style::new()
-                .fg(crate::theme::muted(ctx))
-                .add_modifier(Modifier::BOLD),
-        )))
+
+        // 拖拽期间以页面状态为准，否则拖拽结果会被每帧重载覆盖。
+        if self.column_resize.is_none() {
+            let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+            self.columns = song_table::load_columns_for_page(
+                &cfg.ui.table_columns,
+                "search",
+                inner_area.width,
+            );
+        }
+
+        song_table::header_paragraph(
+            inner_area.width,
+            &self.columns,
+            song_table::TablePalette::from_theme(ctx),
+        )
         .render(header_area, buf);
         let list_area = Rect::new(
             inner_area.x,
@@ -839,7 +856,13 @@ impl SearchPage {
             }
 
             let song = &self.results[i];
-            let text = super::components::song_table::row(song, i, list_area.width);
+            let row_paragraph = song_table::row_paragraph(
+                song,
+                i,
+                list_area.width,
+                &self.columns,
+                song_table::TablePalette::from_theme(ctx),
+            );
 
             let line_area = Rect::new(list_area.x, list_area.y + row as u16, list_area.width, 1);
             let style = if i == self.selected {
@@ -848,7 +871,7 @@ impl SearchPage {
                 normal_style
             };
 
-            Paragraph::new(Line::from(Span::styled(text, style))).render(line_area, buf);
+            row_paragraph.style(style).render(line_area, buf);
         }
 
         self.render_variant_picker(area, buf, ctx);
@@ -1003,6 +1026,37 @@ impl SearchPage {
             );
     }
 
+    /// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
+    pub fn table_header_rect(&self, area: Rect) -> Option<Rect> {
+        if self.part_picker.is_some()
+            || self.bili_parts_loading.is_some()
+            || !self.variant_indices.is_empty()
+            || self.results.is_empty()
+        {
+            return None;
+        }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        let inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
+        (inner.height > 0).then(|| Rect::new(inner.x, inner.y, inner.width, 1))
+    }
+
+    /// 自动列宽的测量样本（搜索结果页），**无副作用**。
+    pub fn autofit_samples(&self, _ctx: &AppContext) -> Vec<SongInfo> {
+        self.results.clone()
+    }
+
+    /// 兜底取消进行中的列宽拖拽。
+    pub fn abort_drag_sessions(&mut self) {
+        self.column_resize = None;
+    }
+
     pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect, activate: bool) -> AppAction {
         if self.part_picker.is_some() {
             return self.handle_bili_part_mouse(event, area, activate);
@@ -1048,20 +1102,77 @@ impl SearchPage {
                 Constraint::Min(0),
             ])
             .split(area);
+        let result_block = Block::default().borders(Borders::ALL);
+        let inner = result_block.inner(chunks[2]);
+        let header_row = inner.y;
+        let table_width = inner.width;
+
+        if let Some(crs) = self.column_resize.clone() {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let delta = (event.column as i32) - (crs.start_local_x as i32);
+                    let adjusted = song_table::adjust_widths(
+                        &self.columns,
+                        crs.boundary_index,
+                        table_width,
+                        delta,
+                    );
+                    self.columns = adjusted;
+                    self.column_resize = Some(ColumnResizeState {
+                        start_local_x: event.column,
+                        ..crs
+                    });
+                    return AppAction::None;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.column_resize = None;
+                    return AppAction::CommitColumnResize {
+                        page_key: "search".to_string(),
+                        columns: self.columns.clone(),
+                    };
+                }
+                _ => return AppAction::None,
+            }
+        }
+
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) && event.row == header_row
+        {
+            let local_x = event.column.saturating_sub(inner.x);
+            if let Some(boundary) = song_table::find_boundary(&self.columns, table_width, local_x) {
+                let layout = song_table::compute_layout(&self.columns, table_width);
+                if boundary + 1 < layout.len() {
+                    self.column_resize = Some(ColumnResizeState {
+                        start_local_x: event.column,
+                        boundary_index: boundary,
+                    });
+                    return AppAction::None;
+                }
+            }
+        }
         if chunks[0].contains((event.column, event.row).into())
             && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
         {
             self.input_mode = true;
             return AppAction::None;
         }
-        if chunks[1].contains((event.column, event.row).into())
-            && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(index) = source_tab_areas(chunks[1], self.search_scopes.len())
-                .iter()
-                .position(|tab| tab.contains((event.column, event.row).into()))
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(selector) = self.source_selector.as_ref()
+            && let Some(key) = selector.tab_at(chunks[1], (event.column, event.row).into())
         {
             self.input_mode = false;
-            return self.select_source(index);
+            match key {
+                SourceSelectorKey::All => return self.select_source(0),
+                SourceSelectorKey::Source(source) => {
+                    if let Some(index) = self
+                        .search_scopes
+                        .iter()
+                        .position(|(candidate, _)| *candidate == Some(source))
+                    {
+                        return self.select_source(index);
+                    }
+                }
+                _ => {}
+            }
         }
 
         // 结果列表区域：滚轮只在光标落在该区域内时移动选中，
@@ -1105,7 +1216,7 @@ impl SearchPage {
 
     pub fn context_song_at(
         &mut self,
-        event: MouseEvent,
+        source: MenuHitSource,
         area: Rect,
     ) -> Option<(Vec<SongInfo>, usize)> {
         if self.part_picker.is_some()
@@ -1123,14 +1234,18 @@ impl SearchPage {
             ])
             .split(area);
         let inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
-        let list_y = inner.y.saturating_add(1);
-        if event.row < list_y || event.row >= inner.bottom() {
-            return None;
-        }
-        let index = self.scroll_offset + event.row.saturating_sub(list_y) as usize;
-        if index >= self.results.len() {
-            return None;
-        }
+        let index = source.resolve_index(
+            |event| {
+                let list_y = inner.y.saturating_add(1);
+                if event.row < list_y || event.row >= inner.bottom() {
+                    return None;
+                }
+                let index = self.scroll_offset + event.row.saturating_sub(list_y) as usize;
+                (index < self.results.len()).then_some(index)
+            },
+            self.selected,
+            self.results.len(),
+        )?;
         self.input_mode = false;
         self.selected = index;
         Some((self.results.clone(), index))
@@ -1467,12 +1582,10 @@ impl SearchPage {
             return;
         }
 
-        Paragraph::new(Line::from(Span::styled(
-            super::components::song_table::header(inner.width),
-            Style::new()
-                .fg(crate::theme::muted(ctx))
-                .add_modifier(Modifier::BOLD),
-        )))
+        super::components::song_table::header_paragraph_default(
+            inner.width,
+            super::components::song_table::TablePalette::from_theme(ctx),
+        )
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
 
         let visible_rows = inner.height.saturating_sub(1) as usize;
@@ -1499,10 +1612,13 @@ impl SearchPage {
             } else {
                 Style::new().fg(crate::theme::text(ctx))
             };
-            Paragraph::new(Line::from(Span::styled(
-                super::components::song_table::row(song, result_index, inner.width),
-                style,
-            )))
+            super::components::song_table::row_paragraph_default(
+                song,
+                result_index,
+                inner.width,
+                super::components::song_table::TablePalette::from_theme(ctx),
+            )
+            .style(style)
             .render(
                 Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
                 buf,
@@ -1596,19 +1712,6 @@ impl SearchPage {
                 buf,
             );
     }
-}
-
-fn source_tab_areas(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
-    if count == 0 {
-        return std::rc::Rc::from([]);
-    }
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(std::iter::repeat_n(
-            Constraint::Ratio(1, count as u32),
-            count,
-        ))
-        .split(area)
 }
 
 fn enabled_search_scopes(enabled_sources: &[SourceId]) -> Vec<(Option<SourceId>, &'static str)> {

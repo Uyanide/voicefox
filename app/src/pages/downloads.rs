@@ -26,6 +26,9 @@ pub struct DownloadsPanel {
     open: bool,
     selected: usize,
     scroll: usize,
+    /// 最近一次渲染出的面板矩形（用于"点外部关闭"的命中判定）。
+    /// 与渲染共用同一次计算，避免两套尺寸推导。
+    panel_area: Rect,
 }
 
 impl Default for DownloadsPanel {
@@ -40,6 +43,7 @@ impl DownloadsPanel {
             open: false,
             selected: 0,
             scroll: 0,
+            panel_area: Rect::default(),
         }
     }
 
@@ -120,31 +124,43 @@ impl DownloadsPanel {
         PanelOutcome::Consumed
     }
 
-    /// 鼠标右键对当前下载项执行与 Delete 相同的移除/取消动作。
-    /// 右键不依赖终端是否能提供精确 panel 矩形，避免浮层尺寸变化导致操作失效。
+    /// 鼠标：右键对当前下载项执行与 Delete 相同的移除/取消动作；
+    /// 左键点面板外部关闭浮层（此前左键完全无响应，只能用键盘关）。
+    ///
+    /// 右键不依赖精确的 panel 矩形，避免浮层尺寸变化导致操作失效。
     pub fn handle_mouse(
         &mut self,
         mouse: &crossterm::event::MouseEvent,
         ctx: &AppContext,
         tasks: &[DownloadTaskView],
     ) -> bool {
-        if !matches!(
-            mouse.kind,
-            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right)
-        ) {
-            return false;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some(task) = tasks.get(self.selected) {
+                    let cancelling = task.state.is_active();
+                    ctx.downloads.cancel(task.id);
+                    ctx.notify(lx_core::events::Notification::info(if cancelling {
+                        format!("已取消下载: {}", task.name)
+                    } else {
+                        format!("已移除下载记录: {}", task.name)
+                    }));
+                    self.selected = self.selected.min(tasks.len().saturating_sub(2));
+                }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let inside = self
+                    .panel_area
+                    .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+                if !inside {
+                    self.open = false;
+                }
+                true
+            }
+            _ => false,
         }
-        if let Some(task) = tasks.get(self.selected) {
-            let cancelling = task.state.is_active();
-            ctx.downloads.cancel(task.id);
-            ctx.notify(lx_core::events::Notification::info(if cancelling {
-                format!("已取消下载: {}", task.name)
-            } else {
-                format!("已移除下载记录: {}", task.name)
-            }));
-            self.selected = self.selected.min(tasks.len().saturating_sub(2));
-        }
-        true
     }
 
     /// 把选中项保持在可视区域内。
@@ -182,6 +198,8 @@ impl DownloadsPanel {
         );
         // 与帮助/详情浮层一致：先清空整屏再画面板，避免和底层页面的边框、
         // 封面图形协议混在一起，关闭时也不会留下两者叠加的痕迹。
+        // 记录面板矩形，供"点外部关闭"复用同一份几何。
+        self.panel_area = panel;
         Clear.render(area, buf);
         Clear.render(panel, buf);
 

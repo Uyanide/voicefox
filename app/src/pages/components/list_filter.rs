@@ -58,6 +58,15 @@ impl ListFilter {
         &self.query
     }
 
+    /// 过滤行是否需要占用面板内的一行。
+    ///
+    /// "正在输入"和"已有过滤词"都要显示过滤行。**渲染与鼠标命中必须都用这个方法**：
+    /// 以前 History 渲染用 `is_active() || !query()`、命中只用 `!query()`，
+    /// 于是"按了过滤键但还没输入"时整块列表点击差一行。
+    pub fn is_visible(&self) -> bool {
+        self.active || !self.query.is_empty()
+    }
+
     #[cfg(test)]
     pub fn set_query(&mut self, query: impl Into<String>) {
         self.query = query.into();

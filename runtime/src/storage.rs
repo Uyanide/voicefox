@@ -188,37 +188,97 @@ pub struct CustomPlaylistSummary {
     pub song_count: u32,
 }
 
-/// voicefox 的数据目录：`~/.config/voicefox/data`。
-///
-/// 收藏、历史、下载记录等持久化文件都落在这里；集中成一个函数，
-/// 避免各模块各写一份 `dirs::config_dir()` 拼接逻辑。
-fn migrate_legacy_data_dir() -> PathBuf {
-    let target = default_data_dir();
-    let legacy = dirs::config_dir()
+/// 当前数据目录（0.3.12 起）：`~/.local/share/voicefox`（Windows 为 `%APPDATA%\voicefox`）。
+fn data_dir_path() -> PathBuf {
+    dirs::data_dir()
+        .or_else(dirs::config_dir)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("voicefox")
-        .join("data");
-    if target != legacy && !target.exists() && legacy.exists() {
-        if let Some(parent) = target.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Err(error) = fs::rename(&legacy, &target) {
-            tracing::warn!("failed to migrate legacy voicefox data directory: {error}");
-            return legacy;
-        }
-    }
+}
+
+/// 0.3.12 之前的数据目录：`~/.config/voicefox/data`。
+fn legacy_data_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("voicefox")
+        .join("data")
+}
+
+/// 0.3.12 之前的目录里由本模块（或同一数据目录）落盘的业务文件。
+const LEGACY_DATA_FILES: &[&str] = &[
+    "favorites.json",
+    "favorite_playlists.json",
+    "custom_playlists.json",
+    "history.json",
+    "playback_state.json",
+    "downloads.json",
+    "netease_collections.json",
+];
+
+/// 把旧数据目录迁移到当前数据目录，返回当前数据目录。
+///
+/// 背景：0.3.12 把数据目录从 `~/.config/voicefox/data` 改成了
+/// `~/.local/share/voicefox`，但只改了路径、没有搬数据，于是升级后收藏、
+/// 历史和播放会话全部读不到（新目录是空的），旧文件则一直留在旧目录里。
+///
+/// 迁移**绝不覆盖当前目录里已有的文件**，分两步：
+/// 1. 当前目录整体不存在时，直接 `rename` 整个旧目录；
+/// 2. 当前目录已存在时，逐文件补迁缺失项（典型情况：新目录已经重建了
+///    收藏/历史，只剩 `playback_state.json` 没搬过来）。
+fn migrate_legacy_data_dir() -> PathBuf {
+    let target = data_dir_path();
+    migrate_data_dir(&target, &legacy_data_dir());
     target
 }
 
+/// [`migrate_legacy_data_dir`](migrate_legacy_data_dir) 的实际实现。
+///
+/// 目录参数显式传入，便于测试覆盖"整体搬迁"和"逐文件补迁"两条路径。
+fn migrate_data_dir(target: &Path, legacy: &Path) {
+    if target == legacy {
+        return;
+    }
+
+    if !target.exists() && legacy.is_dir() {
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::rename(legacy, target) {
+            Ok(()) => {
+                tracing::info!("已把旧数据目录迁移到 {}", target.display());
+                return;
+            }
+            Err(error) => tracing::warn!("整体迁移旧数据目录失败，改为逐文件补迁: {error}"),
+        }
+    }
+
+    if !legacy.is_dir() {
+        return;
+    }
+    if let Err(error) = fs::create_dir_all(target) {
+        tracing::warn!("创建数据目录失败: {error}");
+        return;
+    }
+    for name in LEGACY_DATA_FILES {
+        let (source, destination) = (legacy.join(name), target.join(name));
+        // 已经有新数据时绝不回退覆盖，否则会把用户 0.3.12 之后的收藏/历史冲掉。
+        if destination.exists() || !source.is_file() {
+            continue;
+        }
+        if fs::rename(&source, &destination).is_ok() || fs::copy(&source, &destination).is_ok() {
+            tracing::info!("已从旧数据目录迁移 {name}");
+        }
+    }
+}
+
+/// 数据目录。首次调用时会顺带完成旧目录迁移，因此无论调用方是
+/// `Storage`、下载记录还是远程缓存，拿到的都是迁移后的路径。
 pub fn default_data_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "voicefox")
-        .map(|project| project.data_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("voicefox")
-                .join("data")
-        })
+    static MIGRATION: std::sync::Once = std::sync::Once::new();
+    MIGRATION.call_once(|| {
+        migrate_legacy_data_dir();
+    });
+    data_dir_path()
 }
 
 pub struct Storage {
@@ -236,7 +296,7 @@ pub struct Storage {
 
 impl Storage {
     pub fn new() -> Self {
-        let dir = migrate_legacy_data_dir();
+        let dir = default_data_dir();
         fs::create_dir_all(&dir).ok();
         let favorites = Self::load_file(&dir.join("favorites.json"));
         let favorite_playlists = Self::load_file(&dir.join("favorite_playlists.json"));
@@ -532,24 +592,32 @@ impl Storage {
     // ── 收藏 ──────────────────────────────────────────
 
     pub fn add_favorite(&self, song: &SongInfo) -> bool {
-        let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
-        if favs.iter().any(|favorite| songs_equivalent(favorite, song)) {
-            return false;
-        }
-        favs.push(song.clone());
-        self.save_favorites(&favs);
+        // 变更与快照都在写锁内一次性完成，落盘放到锁外：
+        // 否则渲染路径的 is_favorite 等读锁要被整次序列化 + fsync + rename 阻塞。
+        let snapshot = {
+            let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
+            if favs.iter().any(|favorite| songs_equivalent(favorite, song)) {
+                return false;
+            }
+            favs.push(song.clone());
+            favs.clone()
+        };
+        self.save_favorites(&snapshot);
         true
     }
 
     pub fn remove_favorite(&self, song: &SongInfo) -> bool {
-        let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
-        let old_len = favs.len();
-        favs.retain(|favorite| !songs_equivalent(favorite, song));
-        if favs.len() != old_len {
-            self.save_favorites(&favs);
-            return true;
-        }
-        false
+        let snapshot = {
+            let mut favs = self.favorites.write().unwrap_or_else(|e| e.into_inner());
+            let old_len = favs.len();
+            favs.retain(|favorite| !songs_equivalent(favorite, song));
+            if favs.len() == old_len {
+                return false;
+            }
+            favs.clone()
+        };
+        self.save_favorites(&snapshot);
+        true
     }
 
     pub fn is_favorite(&self, song: &SongInfo) -> bool {
@@ -563,33 +631,41 @@ impl Storage {
     // ── 歌单收藏 ──────────────────────────────────────
 
     pub fn add_favorite_playlist(&self, playlist: &Playlist) -> bool {
-        let mut favorites = self
-            .favorite_playlists
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if favorites
-            .iter()
-            .any(|favorite| favorite.id == playlist.id && favorite.source == playlist.source)
-        {
-            return false;
-        }
-        favorites.push(playlist.clone());
-        self.save_favorite_playlists(&favorites);
+        // 同 add_favorite：写锁内只做变更 + 快照，磁盘 I/O 在锁外。
+        let snapshot = {
+            let mut favorites = self
+                .favorite_playlists
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if favorites
+                .iter()
+                .any(|favorite| favorite.id == playlist.id && favorite.source == playlist.source)
+            {
+                return false;
+            }
+            favorites.push(playlist.clone());
+            favorites.clone()
+        };
+        self.save_favorite_playlists(&snapshot);
         true
     }
 
     pub fn remove_favorite_playlist(&self, playlist: &Playlist) -> bool {
-        let mut favorites = self
-            .favorite_playlists
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let old_len = favorites.len();
-        favorites
-            .retain(|favorite| favorite.id != playlist.id || favorite.source != playlist.source);
-        if favorites.len() == old_len {
-            return false;
-        }
-        self.save_favorite_playlists(&favorites);
+        let snapshot = {
+            let mut favorites = self
+                .favorite_playlists
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let old_len = favorites.len();
+            favorites.retain(|favorite| {
+                favorite.id != playlist.id || favorite.source != playlist.source
+            });
+            if favorites.len() == old_len {
+                return false;
+            }
+            favorites.clone()
+        };
+        self.save_favorite_playlists(&snapshot);
         true
     }
 
@@ -630,7 +706,7 @@ impl Storage {
     pub fn custom_playlist_choices(&self) -> Vec<(String, String)> {
         self.custom_playlists
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
             .collect()
@@ -639,7 +715,7 @@ impl Storage {
     pub fn custom_playlist(&self, playlist_id: &str) -> Option<CustomPlaylist> {
         self.custom_playlists
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|playlist| playlist.id == playlist_id)
             .cloned()
@@ -817,42 +893,55 @@ impl Storage {
     // ── 播放历史 ──────────────────────────────────────
 
     pub fn add_history(&self, song: &SongInfo, limit: usize) {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        history.retain(|s| !(s.id == song.id && s.source == song.source));
-        history.insert(0, HistoryEntry::from_song(song));
-        history.truncate(limit.max(1));
-        self.save_history(&history);
+        // 同收藏：写锁内完成变更 + 取快照，落盘在锁外，避免读侧被磁盘 I/O 拖住。
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            history.retain(|s| !(s.id == song.id && s.source == song.source));
+            history.insert(0, HistoryEntry::from_song(song));
+            history.truncate(limit.max(1));
+            history.clone()
+        };
+        self.save_history(&snapshot);
     }
 
     pub fn remove_history(&self, song: &SongInfo) -> bool {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        let old_len = history.len();
-        history.retain(|item| !(item.id == song.id && item.source == song.source));
-        if history.len() == old_len {
-            return false;
-        }
-        self.save_history(&history);
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            let old_len = history.len();
+            history.retain(|item| !(item.id == song.id && item.source == song.source));
+            if history.len() == old_len {
+                return false;
+            }
+            history.clone()
+        };
+        self.save_history(&snapshot);
         true
     }
 
     pub fn clear_history(&self) -> bool {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        if history.is_empty() {
-            return false;
-        }
-        history.clear();
-        self.save_history(&history);
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            if history.is_empty() {
+                return false;
+            }
+            history.clear();
+            history.clone()
+        };
+        self.save_history(&snapshot);
         true
     }
 
     pub fn trim_history(&self, limit: usize) -> bool {
-        let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
-        let old_len = history.len();
-        history.truncate(limit.max(1));
-        if history.len() == old_len {
-            return false;
-        }
-        self.save_history(&history);
+        let snapshot = {
+            let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+            let old_len = history.len();
+            history.truncate(limit.max(1));
+            if history.len() == old_len {
+                return false;
+            }
+            history.clone()
+        };
+        self.save_history(&snapshot);
         true
     }
 
@@ -876,7 +965,7 @@ impl Storage {
     pub fn load_history(&self) -> Vec<SongInfo> {
         self.history
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
             .map(HistoryEntry::into_song)
@@ -887,8 +976,17 @@ impl Storage {
 
     pub fn load_playback_session(&self) -> Option<PlaybackSession> {
         let path = self.data_dir.join("playback_state.json");
-        let json = fs::read_to_string(path).ok()?;
-        let mut session = serde_json::from_str::<PlaybackSession>(&json).ok()?;
+        let json = fs::read_to_string(&path).ok()?;
+        let mut session = match serde_json::from_str::<PlaybackSession>(&json) {
+            Ok(session) => session,
+            // 静默吞掉解析错误会让调用方以为"从未保存过"，随后一次退出就可能
+            // 把这个文件清掉，问题再也没法复现。这里保留现场并留下告警。
+            Err(error) => {
+                tracing::warn!("播放会话解析失败，已隔离该文件: {error}");
+                Self::quarantine_corrupt_file(&path, &error.to_string());
+                return None;
+            }
+        };
         if session.playlist.is_empty() {
             return None;
         }
@@ -1033,7 +1131,7 @@ impl Storage {
     }
 }
 
-pub(crate) fn save_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
+pub fn save_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
     save_atomic_impl(path, content, true)
 }
 
@@ -1462,7 +1560,7 @@ fn ensure_unique_custom_playlist_name(
     Ok(())
 }
 
-pub(crate) fn same_song_identity(left: &SongInfo, right: &SongInfo) -> bool {
+pub fn same_song_identity(left: &SongInfo, right: &SongInfo) -> bool {
     if left.source == right.source && !left.id.is_empty() && left.id == right.id {
         return true;
     }
@@ -1472,7 +1570,7 @@ pub(crate) fn same_song_identity(left: &SongInfo, right: &SongInfo) -> bool {
         && left.file_path == right.file_path
 }
 
-pub(crate) fn local_song_matches_path(song: &SongInfo, path: &Path) -> bool {
+pub fn local_song_matches_path(song: &SongInfo, path: &Path) -> bool {
     song.source == lx_core::model::source::SourceId::Local
         && (song.file_path.as_deref() == Some(path) || song.id == path.to_string_lossy())
 }
@@ -1480,11 +1578,12 @@ pub(crate) fn local_song_matches_path(song: &SongInfo, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CustomPlaylist, DataBackup, PlaybackSession, SavedPlayerState, Storage, same_song_identity,
-        songs_equivalent, unix_nanos,
+        CustomPlaylist, DataBackup, PlaybackSession, SavedPlayerState, Storage, migrate_data_dir,
+        same_song_identity, songs_equivalent, unix_nanos,
     };
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
+    use std::path::{Path, PathBuf};
     use std::sync::RwLock;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -1603,6 +1702,107 @@ mod tests {
         assert_eq!(restored.state, SavedPlayerState::Paused);
         storage.clear_playback_session().unwrap();
         assert!(storage.load_playback_session().is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "voicefox-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn storage_at(data_dir: &Path) -> Storage {
+        Storage {
+            data_dir: data_dir.to_path_buf(),
+            favorites: RwLock::new(Vec::new()),
+            favorite_playlists: RwLock::new(Vec::new()),
+            custom_playlists: RwLock::new(Vec::new()),
+            history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// 复现 0.3.12 那次数据目录切换：旧目录里缺失的文件必须补迁进新目录，
+    /// 但新目录里已经重建过的文件绝不能被旧文件覆盖。
+    #[test]
+    fn migrates_missing_files_from_legacy_data_dir_without_overwriting() {
+        let root = temp_dir("legacy-migration");
+        let legacy = root.join("legacy");
+        let target = root.join("target");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        // 旧目录：一份播放会话（新目录没有）+ 一份过期收藏（新目录已有更新的）
+        std::fs::write(legacy.join("playback_state.json"), b"legacy-session").unwrap();
+        std::fs::write(legacy.join("favorites.json"), b"stale-favorites").unwrap();
+        std::fs::write(target.join("favorites.json"), b"fresh-favorites").unwrap();
+
+        migrate_data_dir(&target, &legacy);
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("playback_state.json")).unwrap(),
+            "legacy-session",
+            "旧目录里缺失的播放会话应当补迁到新目录"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("favorites.json")).unwrap(),
+            "fresh-favorites",
+            "新目录里已有的收藏不能被旧文件覆盖"
+        );
+        assert!(
+            !legacy.join("playback_state.json").exists(),
+            "迁移成功后旧文件不应残留"
+        );
+
+        // 幂等：重复调用不报错、也不改变结果
+        migrate_data_dir(&target, &legacy);
+        assert_eq!(
+            std::fs::read_to_string(target.join("favorites.json")).unwrap(),
+            "fresh-favorites"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 新目录整体不存在时直接搬迁整个旧目录。
+    #[test]
+    fn moves_whole_legacy_dir_when_target_is_absent() {
+        let root = temp_dir("legacy-move");
+        let legacy = root.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("history.json"), b"[]").unwrap();
+        let target = root.join("nested").join("target");
+
+        migrate_data_dir(&target, &legacy);
+
+        assert!(target.join("history.json").is_file());
+        assert!(!legacy.exists(), "整目录搬迁后旧目录应当消失");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 会话文件解析失败时必须保留现场：静默返回 None 会让下一次退出
+    /// 把它当成"用户清空了队列"删掉，问题再也无法复现。
+    #[test]
+    fn unparsable_playback_session_is_quarantined_instead_of_dropped() {
+        let data_dir = temp_dir("playback-corrupt");
+        let storage = storage_at(&data_dir);
+        let path = data_dir.join("playback_state.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        assert!(storage.load_playback_session().is_none());
+        assert!(!path.exists(), "损坏文件应当被改名隔离，而不是留在原处");
+        let quarantined = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(quarantined, "应当留下 .corrupt-* 现场文件");
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

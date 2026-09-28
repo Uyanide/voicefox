@@ -38,8 +38,6 @@ directories.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 ratatui-image.workspace = true
-rat-menu.workspace = true
-tui-popup.workspace = true
 nucleo-matcher.workspace = true
 qrcode = { version = "0.4", default-features = false }
 md-5.workspace = true

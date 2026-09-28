@@ -14,6 +14,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::hit_test::PanelRows;
 use crate::pages::components::list_filter::ListFilter;
 use crate::pages::sort::{SortState, SortTarget, SortedListCache};
 
@@ -58,7 +60,6 @@ pub fn render(
 ) {
     let (sorted, indices) = history_view(ctx, state, filter.query(), cache);
     let history_len = indices.len();
-    let filter_visible = filter.is_active() || !filter.query().is_empty();
     let filter_suffix = if filter.query().is_empty() {
         String::new()
     } else {
@@ -75,21 +76,22 @@ pub fn render(
             filter_suffix
         ));
 
-    let inner = block.inner(area);
     block.render(area, buf);
 
-    if filter_visible {
-        filter.render(Rect::new(inner.x, inner.y, inner.width, 1), buf, ctx);
+    // 行账本：过滤行 → 表头 → 列表。渲染与鼠标命中共用同一份，
+    // 过滤行是否可见统一走 `ListFilter::is_visible()`。
+    let rows = PanelRows::new(area, filter.is_visible(), false, true);
+    let inner = rows.inner;
+    if let Some(row) = rows.filter_row() {
+        filter.render(row, buf, ctx);
     }
 
-    let content_y = if filter_visible { inner.y + 1 } else { inner.y };
-    let content_height = if filter_visible {
-        inner.height.saturating_sub(1)
-    } else {
-        inner.height
-    };
-
     if history_len == 0 {
+        let message_area = if rows.list.height > 0 {
+            rows.list
+        } else {
+            rows.inner
+        };
         Paragraph::new(Line::from(Span::styled(
             if filter.query().is_empty() {
                 "暂无播放历史"
@@ -98,10 +100,7 @@ pub fn render(
             },
             Style::new().fg(crate::theme::muted(ctx)),
         )))
-        .render(
-            Rect::new(inner.x, content_y, inner.width, content_height),
-            buf,
-        );
+        .render(message_area, buf);
         return;
     }
 
@@ -116,20 +115,30 @@ pub fn render(
         .add_modifier(Modifier::BOLD);
     let normal_style = Style::new().fg(crate::theme::text(ctx));
 
-    if content_height == 0 {
+    let Some(header_row) = rows.header else {
+        return;
+    };
+    if rows.list.height == 0 {
         return;
     }
-    Paragraph::new(Line::from(Span::styled(
-        super::components::song_table::header(inner.width),
-        Style::new().fg(crate::theme::muted(ctx)),
-    )))
-    .render(Rect::new(inner.x, content_y, inner.width, 1), buf);
-    let list = Rect::new(
-        inner.x,
-        content_y.saturating_add(1),
+
+    // 拖拽期间以页面状态为准：每帧从 Config 重载会把拖拽结果覆盖掉。
+    if state.column_resize.is_none() {
+        let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+        state.columns = crate::pages::components::song_table::load_columns_for_page(
+            &cfg.ui.table_columns,
+            state.page_key,
+            inner.width,
+        );
+    }
+
+    crate::pages::components::song_table::header_paragraph(
         inner.width,
-        content_height.saturating_sub(1),
-    );
+        &state.columns,
+        crate::pages::components::song_table::TablePalette::from_theme(ctx),
+    )
+    .render(header_row, buf);
+    let list = rows.list;
     let visible_height = list.height as usize;
     if visible_height == 0 {
         return;
@@ -156,14 +165,20 @@ pub fn render(
         if row as u16 >= list.height {
             break;
         }
-        let text = super::components::song_table::row(song, view_index, list.width);
+        let row_paragraph = crate::pages::components::song_table::row_paragraph(
+            song,
+            view_index,
+            list.width,
+            &state.columns,
+            crate::pages::components::song_table::TablePalette::from_theme(ctx),
+        );
         let line_area = Rect::new(list.x, list.y + row as u16, list.width, 1);
         let style = if view_index == state.selected {
             selected_style
         } else {
             normal_style
         };
-        Paragraph::new(Line::from(Span::styled(text, style))).render(line_area, buf);
+        row_paragraph.style(style).render(line_area, buf);
     }
 }
 
@@ -408,11 +423,61 @@ pub fn handle_mouse(
     area: Rect,
     ctx: &AppContext,
     state: &mut SortState,
-    filter_query: &str,
+    filter: &ListFilter,
     cache: &mut SortedListCache,
     activate: bool,
 ) -> AppAction {
-    let (sorted, indices) = history_view(ctx, state, filter_query, cache);
+    use crate::pages::components::song_table::{
+        ColumnResizeState, adjust_widths, compute_layout, find_boundary,
+    };
+
+    // 与渲染共用行账本；过滤行可见性统一走 `ListFilter::is_visible()`。
+    let rows = PanelRows::new(area, filter.is_visible(), false, true);
+    let inner = rows.inner;
+    let table_width = inner.width;
+
+    if let Some(crs) = state.column_resize.clone() {
+        match event.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let delta = (event.column as i32) - (crs.start_local_x as i32);
+                let adjusted =
+                    adjust_widths(&state.columns, crs.boundary_index, table_width, delta);
+                state.columns = adjusted;
+                state.column_resize = Some(ColumnResizeState {
+                    start_local_x: event.column,
+                    ..crs
+                });
+                return AppAction::None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                state.column_resize = None;
+                return AppAction::CommitColumnResize {
+                    page_key: state.page_key.to_string(),
+                    columns: state.columns.clone(),
+                };
+            }
+            _ => return AppAction::None,
+        }
+    }
+
+    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(header) = rows.header
+        && header.y == event.row
+    {
+        let local_x = event.column.saturating_sub(inner.x);
+        if let Some(boundary) = find_boundary(&state.columns, table_width, local_x) {
+            let layout = compute_layout(&state.columns, table_width);
+            if boundary + 1 < layout.len() {
+                state.column_resize = Some(ColumnResizeState {
+                    start_local_x: event.column,
+                    boundary_index: boundary,
+                });
+                return AppAction::None;
+            }
+        }
+    }
+
+    let (sorted, indices) = history_view(ctx, state, filter.query(), cache);
     let len = indices.len();
     let scroll_amount = ctx
         .config
@@ -421,23 +486,17 @@ pub fn handle_mouse(
         .ui
         .scroll_amount
         .max(1);
+    let position = Position::new(event.column, event.row);
     let mut activate_index = None;
     match event.kind {
-        MouseEventKind::ScrollUp => {
+        MouseEventKind::ScrollUp if rows.list.contains(position) => {
             state.selected = state.selected.saturating_sub(scroll_amount);
         }
-        MouseEventKind::ScrollDown => {
+        MouseEventKind::ScrollDown if rows.list.contains(position) => {
             state.selected = (state.selected + scroll_amount).min(len.saturating_sub(1));
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let search_height = u16::from(!filter_query.trim().is_empty());
-            if let Some(index) = crate::pages::components::hit_test::row_at(
-                area,
-                Position::new(event.column, event.row),
-                state.scroll,
-                len,
-                search_height + 1,
-            ) {
+            if let Some(index) = rows.index_at(position, state.scroll, len) {
                 state.selected = index;
                 if activate {
                     activate_index = Some(index);
@@ -455,22 +514,36 @@ pub fn handle_mouse(
     AppAction::None
 }
 
+/// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
+pub fn table_header_rect(area: Rect, filter: &ListFilter) -> Option<Rect> {
+    PanelRows::new(area, filter.is_visible(), false, true).header
+}
+
+/// 自动列宽的测量样本，**无副作用**。
+pub fn autofit_samples(ctx: &AppContext) -> Vec<SongInfo> {
+    ctx.storage.load_history()
+}
+
 pub fn context_song_at(
-    event: MouseEvent,
+    source: MenuHitSource,
     area: Rect,
     ctx: &AppContext,
     state: &mut SortState,
-    filter_query: &str,
+    filter: &ListFilter,
     cache: &mut SortedListCache,
 ) -> Option<(Vec<SongInfo>, usize)> {
-    let history = filtered_history(ctx, state, filter_query, cache);
-    let search_height = u16::from(!filter_query.trim().is_empty());
-    let index = crate::pages::components::hit_test::row_at(
-        area,
-        Position::new(event.column, event.row),
-        state.scroll,
+    let history = filtered_history(ctx, state, filter.query(), cache);
+    let rows = PanelRows::new(area, filter.is_visible(), false, true);
+    let index = source.resolve_index(
+        |event| {
+            rows.index_at(
+                Position::new(event.column, event.row),
+                state.scroll,
+                history.len(),
+            )
+        },
+        state.selected,
         history.len(),
-        search_height + 1,
     )?;
     state.selected = index;
     Some((history, index))

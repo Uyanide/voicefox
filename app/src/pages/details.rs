@@ -271,7 +271,9 @@ impl DetailsPage {
         _ctx: &AppContext,
         activate: bool,
     ) -> AppAction {
-        let chunks = self.content_chunks(area);
+        // 与外框渲染共用同一内缩：以前命中直接用未内缩的 area，
+        // 于是点击整体偏移 1 行 1 列。
+        let chunks = self.content_chunks(Self::content_area(area));
         match event.kind {
             MouseEventKind::ScrollUp => {
                 if chunks
@@ -348,7 +350,7 @@ impl DetailsPage {
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(title);
-        let inner = outer.inner(area);
+        let inner = Self::content_area(area);
         outer.render(area, buf);
 
         if self.loading {
@@ -543,6 +545,11 @@ impl DetailsPage {
         self.selected_song = self.selected_song.min(self.songs.len().saturating_sub(1));
     }
 
+    /// 详情页外框的内缩区域。**渲染与鼠标命中必须都经由它**。
+    fn content_area(area: Rect) -> Rect {
+        Block::default().borders(Borders::ALL).inner(area)
+    }
+
     fn content_chunks(&self, area: Rect) -> DetailsChunks {
         if matches!(self.target, DetailsTarget::Album(_)) {
             return DetailsChunks {
@@ -612,12 +619,10 @@ impl DetailsPage {
                 .render(inner, buf);
             return;
         }
-        Paragraph::new(Line::from(Span::styled(
-            super::components::song_table::header(inner.width),
-            Style::new()
-                .fg(crate::theme::muted(ctx))
-                .add_modifier(Modifier::BOLD),
-        )))
+        super::components::song_table::header_paragraph_default(
+            inner.width,
+            super::components::song_table::TablePalette::from_theme(ctx),
+        )
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
         let list_area = Rect::new(
             inner.x,
@@ -629,8 +634,12 @@ impl DetailsPage {
         for index in
             self.song_scroll..(self.song_scroll + list_area.height as usize).min(self.songs.len())
         {
-            let text =
-                super::components::song_table::row(&self.songs[index], index, list_area.width);
+            let row_paragraph = super::components::song_table::row_paragraph_default(
+                &self.songs[index],
+                index,
+                list_area.width,
+                super::components::song_table::TablePalette::from_theme(ctx),
+            );
             let style = if self.focus == DetailsFocus::Songs && index == self.selected_song {
                 Style::new()
                     .bg(crate::theme::accent(ctx))
@@ -639,7 +648,7 @@ impl DetailsPage {
             } else {
                 Style::new().fg(crate::theme::text(ctx))
             };
-            Paragraph::new(Line::from(Span::styled(text, style))).render(
+            row_paragraph.style(style).render(
                 Rect::new(
                     list_area.x,
                     list_area.y + (index - self.song_scroll) as u16,

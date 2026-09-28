@@ -294,6 +294,39 @@ impl Default for ThemeConfig {
     }
 }
 
+/// 歌曲列表表格的列配置（可持久化，支持用户手动调整列宽和隐藏）。
+///
+/// 每个页面可以有一套独立的列配置，key 使用页面标识（如 `"queue"`、`"search"`）。
+/// 用户未调整过的页面走 `song_table.rs` 里的默认档位公式，不会写入 Config。
+///
+/// `serde(default)` 不可省略：这一节是用户可手写的，缺字段（或将来新增字段）
+/// 时若反序列化失败，会让整份 `Config` 解析失败并**直接导致程序启动失败**。
+/// 非法取值（`min_width > max_width`、`width = 0`）由
+/// `song_table::load_columns_for_page` 在读取时校正。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TableColumnConfig {
+    pub key: String,
+    pub label: String,
+    pub visible: bool,
+    pub width: u16,
+    pub min_width: u16,
+    pub max_width: u16,
+}
+
+impl Default for TableColumnConfig {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            label: String::new(),
+            visible: true,
+            width: 8,
+            min_width: 2,
+            max_width: 64,
+        }
+    }
+}
+
 /// TUI 交互配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -324,6 +357,17 @@ pub struct UiConfig {
         deserialize_with = "deserialize_status_bar_items"
     )]
     pub status_bar_items: Vec<StatusBarItem>,
+    /// 用户自定义的歌曲列表列配置，按页面 key 存储。
+    /// 空 HashMap 表示所有页面都使用默认档位公式。
+    #[serde(default)]
+    pub table_columns: std::collections::HashMap<String, Vec<TableColumnConfig>>,
+    /// 用户拖拽出的面板分隔比例，按页面 key 存储。
+    ///
+    /// 形如 `{"queue": {"wide_columns": 0.4, "narrow_queue": 0.6}}`。
+    /// 用嵌套表而不是固定字段，是为了以后加 Pane 时不必再动配置结构；
+    /// 缺省（或页面没拖过）时各页面走自己的内置默认比例。
+    #[serde(default)]
+    pub pane_ratios: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
 }
 
 impl Default for UiConfig {
@@ -341,6 +385,8 @@ impl Default for UiConfig {
             notification_timeout: None,
             max_fps: 20,
             status_bar_items: default_status_bar_items(),
+            table_columns: std::collections::HashMap::new(),
+            pane_ratios: std::collections::HashMap::new(),
         }
     }
 }

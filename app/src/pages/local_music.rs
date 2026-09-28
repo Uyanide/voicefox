@@ -2,9 +2,11 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use lx_core::events::AppAction;
 use lx_core::model::song::SongInfo;
 use ratatui::layout::{Position, Rect};
-use ratatui::widgets::{Block, Borders};
 
 use crate::context::AppContext;
+use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::hit_test::PanelRows;
+use crate::pages::components::list_filter::ListFilter;
 use crate::pages::sort::{SortState, SortTarget, SortedListCache};
 
 /// 排序 + 过滤后的本地歌曲视图：键盘、鼠标和渲染共用同一份下标映射，
@@ -69,12 +71,62 @@ pub fn handle_mouse(
     ctx: &AppContext,
     state: &mut SortState,
     cache: &mut SortedListCache,
-    filter_visible: bool,
-    filter_query: &str,
+    filter: &ListFilter,
     activate: bool,
 ) -> AppAction {
+    use crate::pages::components::song_table::{
+        ColumnResizeState, adjust_widths, compute_layout, find_boundary,
+    };
+
     let all_songs = sorted_local_songs(ctx, state, cache);
-    let view = LocalSongView::build(all_songs, filter_query);
+    let view = LocalSongView::build(all_songs, filter.query());
+
+    // 与渲染共用行账本；过滤行可见性统一走 `ListFilter::is_visible()`。
+    let rows = PanelRows::new(area, filter.is_visible(), false, true);
+    let inner = rows.inner;
+    let table_width = inner.width;
+
+    if let Some(crs) = state.column_resize.clone() {
+        match event.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let delta = (event.column as i32) - (crs.start_local_x as i32);
+                let adjusted =
+                    adjust_widths(&state.columns, crs.boundary_index, table_width, delta);
+                state.columns = adjusted;
+                state.column_resize = Some(ColumnResizeState {
+                    start_local_x: event.column,
+                    ..crs
+                });
+                return AppAction::None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                state.column_resize = None;
+                return AppAction::CommitColumnResize {
+                    page_key: state.page_key.to_string(),
+                    columns: state.columns.clone(),
+                };
+            }
+            _ => return AppAction::None,
+        }
+    }
+
+    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(header) = rows.header
+        && header.y == event.row
+    {
+        let local_x = event.column.saturating_sub(inner.x);
+        if let Some(boundary) = find_boundary(&state.columns, table_width, local_x) {
+            let layout = compute_layout(&state.columns, table_width);
+            if boundary + 1 < layout.len() {
+                state.column_resize = Some(ColumnResizeState {
+                    start_local_x: event.column,
+                    boundary_index: boundary,
+                });
+                return AppAction::None;
+            }
+        }
+    }
+
     let scroll_amount = ctx
         .config
         .read()
@@ -82,18 +134,16 @@ pub fn handle_mouse(
         .ui
         .scroll_amount
         .max(1);
+    let position = Position::new(event.column, event.row);
     match event.kind {
-        MouseEventKind::ScrollUp => {
+        MouseEventKind::ScrollUp if rows.list.contains(position) => {
             state.selected = state.selected.saturating_sub(scroll_amount);
         }
-        MouseEventKind::ScrollDown => {
+        MouseEventKind::ScrollDown if rows.list.contains(position) => {
             state.selected = (state.selected + scroll_amount).min(view.len().saturating_sub(1));
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let position = Position::new(event.column, event.row);
-            if let Some(index) =
-                song_index_at(area, position, state.scroll, view.len(), filter_visible)
-            {
+            if let Some(index) = rows.index_at(position, state.scroll, view.len()) {
                 state.selected = index;
                 if activate {
                     return AppAction::PlaySong {
@@ -108,19 +158,38 @@ pub fn handle_mouse(
     AppAction::None
 }
 
+/// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
+pub fn table_header_rect(area: Rect, filter: &ListFilter) -> Option<Rect> {
+    PanelRows::new(area, filter.is_visible(), false, true).header
+}
+
+/// 自动列宽的测量样本，**无副作用**。
+pub fn autofit_samples(ctx: &AppContext) -> Vec<SongInfo> {
+    ctx.source_manager.local_source().all_songs()
+}
+
 pub fn context_song_at(
-    event: MouseEvent,
+    source: MenuHitSource,
     area: Rect,
     ctx: &AppContext,
     state: &mut SortState,
     cache: &mut SortedListCache,
-    filter_visible: bool,
-    filter_query: &str,
+    filter: &ListFilter,
 ) -> Option<(Vec<SongInfo>, usize)> {
     let all_songs = sorted_local_songs(ctx, state, cache);
-    let view = LocalSongView::build(all_songs, filter_query);
-    let position = Position::new(event.column, event.row);
-    let index = song_index_at(area, position, state.scroll, view.len(), filter_visible)?;
+    let view = LocalSongView::build(all_songs, filter.query());
+    let rows = PanelRows::new(area, filter.is_visible(), false, true);
+    let index = source.resolve_index(
+        |event| {
+            rows.index_at(
+                Position::new(event.column, event.row),
+                state.scroll,
+                view.len(),
+            )
+        },
+        state.selected,
+        view.len(),
+    )?;
     state.selected = index;
     Some((view.to_queue(), index))
 }
@@ -141,79 +210,82 @@ pub fn sorted_local_songs<'a>(
     )
 }
 
-/// 屏幕行 → 视图下标。`filter_visible` 时列表上方多占一行过滤输入框，
-/// 命中区域与渲染路径的行坐标保持一致。
-fn song_index_at(
-    area: Rect,
-    position: Position,
-    scroll: usize,
-    len: usize,
-    filter_visible: bool,
-) -> Option<usize> {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
-    let rows_top = 1 + u16::from(filter_visible);
-    let visible_height = inner.height.saturating_sub(2);
-    let list_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(rows_top),
-        inner.width,
-        visible_height,
-    );
-    if !list_area.contains(position) {
-        return None;
-    }
-
-    let index = scroll + position.y.saturating_sub(list_area.y) as usize;
-    (index < len).then_some(index)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::song_index_at;
+    use crate::pages::components::hit_test::PanelRows;
     use ratatui::layout::{Position, Rect};
+
+    /// 面板行账本：过滤行 → 表头 → 列表。命中与渲染共用同一份。
+    fn rows(area: Rect, filter_visible: bool) -> PanelRows {
+        PanelRows::new(area, filter_visible, false, true)
+    }
 
     #[test]
     fn maps_visible_rows_to_scrolled_song_indices() {
         let area = Rect::new(10, 5, 80, 12);
+        let rows = rows(area, false);
 
-        assert_eq!(
-            song_index_at(area, Position::new(12, 7), 4, 20, false),
-            Some(4)
-        );
-        assert_eq!(
-            song_index_at(area, Position::new(12, 10), 4, 20, false),
-            Some(7)
-        );
+        assert_eq!(rows.index_at(Position::new(12, 7), 4, 20), Some(4));
+        assert_eq!(rows.index_at(Position::new(12, 10), 4, 20), Some(7));
     }
 
     #[test]
-    fn ignores_header_border_and_unused_bottom_row() {
+    fn ignores_header_border_and_outside_rows() {
         let area = Rect::new(10, 5, 80, 12);
+        let rows = rows(area, false);
 
+        assert_eq!(rows.index_at(Position::new(12, 6), 0, 20), None, "表头行");
+        assert_eq!(rows.index_at(Position::new(12, 5), 0, 20), None, "上边框");
+        // inner = (11,6,78,10)：表头占 1 行，数据行 7..16 全部可用
+        assert_eq!(rows.list.y, 7);
+        assert_eq!(rows.list.bottom(), 16);
         assert_eq!(
-            song_index_at(area, Position::new(12, 6), 0, 20, false),
-            None
+            rows.index_at(Position::new(12, 15), 0, 20),
+            Some(8),
+            "面板内最后一行数据行应当可点（旧实现会白丢这一行）"
         );
         assert_eq!(
-            song_index_at(area, Position::new(12, 15), 0, 20, false),
-            None
+            rows.index_at(Position::new(12, 16), 0, 20),
+            None,
+            "下边框不属于列表"
         );
-        assert_eq!(song_index_at(area, Position::new(9, 7), 0, 20, false), None);
+        assert_eq!(rows.index_at(Position::new(9, 7), 0, 20), None, "边框左侧");
     }
 
     #[test]
     fn filter_row_shifts_hit_area_down_by_one() {
         let area = Rect::new(10, 5, 80, 12);
+        let filtered = rows(area, true);
+        let plain = rows(area, false);
 
-        // 过滤条可见时数据行整体下移一行：原第 0 行位置现在点不中表头之上
-        assert_eq!(song_index_at(area, Position::new(12, 7), 0, 20, true), None);
+        // 过滤条可见时数据行整体下移一行
+        assert_eq!(filtered.index_at(Position::new(12, 7), 0, 20), None);
+        assert_eq!(filtered.index_at(Position::new(12, 8), 0, 20), Some(0));
+        assert_eq!(plain.index_at(Position::new(12, 7), 0, 20), Some(0));
+    }
+
+    /// 过滤行可见时，命中区**不能**比渲染多出一行（旧实现底部会多一行，
+    /// 点到面板下边框会选中屏幕外的歌）。
+    #[test]
+    fn filtered_and_plain_hit_areas_never_exceed_the_rendered_rows() {
+        let area = Rect::new(10, 5, 80, 12);
+        let filtered = rows(area, true);
+        let plain = rows(area, false);
+
+        // 渲染的数据行数：面板可用高度 - 过滤行 - 表头
+        assert_eq!(filtered.list.height, plain.list.height - 1);
+        assert_eq!(filtered.list.bottom(), plain.list.bottom(), "两者底部对齐");
+
+        let last_row = Position::new(12, filtered.list.bottom() - 1);
         assert_eq!(
-            song_index_at(area, Position::new(12, 8), 0, 20, true),
-            Some(0)
+            filtered.index_at(last_row, 0, 20),
+            Some(filtered.list.height as usize - 1),
+            "最后一行可见数据行的下标"
         );
         assert_eq!(
-            song_index_at(area, Position::new(12, 7), 0, 20, false),
-            Some(0)
+            filtered.index_at(Position::new(12, filtered.list.bottom()), 0, 20),
+            None,
+            "面板下边框那一行不属于列表"
         );
     }
 }

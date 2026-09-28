@@ -230,7 +230,12 @@ impl AppContext {
         }
         let (playlist, current_index) = self.playlist.snapshot_arc();
         if playlist.is_empty() {
-            return self.storage.clear_playback_session();
+            // 队列为空 ≠ 用户想丢弃上一次的播放会话：更常见的情况是本次启动还没
+            // 恢复（会话文件缺失或解析失败），或者用户压根没开始播放。以前这里
+            // 直接把会话文件删掉，于是「打开 → 没播放 → 退出」会把上一次保存的
+            // 播放状态一并抹掉，表现就是"播放状态从来没保存过"。
+            // 真正要丢弃请走显式路径：`forget_playback_session`。
+            return Ok(());
         }
         let state = match *self.player_state.borrow() {
             PlayerState::Playing | PlayerState::Loading => SavedPlayerState::Playing,
@@ -243,6 +248,14 @@ impl AppContext {
             *self.position.borrow(),
             state,
         )
+    }
+
+    /// 用户显式丢弃已保存的播放会话（清空队列时调用）。
+    ///
+    /// 与 [`persist_playback_session`](Self::persist_playback_session) 的区别：
+    /// 后者只在队列非空时覆盖会话，队列为空时保持原样，不会误删。
+    pub fn forget_playback_session(&self) -> Result<(), String> {
+        self.storage.clear_playback_session()
     }
 
     pub fn cycle_playback_speed(&self) -> String {

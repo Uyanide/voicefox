@@ -15,6 +15,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::context::AppContext;
+use crate::pages::components::splitter::{
+    DividerHit, SplitAxis, Splitter, clamp_ratio, ratio_within,
+};
 
 /// 删除类操作（音源 / 本地目录）二次确认的窗口时长
 const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
@@ -191,6 +194,12 @@ pub struct SettingsPage {
     status_item_scroll: usize,
     /// 状态栏拖拽当前所在的字段行，避免同一行重复触发重排。
     status_drag_target: Option<usize>,
+    /// 面板尺寸参数（可被用户拖拽改变，并持久化到 Config）。
+    layout: SettingsLayout,
+    /// 面板分隔条拖拽状态机。
+    splitter: Splitter<SettingsResizeTarget>,
+    /// 拖拽开始前的布局快照，用于 Esc 取消还原。
+    layout_before_drag: Option<SettingsLayout>,
     /// 当前聚焦区域
     focus: SettingsFocus,
     category: SettingsCategory,
@@ -273,6 +282,9 @@ impl SettingsPage {
             selected_status_item: 0,
             status_item_scroll: 0,
             status_drag_target: None,
+            layout: SettingsLayout::default(),
+            splitter: Splitter::default(),
+            layout_before_drag: None,
             focus: SettingsFocus::JsSources,
             category: SettingsCategory::Interface,
             delete_source_armed: None,
@@ -294,6 +306,11 @@ impl SettingsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
+        if self.splitter.is_dragging() && key.code == KeyCode::Esc {
+            // Esc 还原拖拽前的面板布局（与其它页面的分割条行为一致）。
+            self.cancel_resize();
+            return AppAction::None;
+        }
         if self.proxy_input_mode {
             return self.handle_proxy_input(key, ctx);
         }
@@ -1695,7 +1712,8 @@ impl SettingsPage {
         let local_paths = &config.local_music.paths;
         let accent = crate::theme::accent(ctx);
         let muted = crate::theme::muted(ctx);
-        let chunks = settings_chunks(area, self.focus, self.category);
+        let chunks = settings_chunks_with(area, self.focus, self.category, self.layout);
+        let divider_lines = settings_dividers(area, self.focus, self.category, self.layout);
         let proxy_label = if config.network.proxy_url.is_empty() {
             "未设置".to_string()
         } else {
@@ -2265,6 +2283,30 @@ impl SettingsPage {
         }
 
         // 登录状态常驻在设置页右侧，不再要求按 P 才展开。
+        // 分隔条画在面板之上（坐标与命中共用 settings_dividers）。
+        let divider_style = {
+            let base = Style::new().fg(crate::theme::accent(ctx));
+            if self.splitter.is_dragging() {
+                base.add_modifier(Modifier::BOLD)
+            } else {
+                base
+            }
+        };
+        for (_, hit) in divider_lines {
+            match hit.axis {
+                SplitAxis::Vertical => {
+                    for y in hit.span.0..hit.span.1 {
+                        buf.set_string(hit.divider, y, "│", divider_style);
+                    }
+                }
+                SplitAxis::Horizontal => {
+                    for x in hit.span.0..hit.span.1 {
+                        buf.set_string(x, hit.divider, "─", divider_style);
+                    }
+                }
+            }
+        }
+
         // Accounts 分类只是把焦点切到登录区域；实际登录面板始终可见。
         let login_area = chunks[3];
         let all = SourceId::all_online();
@@ -2520,6 +2562,97 @@ impl SettingsPage {
         }
     }
 
+    /// 兜底取消进行中的状态栏条目拖拽。
+    pub fn abort_drag_sessions(&mut self) {
+        self.status_drag_target = None;
+        self.splitter.cancel();
+        self.layout_before_drag = None;
+    }
+
+    /// 页面在 `ui.pane_ratios` 里的 key。
+    pub fn pane_page_key(&self) -> &'static str {
+        SETTINGS_PAGE_KEY
+    }
+
+    /// 从 Config 恢复用户拖拽过的面板尺寸（页面构造后调用一次）。
+    pub fn apply_pane_ratios(&mut self, ratios: &std::collections::HashMap<String, f32>) {
+        if let Some(value) = ratios.get("options_panels").copied() {
+            self.layout.options_ratio = clamp_ratio(value, 0.0, 0.5);
+        }
+        if let Some(value) = ratios.get("wide_left").copied() {
+            self.layout.wide_left = clamp_ratio(value, 0.15, 0.55);
+        }
+        if let Some(value) = ratios.get("wide_middle_end").copied() {
+            self.layout.wide_middle_end = clamp_ratio(value, 0.45, 0.85);
+        }
+        if let Some(value) = ratios.get("narrow_left").copied() {
+            self.layout.narrow_left = clamp_ratio(value, 0.25, 0.80);
+        }
+        self.layout.clamp_all();
+    }
+
+    /// 该分隔线当前的比例（拖拽起点）。
+    fn committed_ratio(&self, target: SettingsResizeTarget) -> f32 {
+        match target {
+            SettingsResizeTarget::OptionsPanels => self.layout.options_ratio,
+            SettingsResizeTarget::WidePanelsLeft => self.layout.wide_left,
+            SettingsResizeTarget::WidePanelsRight => self.layout.wide_middle_end,
+            SettingsResizeTarget::NarrowPanels => self.layout.narrow_left,
+        }
+    }
+
+    /// 拖拽中实时写入布局（渲染与命中读同一份，预览即时可见）。
+    fn update_resize_preview(
+        &mut self,
+        target: SettingsResizeTarget,
+        event: MouseEvent,
+        area: Rect,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        match target {
+            SettingsResizeTarget::OptionsPanels => {
+                let raw = ratio_within(area.y, area.height, event.row);
+                self.layout.options_ratio = clamp_ratio(raw, 0.05, 0.5);
+            }
+            SettingsResizeTarget::WidePanelsLeft => {
+                let raw = ratio_within(area.x, area.width, event.column);
+                self.layout.wide_left = clamp_ratio(raw, 0.15, 0.55);
+            }
+            SettingsResizeTarget::WidePanelsRight => {
+                let raw = ratio_within(area.x, area.width, event.column);
+                self.layout.wide_middle_end = clamp_ratio(raw, 0.45, 0.85);
+            }
+            SettingsResizeTarget::NarrowPanels => {
+                let raw = ratio_within(area.x, area.width, event.column);
+                self.layout.narrow_left = clamp_ratio(raw, 0.25, 0.80);
+            }
+        }
+        self.layout.clamp_all();
+    }
+
+    /// 鼠标抬起：结束拖拽并返回要持久化的 `(ratio_key, ratio)`。
+    fn commit_resize(&mut self) -> Option<(&'static str, f32)> {
+        let (target, _) = self.splitter.commit()?;
+        self.layout_before_drag = None;
+        let key = match target {
+            SettingsResizeTarget::OptionsPanels => "options_panels",
+            SettingsResizeTarget::WidePanelsLeft => "wide_left",
+            SettingsResizeTarget::WidePanelsRight => "wide_middle_end",
+            SettingsResizeTarget::NarrowPanels => "narrow_left",
+        };
+        Some((key, self.committed_ratio(target)))
+    }
+
+    /// Esc 取消：还原拖拽前的布局。
+    fn cancel_resize(&mut self) {
+        self.splitter.cancel();
+        if let Some(before) = self.layout_before_drag.take() {
+            self.layout = before;
+        }
+    }
+
     pub fn handle_mouse(
         &mut self,
         event: MouseEvent,
@@ -2527,10 +2660,49 @@ impl SettingsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
-        if self.any_input_active() {
+        // 只有"按下"才算用户主动离开输入态：否则鼠标一移动就会退出输入模式，
+        // 后续按键转入全局/选项键位分发（曾经因此误触"保留播放状态"开关）。
+        if self.any_input_active() && matches!(event.kind, MouseEventKind::Down(_)) {
+            self.input_mode = false;
+            self.local_path_mode = false;
+            self.proxy_input_mode = false;
+            self.audio_device_input_mode = false;
+            self.playlist_import_mode = false;
+            self.download_input_target = None;
+        }
+        let chunks = settings_chunks_with(area, self.focus, self.category, self.layout);
+        // 分隔条拖拽会话优先于一切：拖拽期间其余鼠标事件不能穿透。
+        let dividers = settings_dividers(area, self.focus, self.category, self.layout);
+        if let Some(target) = self.splitter.dragging().copied() {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.update_resize_preview(target, event, area);
+                    return AppAction::None;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    return match self.commit_resize() {
+                        Some((ratio_key, ratio)) => AppAction::CommitPaneRatio {
+                            page_key: SETTINGS_PAGE_KEY.to_string(),
+                            ratio_key: ratio_key.to_string(),
+                            ratio,
+                        },
+                        None => AppAction::None,
+                    };
+                }
+                _ => return AppAction::None,
+            }
+        }
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some((target, _)) = dividers
+                .iter()
+                .find(|(_, hit)| hit.matches(event.column, event.row))
+        {
+            self.layout_before_drag = Some(self.layout);
+            let committed = self.committed_ratio(*target);
+            self.splitter.begin(*target, committed);
             return AppAction::None;
         }
-        let chunks = settings_chunks(area, self.focus, self.category);
+
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::ScrollUp => {
@@ -3165,6 +3337,8 @@ const SETTING_OPTION_ACTIONS: [Option<Action>; 60] = [
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 const THREE_COLUMN_OPTIONS_MIN_WIDTH: u16 = 72;
 const ALL_MANAGEMENT_PANELS_MIN_WIDTH: u16 = 108;
+/// 页面在 `ui.pane_ratios` 里的 key。
+const SETTINGS_PAGE_KEY: &str = "settings";
 
 /// 设置页在非输入模式下响应的字符键：选项键之外还有列表操作键
 /// （a 添加 / d 删除 / h 检测 / s 切换焦点 / r 扫描 / y 与 [ 见 `handle_input`）。
@@ -3232,9 +3406,147 @@ fn setting_options_height(panel_width: u16, option_count: usize) -> u16 {
     rows.saturating_add(2)
 }
 
+/// 设置页可拖拽的分隔线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsResizeTarget {
+    /// 选项区与下排面板之间（水平线）。
+    OptionsPanels,
+    /// 宽屏下排三个面板之间的两条竖线。
+    WidePanelsLeft,
+    WidePanelsRight,
+    /// 窄屏下排两个面板之间（竖线）。
+    NarrowPanels,
+}
+
+/// 设置页的面板尺寸参数。默认值 = 以前的硬编码百分比，用户拖过之后生效。
+#[derive(Debug, Clone, Copy)]
+struct SettingsLayout {
+    /// 选项区占整页高度（上限由选项行数决定，见 `setting_options_height`）。
+    options_ratio: f32,
+    /// 宽屏下排：第一个面板的宽度占比。
+    wide_left: f32,
+    /// 宽屏下排：前两个面板的宽度占比（第三个 = 1 - 它）。
+    wide_middle_end: f32,
+    /// 窄屏下排：左侧面板宽度占比。
+    narrow_left: f32,
+}
+
+impl Default for SettingsLayout {
+    fn default() -> Self {
+        Self {
+            options_ratio: 0.0, // 0 = 用选项行数推导（与旧行为一致）
+            wide_left: 0.34,
+            wide_middle_end: 0.66,
+            narrow_left: 0.60,
+        }
+    }
+}
+
+impl SettingsLayout {
+    fn options_height(&self, width: u16, option_count: usize, total_height: u16) -> u16 {
+        let by_rows = setting_options_height(width, option_count);
+        let by_ratio = if self.options_ratio > 0.0 {
+            (total_height as f32 * self.options_ratio).round() as u16
+        } else {
+            by_rows
+        };
+        by_ratio
+            .clamp(3, total_height.saturating_sub(3).max(3))
+            .min(by_rows.max(3))
+    }
+
+    fn clamp_all(&mut self) {
+        self.options_ratio = clamp_ratio(self.options_ratio, 0.0, 0.5);
+        self.wide_left = clamp_ratio(self.wide_left, 0.15, 0.55);
+        self.wide_middle_end = clamp_ratio(self.wide_middle_end, self.wide_left + 0.15, 0.85);
+        self.narrow_left = clamp_ratio(self.narrow_left, 0.25, 0.80);
+    }
+}
+
+/// 分隔条的绘制跨度与命中（渲染与命中共用）。
+fn settings_dividers(
+    area: Rect,
+    focus: SettingsFocus,
+    category: SettingsCategory,
+    layout: SettingsLayout,
+) -> Vec<(SettingsResizeTarget, DividerHit)> {
+    let chunks = settings_chunks_with(area, focus, category, layout);
+    let mut out = Vec::new();
+
+    // 选项区与面板区之间：只有下面还有空间时才画。
+    let options_bottom = chunks[0].bottom();
+    if options_bottom > chunks[0].y && options_bottom <= area.bottom() {
+        let divider = options_bottom.saturating_sub(1);
+        if divider >= area.y && divider < area.bottom() {
+            out.push((
+                SettingsResizeTarget::OptionsPanels,
+                DividerHit::new(SplitAxis::Horizontal, divider, (area.x, area.right())),
+            ));
+        }
+    }
+
+    let panels_y = (chunks[0].bottom(), area.bottom());
+    if panels_y.0 >= panels_y.1 {
+        return out;
+    }
+    if area.width >= ALL_MANAGEMENT_PANELS_MIN_WIDTH {
+        let left = chunks[1];
+        let middle = chunks[2];
+        if left.width > 0 && middle.width > 0 {
+            out.push((
+                SettingsResizeTarget::WidePanelsLeft,
+                DividerHit::new(
+                    SplitAxis::Vertical,
+                    left.right().saturating_sub(1),
+                    panels_y,
+                ),
+            ));
+        }
+        if middle.width > 0 && chunks[3].width > 0 {
+            out.push((
+                SettingsResizeTarget::WidePanelsRight,
+                DividerHit::new(
+                    SplitAxis::Vertical,
+                    middle.right().saturating_sub(1),
+                    panels_y,
+                ),
+            ));
+        }
+    } else {
+        // 窄屏下排只有左侧那一个面板 + 常驻登录区
+        let left = if chunks[1].width > 0 {
+            chunks[1]
+        } else {
+            chunks[2]
+        };
+        if left.width > 0 && chunks[3].width > 0 {
+            out.push((
+                SettingsResizeTarget::NarrowPanels,
+                DividerHit::new(
+                    SplitAxis::Vertical,
+                    left.right().saturating_sub(1),
+                    panels_y,
+                ),
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 fn settings_chunks(area: Rect, focus: SettingsFocus, category: SettingsCategory) -> [Rect; 4] {
-    let option_height =
-        setting_options_height(area.width, category.option_indices().len()).min(area.height);
+    settings_chunks_with(area, focus, category, SettingsLayout::default())
+}
+
+fn settings_chunks_with(
+    area: Rect,
+    focus: SettingsFocus,
+    category: SettingsCategory,
+    layout: SettingsLayout,
+) -> [Rect; 4] {
+    let option_height = layout
+        .options_height(area.width, category.option_indices().len(), area.height)
+        .min(area.height);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(option_height), Constraint::Min(0)])
@@ -3246,9 +3558,11 @@ fn settings_chunks(area: Rect, focus: SettingsFocus, category: SettingsCategory)
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(34),
-                Constraint::Percentage(32),
-                Constraint::Percentage(34),
+                Constraint::Percentage((layout.wide_left * 100.0).round() as u16),
+                Constraint::Percentage(
+                    ((layout.wide_middle_end - layout.wide_left) * 100.0).round() as u16,
+                ),
+                Constraint::Min(0),
             ])
             .split(vertical[1]);
         [vertical[0], bottom[0], bottom[1], bottom[2]]
@@ -3256,7 +3570,10 @@ fn settings_chunks(area: Rect, focus: SettingsFocus, category: SettingsCategory)
         // 窄屏也保留常驻登录区；左侧管理区根据焦点显示 JS 音源或本地+状态栏。
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .constraints([
+                Constraint::Percentage((layout.narrow_left * 100.0).round() as u16),
+                Constraint::Min(0),
+            ])
             .split(vertical[1]);
         let mut chunks = [vertical[0], Rect::default(), Rect::default(), bottom[1]];
         if matches!(focus, SettingsFocus::JsSources) {
@@ -3281,12 +3598,97 @@ mod tests {
 
     use super::{
         KEY_COLUMN_WIDTH, LABEL_COLUMN_WIDTH, SETTING_OPTION_ACTIONS, SETTING_OPTION_KEYS,
-        SettingsCategory, SettingsFocus, SettingsPage, command_key_at, reorder_status_bar_items,
-        setting_line, setting_option_index, setting_value_line, settings_chunks, shorten_source,
+        SettingsCategory, SettingsFocus, SettingsLayout, SettingsPage, command_key_at,
+        reorder_status_bar_items, setting_line, setting_option_index, setting_value_line,
+        settings_chunks, settings_chunks_with, settings_dividers, shorten_source,
     };
+    use crate::pages::components::splitter::SplitAxis;
 
     /// 各设置项取值统一起始的列号
     const VALUE_COLUMN: usize = 1 + KEY_COLUMN_WIDTH + 1 + LABEL_COLUMN_WIDTH + 1;
+
+    /// 默认布局必须与旧硬编码完全一致（34/32/34 宽屏、60/40 窄屏），
+    /// 否则这次"可拖拽化"就顺手改了别人的界面。
+    #[test]
+    fn default_layout_keeps_the_previous_hardcoded_panel_widths() {
+        let area = Rect::new(0, 0, 160, 40);
+        let chunks = settings_chunks(area, SettingsFocus::JsSources, SettingsCategory::Interface);
+        // ratatui 的 Percentage 取整结果：34% → 54、32% → 52，第三个吃剩余
+        assert_eq!(chunks[1].width, 54, "160 * 34%");
+        assert_eq!(chunks[2].width, 52, "160 * 32%");
+        assert_eq!(
+            chunks[1].width + chunks[2].width + chunks[3].width,
+            160,
+            "三个面板必须铺满下排"
+        );
+
+        let narrow = Rect::new(0, 0, 100, 40);
+        let chunks = settings_chunks(
+            narrow,
+            SettingsFocus::JsSources,
+            SettingsCategory::Interface,
+        );
+        assert_eq!(chunks[1].width, 60, "窄屏 100 * 60%");
+        assert_eq!(chunks[3].width, 40);
+    }
+
+    /// 分隔条必须"看得见就抓得住"：命中坐标与绘制坐标同源。
+    #[test]
+    fn every_divider_is_hittable_on_its_own_line() {
+        let area = Rect::new(0, 0, 160, 40);
+        let layout = SettingsLayout::default();
+        let dividers = settings_dividers(
+            area,
+            SettingsFocus::JsSources,
+            SettingsCategory::Interface,
+            layout,
+        );
+        assert!(
+            dividers.len() >= 3,
+            "宽屏应有 选项/面板 横线 + 两条竖线，实际 {}",
+            dividers.len()
+        );
+        for (_, hit) in &dividers {
+            match hit.axis {
+                SplitAxis::Vertical => {
+                    assert!(hit.matches(hit.divider, hit.span.0), "竖线首行应命中");
+                    assert!(hit.matches(hit.divider + 1, hit.span.0), "容差 ±1");
+                    assert!(!hit.matches(hit.divider + 2, hit.span.0));
+                }
+                SplitAxis::Horizontal => {
+                    assert!(hit.matches(hit.span.0, hit.divider), "横线首列应命中");
+                    assert!(hit.matches(hit.span.0, hit.divider + 1), "容差 ±1");
+                    assert!(!hit.matches(hit.span.0, hit.divider + 2));
+                }
+            }
+        }
+    }
+
+    /// 拖拽比例真的会改变面板尺寸，且被夹在合理范围内。
+    #[test]
+    fn dragging_ratios_resizes_the_panels_within_bounds() {
+        let area = Rect::new(0, 0, 160, 40);
+        let mut layout = SettingsLayout {
+            options_ratio: 0.0,
+            wide_left: 0.50,
+            wide_middle_end: 0.70,
+            narrow_left: 0.60,
+        };
+        layout.clamp_all();
+        let chunks = settings_chunks_with(
+            area,
+            SettingsFocus::JsSources,
+            SettingsCategory::Interface,
+            layout,
+        );
+        assert_eq!(chunks[1].width, 80, "50% 宽度");
+
+        // 越界值会被夹回来，不会把面板压成 0
+        layout.wide_left = 0.99;
+        layout.clamp_all();
+        assert!(layout.wide_left <= 0.55);
+        assert!(layout.wide_middle_end > layout.wide_left);
+    }
 
     #[test]
     fn every_setting_option_belongs_to_exactly_one_category() {

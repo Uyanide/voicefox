@@ -2,6 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::keybinding::{Action, KeybindingResolver};
+use lx_core::model::config::TableColumnConfig;
 use lx_core::model::song::SongInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -26,11 +27,8 @@ pub enum SongMenuAction {
     Download,
     PlayNext,
     AddToQueue,
-    OpenCustomPlaylists,
-    OpenPlaybackControls,
     Playback(PlaybackMenuAction),
     AddToCustomPlaylist(String),
-    NoCustomPlaylists,
     ToggleFavorite,
     CycleSort(SortTarget),
     RemoveFromQueue,
@@ -40,6 +38,49 @@ pub enum SongMenuAction {
     RemoveFromCustomPlaylist(String),
     ViewArtist(String),
     ViewAlbum,
+}
+
+/// 表头右键菜单的动作。
+///
+/// 把"新的列配置"直接放进动作里（而不是只带一个列 key），
+/// 是因为菜单在构造时已经知道完整列配置，这样处理端不需要回头去问页面，
+/// 显示/隐藏切换、自动列宽两条路径共用同一个提交动作。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnMenuAction {
+    /// 应用一份新的列配置（显示隐藏切换、自动列宽都走这里）。
+    Apply(Vec<TableColumnConfig>),
+    /// 删除该页面的列配置，恢复默认档位与可见性。
+    Reset,
+}
+
+/// 菜单条目要执行的动作。
+///
+/// 菜单本身是**通用**的：歌曲动作、表头列动作、以及"打开子菜单"都走这一个
+/// 枚举，所以队列、表头、歌单行等场景共用同一套渲染 / 命中 / 键盘导航，
+/// 不会再出现每个场景各写一套菜单。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MenuAction {
+    Song(SongMenuAction),
+    Column(ColumnMenuAction),
+    /// 打开子菜单（条目在构造时确定）。
+    Submenu {
+        title: String,
+        items: Vec<MenuItem>,
+    },
+    /// 返回上一级（根层时关闭菜单）。
+    Back,
+}
+
+impl From<SongMenuAction> for MenuAction {
+    fn from(action: SongMenuAction) -> Self {
+        Self::Song(action)
+    }
+}
+
+impl From<ColumnMenuAction> for MenuAction {
+    fn from(action: ColumnMenuAction) -> Self {
+        Self::Column(action)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,11 +100,46 @@ pub enum PlaybackMenuAction {
     ClearAbLoop,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 上下文菜单目标的来源：鼠标位置 or 键盘当前选中项。
+///
+/// 统一成一个入参，让"鼠标右键"和"键盘打开菜单（默认 `x`）"走
+/// **完全同一条**目标解析路径，避免两条路径各写一份命中逻辑而跑偏。
+#[derive(Debug, Clone, Copy)]
+pub enum MenuHitSource {
+    /// 鼠标事件：按行命中。
+    Mouse(MouseEvent),
+    /// 键盘：用列表当前选中项。
+    Selected,
+}
+
+impl MenuHitSource {
+    /// 解析出列表下标。
+    ///
+    /// `row_hit` 只在鼠标来源时调用；键盘来源取当前选中项并夹到合法范围。
+    /// `len == 0` 时两者都返回 `None`（没有目标就不该弹菜单）。
+    pub fn resolve_index(
+        self,
+        row_hit: impl FnOnce(MouseEvent) -> Option<usize>,
+        selected: usize,
+        len: usize,
+    ) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        match self {
+            Self::Mouse(event) => row_hit(event),
+            Self::Selected => Some(selected.min(len - 1)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum MenuOutcome {
     None,
     Close,
-    Action(SongMenuAction),
+    /// 用户选中了一个动作。歌曲动作与列动作都从这里出来，
+    /// 由 `main.rs` 按变体分派。
+    Action(MenuAction),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,17 +163,66 @@ pub struct PlaybackMenuState {
     pub ab_loop: String,
 }
 
-#[derive(Debug, Clone)]
-struct MenuItem {
-    label: String,
-    action: SongMenuAction,
+/// 构造子菜单动作：自动补一条"返回上级"，避免每个子菜单各写一遍。
+pub fn submenu(title: impl Into<String>, mut items: Vec<MenuItem>) -> MenuAction {
+    items.push(MenuItem::new("← 返回上级", MenuAction::Back).with_hint("Esc"));
+    MenuAction::Submenu {
+        title: title.into(),
+        items,
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MenuLevel {
-    Root,
-    CustomPlaylists,
-    PlaybackControls,
+#[derive(Debug, Clone, PartialEq)]
+pub struct MenuItem {
+    label: String,
+    action: MenuAction,
+    /// 禁用项会被跳过（键盘选择、鼠标命中和渲染都跳过），不会误触。
+    enabled: bool,
+    /// 可选的快捷键提示，渲染在菜单行右端。
+    hint: Option<String>,
+}
+
+impl MenuItem {
+    pub fn new(label: impl Into<String>, action: impl Into<MenuAction>) -> Self {
+        Self {
+            label: label.into(),
+            action: action.into(),
+            enabled: true,
+            hint: None,
+        }
+    }
+
+    /// 占位/不可用项：可见但不可选，也不会触发动作。
+    pub fn disabled(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            action: MenuAction::Back,
+            enabled: false,
+            hint: None,
+        }
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
+/// 一层菜单（标题 + 条目）。菜单用 `Vec<MenuLevel>` 作栈，
+/// 因此层级数量与子菜单内容都是运行期决定的通用能力。
+#[derive(Debug, Clone)]
+struct MenuLevel {
+    title: String,
+    items: Vec<MenuItem>,
+}
+
+impl MenuLevel {
+    fn new(title: impl Into<String>, items: Vec<MenuItem>) -> Self {
+        Self {
+            title: title.into(),
+            items,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,10 +232,10 @@ pub struct SongContextMenu {
     index: usize,
     selected: usize,
     scroll_offset: usize,
-    level: MenuLevel,
-    root_items: Vec<MenuItem>,
-    custom_playlist_items: Vec<MenuItem>,
-    playback_control_items: Vec<MenuItem>,
+    /// 层级栈：`stack[0]` 恒为根层。
+    stack: Vec<MenuLevel>,
+    /// 该菜单作用的页面 key（列菜单用它把新配置提交到正确的页面）。
+    page_key: Option<String>,
 }
 
 impl SongContextMenu {
@@ -129,47 +254,47 @@ impl SongContextMenu {
             current_custom_playlist,
             playback,
         } = options;
-        let mut root_items = vec![MenuItem {
-            label: "播放".to_string(),
-            action: SongMenuAction::Play,
-        }];
+        let mut root_items = vec![MenuItem::new("播放".to_string(), SongMenuAction::Play)];
         // 本地文件已经在磁盘上，不提供下载入口。
         if kind != SongMenuKind::Local {
-            root_items.push(MenuItem {
-                label: "下载歌曲".to_string(),
-                action: SongMenuAction::Download,
-            });
+            root_items.push(MenuItem::new(
+                "下载歌曲".to_string(),
+                SongMenuAction::Download,
+            ));
         }
         if kind != SongMenuKind::Queue {
             root_items.extend([
-                MenuItem {
-                    label: "设为下一首".to_string(),
-                    action: SongMenuAction::PlayNext,
-                },
-                MenuItem {
-                    label: "加入队尾".to_string(),
-                    action: SongMenuAction::AddToQueue,
-                },
+                MenuItem::new("设为下一首".to_string(), SongMenuAction::PlayNext),
+                MenuItem::new("加入队尾".to_string(), SongMenuAction::AddToQueue),
             ]);
         }
-        root_items.push(MenuItem {
-            label: "加入自建歌单...".to_string(),
-            action: SongMenuAction::OpenCustomPlaylists,
-        });
+        // 子菜单条目先建好，挂成 root 上的一个 Submenu 动作。
+        let custom_playlist_items = if custom_playlists.is_empty() {
+            vec![MenuItem::disabled("暂无自建歌单，请先创建")]
+        } else {
+            custom_playlists
+                .into_iter()
+                .map(|(id, name)| MenuItem::new(name, SongMenuAction::AddToCustomPlaylist(id)))
+                .collect()
+        };
+        root_items.push(MenuItem::new(
+            "加入自建歌单...".to_string(),
+            submenu(" 选择自建歌单 ", custom_playlist_items),
+        ));
         if let Some(playlist_id) = current_custom_playlist {
-            root_items.push(MenuItem {
-                label: "从当前歌单移除".to_string(),
-                action: SongMenuAction::RemoveFromCustomPlaylist(playlist_id),
-            });
+            root_items.push(MenuItem::new(
+                "从当前歌单移除".to_string(),
+                SongMenuAction::RemoveFromCustomPlaylist(playlist_id),
+            ));
         }
-        root_items.push(MenuItem {
-            label: if is_favorite {
+        root_items.push(MenuItem::new(
+            if is_favorite {
                 "取消收藏".to_string()
             } else {
                 "收藏歌曲".to_string()
             },
-            action: SongMenuAction::ToggleFavorite,
-        });
+            SongMenuAction::ToggleFavorite,
+        ));
         let song = &songs[index];
         let artists = song
             .singer
@@ -179,89 +304,92 @@ impl SongContextMenu {
             .collect::<Vec<_>>();
         if artists.len() > 1 {
             for artist in artists {
-                root_items.push(MenuItem {
-                    label: format!("查看歌手：{artist}"),
-                    action: SongMenuAction::ViewArtist(artist.to_string()),
-                });
+                root_items.push(MenuItem::new(
+                    format!("查看歌手：{artist}"),
+                    SongMenuAction::ViewArtist(artist.to_string()),
+                ));
             }
         } else if let Some(artist) = artists.first() {
-            root_items.push(MenuItem {
-                label: "查看歌手".to_string(),
-                action: SongMenuAction::ViewArtist((*artist).to_string()),
-            });
+            root_items.push(MenuItem::new(
+                "查看歌手".to_string(),
+                SongMenuAction::ViewArtist((*artist).to_string()),
+            ));
         }
         if !song.album_name.trim().is_empty() {
-            root_items.push(MenuItem {
-                label: "查看专辑".to_string(),
-                action: SongMenuAction::ViewAlbum,
-            });
+            root_items.push(MenuItem::new(
+                "查看专辑".to_string(),
+                SongMenuAction::ViewAlbum,
+            ));
         }
-        if playback.is_some() {
-            root_items.push(MenuItem {
-                label: "播放控制...".to_string(),
-                action: SongMenuAction::OpenPlaybackControls,
-            });
+        if let Some(playback_state) = playback {
+            root_items.push(MenuItem::new(
+                "播放控制...".to_string(),
+                submenu(" 播放控制 ", build_playback_control_items(playback_state)),
+            ));
         }
         if let Some((target, mode)) = sort {
-            root_items.push(MenuItem {
-                label: format!("排序：{}（切换）", mode.label(target)),
-                action: SongMenuAction::CycleSort(target),
-            });
+            root_items.push(MenuItem::new(
+                format!("排序：{}（切换）", mode.label(target)),
+                SongMenuAction::CycleSort(target),
+            ));
         }
         match kind {
-            SongMenuKind::Queue => root_items.push(MenuItem {
-                label: "从队列移除".to_string(),
-                action: SongMenuAction::RemoveFromQueue,
-            }),
+            SongMenuKind::Queue => root_items.push(MenuItem::new(
+                "从队列移除".to_string(),
+                SongMenuAction::RemoveFromQueue,
+            )),
             SongMenuKind::History => root_items.extend([
-                MenuItem {
-                    label: "删除这条历史".to_string(),
-                    action: SongMenuAction::RemoveFromHistory,
-                },
-                MenuItem {
-                    label: "清空播放历史".to_string(),
-                    action: SongMenuAction::ClearHistory,
-                },
+                MenuItem::new(
+                    "删除这条历史".to_string(),
+                    SongMenuAction::RemoveFromHistory,
+                ),
+                MenuItem::new("清空播放历史".to_string(), SongMenuAction::ClearHistory),
             ]),
-            SongMenuKind::Local => root_items.push(MenuItem {
-                label: "删除本地文件".to_string(),
-                action: SongMenuAction::DeleteLocal,
-            }),
+            SongMenuKind::Local => root_items.push(MenuItem::new(
+                "删除本地文件".to_string(),
+                SongMenuAction::DeleteLocal,
+            )),
             SongMenuKind::Standard => {}
         }
-        let custom_playlist_items = if custom_playlists.is_empty() {
-            vec![MenuItem {
-                label: "暂无自建歌单，请先创建".to_string(),
-                action: SongMenuAction::NoCustomPlaylists,
-            }]
-        } else {
-            custom_playlists
-                .into_iter()
-                .map(|(id, name)| MenuItem {
-                    label: name,
-                    action: SongMenuAction::AddToCustomPlaylist(id),
-                })
-                .collect()
-        };
-        let playback_control_items = playback
-            .map(build_playback_control_items)
-            .unwrap_or_default();
-
         Some(Self {
             origin,
             songs,
             index,
             selected: 0,
             scroll_offset: 0,
-            level: MenuLevel::Root,
-            root_items,
-            custom_playlist_items,
-            playback_control_items,
+            stack: vec![MenuLevel::new(" 歌曲操作 ", root_items)],
+            page_key: None,
         })
     }
 
     pub fn songs(&self) -> &[SongInfo] {
         &self.songs
+    }
+
+    /// 用任意条目构造一个通用菜单。
+    ///
+    /// 表头列菜单、行级菜单等非歌曲场景复用它，因此渲染、命中、键盘导航、
+    /// 子菜单与"返回上级"只有一份实现。
+    pub fn from_entries(
+        origin: Position,
+        title: impl Into<String>,
+        items: Vec<MenuItem>,
+        page_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            origin,
+            songs: Vec::new(),
+            index: 0,
+            selected: 0,
+            scroll_offset: 0,
+            stack: vec![MenuLevel::new(title, items)],
+            page_key: Some(page_key.into()),
+        }
+    }
+
+    /// 该菜单作用的页面 key（歌曲菜单为 `None`）。
+    pub fn page_key(&self) -> Option<&str> {
+        self.page_key.as_deref()
     }
 
     pub fn index(&self) -> usize {
@@ -297,7 +425,14 @@ impl SongContextMenu {
             Some(Action::ListSelectUp) => self.select_previous(visible_items),
             Some(Action::ListSelectDown) => self.select_next(visible_items),
             Some(Action::ListActivate) => return self.activate(),
-            Some(Action::ListGoBack) => return MenuOutcome::Close,
+            Some(Action::ListGoBack) => {
+                // 子菜单里"返回"只回上一级，根层才关闭整个菜单。
+                return if self.pop_level() {
+                    MenuOutcome::None
+                } else {
+                    MenuOutcome::Close
+                };
+            }
             _ => match (key.modifiers, key.code) {
                 (KeyModifiers::NONE, KeyCode::Up) => self.select_previous(visible_items),
                 (KeyModifiers::NONE, KeyCode::Down) => self.select_next(visible_items),
@@ -352,11 +487,7 @@ impl SongContextMenu {
                     .bg(crate::theme::surface0(ctx))
                     .fg(crate::theme::text(ctx)),
             )
-            .title(match self.level {
-                MenuLevel::Root => " 歌曲操作 ",
-                MenuLevel::CustomPlaylists => " 选择自建歌单 ",
-                MenuLevel::PlaybackControls => " 播放控制 ",
-            });
+            .title(self.title());
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -368,7 +499,12 @@ impl SongContextMenu {
             .take(inner.height as usize)
             .enumerate()
         {
-            let style = if index == self.selected {
+            let style = if !item.enabled {
+                // 禁用项：不可选，用 muted 色区分。
+                Style::new()
+                    .bg(crate::theme::surface0(ctx))
+                    .fg(crate::theme::muted(ctx))
+            } else if index == self.selected {
                 Style::new()
                     .bg(crate::theme::accent(ctx))
                     .fg(crate::theme::selection_fg(ctx))
@@ -378,12 +514,31 @@ impl SongContextMenu {
                     .bg(crate::theme::surface0(ctx))
                     .fg(crate::theme::text(ctx))
             };
+            let row_rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+            let hint_width = item
+                .hint
+                .as_deref()
+                .map(|hint| unicode_width::UnicodeWidthStr::width(hint) as u16 + 1)
+                .unwrap_or(0)
+                .min(inner.width);
+            let label_width = inner.width.saturating_sub(hint_width);
             Paragraph::new(Line::from(Span::styled(format!(" {}", item.label), style)))
                 .style(style)
+                .render(Rect::new(row_rect.x, row_rect.y, label_width, 1), buf);
+            if let Some(hint) = item.hint.as_deref()
+                && hint_width > 0
+            {
+                Paragraph::new(Line::from(Span::styled(
+                    format!("{hint} "),
+                    style.add_modifier(Modifier::DIM),
+                )))
+                .alignment(ratatui::layout::Alignment::Right)
+                .style(style)
                 .render(
-                    Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                    Rect::new(row_rect.x + label_width, row_rect.y, hint_width, 1),
                     buf,
                 );
+            }
         }
     }
 
@@ -399,40 +554,50 @@ impl SongContextMenu {
     }
 
     fn select_previous(&mut self, visible_items: usize) {
+        self.step_selection(false, visible_items);
+    }
+
+    fn select_next(&mut self, visible_items: usize) {
+        self.step_selection(true, visible_items);
+    }
+
+    /// 按方向移动选中，跳过禁用项；全部禁用时保持不动。
+    fn step_selection(&mut self, forward: bool, visible_items: usize) {
         let len = self.items().len();
         if len == 0 {
             return;
         }
-        self.selected = if self.selected == 0 {
-            len - 1
-        } else {
-            self.selected - 1
-        };
-        self.ensure_selected_visible(visible_items);
-    }
-
-    fn select_next(&mut self, visible_items: usize) {
-        let len = self.items().len();
-        if len > 0 {
-            self.selected = (self.selected + 1) % len;
-            self.ensure_selected_visible(visible_items);
+        let mut index = self.selected;
+        for _ in 0..len {
+            index = if forward {
+                (index + 1) % len
+            } else if index == 0 {
+                len - 1
+            } else {
+                index - 1
+            };
+            if self.items()[index].enabled {
+                self.selected = index;
+                self.ensure_selected_visible(visible_items);
+                return;
+            }
         }
     }
 
     fn activate(&mut self) -> MenuOutcome {
-        let action = self
-            .items()
-            .get(self.selected)
-            .map(|item| item.action.clone());
+        let item = self.items().get(self.selected);
+        if item.is_some_and(|item| !item.enabled) {
+            // 禁用项：不派发动作，也不关菜单。
+            return MenuOutcome::None;
+        }
+        let action = item.map(|item| item.action.clone());
         match action {
-            Some(SongMenuAction::OpenCustomPlaylists) => {
-                self.level = MenuLevel::CustomPlaylists;
-                self.selected = 0;
-                self.scroll_offset = 0;
+            Some(MenuAction::Back) => {
+                self.pop_level();
                 MenuOutcome::None
             }
-            Some(SongMenuAction::OpenPlaybackControls) => {
-                self.level = MenuLevel::PlaybackControls;
+            Some(MenuAction::Submenu { title, items }) => {
+                self.stack.push(MenuLevel::new(title, items));
                 self.selected = 0;
                 self.scroll_offset = 0;
                 MenuOutcome::None
@@ -442,12 +607,39 @@ impl SongContextMenu {
         }
     }
 
-    fn items(&self) -> &[MenuItem] {
-        match self.level {
-            MenuLevel::Root => &self.root_items,
-            MenuLevel::CustomPlaylists => &self.custom_playlist_items,
-            MenuLevel::PlaybackControls => &self.playback_control_items,
+    /// 返回上一级；已在根层时返回 `false`（调用方据此决定是否关闭菜单）。
+    fn pop_level(&mut self) -> bool {
+        if self.stack.len() <= 1 {
+            return false;
         }
+        self.stack.pop();
+        self.selected = 0;
+        self.scroll_offset = 0;
+        true
+    }
+
+    /// 当前层级标题。
+    fn title(&self) -> &str {
+        self.stack
+            .last()
+            .map(|level| level.title.as_str())
+            .unwrap_or("")
+    }
+
+    fn items(&self) -> &[MenuItem] {
+        self.stack
+            .last()
+            .map(|level| level.items.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// 测试辅助：取某一层的条目（按栈序，0 = 根层）。
+    #[cfg(test)]
+    fn items_at_level(&self, level: usize) -> &[MenuItem] {
+        self.stack
+            .get(level)
+            .map(|level| level.items.as_slice())
+            .unwrap_or(&[])
     }
 
     fn ensure_selected_visible(&mut self, visible_items: usize) {
@@ -527,10 +719,7 @@ fn build_playback_control_items(state: PlaybackMenuState) -> Vec<MenuItem> {
 }
 
 fn playback_item(label: String, action: PlaybackMenuAction) -> MenuItem {
-    MenuItem {
-        label,
-        action: SongMenuAction::Playback(action),
-    }
+    MenuItem::new(label, SongMenuAction::Playback(action))
 }
 
 fn item_at(
@@ -555,11 +744,99 @@ mod tests {
     use lx_core::model::source::SourceId;
 
     use super::{
-        MenuLevel, MenuOutcome, PlaybackMenuAction, PlaybackMenuState, SongContextMenu,
+        MenuAction, MenuOutcome, PlaybackMenuAction, PlaybackMenuState, SongContextMenu,
         SongContextMenuOptions, SongMenuAction, SongMenuKind, item_at, menu_area,
     };
     use crate::pages::sort::{SortMode, SortTarget};
     use ratatui::layout::{Position, Rect};
+
+    fn menu_with_playlists() -> SongContextMenu {
+        let song = SongInfo::new(
+            "1".to_string(),
+            SourceId::Kw,
+            "Song".to_string(),
+            "Artist".to_string(),
+        );
+        SongContextMenu::new(
+            Position::new(2, 2),
+            vec![song],
+            0,
+            SongMenuKind::Standard,
+            false,
+            SongContextMenuOptions {
+                custom_playlists: vec![("p1".to_string(), "歌单A".to_string())],
+                ..SongContextMenuOptions::default()
+            },
+        )
+        .expect("菜单应当能构造")
+    }
+
+    /// 子菜单必须能回到根层：以前 Esc / ListGoBack 都直接关掉整个菜单。
+    #[test]
+    fn back_item_returns_to_the_root_level() {
+        let mut menu = menu_with_playlists();
+        assert_eq!(menu.stack.len(), 1, "初始只有根层");
+
+        // 进入"加入自建歌单"子菜单
+        menu.selected = menu
+            .items()
+            .iter()
+            .position(|item| matches!(item.action, MenuAction::Submenu { .. }))
+            .expect("应当有进入自建歌单的入口");
+        assert_eq!(menu.activate(), MenuOutcome::None);
+        assert_eq!(menu.stack.len(), 2, "应当进入子菜单");
+
+        // 最后一项是"返回上级"
+        let back_index = menu.items().len().checked_sub(1).expect("子菜单非空");
+        assert!(matches!(menu.items()[back_index].action, MenuAction::Back));
+
+        menu.selected = back_index;
+        assert_eq!(menu.activate(), MenuOutcome::None);
+        assert_eq!(menu.stack.len(), 1, "应当回到根层而不是关掉菜单");
+    }
+
+    /// 禁用项既不能被选中，也不能被激活。
+    #[test]
+    fn disabled_items_are_skipped_and_never_activate() {
+        let mut menu = menu_with_playlists();
+        // 造一个"空自建歌单"菜单：唯一的子菜单项是禁用占位
+        let song = SongInfo::new(
+            "1".to_string(),
+            SourceId::Kw,
+            "Song".to_string(),
+            "Artist".to_string(),
+        );
+        let empty = SongContextMenu::new(
+            Position::new(2, 2),
+            vec![song],
+            0,
+            SongMenuKind::Standard,
+            false,
+            SongContextMenuOptions {
+                custom_playlists: Vec::new(),
+                ..SongContextMenuOptions::default()
+            },
+        )
+        .expect("菜单应当能构造");
+        assert!(
+            empty
+                .items_at_level(0)
+                .iter()
+                .find_map(|item| match &item.action {
+                    MenuAction::Submenu { items, .. } => Some(items),
+                    _ => None,
+                })
+                .expect("根层有自建歌单子菜单")
+                .iter()
+                .any(|item| !item.enabled)
+        );
+
+        // 根层全是可选项，逐个下移一圈都不会停在禁用项上
+        for _ in 0..menu.items().len() {
+            menu.select_next(10);
+            assert!(menu.items()[menu.selected].enabled, "选中项不应是禁用项");
+        }
+    }
 
     #[test]
     fn context_menu_is_clamped_inside_content_area() {
@@ -604,7 +881,9 @@ mod tests {
 
         assert_eq!(
             menu.items().last().map(|item| item.action.clone()),
-            Some(SongMenuAction::CycleSort(SortTarget::Favorites))
+            Some(MenuAction::Song(SongMenuAction::CycleSort(
+                SortTarget::Favorites
+            )))
         );
     }
 
@@ -629,12 +908,12 @@ mod tests {
         )
         .unwrap();
         menu.selected = menu
-            .root_items
+            .items()
             .iter()
-            .position(|item| item.action == SongMenuAction::OpenCustomPlaylists)
+            .position(|item| matches!(item.action, MenuAction::Submenu { .. }))
             .unwrap();
         assert_eq!(menu.activate(), MenuOutcome::None);
-        assert_eq!(menu.level, MenuLevel::CustomPlaylists);
+        assert_eq!(menu.stack.len(), 2);
 
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
         assert_eq!(
@@ -671,7 +950,15 @@ mod tests {
             },
         )
         .unwrap();
-        menu.level = MenuLevel::CustomPlaylists;
+        if menu.stack.len() == 1 {
+            let index = menu
+                .items()
+                .iter()
+                .position(|item| matches!(item.action, MenuAction::Submenu { .. }))
+                .expect("有子菜单入口");
+            menu.selected = index;
+            menu.activate();
+        }
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
         let bounds = Rect::new(0, 0, 40, 5);
 
@@ -719,17 +1006,72 @@ mod tests {
             },
         )
         .unwrap();
+        // 根层有两个子菜单（自建歌单 / 播放控制），按标题精确定位后者。
         menu.selected = menu
-            .root_items
+            .items()
             .iter()
-            .position(|item| item.action == SongMenuAction::OpenPlaybackControls)
+            .position(|item| {
+                matches!(&item.action, MenuAction::Submenu { title, .. } if title.contains("播放控制"))
+            })
             .unwrap();
 
         assert_eq!(menu.activate(), MenuOutcome::None);
-        assert_eq!(menu.level, MenuLevel::PlaybackControls);
+        assert_eq!(menu.stack.len(), 2);
         assert_eq!(
             menu.activate(),
-            MenuOutcome::Action(SongMenuAction::Playback(PlaybackMenuAction::CycleSpeed))
+            MenuOutcome::Action(MenuAction::Song(SongMenuAction::Playback(
+                PlaybackMenuAction::CycleSpeed
+            )))
+        );
+    }
+}
+
+#[cfg(test)]
+mod hit_source_tests {
+    use super::MenuHitSource;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// 键盘来源用当前选中项，鼠标来源用行命中 —— 但两者共用同一条解析入口。
+    #[test]
+    fn selected_source_uses_the_current_selection() {
+        let index = MenuHitSource::Selected.resolve_index(|_| None, 3, 10);
+        assert_eq!(index, Some(3));
+    }
+
+    #[test]
+    fn selected_source_clamps_to_the_last_row() {
+        assert_eq!(
+            MenuHitSource::Selected.resolve_index(|_| None, 99, 4),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn mouse_source_uses_the_row_hit_test() {
+        let index = MenuHitSource::Mouse(click(5, 5)).resolve_index(
+            |event| Some(event.row as usize),
+            0,
+            10,
+        );
+        assert_eq!(index, Some(5));
+    }
+
+    /// 没有目标（空列表）时两种来源都不该弹菜单。
+    #[test]
+    fn empty_list_never_yields_a_target() {
+        assert_eq!(MenuHitSource::Selected.resolve_index(|_| None, 0, 0), None);
+        assert_eq!(
+            MenuHitSource::Mouse(click(1, 1)).resolve_index(|_| Some(0), 0, 0),
+            None
         );
     }
 }

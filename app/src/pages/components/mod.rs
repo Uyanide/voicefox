@@ -10,12 +10,11 @@ pub mod header;
 pub mod list_filter;
 pub mod lyric;
 pub mod notification;
-pub mod popup_poc;
 pub mod progress_bar;
-pub mod rat_menu_adapter;
 pub mod scroll;
 pub mod song_table;
 pub mod source_selector;
+pub mod splitter;
 pub mod status_bar;
 pub mod text;
 

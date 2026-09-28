@@ -15,7 +15,6 @@ pub mod search;
 pub mod settings;
 pub mod sidebar;
 pub mod sort;
-pub mod sources;
 pub mod sync_overlay;
 
 pub(crate) fn is_song_activation_key(key: &KeyEvent) -> bool {

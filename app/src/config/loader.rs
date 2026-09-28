@@ -495,4 +495,34 @@ mod tests {
         assert_eq!(config.source.enabled, SourceId::default_enabled());
         let _ = std::fs::remove_file(path);
     }
+
+    /// `ui.table_columns` 是用户可以手写的：只写半个列条目不能把整份配置
+    /// 弄成解析失败，否则 `main` 里的 `?` 会让程序直接起不来。
+    #[test]
+    fn partial_table_column_entry_does_not_break_the_whole_config() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "voicefox-partial-columns-{}-{}.toml",
+            std::process::id(),
+            unique
+        ));
+        std::fs::write(
+            &path,
+            "[ui.table_columns]\n[[ui.table_columns.queue]]\nkey = \"name\"\n",
+        )
+        .unwrap();
+
+        let (config, _) = load(path.to_str().unwrap()).unwrap();
+
+        let columns = config.ui.table_columns.get("queue").unwrap();
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].key, "name");
+        // 缺失字段走 TableColumnConfig::default()
+        assert_eq!(columns[0].width, 8);
+        assert!(columns[0].visible);
+        let _ = std::fs::remove_file(path);
+    }
 }

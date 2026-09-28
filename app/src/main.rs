@@ -52,9 +52,10 @@ use context::AppContext;
 use data_cache::DataCache;
 use pages::components;
 use pages::components::context_menu::{
-    MenuOutcome, PlaybackMenuAction, PlaybackMenuState, SongContextMenu, SongContextMenuOptions,
-    SongMenuAction, SongMenuKind,
+    ColumnMenuAction, MenuAction, MenuHitSource, MenuItem, MenuOutcome, PlaybackMenuAction,
+    PlaybackMenuState, SongContextMenu, SongContextMenuOptions, SongMenuAction, SongMenuKind,
 };
+use pages::components::list_filter::ListFilter;
 use pages::sidebar::NavTab;
 use pages::sort::{SortMode, SortState, SortTarget, SortedListCache};
 use storage::SavedPlayerState;
@@ -99,6 +100,8 @@ enum PlaylistResponse {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct UiAreas {
+    /// 整屏区域。整屏浮层（详情页/帮助页等）的渲染与命中都以它为基准。
+    screen: Rect,
     tabs: Rect,
     content: Rect,
     progress: Rect,
@@ -216,6 +219,311 @@ fn should_go_to_main(
         && !(active_tab == NavTab::Leaderboard && leaderboard_open)
 }
 
+/// 页面在键位配置里的 scope 名（用于 `resolve_page`）。
+fn page_scope_for_tab(tab: NavTab) -> Option<&'static str> {
+    match tab {
+        NavTab::Main => Some("main"),
+        NavTab::Search => Some("search"),
+        NavTab::Leaderboard => Some("leaderboard"),
+        NavTab::Playlists => Some("playlists"),
+        NavTab::Favorites => Some("favorites"),
+        NavTab::History => Some("history"),
+        NavTab::LocalMusic => Some("local"),
+        NavTab::Settings => Some("settings"),
+    }
+}
+
+/// 上下文菜单目标：`(歌曲列表, 下标)` + 菜单类型 + 可选的排序项。
+type SongMenuTarget = (
+    (Vec<SongInfo>, usize),
+    SongMenuKind,
+    Option<(SortTarget, SortMode)>,
+);
+
+/// 解析"当前页面上下文菜单的目标歌曲"。
+///
+/// 鼠标右键与键盘入口（默认 `x`）共用这一条路径 —— `source` 决定目标是
+/// "鼠标点中那一行"还是"当前选中项"，其余（过滤视图映射、菜单类型、排序项）
+/// 完全一致，不会出现两条路径跑偏。
+#[allow(clippy::too_many_arguments)]
+fn context_menu_target(
+    source: MenuHitSource,
+    active_tab: NavTab,
+    area: Rect,
+    ctx: &AppContext,
+    main_page: &mut pages::main_page::MainPage,
+    leaderboard: &mut pages::leaderboard::LeaderboardPage,
+    playlists: &mut pages::playlists::PlaylistsPage,
+    favorites_page: &mut pages::favorites::FavoritesPage,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    history_state: &mut SortState,
+    local_state: &mut SortState,
+    history_filter: &ListFilter,
+    local_filter: &ListFilter,
+    data_cache: &mut DataCache,
+) -> Option<SongMenuTarget> {
+    match active_tab {
+        NavTab::Main => main_page
+            .context_song_at(source, area, ctx)
+            .map(|target| (target, SongMenuKind::Queue, None)),
+        NavTab::Search => search_page
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .context_song_at(source, area)
+            .map(|target| (target, SongMenuKind::Standard, None)),
+        NavTab::Leaderboard => leaderboard
+            .context_song_at(source, area)
+            .map(|target| (target, SongMenuKind::Standard, None)),
+        NavTab::Playlists => playlists
+            .context_song_at(source, area)
+            .map(|target| (target, SongMenuKind::Standard, None)),
+        NavTab::Favorites => favorites_page
+            .context_song_at(source, area, ctx, &mut data_cache.favorites)
+            .map(|target| {
+                (
+                    target,
+                    SongMenuKind::Standard,
+                    Some((SortTarget::Favorites, favorites_page.sort_mode())),
+                )
+            }),
+        NavTab::History => pages::history::context_song_at(
+            source,
+            area,
+            ctx,
+            history_state,
+            history_filter,
+            &mut data_cache.history,
+        )
+        .map(|target| {
+            (
+                target,
+                SongMenuKind::History,
+                Some((SortTarget::History, history_state.mode)),
+            )
+        }),
+        NavTab::LocalMusic => pages::local_music::context_song_at(
+            source,
+            area,
+            ctx,
+            local_state,
+            &mut data_cache.local,
+            local_filter,
+        )
+        .map(|target| {
+            (
+                target,
+                SongMenuKind::Local,
+                Some((SortTarget::Local, local_state.mode)),
+            )
+        }),
+        NavTab::Settings => None,
+    }
+}
+
+/// 用已解析出的目标构造歌曲上下文菜单。
+fn build_song_menu(
+    target: SongMenuTarget,
+    origin: Position,
+    active_tab: NavTab,
+    ctx: &AppContext,
+    playlists: &pages::playlists::PlaylistsPage,
+) -> Option<SongContextMenu> {
+    let ((songs, index), kind, sort) = target;
+    let is_favorite = ctx.storage.is_favorite(songs.get(index)?);
+    let custom_playlists = ctx.storage.custom_playlist_choices();
+    let current_custom_playlist = (active_tab == NavTab::Playlists)
+        .then(|| playlists.current_custom_playlist_id())
+        .flatten();
+    SongContextMenu::new(
+        origin,
+        songs,
+        index,
+        kind,
+        is_favorite,
+        SongContextMenuOptions {
+            sort,
+            custom_playlists,
+            current_custom_playlist,
+            playback: Some(playback_menu_state(ctx)),
+        },
+    )
+}
+
+/// 分发上下文菜单选中的动作。
+///
+/// 歌曲动作走原有业务路径；列动作复用既有的 `CommitColumnResize` /
+/// `ResetColumnWidths` 两个 AppAction（`ResetColumnWidths` 至此才有了生产者）。
+/// 列菜单作用的页面 key（与 `table_columns` 持久化用的 key 一致）。
+fn column_page_key(tab: NavTab) -> Option<&'static str> {
+    match tab {
+        NavTab::Main => Some("queue"),
+        NavTab::Search => Some("search"),
+        NavTab::Leaderboard => Some("leaderboard"),
+        NavTab::Playlists => Some("playlists"),
+        NavTab::Favorites => Some("favorites"),
+        NavTab::History => Some("history"),
+        NavTab::LocalMusic => Some("local_music"),
+        NavTab::Settings => None,
+    }
+}
+
+/// 当前页面的歌曲表头矩形 + 自动列宽样本（都是无副作用的只读信息）。
+#[allow(clippy::too_many_arguments)]
+fn table_header_and_samples(
+    active_tab: NavTab,
+    area: Rect,
+    ctx: &AppContext,
+    main_page: &mut pages::main_page::MainPage,
+    leaderboard: &pages::leaderboard::LeaderboardPage,
+    playlists: &pages::playlists::PlaylistsPage,
+    favorites_page: &pages::favorites::FavoritesPage,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    history_filter: &ListFilter,
+    local_filter: &ListFilter,
+) -> Option<(Rect, Vec<SongInfo>)> {
+    match active_tab {
+        NavTab::Main => {
+            let header = main_page.table_header_rect(area, ctx)?;
+            Some((header, main_page.autofit_samples(ctx)))
+        }
+        NavTab::Search => {
+            let page = search_page.lock().unwrap_or_else(|e| e.into_inner());
+            let header = page.table_header_rect(area)?;
+            Some((header, page.autofit_samples(ctx)))
+        }
+        NavTab::Leaderboard => Some((
+            leaderboard.table_header_rect(area, ctx)?,
+            leaderboard.autofit_samples(ctx),
+        )),
+        NavTab::Playlists => Some((
+            playlists.table_header_rect(area, ctx)?,
+            playlists.autofit_samples(ctx),
+        )),
+        NavTab::Favorites => Some((
+            favorites_page.table_header_rect(area, ctx)?,
+            favorites_page.autofit_samples(ctx),
+        )),
+        NavTab::History => Some((
+            pages::history::table_header_rect(area, history_filter)?,
+            pages::history::autofit_samples(ctx),
+        )),
+        NavTab::LocalMusic => Some((
+            pages::local_music::table_header_rect(area, local_filter)?,
+            pages::local_music::autofit_samples(ctx),
+        )),
+        NavTab::Settings => None,
+    }
+}
+
+/// 构造表头列设置菜单：显示/隐藏切换 + 自动列宽 + 恢复默认。
+///
+/// 切换项直接把"换过 visible 之后的完整列配置"放进动作里，
+/// 提交端不需要回头问页面，显示隐藏与自动列宽共用同一个 AppAction。
+fn build_column_menu(
+    active_tab: NavTab,
+    origin: Position,
+    content: Rect,
+    ctx: &AppContext,
+    samples: &[SongInfo],
+) -> Option<SongContextMenu> {
+    use pages::components::song_table::{
+        auto_fit_columns, column_is_hideable, load_columns_for_page, toggle_column_visibility,
+    };
+
+    let page_key = column_page_key(active_tab)?;
+    // 与页面渲染用同一个宽度口径（内容区去掉左右边框）。
+    let width = content.width.saturating_sub(2);
+    let columns = {
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+        load_columns_for_page(&config.ui.table_columns, page_key, width)
+    };
+
+    let mut items = Vec::new();
+    for column in &columns {
+        let mark = if column.visible { "✓" } else { "○" };
+        let label = format!("{mark} {}", column.label);
+        // "歌曲"列不允许隐藏，做成可见但不可选的禁用项。
+        if !column_is_hideable(&column.key) {
+            items.push(MenuItem::disabled(label).with_hint("必显"));
+            continue;
+        }
+        items.push(MenuItem::new(
+            label,
+            ColumnMenuAction::Apply(toggle_column_visibility(&columns, &column.key)),
+        ));
+    }
+    items.push(MenuItem::new(
+        "自动调整列宽",
+        ColumnMenuAction::Apply(auto_fit_columns(&columns, samples, width)),
+    ));
+    items.push(MenuItem::new("恢复默认列宽", ColumnMenuAction::Reset));
+    Some(SongContextMenu::from_entries(
+        origin,
+        " 列设置 ",
+        items,
+        page_key,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_menu_action(
+    action: MenuAction,
+    menu: &SongContextMenu,
+    main_page: &mut pages::main_page::MainPage,
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    search_seq: &Arc<AtomicU64>,
+    favorites_page: &mut pages::favorites::FavoritesPage,
+    playlists_page: &mut pages::playlists::PlaylistsPage,
+    history_state: &mut SortState,
+    local_state: &mut SortState,
+    confirm_delete: &mut Option<LocalDeleteConfirmation>,
+) {
+    match action {
+        MenuAction::Song(song_action) => execute_song_menu_action(
+            song_action,
+            menu,
+            main_page,
+            ctx,
+            rt,
+            action_tx,
+            search_page,
+            settings_page,
+            search_seq,
+            favorites_page,
+            playlists_page,
+            history_state,
+            local_state,
+            confirm_delete,
+        ),
+        MenuAction::Column(column_action) => {
+            let Some(page_key) = menu.page_key().map(str::to_string) else {
+                return;
+            };
+            let action = match column_action {
+                ColumnMenuAction::Apply(columns) => {
+                    AppAction::CommitColumnResize { page_key, columns }
+                }
+                ColumnMenuAction::Reset => AppAction::ResetColumnWidths { page_key },
+            };
+            execute_action(
+                action,
+                ctx,
+                rt,
+                action_tx,
+                search_page,
+                settings_page,
+                search_seq,
+            );
+        }
+        // 子菜单与返回上级由菜单自身消费，不会走到这里。
+        MenuAction::Submenu { .. } | MenuAction::Back => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_song_menu_action(
     action: SongMenuAction,
@@ -247,11 +555,6 @@ fn execute_song_menu_action(
             song: Box::new(menu.song().clone()),
             position: InsertPosition::End,
         },
-        SongMenuAction::OpenPlaybackControls => AppAction::None,
-        SongMenuAction::OpenCustomPlaylists => {
-            ctx.notify(Notification::info("请选择一个自建歌单"));
-            AppAction::None
-        }
         SongMenuAction::AddToCustomPlaylist(playlist_id) => {
             let song = menu.song();
             match ctx.storage.add_song_to_custom_playlist(&playlist_id, song) {
@@ -262,10 +565,6 @@ fn execute_song_menu_action(
                 Ok(false) => ctx.notify(Notification::info("歌曲已经在这个歌单中")),
                 Err(error) => ctx.notify(Notification::error(error)),
             }
-            AppAction::None
-        }
-        SongMenuAction::NoCustomPlaylists => {
-            ctx.notify(Notification::info("暂无自建歌单，请先进入歌单页按 c 创建"));
             AppAction::None
         }
         SongMenuAction::ToggleFavorite => {
@@ -643,10 +942,34 @@ fn run_app(
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
+    // 恢复用户拖拽过的面板分隔比例（run_app 开头 config 已就绪）
+    {
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ratios) = config.ui.pane_ratios.get(leaderboard.pane_page_key()) {
+            leaderboard.apply_pane_ratios(ratios);
+        }
+        let playlists_key = playlists.pane_page_key();
+        if let Some(ratios) = config.ui.pane_ratios.get(playlists_key) {
+            playlists.apply_pane_ratios(ratios);
+        }
+        if let Some(ratios) = config.ui.pane_ratios.get(main_page.pane_page_key()) {
+            main_page.apply_pane_ratios(ratios);
+        }
+        let settings_key = settings_page
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pane_page_key();
+        if let Some(ratios) = config.ui.pane_ratios.get(settings_key) {
+            settings_page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .apply_pane_ratios(ratios);
+        }
+    }
     let mut favorites_page =
         pages::favorites::FavoritesPage::new(ctx.source_manager.enabled_sources());
-    let mut history_state = SortState::new(SortMode::Newest);
-    let mut local_state = SortState::new(SortMode::TitleAsc);
+    let mut history_state = SortState::new(SortMode::Newest, "history");
+    let mut local_state = SortState::new(SortMode::TitleAsc, "local_music");
     let mut data_cache = DataCache::default();
     let mut local_filter = components::list_filter::ListFilter::new();
     let mut history_filter = components::list_filter::ListFilter::new();
@@ -889,6 +1212,17 @@ fn run_app(
         if observed_active_tab != active_tab {
             let previous_tab = observed_active_tab;
             observed_active_tab = active_tab;
+            // 切页时上一页可能还停在拖拽会话里，先统一收尾。
+            abort_all_drag_sessions(
+                &mut main_page,
+                &mut leaderboard,
+                &mut playlists,
+                &mut favorites_page,
+                &search_page,
+                &settings_page,
+                &mut history_state,
+                &mut local_state,
+            );
             let local_source = ctx.source_manager.local_source();
             let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
             if should_scan_local_music_on_entry(
@@ -1713,7 +2047,7 @@ fn run_app(
                     }
                     MenuOutcome::Action(action) => {
                         let menu = song_menu.take().unwrap();
-                        execute_song_menu_action(
+                        dispatch_menu_action(
                             action,
                             &menu,
                             &mut main_page,
@@ -2054,6 +2388,38 @@ fn run_app(
                         continue;
                     }
                     _ => {}
+                }
+            }
+
+            // 键盘打开上下文菜单（无鼠标环境下的右键替代入口）。
+            // 与鼠标右键共用 `context_menu_target`，两条路径不会跑偏。
+            if !text_input_active
+                && let Some(scope) = page_scope_for_tab(active_tab)
+                && kb_resolver.resolve_page(scope, &key) == Some(Action::ListContextMenu)
+            {
+                let origin = Position::new(
+                    ui_areas.content.x.saturating_add(2),
+                    ui_areas.content.y.saturating_add(2),
+                );
+                if let Some(target) = context_menu_target(
+                    MenuHitSource::Selected,
+                    active_tab,
+                    ui_areas.content,
+                    &ctx,
+                    &mut main_page,
+                    &mut leaderboard,
+                    &mut playlists,
+                    &mut favorites_page,
+                    &search_page,
+                    &mut history_state,
+                    &mut local_state,
+                    &history_filter,
+                    &local_filter,
+                    &mut data_cache,
+                ) {
+                    song_menu = build_song_menu(target, origin, active_tab, &ctx, &playlists);
+                    needs_render = true;
+                    continue;
                 }
             }
 
@@ -2636,6 +3002,31 @@ fn run_app(
                 continue;
             }
             let mouse = *mouse;
+            // 扫码登录 / 同步浮层是模态的：键盘分支早已拦住按键，鼠标分支以前漏了，
+            // 于是浮层在屏上时点 tab 会切页、点进度条会 seek、点通知会开外链。
+            if qr_login_page.is_some() || sync_overlay.is_some() {
+                needs_render = true;
+                continue;
+            }
+            // 页面只在 `ui_areas.content` 内收到鼠标事件；在标签栏/侧边栏/进度条上
+            // 松开左键时页面拿不到 Up，这里兜底结束它的拖拽会话。
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                && !ui_areas
+                    .content
+                    .contains(Position::new(mouse.column, mouse.row))
+            {
+                abort_all_drag_sessions(
+                    &mut main_page,
+                    &mut leaderboard,
+                    &mut playlists,
+                    &mut favorites_page,
+                    &search_page,
+                    &settings_page,
+                    &mut history_state,
+                    &mut local_state,
+                );
+                needs_render = true;
+            }
             if downloads_panel.is_open() {
                 let tasks = ctx.downloads.snapshot();
                 downloads_panel.handle_mouse(&mouse, &ctx, &tasks);
@@ -2652,7 +3043,7 @@ fn run_app(
                     }
                     MenuOutcome::Action(action) => {
                         let menu = song_menu.take().unwrap();
-                        execute_song_menu_action(
+                        dispatch_menu_action(
                             action,
                             &menu,
                             &mut main_page,
@@ -2691,15 +3082,11 @@ fn run_app(
                 .unwrap_or_else(|e| e.into_inner())
                 .as_mut()
             {
-                let action = page.handle_mouse(mouse, ui_areas.content, &ctx, activate);
+                // 详情页渲染在整屏上（见 draw_app），命中必须用同一矩形。
+                let action = page.handle_mouse(mouse, ui_areas.screen, &ctx, activate);
                 if let AppAction::GoBack = action {
                     *ctx.details_page.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
-                needs_render = true;
-                continue;
-            }
-
-            if active_tab == NavTab::Playlists && playlists.input_active() {
                 needs_render = true;
                 continue;
             }
@@ -2756,88 +3143,49 @@ fn run_app(
                     ctx.seek(position);
                 }
             } else if ui_areas.content.contains(position) {
+                // 表头右键 → 列设置菜单。与歌曲菜单共用同一个槽位与交互
+                // （渲染、键盘、点外关闭都只有一份实现）。
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                    && let Some((header, samples)) = table_header_and_samples(
+                        active_tab,
+                        ui_areas.content,
+                        &ctx,
+                        &mut main_page,
+                        &leaderboard,
+                        &playlists,
+                        &favorites_page,
+                        &search_page,
+                        &history_filter,
+                        &local_filter,
+                    )
+                    && header.y == mouse.row
+                    && mouse.column >= header.x
+                    && mouse.column < header.right()
+                    && let Some(menu) =
+                        build_column_menu(active_tab, position, ui_areas.content, &ctx, &samples)
+                {
+                    song_menu = Some(menu);
+                    needs_render = true;
+                    continue;
+                }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
-                    let target = match active_tab {
-                        NavTab::Main => main_page
-                            .context_song_at(mouse, ui_areas.content, &ctx)
-                            .map(|target| (target, SongMenuKind::Queue, None)),
-                        NavTab::Search => search_page
-                            .lock()
-                            .unwrap()
-                            .context_song_at(mouse, ui_areas.content)
-                            .map(|target| (target, SongMenuKind::Standard, None)),
-                        NavTab::Leaderboard => leaderboard
-                            .context_song_at(mouse, ui_areas.content)
-                            .map(|target| (target, SongMenuKind::Standard, None)),
-                        NavTab::Playlists => playlists
-                            .context_song_at(mouse, ui_areas.content)
-                            .map(|target| (target, SongMenuKind::Standard, None)),
-                        NavTab::Favorites => favorites_page
-                            .context_song_at(
-                                mouse,
-                                ui_areas.content,
-                                &ctx,
-                                &mut data_cache.favorites,
-                            )
-                            .map(|target| {
-                                (
-                                    target,
-                                    SongMenuKind::Standard,
-                                    Some((SortTarget::Favorites, favorites_page.sort_mode())),
-                                )
-                            }),
-                        NavTab::History => pages::history::context_song_at(
-                            mouse,
-                            ui_areas.content,
-                            &ctx,
-                            &mut history_state,
-                            history_filter.query(),
-                            &mut data_cache.history,
-                        )
-                        .map(|target| {
-                            (
-                                target,
-                                SongMenuKind::History,
-                                Some((SortTarget::History, history_state.mode)),
-                            )
-                        }),
-                        NavTab::LocalMusic => pages::local_music::context_song_at(
-                            mouse,
-                            ui_areas.content,
-                            &ctx,
-                            &mut local_state,
-                            &mut data_cache.local,
-                            local_filter.is_active() || !local_filter.query().is_empty(),
-                            local_filter.query(),
-                        )
-                        .map(|target| {
-                            (
-                                target,
-                                SongMenuKind::Local,
-                                Some((SortTarget::Local, local_state.mode)),
-                            )
-                        }),
-                        NavTab::Settings => None,
-                    };
-                    if let Some(((songs, index), kind, sort)) = target {
-                        let is_favorite = ctx.storage.is_favorite(&songs[index]);
-                        let custom_playlists = ctx.storage.custom_playlist_choices();
-                        let current_custom_playlist = (active_tab == NavTab::Playlists)
-                            .then(|| playlists.current_custom_playlist_id())
-                            .flatten();
-                        song_menu = SongContextMenu::new(
-                            position,
-                            songs,
-                            index,
-                            kind,
-                            is_favorite,
-                            SongContextMenuOptions {
-                                sort,
-                                custom_playlists,
-                                current_custom_playlist,
-                                playback: Some(playback_menu_state(&ctx)),
-                            },
-                        );
+                    if let Some(target) = context_menu_target(
+                        MenuHitSource::Mouse(mouse),
+                        active_tab,
+                        ui_areas.content,
+                        &ctx,
+                        &mut main_page,
+                        &mut leaderboard,
+                        &mut playlists,
+                        &mut favorites_page,
+                        &search_page,
+                        &mut history_state,
+                        &mut local_state,
+                        &history_filter,
+                        &local_filter,
+                        &mut data_cache,
+                    ) {
+                        song_menu = build_song_menu(target, position, active_tab, &ctx, &playlists);
                         needs_render = true;
                         continue;
                     }
@@ -2874,7 +3222,7 @@ fn run_app(
                         ui_areas.content,
                         &ctx,
                         &mut history_state,
-                        history_filter.query(),
+                        &history_filter,
                         &mut data_cache.history,
                         activate,
                     ),
@@ -2888,8 +3236,7 @@ fn run_app(
                         &ctx,
                         &mut local_state,
                         &mut data_cache.local,
-                        local_filter.is_active() || !local_filter.query().is_empty(),
-                        local_filter.query(),
+                        &local_filter,
                         activate,
                     ),
                 };
@@ -2907,6 +3254,17 @@ fn run_app(
             needs_render = true;
         } else if matches!(terminal_event, Some(Event::Resize(_, _))) {
             main_page.refresh_cover_font_size();
+            // 尺寸变了，拖拽中的比例/坐标已经失效，统一收尾。
+            abort_all_drag_sessions(
+                &mut main_page,
+                &mut leaderboard,
+                &mut playlists,
+                &mut favorites_page,
+                &search_page,
+                &settings_page,
+                &mut history_state,
+                &mut local_state,
+            );
             needs_render = true;
         }
 
@@ -3017,6 +3375,7 @@ fn draw_app(
         pages::sidebar::render(main_chunks[1], frame.buffer_mut(), active_tab, ctx);
         let content_area = main_chunks[2];
         *ui_areas = UiAreas {
+            screen: area,
             tabs: main_chunks[1],
             content: content_area,
             progress: main_chunks[3],
@@ -3110,15 +3469,18 @@ fn draw_app(
                                 diagnostics
                             )
                         });
-                    let inner = block.inner(content_area);
                     block.render(content_area, frame.buffer_mut());
+                    // 与 local_music 的鼠标命中共用同一份行账本（过滤行 → 表头 → 列表）。
+                    let rows = components::hit_test::PanelRows::new(
+                        content_area,
+                        local_filter.is_visible(),
+                        false,
+                        true,
+                    );
+                    let inner = rows.inner;
 
-                    if local_filter.is_active() || !local_filter.query().is_empty() {
-                        local_filter.render(
-                            Rect::new(inner.x, inner.y, inner.width, 1),
-                            frame.buffer_mut(),
-                            ctx,
-                        );
+                    if let Some(row) = rows.filter_row() {
+                        local_filter.render(row, frame.buffer_mut(), ctx);
                     }
 
                     if inner.height < 2 {
@@ -3146,20 +3508,14 @@ fn draw_app(
                         break 'local_content;
                     }
 
-                    let filter_visible =
-                        local_filter.is_active() || !local_filter.query().is_empty();
-                    let content_y = if filter_visible { inner.y + 1 } else { inner.y };
-                    let content_height = if filter_visible {
-                        inner.height.saturating_sub(1)
-                    } else {
-                        inner.height
+                    let Some(header_row) = rows.header else {
+                        break 'local_content;
                     };
-
-                    if content_height < 3 {
+                    if rows.list.height < 2 {
                         break 'local_content;
                     }
 
-                    let visible_height = (content_height.saturating_sub(2)) as usize;
+                    let visible_height = rows.list.height as usize;
                     let sel = local_state.selected;
                     let mut sc = local_state.scroll;
 
@@ -3171,17 +3527,23 @@ fn draw_app(
                     sc = sc.min(songs.len().saturating_sub(visible_height));
                     local_state.scroll = sc;
 
-                    let header = pages::components::song_table::header(inner.width);
-                    Paragraph::new(Line::from(Span::styled(
-                        header,
-                        Style::new()
-                            .fg(crate::theme::text(ctx))
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    )))
-                    .render(
-                        Rect::new(inner.x, content_y, inner.width, 1),
-                        frame.buffer_mut(),
-                    );
+                    // 拖拽期间以页面状态为准：这里每帧都从 Config 重载的话，
+                    // 鼠标刚算出来的宽度会在同一帧被覆盖回旧值，拖拽看起来毫无反应。
+                    if local_state.column_resize.is_none() {
+                        let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                        local_state.columns = pages::components::song_table::load_columns_for_page(
+                            &cfg.ui.table_columns,
+                            local_state.page_key,
+                            inner.width,
+                        );
+                    }
+
+                    pages::components::song_table::header_paragraph(
+                        inner.width,
+                        &local_state.columns,
+                        pages::components::song_table::TablePalette::from_theme(ctx),
+                    )
+                    .render(header_row, frame.buffer_mut());
 
                     let end = (sc + visible_height).min(songs.len());
                     for row in sc..end {
@@ -3189,11 +3551,21 @@ fn draw_app(
                             break;
                         };
                         let i = row;
-                        let text = pages::components::song_table::row(song, i, inner.width);
+                        let row_paragraph = pages::components::song_table::row_paragraph(
+                            song,
+                            i,
+                            inner.width,
+                            &local_state.columns,
+                            pages::components::song_table::TablePalette::from_theme(ctx),
+                        );
                         // 数据行紧跟在列头下方：过滤条可见时整体下移一行，
                         // 否则 row 0 会把列头覆盖掉。
-                        let line_area =
-                            Rect::new(inner.x, content_y + 1 + (row - sc) as u16, inner.width, 1);
+                        let line_area = Rect::new(
+                            rows.list.x,
+                            rows.list.y + (row - sc) as u16,
+                            rows.list.width,
+                            1,
+                        );
                         let style = if i == sel {
                             Style::new()
                                 .bg(crate::theme::accent(ctx))
@@ -3201,7 +3573,8 @@ fn draw_app(
                         } else {
                             Style::new().fg(crate::theme::text(ctx))
                         };
-                        Paragraph::new(Line::from(Span::styled(text, style)))
+                        row_paragraph
+                            .style(style)
                             .render(line_area, frame.buffer_mut());
                     }
 
@@ -4113,6 +4486,48 @@ fn execute_action(
                 }
             });
         }
+        AppAction::CommitColumnResize { page_key, columns } => {
+            let save_result = {
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                config.ui.table_columns.insert(page_key.clone(), columns);
+                crate::config::loader::save(&config, &ctx.config_path)
+            };
+            if let Err(e) = save_result {
+                ctx.notify(Notification::error(format!("保存列宽配置失败: {}", e)));
+            }
+        }
+        // 键盘菜单入口在 run_app 里就地处理（菜单状态是那里的局部变量），
+        // 走到这里说明没有可作用的页面，忽略即可。
+        AppAction::OpenContextMenu => {}
+        AppAction::CommitPaneRatio {
+            page_key,
+            ratio_key,
+            ratio,
+        } => {
+            let save_result = {
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                config
+                    .ui
+                    .pane_ratios
+                    .entry(page_key)
+                    .or_default()
+                    .insert(ratio_key, ratio);
+                crate::config::loader::save(&config, &ctx.config_path)
+            };
+            if let Err(e) = save_result {
+                ctx.notify(Notification::error(format!("保存面板布局失败: {}", e)));
+            }
+        }
+        AppAction::ResetColumnWidths { page_key } => {
+            let save_result = {
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                config.ui.table_columns.remove(&page_key);
+                crate::config::loader::save(&config, &ctx.config_path)
+            };
+            if let Err(e) = save_result {
+                ctx.notify(Notification::error(format!("恢复默认列宽失败: {}", e)));
+            }
+        }
         AppAction::Navigate(_)
         | AppAction::GoBack
         | AppAction::Quit
@@ -4764,6 +5179,38 @@ fn spawn_js_source_loader(
             ))));
         }
     });
+}
+
+/// 兜底清理所有页面进行中的拖拽会话。
+///
+/// 触发场景：鼠标在内容区之外松开（页面根本收不到 `Up`）、键盘切页、终端 resize。
+/// 缺少这一步时残留的拖拽状态会让该页后续鼠标事件被拖拽分支的
+/// `_ => return AppAction::None` 永久吞掉，表现为"这一页突然点不动了"。
+#[allow(clippy::too_many_arguments)]
+fn abort_all_drag_sessions(
+    main_page: &mut pages::main_page::MainPage,
+    leaderboard: &mut pages::leaderboard::LeaderboardPage,
+    playlists: &mut pages::playlists::PlaylistsPage,
+    favorites_page: &mut pages::favorites::FavoritesPage,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    history_state: &mut SortState,
+    local_state: &mut SortState,
+) {
+    main_page.abort_drag_sessions();
+    leaderboard.abort_drag_sessions();
+    playlists.abort_drag_sessions();
+    favorites_page.abort_drag_sessions();
+    search_page
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .abort_drag_sessions();
+    settings_page
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .abort_drag_sessions();
+    history_state.cancel_column_resize();
+    local_state.cancel_column_resize();
 }
 
 fn next_generation(sequence: &AtomicU64) -> u64 {

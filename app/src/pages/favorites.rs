@@ -12,8 +12,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::hit_test::PanelRows;
+use crate::pages::components::song_table::{self, ColumnResizeState};
 use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 use crate::pages::sort::{SortMode, SortTarget, SortedListCache};
+use lx_core::model::config::TableColumnConfig;
 
 pub struct FavoritesPage {
     selected: usize,
@@ -28,6 +32,8 @@ pub struct FavoritesPage {
     /// 上一次渲染时的页面区域；右键菜单的定位与命中判定共用它，
     /// 否则「渲染时贴边内缩、点击时用原始坐标」会让点中的条目错位。
     last_area: Rect,
+    column_resize: Option<ColumnResizeState>,
+    columns: Vec<TableColumnConfig>,
 }
 
 /// 网易云收藏右键菜单的条目。渲染与命中判定共用这一份，
@@ -56,6 +62,8 @@ impl FavoritesPage {
             source_selector: Some(SourceSelector::from_sources(&sources, true)),
             remote_menu: None,
             last_area: Rect::default(),
+            column_resize: None,
+            columns: Vec::new(),
         }
     }
 
@@ -552,42 +560,46 @@ impl FavoritesPage {
                     .unwrap_or("全部音源"),
                 self.sort_label()
             ));
-        let inner = block.inner(area);
         block.render(area, buf);
-        if inner.height == 0 {
-            return;
-        }
-
-        let show_search = self.filter.is_active() || !self.filter.query().is_empty();
-        let mut cursor_y = inner.y;
-        if show_search {
-            self.filter
-                .render(Rect::new(inner.x, cursor_y, inner.width, 1), buf, ctx);
-            cursor_y = cursor_y.saturating_add(1);
-        }
-        if cursor_y < inner.bottom() {
-            self.render_source_tabs(Rect::new(inner.x, cursor_y, inner.width, 1), buf, ctx);
-            cursor_y = cursor_y.saturating_add(1);
-        }
-
-        if cursor_y >= inner.bottom() {
-            return;
-        }
-        Paragraph::new(Line::from(Span::styled(
-            super::components::song_table::header(inner.width),
-            Style::new()
-                .fg(crate::theme::subtext0(ctx))
-                .add_modifier(Modifier::BOLD),
-        )))
-        .render(Rect::new(inner.x, cursor_y, inner.width, 1), buf);
-        cursor_y = cursor_y.saturating_add(1);
-
-        let list = Rect::new(
-            inner.x,
-            cursor_y,
-            inner.width,
-            inner.bottom().saturating_sub(cursor_y),
+        // 行账本：过滤行 → 音源条 → 表头 → 列表。渲染与鼠标命中共用同一份。
+        // 命中侧以前漏记了"音源条"这一行，导致点击恒定选中下一首。
+        let rows = PanelRows::new(
+            area,
+            self.filter.is_active() || !self.filter.query().is_empty(),
+            true,
+            true,
         );
+        if rows.inner.height == 0 {
+            return;
+        }
+        if let Some(row) = rows.filter_row() {
+            self.filter.render(row, buf, ctx);
+        }
+        if let Some(row) = rows.toolbar_row() {
+            self.render_source_tabs(row, buf, ctx);
+        }
+        let Some(header_row) = rows.header else {
+            return;
+        };
+
+        // 拖拽期间以页面状态为准，否则拖拽结果会被每帧重载覆盖。
+        if self.column_resize.is_none() {
+            let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+            self.columns = song_table::load_columns_for_page(
+                &cfg.ui.table_columns,
+                "favorites",
+                rows.inner.width,
+            );
+        }
+
+        song_table::header_paragraph(
+            rows.inner.width,
+            &self.columns,
+            song_table::TablePalette::from_theme(ctx),
+        )
+        .render(header_row, buf);
+
+        let list = rows.list;
         self.viewport_height = list.height.max(1) as usize;
 
         if favorites.is_empty() {
@@ -640,10 +652,14 @@ impl FavoritesPage {
             } else {
                 Style::new().fg(crate::theme::text(ctx))
             };
-            Paragraph::new(Line::from(Span::styled(
-                super::components::song_table::row(song, filtered_index, list.width),
-                style,
-            )))
+            song_table::row_paragraph(
+                song,
+                filtered_index,
+                list.width,
+                &self.columns,
+                song_table::TablePalette::from_theme(ctx),
+            )
+            .style(style)
             .render(Rect::new(list.x, list.y + row as u16, list.width, 1), buf);
         }
         self.render_source_selector(area, buf, ctx);
@@ -695,6 +711,27 @@ impl FavoritesPage {
         Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
+    /// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
+    pub fn table_header_rect(&self, area: Rect, _ctx: &AppContext) -> Option<Rect> {
+        PanelRows::new(
+            area,
+            self.filter.is_active() || !self.filter.query().is_empty(),
+            true,
+            true,
+        )
+        .header
+    }
+
+    /// 自动列宽的测量样本，**无副作用**（直接读收藏库，不动排序缓存与过滤）。
+    pub fn autofit_samples(&self, ctx: &AppContext) -> Vec<SongInfo> {
+        ctx.storage.load_favorites()
+    }
+
+    /// 兜底取消进行中的列宽拖拽。
+    pub fn abort_drag_sessions(&mut self) {
+        self.column_resize = None;
+    }
+
     pub fn handle_mouse(
         &mut self,
         event: MouseEvent,
@@ -727,6 +764,81 @@ impl FavoritesPage {
             }
             return AppAction::None;
         }
+        // 与渲染共用同一份行账本，避免"渲染画了三行、命中只算两行"。
+        let rows = PanelRows::new(
+            area,
+            self.filter.is_active() || !self.filter.query().is_empty(),
+            true,
+            true,
+        );
+        let inner = rows.inner;
+        let table_width = inner.width;
+
+        if let Some(crs) = self.column_resize.clone() {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let delta = (event.column as i32) - (crs.start_local_x as i32);
+                    let adjusted = song_table::adjust_widths(
+                        &self.columns,
+                        crs.boundary_index,
+                        table_width,
+                        delta,
+                    );
+                    self.columns = adjusted;
+                    self.column_resize = Some(ColumnResizeState {
+                        start_local_x: event.column,
+                        ..crs
+                    });
+                    return AppAction::None;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.column_resize = None;
+                    return AppAction::CommitColumnResize {
+                        page_key: "favorites".to_string(),
+                        columns: self.columns.clone(),
+                    };
+                }
+                _ => return AppAction::None,
+            }
+        }
+
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(header) = rows.header
+            && header.y == event.row
+        {
+            let local_x = event.column.saturating_sub(inner.x);
+            if let Some(boundary) = song_table::find_boundary(&self.columns, table_width, local_x) {
+                let layout = song_table::compute_layout(&self.columns, table_width);
+                if boundary + 1 < layout.len() {
+                    self.column_resize = Some(ColumnResizeState {
+                        start_local_x: event.column,
+                        boundary_index: boundary,
+                    });
+                    return AppAction::None;
+                }
+            }
+        }
+
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(tab_area) = rows.toolbar_row()
+            && let Some(selector) = self.source_selector.as_ref()
+            && let Some(key) = selector.tab_at(tab_area, (event.column, event.row).into())
+        {
+            match key {
+                SourceSelectorKey::All => self.select_source(0),
+                SourceSelectorKey::Source(source) => {
+                    if let Some(index) = self
+                        .sources
+                        .iter()
+                        .position(|candidate| *candidate == source)
+                    {
+                        self.select_source(index + 1);
+                    }
+                }
+                _ => {}
+            }
+            return AppAction::None;
+        }
         let favorites = self.sorted_favorites(ctx, cache);
         let filtered = self.filtered_song_indices(favorites);
         let scroll_amount = ctx
@@ -736,29 +848,21 @@ impl FavoritesPage {
             .ui
             .scroll_amount
             .max(1);
+        let position = Position::new(event.column, event.row);
         match event.kind {
-            MouseEventKind::ScrollUp => {
+            MouseEventKind::ScrollUp if rows.list.contains(position) => {
                 self.selected = self.selected.saturating_sub(scroll_amount);
             }
-            MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown if rows.list.contains(position) => {
                 self.selected =
                     (self.selected + scroll_amount).min(filtered.len().saturating_sub(1));
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let inner = Block::default().borders(Borders::ALL).inner(area);
-                let search_height =
-                    u16::from(self.filter.is_active() || !self.filter.query().is_empty());
-                if search_height == 1 && event.row == inner.y {
+                if rows.filter_row().is_some_and(|row| row.y == event.row) {
                     self.filter.activate();
                     return AppAction::None;
                 }
-                if let Some(selected) = crate::pages::components::hit_test::row_at(
-                    area,
-                    Position::new(event.column, event.row),
-                    self.scroll,
-                    filtered.len(),
-                    search_height + 1,
-                ) {
+                if let Some(selected) = rows.index_at(position, self.scroll, filtered.len()) {
                     self.selected = selected;
                     if activate {
                         let songs = filtered
@@ -779,20 +883,30 @@ impl FavoritesPage {
 
     pub fn context_song_at(
         &mut self,
-        event: MouseEvent,
+        source: MenuHitSource,
         area: Rect,
         ctx: &AppContext,
         cache: &mut SortedListCache,
     ) -> Option<(Vec<SongInfo>, usize)> {
         let favorites = self.sorted_favorites(ctx, cache);
         let filtered = self.filtered_song_indices(favorites);
-        let search_height = u16::from(self.filter.is_active() || !self.filter.query().is_empty());
-        let index = crate::pages::components::hit_test::row_at(
+        // 与渲染共用行账本：过滤行 → 音源条 → 表头 → 列表。
+        let rows = PanelRows::new(
             area,
-            Position::new(event.column, event.row),
-            self.scroll,
+            self.filter.is_active() || !self.filter.query().is_empty(),
+            true,
+            true,
+        );
+        let index = source.resolve_index(
+            |event| {
+                rows.index_at(
+                    Position::new(event.column, event.row),
+                    self.scroll,
+                    filtered.len(),
+                )
+            },
+            self.selected,
             filtered.len(),
-            search_height + 1,
         )?;
         let Some(original_index) = filtered.get(index).copied() else {
             return None;

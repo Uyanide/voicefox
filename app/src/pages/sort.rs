@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use lx_core::model::config::TableColumnConfig;
 use lx_core::model::song::{EXTRA_FILE_MODIFIED_UNIX_NANOS, SongInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,19 +58,33 @@ impl SortMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SortState {
     pub selected: usize,
     pub scroll: usize,
     pub mode: SortMode,
+    pub page_key: &'static str,
+    pub columns: Vec<TableColumnConfig>,
+    pub column_resize: Option<crate::pages::components::song_table::ColumnResizeState>,
 }
 
 impl SortState {
-    pub fn new(mode: SortMode) -> Self {
+    /// 兜底取消进行中的列宽拖拽（鼠标在列表外松开、切页、终端 resize 等）。
+    ///
+    /// 不做这件事的话，`column_resize` 会永久停在 `Some`，而各页面的
+    /// 拖拽分支对其它鼠标事件是 `return None` —— 该页从此点不动。
+    pub fn cancel_column_resize(&mut self) {
+        self.column_resize = None;
+    }
+
+    pub fn new(mode: SortMode, page_key: &'static str) -> Self {
         Self {
             selected: 0,
             scroll: 0,
             mode,
+            page_key,
+            columns: Vec::new(),
+            column_resize: None,
         }
     }
 

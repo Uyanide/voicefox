@@ -17,7 +17,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use unicode_width::UnicodeWidthChar;
 
 use crate::context::AppContext;
+use crate::pages::components::context_menu::MenuHitSource;
 use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
+use crate::pages::components::splitter::{
+    DividerHit, SplitAxis, Splitter, clamp_ratio, ratio_within,
+};
 use crate::storage::{CustomPlaylistSummary, local_song_matches_path, same_song_identity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +75,19 @@ struct PlaylistListCache {
     has_more: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PPResizeTarget {
+    WidePlaylists,
+    NarrowPlaylists,
+}
+
+const PP_DEFAULT_PLAYLISTS_RATIO_WIDE: f32 = 0.34;
+const PP_DEFAULT_PLAYLISTS_RATIO_NARROW: f32 = 0.18;
+/// 宽/窄布局分界（与 leaderboard 一致）。
+const PP_WIDE_MIN_WIDTH: u16 = 82;
+/// 页面在 `ui.pane_ratios` 里的 key。
+const PP_PAGE_KEY: &str = "playlists";
+
 pub struct PlaylistsPage {
     scopes: Vec<PlaylistScope>,
     scope_index: usize,
@@ -98,6 +115,11 @@ pub struct PlaylistsPage {
     name_input_value: String,
     pending_delete: Option<CustomDeleteTarget>,
     scope_selector: Option<SourceSelector>,
+    playlists_ratio_wide: f32,
+    playlists_ratio_narrow: f32,
+    splitter: Splitter<PPResizeTarget>,
+    column_resize: Option<super::components::song_table::ColumnResizeState>,
+    song_columns: Vec<lx_core::model::config::TableColumnConfig>,
 }
 
 impl PlaylistsPage {
@@ -147,6 +169,11 @@ impl PlaylistsPage {
             name_input_value: String::new(),
             pending_delete: None,
             scope_selector: Some(SourceSelector::new(selector_items, 0)),
+            playlists_ratio_wide: PP_DEFAULT_PLAYLISTS_RATIO_WIDE,
+            playlists_ratio_narrow: PP_DEFAULT_PLAYLISTS_RATIO_NARROW,
+            splitter: Splitter::default(),
+            column_resize: None,
+            song_columns: Vec::new(),
         }
     }
 
@@ -514,6 +541,12 @@ impl PlaylistsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
+        if self.splitter.is_dragging() && key.code == KeyCode::Esc {
+            // Esc 取消本次分栏拖拽预览，不污染已提交布局
+            // （与 main_page / leaderboard 保持一致）。
+            self.cancel_resize();
+            return AppAction::None;
+        }
         if self.name_input.is_some() {
             return self.handle_name_input(key, ctx);
         }
@@ -858,6 +891,25 @@ impl PlaylistsPage {
         AppAction::None
     }
 
+    /// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
+    pub fn table_header_rect(&self, area: Rect, _ctx: &AppContext) -> Option<Rect> {
+        self.selected_playlist?;
+        let page = self.compute_layout(area, self.playlists.len());
+        let inner = Block::default().borders(Borders::ALL).inner(page.songs);
+        (inner.height > 0).then(|| Rect::new(inner.x, inner.y, inner.width, 1))
+    }
+
+    /// 自动列宽的测量样本，**无副作用**。
+    pub fn autofit_samples(&self, _ctx: &AppContext) -> Vec<SongInfo> {
+        self.songs.clone()
+    }
+
+    /// 兜底取消所有进行中的拖拽会话（分割条 + 列宽）。
+    pub fn abort_drag_sessions(&mut self) {
+        self.splitter.cancel();
+        self.column_resize = None;
+    }
+
     pub fn handle_mouse(
         &mut self,
         event: MouseEvent,
@@ -891,10 +943,103 @@ impl PlaylistsPage {
             }
             return AppAction::None;
         }
-        if self.input_active() {
-            return AppAction::None;
+        // 只有"按下"才算用户主动放弃输入：以前对所有鼠标事件都执行，
+        // 于是新歌单一动鼠标就把刚输入的名字清掉（删除确认也会被鼠标移动取消）。
+        if self.input_active() && matches!(event.kind, MouseEventKind::Down(_)) {
+            self.name_input = None;
+            self.name_input_value.clear();
+            self.pending_delete = None;
         }
-        let page = page_chunks(area, self.playlists.len());
+        let page = self.compute_layout(area, self.playlists.len());
+        let content_area = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        );
+        if let Some(target) = self.splitter.dragging().copied() {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.update_resize_preview(target, event, content_area);
+                    return AppAction::None;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    return match self.commit_resize() {
+                        Some((ratio_key, ratio)) => AppAction::CommitPaneRatio {
+                            page_key: PP_PAGE_KEY.to_string(),
+                            ratio_key: ratio_key.to_string(),
+                            ratio,
+                        },
+                        None => AppAction::None,
+                    };
+                }
+                _ => return AppAction::None,
+            }
+        } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(target) = self.resize_target_at(event, &page) {
+                let committed = self.committed_ratio(target);
+                self.splitter.begin(target, committed);
+                return AppAction::None;
+            }
+        }
+
+        if self.selected_playlist.is_some() {
+            let block = Block::default().borders(Borders::ALL);
+            let songs_inner = block.inner(page.songs);
+            let header_row = songs_inner.y;
+            let table_width = songs_inner.width;
+
+            if let Some(crs) = self.column_resize.clone() {
+                match event.kind {
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        let delta = (event.column as i32) - (crs.start_local_x as i32);
+                        self.song_columns = super::components::song_table::adjust_widths(
+                            &self.song_columns,
+                            crs.boundary_index,
+                            table_width,
+                            delta,
+                        );
+                        self.column_resize =
+                            Some(super::components::song_table::ColumnResizeState {
+                                start_local_x: event.column,
+                                ..crs
+                            });
+                        return AppAction::None;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        self.column_resize = None;
+                        return AppAction::CommitColumnResize {
+                            page_key: "playlists".to_string(),
+                            columns: self.song_columns.clone(),
+                        };
+                    }
+                    _ => return AppAction::None,
+                }
+            } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && event.row == header_row
+            {
+                let local_x = event.column.saturating_sub(songs_inner.x);
+                if let Some(boundary) = super::components::song_table::find_boundary(
+                    &self.song_columns,
+                    table_width,
+                    local_x,
+                ) {
+                    let layout = super::components::song_table::compute_layout(
+                        &self.song_columns,
+                        table_width,
+                    );
+                    if boundary + 1 < layout.len() {
+                        self.column_resize =
+                            Some(super::components::song_table::ColumnResizeState {
+                                start_local_x: event.column,
+                                boundary_index: boundary,
+                            });
+                        return AppAction::None;
+                    }
+                }
+            }
+        }
+
         let position = Position::new(event.column, event.row);
         let scroll_amount = ctx
             .config
@@ -1000,28 +1145,235 @@ impl PlaylistsPage {
 
     pub fn context_song_at(
         &mut self,
-        event: MouseEvent,
+        source: MenuHitSource,
         area: Rect,
     ) -> Option<(Vec<SongInfo>, usize)> {
         self.selected_playlist?;
-        let page = page_chunks(area, self.playlists.len());
-        let position = Position::new(event.column, event.row);
-        let index = crate::pages::components::hit_test::row_at(
-            page.songs,
-            position,
-            self.song_scroll_offset,
+        let page = self.compute_layout(area, self.playlists.len());
+        let index = source.resolve_index(
+            |event| {
+                crate::pages::components::hit_test::row_at(
+                    page.songs,
+                    Position::new(event.column, event.row),
+                    self.song_scroll_offset,
+                    self.songs.len(),
+                    1,
+                )
+            },
+            self.selected,
             self.songs.len(),
-            1,
         )?;
         self.selected = index;
         Some((self.songs.clone(), index))
     }
 
+    fn compute_layout(&self, area: Rect, playlist_count: usize) -> PageChunks {
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        let min_playlists_rows = (playlist_count as u16 + 2).clamp(5, 11);
+        let min_playlists_cols: u16 = 14;
+        let min_songs_cols: u16 = 20;
+        let min_songs_rows: u16 = 5;
+
+        let wide = vertical[1].width >= PP_WIDE_MIN_WIDTH;
+        let content = if !wide {
+            let ratio = self.splitter.effective(
+                &PPResizeTarget::NarrowPlaylists,
+                self.playlists_ratio_narrow,
+            );
+            let playlists_height = ((vertical[1].height as f32) * ratio).round() as u16;
+            let playlists_height = playlists_height.clamp(
+                min_playlists_rows,
+                vertical[1].height.saturating_sub(min_songs_rows),
+            );
+            let playlists_height =
+                playlists_height.min(vertical[1].height.saturating_sub(min_songs_rows.max(1)));
+            let playlists = Rect::new(
+                vertical[1].x,
+                vertical[1].y,
+                vertical[1].width,
+                playlists_height,
+            );
+            let songs = Rect::new(
+                vertical[1].x,
+                playlists.bottom().min(vertical[1].bottom()),
+                vertical[1].width,
+                vertical[1].height.saturating_sub(playlists.height),
+            );
+            [playlists, songs]
+        } else {
+            let ratio = self
+                .splitter
+                .effective(&PPResizeTarget::WidePlaylists, self.playlists_ratio_wide);
+            let playlists_width = ((vertical[1].width as f32) * ratio).round() as u16;
+            let playlists_width = playlists_width.clamp(
+                min_playlists_cols,
+                vertical[1].width.saturating_sub(min_songs_cols),
+            );
+            let playlists_width =
+                playlists_width.min(vertical[1].width.saturating_sub(min_songs_cols.max(1)));
+            let playlists = Rect::new(
+                vertical[1].x,
+                vertical[1].y,
+                playlists_width,
+                vertical[1].height,
+            );
+            let songs = Rect::new(
+                playlists.right().min(vertical[1].right()),
+                vertical[1].y,
+                vertical[1].width.saturating_sub(playlists.width),
+                vertical[1].height,
+            );
+            [playlists, songs]
+        };
+        PageChunks {
+            scopes: vertical[0],
+            playlists: content[0],
+            songs: content[1],
+            wide,
+        }
+    }
+
+    /// 当前布局下**唯一**可拖拽的那条分割线。
+    fn divider(&self, layout: &PageChunks) -> Option<(PPResizeTarget, DividerHit)> {
+        if layout.wide {
+            if layout.playlists.width == 0 || layout.songs.width == 0 {
+                return None;
+            }
+            let x = layout.playlists.right().saturating_sub(1);
+            Some((
+                PPResizeTarget::WidePlaylists,
+                DividerHit::new(
+                    SplitAxis::Vertical,
+                    x,
+                    (layout.playlists.y, layout.playlists.bottom()),
+                ),
+            ))
+        } else {
+            if layout.playlists.height == 0 || layout.songs.height == 0 {
+                return None;
+            }
+            let y = layout.playlists.bottom().saturating_sub(1);
+            Some((
+                PPResizeTarget::NarrowPlaylists,
+                DividerHit::new(
+                    SplitAxis::Horizontal,
+                    y,
+                    (layout.playlists.x, layout.playlists.right()),
+                ),
+            ))
+        }
+    }
+
+    fn resize_target_at(&self, event: MouseEvent, layout: &PageChunks) -> Option<PPResizeTarget> {
+        let (target, hit) = self.divider(layout)?;
+        hit.matches(event.column, event.row).then_some(target)
+    }
+
+    fn clamp_resize_ratio(target: PPResizeTarget, ratio: f32) -> f32 {
+        match target {
+            PPResizeTarget::WidePlaylists => clamp_ratio(ratio, 0.15, 0.55),
+            PPResizeTarget::NarrowPlaylists => clamp_ratio(ratio, 0.10, 0.40),
+        }
+    }
+
+    /// 该分割线已提交的比例（开始拖拽时取初值）。
+    fn committed_ratio(&self, target: PPResizeTarget) -> f32 {
+        match target {
+            PPResizeTarget::WidePlaylists => self.playlists_ratio_wide,
+            PPResizeTarget::NarrowPlaylists => self.playlists_ratio_narrow,
+        }
+    }
+
+    fn update_resize_preview(
+        &mut self,
+        target: PPResizeTarget,
+        event: MouseEvent,
+        content_area: Rect,
+    ) {
+        let raw_ratio = match target {
+            PPResizeTarget::WidePlaylists if content_area.width > 0 => {
+                ratio_within(content_area.x, content_area.width, event.column)
+            }
+            PPResizeTarget::NarrowPlaylists if content_area.height > 0 => {
+                ratio_within(content_area.y, content_area.height, event.row)
+            }
+            _ => return,
+        };
+        self.splitter
+            .drag(Self::clamp_resize_ratio(target, raw_ratio));
+    }
+
+    /// 鼠标抬起：提交比例并返回需要持久化的 `(ratio_key, ratio)`。
+    fn commit_resize(&mut self) -> Option<(&'static str, f32)> {
+        let (target, ratio) = self.splitter.commit()?;
+        let key = match target {
+            PPResizeTarget::WidePlaylists => {
+                self.playlists_ratio_wide = ratio;
+                "playlists_wide"
+            }
+            PPResizeTarget::NarrowPlaylists => {
+                self.playlists_ratio_narrow = ratio;
+                "playlists_narrow"
+            }
+        };
+        Some((key, ratio))
+    }
+
+    fn cancel_resize(&mut self) {
+        self.splitter.cancel();
+    }
+
+    /// 从 Config 恢复用户拖拽过的比例（页面构造后调用一次）。
+    pub fn apply_pane_ratios(&mut self, ratios: &HashMap<String, f32>) {
+        if let Some(value) = ratios.get("playlists_wide").copied() {
+            self.playlists_ratio_wide =
+                Self::clamp_resize_ratio(PPResizeTarget::WidePlaylists, value);
+        }
+        if let Some(value) = ratios.get("playlists_narrow").copied() {
+            self.playlists_ratio_narrow =
+                Self::clamp_resize_ratio(PPResizeTarget::NarrowPlaylists, value);
+        }
+    }
+
+    pub fn pane_page_key(&self) -> &'static str {
+        PP_PAGE_KEY
+    }
+
+    fn render_resize_dividers(&self, layout: &PageChunks, buf: &mut Buffer, ctx: &AppContext) {
+        use ratatui::style::Style;
+        let base = Style::new().fg(crate::theme::accent(ctx));
+        let style = if self.splitter.is_dragging() {
+            base.bold()
+        } else {
+            base
+        };
+        // 只画当前方向的那条线（以前两个方向都画，只是恰好压在面板边框上）。
+        let Some((_, hit)) = self.divider(layout) else {
+            return;
+        };
+        match hit.axis {
+            SplitAxis::Vertical => {
+                for y in hit.span.0..hit.span.1 {
+                    buf.set_string(hit.divider, y, "│", style);
+                }
+            }
+            SplitAxis::Horizontal => {
+                for x in hit.span.0..hit.span.1 {
+                    buf.set_string(x, hit.divider, "─", style);
+                }
+            }
+        }
+    }
+
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-        let page = page_chunks(area, self.playlists.len());
+        let page = self.compute_layout(area, self.playlists.len());
         self.render_scopes(page.scopes, buf, ctx);
         self.render_playlists(page.playlists, buf, ctx);
         self.render_songs(page.songs, buf, ctx);
+        self.render_resize_dividers(&page, buf, ctx);
         self.render_dialog(area, buf, ctx);
         self.render_scope_selector(area, buf, ctx);
     }
@@ -1246,12 +1598,21 @@ impl PlaylistsPage {
             return;
         }
 
-        Paragraph::new(Line::from(Span::styled(
-            super::components::song_table::header(inner.width),
-            Style::new()
-                .fg(crate::theme::muted(ctx))
-                .add_modifier(Modifier::BOLD),
-        )))
+        // 拖拽期间以页面状态为准，否则拖拽结果会被每帧重载覆盖。
+        if self.column_resize.is_none() {
+            let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+            self.song_columns = super::components::song_table::load_columns_for_page(
+                &cfg.ui.table_columns,
+                "playlists",
+                inner.width,
+            );
+        }
+
+        super::components::song_table::header_paragraph(
+            inner.width,
+            &self.song_columns,
+            super::components::song_table::TablePalette::from_theme(ctx),
+        )
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
         let list_area = Rect::new(
             inner.x,
@@ -1272,8 +1633,13 @@ impl PlaylistsPage {
         for index in self.song_scroll_offset
             ..(self.song_scroll_offset + visible_height).min(self.songs.len())
         {
-            let text =
-                super::components::song_table::row(&self.songs[index], index, list_area.width);
+            let row_paragraph = super::components::song_table::row_paragraph(
+                &self.songs[index],
+                index,
+                list_area.width,
+                &self.song_columns,
+                super::components::song_table::TablePalette::from_theme(ctx),
+            );
             let style = if index == self.selected {
                 Style::new()
                     .bg(crate::theme::accent(ctx))
@@ -1282,7 +1648,7 @@ impl PlaylistsPage {
             } else {
                 Style::new().fg(crate::theme::text(ctx))
             };
-            Paragraph::new(Line::from(Span::styled(text, style))).render(
+            row_paragraph.style(style).render(
                 Rect::new(
                     list_area.x,
                     list_area.y + (index - self.song_scroll_offset) as u16,
@@ -1636,32 +2002,8 @@ struct PageChunks {
     scopes: Rect,
     playlists: Rect,
     songs: Rect,
-}
-
-fn page_chunks(area: Rect, playlist_count: usize) -> PageChunks {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(area);
-    let content = if area.width < 82 {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length((playlist_count as u16 + 2).clamp(5, 11)),
-                Constraint::Min(0),
-            ])
-            .split(vertical[1])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(34), Constraint::Min(0)])
-            .split(vertical[1])
-    };
-    PageChunks {
-        scopes: vertical[0],
-        playlists: content[0],
-        songs: content[1],
-    }
+    /// 是否宽布局（左右并排）。分割条靠它决定方向，不再靠几何猜。
+    wide: bool,
 }
 
 fn centered_dialog(area: Rect, max_width: u16, height: u16) -> Rect {

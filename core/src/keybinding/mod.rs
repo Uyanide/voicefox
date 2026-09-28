@@ -83,6 +83,8 @@ pub enum Action {
     ListDownload,
     /// 循环切换当前列表的排序方式
     ListCycleSort,
+    /// 打开当前选中项的上下文菜单（无鼠标环境下的右键替代入口）
+    ListContextMenu,
 
     // --- 搜索页面专用 ---
     /// 进入搜索输入模式
@@ -188,6 +190,7 @@ impl Action {
             Action::ListActivate => "激活选中项（播放 / 进入）",
             Action::ListToggleFavorite => "收藏 / 取消收藏选中歌曲",
             Action::ListGoBack => "返回 / 退出",
+            Action::ListContextMenu => "打开选中项菜单",
             Action::ListAddToQueue => "添加到队列尾部",
             Action::ListAddToQueueNext => "添加到队列下一首",
             Action::ListDownload => "下载选中歌曲",
@@ -226,7 +229,7 @@ impl Action {
     }
 
     /// 动作的规范展示顺序，帮助浮层按此排序。
-    pub const ALL: [Action; 59] = [
+    pub const ALL: [Action; 60] = [
         Action::GlobalQuit,
         Action::GlobalPlayPause,
         Action::GlobalNextTrack,
@@ -256,6 +259,7 @@ impl Action {
         Action::ListAddToQueueNext,
         Action::ListDownload,
         Action::ListCycleSort,
+        Action::ListContextMenu,
         Action::SearchInputMode,
         Action::SearchStart,
         Action::SearchToggleAggregate,
@@ -454,6 +458,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     search.insert(Action::SearchCycleSourcePrev, "Left".to_string());
     search.insert(Action::SearchCycleSourceNext, "Right".to_string());
     search.insert(Action::ListGoBack, "Esc".to_string());
+    search.insert(Action::ListContextMenu, "x".to_string());
     pages.insert("search".to_string(), search);
 
     // --- 主页（队列） ---
@@ -468,6 +473,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     main.insert(Action::ListToggleFavorite, "f".to_string());
     // 队列页的 D 已经用于「清空队列」，下载沿用 Ctrl+S 的语义，落在选中的队列项上。
     main.insert(Action::ListDownload, "Ctrl+s".to_string());
+    main.insert(Action::ListContextMenu, "x".to_string());
     pages.insert("main".to_string(), main);
 
     // --- 排行榜 ---
@@ -486,6 +492,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     leaderboard.insert(Action::SearchCycleSourcePrev, "Left".to_string());
     leaderboard.insert(Action::SearchCycleSourceNext, "Right".to_string());
     leaderboard.insert(Action::ListGoBack, "Esc".to_string());
+    leaderboard.insert(Action::ListContextMenu, "x".to_string());
     pages.insert("leaderboard".to_string(), leaderboard);
 
     // --- 歌单 ---
@@ -504,6 +511,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     playlists.insert(Action::SearchCycleSourcePrev, "Left".to_string());
     playlists.insert(Action::SearchCycleSourceNext, "Right".to_string());
     playlists.insert(Action::ListGoBack, "Esc".to_string());
+    playlists.insert(Action::ListContextMenu, "x".to_string());
     pages.insert("playlists".to_string(), playlists);
 
     // --- 收藏 ---
@@ -523,6 +531,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     favorites.insert(Action::FavoritesRemove, "d".to_string());
     favorites.insert(Action::ListDownload, "D".to_string());
     favorites.insert(Action::ListGoBack, "Esc".to_string());
+    favorites.insert(Action::ListContextMenu, "x".to_string());
     pages.insert("favorites".to_string(), favorites);
 
     // --- 历史 ---
@@ -540,6 +549,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     history.insert(Action::ListDownload, "D".to_string());
     history.insert(Action::ListCycleSort, "s".to_string());
     history.insert(Action::HistoryFilter, "/".to_string());
+    history.insert(Action::ListContextMenu, "x".to_string());
     pages.insert("history".to_string(), history);
 
     // --- 本地音乐 ---
@@ -558,6 +568,7 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     local.insert(Action::LocalRescan, "r".to_string());
     local.insert(Action::LocalDelete, "d".to_string());
     local.insert(Action::LocalFilter, "/".to_string());
+    local.insert(Action::ListContextMenu, "x".to_string());
     pages.insert("local".to_string(), local);
 
     // --- 设置 ---
@@ -851,6 +862,39 @@ pub fn colemak_preset() -> KeybindingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 无鼠标环境下的右键替代入口：所有歌曲列表页都必须绑上 `ListContextMenu`，
+    /// 否则"清空历史/删除本地/查看歌手/播放控制"这些只在菜单里的功能不可达。
+    #[test]
+    fn song_list_pages_bind_a_keyboard_context_menu_entry() {
+        let config = KeybindingConfig::default();
+        for page in [
+            "main",
+            "search",
+            "leaderboard",
+            "playlists",
+            "favorites",
+            "history",
+            "local",
+        ] {
+            let bindings = config
+                .pages
+                .get(page)
+                .unwrap_or_else(|| panic!("{page} 应有默认页键位"));
+            assert_eq!(
+                bindings.get(&Action::ListContextMenu).map(String::as_str),
+                Some("x"),
+                "{page} 应把打开上下文菜单绑到 x"
+            );
+        }
+        // 设置页没有歌曲列表，不该占用这个键
+        assert!(
+            !config
+                .pages
+                .get("settings")
+                .is_some_and(|b| b.contains_key(&Action::ListContextMenu))
+        );
+    }
 
     #[test]
     fn parse_simple_char() {

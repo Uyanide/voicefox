@@ -13,6 +13,10 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::cover::{CoverGeometry, CoverRenderer, CoverState};
+use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::splitter::{
+    DividerHit, SplitAxis, Splitter, clamp_ratio, ratio_within,
+};
 
 /// “D 清空整个队列”的确认窗口：首次按下武装，窗口内再按一次才执行。
 const CLEAR_QUEUE_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
@@ -35,11 +39,8 @@ enum ResizeTarget {
 const DEFAULT_WIDE_COLUMNS_RATIO: f32 = 0.36;
 const DEFAULT_WIDE_COVER_RATIO: f32 = 0.52;
 const DEFAULT_NARROW_QUEUE_RATIO: f32 = 0.62;
-const RESIZE_GRAB_RADIUS: u16 = 1;
-
-fn clamp_ratio(value: f32, min: f32, max: f32) -> f32 {
-    value.clamp(min, max)
-}
+/// 页面在 `ui.pane_ratios` 里的 key。
+const MP_PAGE_KEY: &str = "queue";
 
 fn queue_edit_command(key: &KeyEvent) -> Option<QueueEditCommand> {
     match (key.modifiers, key.code) {
@@ -83,14 +84,14 @@ pub struct MainPage {
     wide_cover_ratio: f32,
     /// 窄屏：上方队列占整个内容区高度的比例。
     narrow_queue_ratio: f32,
-    /// 当前鼠标正在拖动的布局分隔线。
-    resize_target: Option<ResizeTarget>,
-    /// 拖动期间只更新视觉预览，不立即提交到稳定布局状态。
-    resize_preview: Option<(ResizeTarget, f32)>,
+    /// 分割条拖拽状态机（预览 / 提交 / 取消统一实现在 components::splitter）。
+    splitter: Splitter<ResizeTarget>,
     /// 首次绘制前保持旧版封面高度策略；之后由用户拖拽接管。
     layout_initialized: bool,
     /// “D 清空整个队列”的武装时刻，确认窗口外或 Esc 后解除
     clear_armed: Option<Instant>,
+    column_resize: Option<super::components::song_table::ColumnResizeState>,
+    queue_columns: Vec<lx_core::model::config::TableColumnConfig>,
 }
 
 impl MainPage {
@@ -106,10 +107,11 @@ impl MainPage {
             wide_columns_ratio: DEFAULT_WIDE_COLUMNS_RATIO,
             wide_cover_ratio: DEFAULT_WIDE_COVER_RATIO,
             narrow_queue_ratio: DEFAULT_NARROW_QUEUE_RATIO,
-            resize_target: None,
-            resize_preview: None,
+            splitter: Splitter::default(),
             layout_initialized: false,
             clear_armed: None,
+            column_resize: None,
+            queue_columns: Vec::new(),
         }
     }
 
@@ -155,10 +157,9 @@ impl MainPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
-        if self.resize_target.is_some() && key.code == KeyCode::Esc {
+        if self.splitter.is_dragging() && key.code == KeyCode::Esc {
             // Esc 取消本次视觉预览，不污染已提交布局。
-            self.resize_target = None;
-            self.resize_preview = None;
+            self.splitter.cancel();
             return AppAction::None;
         }
 
@@ -259,6 +260,11 @@ impl MainPage {
                     }
                     self.clear_armed = None;
                     ctx.playlist.clear();
+                    // 显式清空队列才丢弃已保存的播放会话；否则「队列为空」不再
+                    // 触发删除，下次启动会把这次清掉的队列又恢复回来。
+                    if let Err(error) = ctx.forget_playback_session() {
+                        tracing::warn!("清空已保存的播放会话失败: {error}");
+                    }
                     ctx.stop_player();
                     ctx.cover_service.clear();
                     ctx.lyric_service.clear();
@@ -431,15 +437,10 @@ impl MainPage {
     }
 
     fn compute_layout(&mut self, area: Rect, ctx: &AppContext) -> MainLayout {
-        let effective_ratio = |target: ResizeTarget, committed: f32| {
-            self.resize_preview
-                .filter(|(preview_target, _)| *preview_target == target)
-                .map(|(_, ratio)| ratio)
-                .unwrap_or(committed)
-        };
-
         if area.width >= 72 {
-            let columns_ratio = effective_ratio(ResizeTarget::WideColumns, self.wide_columns_ratio);
+            let columns_ratio = self
+                .splitter
+                .effective(&ResizeTarget::WideColumns, self.wide_columns_ratio);
             let left_width = ((area.width as f32) * columns_ratio).round() as u16;
             let left_width = left_width.clamp(24, area.width.saturating_sub(24).max(24));
             let left = Rect::new(area.x, area.y, left_width.min(area.width), area.height);
@@ -477,7 +478,9 @@ impl MainPage {
             let max_cover = left
                 .height
                 .saturating_sub(super::components::lyric::MIN_HEIGHT);
-            let cover_ratio = effective_ratio(ResizeTarget::WideCoverLyrics, self.wide_cover_ratio);
+            let cover_ratio = self
+                .splitter
+                .effective(&ResizeTarget::WideCoverLyrics, self.wide_cover_ratio);
             let cover_height = if geometry.is_some() {
                 ((left.height as f32) * cover_ratio)
                     .round()
@@ -503,8 +506,9 @@ impl MainPage {
         } else {
             let min_queue = 7.min(area.height);
             let min_lyric = 5.min(area.height.saturating_sub(min_queue));
-            let queue_ratio =
-                effective_ratio(ResizeTarget::NarrowQueueLyrics, self.narrow_queue_ratio);
+            let queue_ratio = self
+                .splitter
+                .effective(&ResizeTarget::NarrowQueueLyrics, self.narrow_queue_ratio);
             let queue_height = ((area.height as f32) * queue_ratio).round() as u16;
             let max_queue = area.height.saturating_sub(min_lyric);
             let queue_height = queue_height.clamp(min_queue, max_queue.max(min_queue));
@@ -527,26 +531,49 @@ impl MainPage {
     }
 
     fn render_resize_dividers(&self, layout: &MainLayout, buf: &mut Buffer, ctx: &AppContext) {
-        let style = Style::new().fg(crate::theme::accent(ctx));
-        if layout.wide {
-            if layout.left.width > 0 && layout.queue.width > 0 {
-                let x = layout.left.right().saturating_sub(1);
-                for y in layout.left.y..layout.left.bottom() {
-                    buf.set_string(x, y, "│", style);
+        let base = Style::new().fg(crate::theme::accent(ctx));
+        let style = if self.splitter.is_dragging() {
+            base.bold()
+        } else {
+            base
+        };
+        // 绘制坐标与命中共用 `dividers()`，不会再出现"看得到却抓不住"。
+        for (_, hit) in self.dividers(layout) {
+            match hit.axis {
+                SplitAxis::Vertical => {
+                    for y in hit.span.0..hit.span.1 {
+                        buf.set_string(hit.divider, y, "│", style);
+                    }
                 }
-            }
-            if layout.cover.height > 0 && layout.lyric.height > 0 {
-                let y = layout.cover.bottom().saturating_sub(1);
-                for x in layout.left.x..layout.left.right() {
-                    buf.set_string(x, y, "─", style);
+                SplitAxis::Horizontal => {
+                    for x in hit.span.0..hit.span.1 {
+                        buf.set_string(x, hit.divider, "─", style);
+                    }
                 }
-            }
-        } else if layout.queue.height > 0 && layout.lyric.height > 0 {
-            let y = layout.queue.bottom().saturating_sub(1);
-            for x in layout.queue.x..layout.queue.right() {
-                buf.set_string(x, y, "─", style);
             }
         }
+    }
+
+    /// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
+    pub fn table_header_rect(&mut self, area: Rect, ctx: &AppContext) -> Option<Rect> {
+        let layout = self.compute_layout(area, ctx);
+        let inner = Block::default().borders(Borders::ALL).inner(layout.queue);
+        Some(Rect::new(inner.x, inner.y, inner.width, 1))
+    }
+
+    /// 自动列宽的测量样本：当前队列，**无副作用**。
+    pub fn autofit_samples(&self, ctx: &AppContext) -> Vec<lx_core::model::song::SongInfo> {
+        ctx.playlist.snapshot().0
+    }
+
+    /// 兜底取消所有进行中的拖拽会话（分割条 + 列宽）。
+    ///
+    /// 鼠标只在 `ui_areas.content` 内派发，所以在列表外松开左键时页面收不到
+    /// `Up`；切页与终端 resize 也会留下残留状态。残留会让整个页面的鼠标
+    /// 事件被拖拽分支吞掉，表现为"这一页突然点不动了"。
+    pub fn abort_drag_sessions(&mut self) {
+        self.splitter.cancel();
+        self.column_resize = None;
     }
 
     pub fn handle_mouse(
@@ -557,24 +584,84 @@ impl MainPage {
         activate: bool,
     ) -> AppAction {
         let layout = self.compute_layout(area, ctx);
-        if let Some(target) = self.resize_target {
+        if let Some(target) = self.splitter.dragging().copied() {
             match event.kind {
                 MouseEventKind::Drag(MouseButton::Left) => {
                     self.update_resize_preview(target, event, area, &layout);
                     return AppAction::None;
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    self.commit_resize();
-                    return AppAction::None;
+                    return match self.commit_resize() {
+                        Some((ratio_key, ratio)) => AppAction::CommitPaneRatio {
+                            page_key: MP_PAGE_KEY.to_string(),
+                            ratio_key: ratio_key.to_string(),
+                            ratio,
+                        },
+                        None => AppAction::None,
+                    };
                 }
                 // Resize 会话期间其它鼠标事件不能穿透到队列，避免拖动时误触。
                 _ => return AppAction::None,
             }
         } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(target) = self.resize_target_at(event, &layout) {
-                self.resize_target = Some(target);
-                self.resize_preview = Some((target, self.committed_ratio(target)));
+                let committed = self.committed_ratio(target);
+                self.splitter.begin(target, committed);
                 return AppAction::None;
+            }
+        }
+
+        let block = Block::default().borders(Borders::ALL);
+        let queue_inner = block.inner(layout.queue);
+        let header_row = queue_inner.y;
+        let table_width = queue_inner.width;
+
+        if let Some(crs) = self.column_resize.clone() {
+            match event.kind {
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                    let delta = (event.column as i32) - (crs.start_local_x as i32);
+                    let adjusted = super::components::song_table::adjust_widths(
+                        &self.queue_columns,
+                        crs.boundary_index,
+                        table_width,
+                        delta,
+                    );
+                    self.queue_columns = adjusted;
+                    self.column_resize = Some(super::components::song_table::ColumnResizeState {
+                        start_local_x: event.column,
+                        ..crs
+                    });
+                    return AppAction::None;
+                }
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                    self.column_resize = None;
+                    return AppAction::CommitColumnResize {
+                        page_key: "queue".to_string(),
+                        columns: self.queue_columns.clone(),
+                    };
+                }
+                _ => return AppAction::None,
+            }
+        } else if matches!(
+            event.kind,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) && event.row == header_row
+        {
+            let local_x = event.column.saturating_sub(queue_inner.x);
+            if let Some(boundary) = super::components::song_table::find_boundary(
+                &self.queue_columns,
+                table_width,
+                local_x,
+            ) {
+                let layout =
+                    super::components::song_table::compute_layout(&self.queue_columns, table_width);
+                if boundary + 1 < layout.len() {
+                    self.column_resize = Some(super::components::song_table::ColumnResizeState {
+                        start_local_x: event.column,
+                        boundary_index: boundary,
+                    });
+                    return AppAction::None;
+                }
             }
         }
 
@@ -587,6 +674,7 @@ impl MainPage {
             .max(1);
         let mut play_songs = None;
         let mut drag_target = None;
+        let pointer = Position::new(event.column, event.row);
         // 先记录拖拽起点：Up 事件会清掉 self.dragging，落点应用阶段仍需用到它。
         let drag_source = self.dragging;
         {
@@ -594,11 +682,13 @@ impl MainPage {
             let songs = ctx.playlist.borrow();
             let current = ctx.playlist.current_index();
             match event.kind {
-                MouseEventKind::ScrollUp => {
+                // 滚轮只在光标位于队列面板内时才改选中：以前光标停在封面/歌词上
+                // 滚轮，队列选中也会跟着跑。
+                MouseEventKind::ScrollUp if layout.queue.contains(pointer) => {
                     self.dragging = None;
                     self.selected = self.selected.saturating_sub(scroll_amount);
                 }
-                MouseEventKind::ScrollDown => {
+                MouseEventKind::ScrollDown if layout.queue.contains(pointer) => {
                     self.dragging = None;
                     self.selected =
                         (self.selected + scroll_amount).min(songs.len().saturating_sub(1));
@@ -663,13 +753,31 @@ impl MainPage {
 
     pub fn context_song_at(
         &mut self,
-        event: MouseEvent,
+        source: MenuHitSource,
         area: Rect,
         ctx: &AppContext,
     ) -> Option<(Vec<lx_core::model::song::SongInfo>, usize)> {
         let songs = ctx.playlist.borrow();
         let layout = self.compute_layout(area, ctx);
-        let index = queue_index_at(event, layout.queue, self.scroll, songs.len())?;
+        // 必须和左键走同一套"过滤 / 未过滤"分流：过滤生效时 `self.scroll` 是
+        // 过滤视图的偏移，若这里仍按未过滤列表换算，右键菜单会指向另一首歌。
+        // 鼠标与键盘入口共用这一份解析。
+        let index = source.resolve_index(
+            |event| {
+                if self.queue_filter.is_empty() {
+                    queue_index_at(event, layout.queue, self.scroll, songs.len())
+                } else {
+                    queue_index_at_filtered(
+                        event,
+                        layout.queue,
+                        self.scroll,
+                        &self.filtered_indices(&songs),
+                    )
+                }
+            },
+            self.selected,
+            songs.len(),
+        )?;
         self.selected = index;
         self.dragging = None;
         Some((songs.to_vec(), index))
@@ -705,38 +813,51 @@ impl MainPage {
         }
     }
 
-    fn resize_target_at(&self, event: MouseEvent, layout: &MainLayout) -> Option<ResizeTarget> {
-        let x = event.column;
-        let y = event.row;
+    /// 当前布局下可拖拽的分割线。
+    ///
+    /// 方向由 `layout.wide` 明确决定：宽布局只有"左栏|队列"竖线和"封面|歌词"横线，
+    /// 窄布局只有"队列|歌词"横线。**不要**把横竖判定串行无条件求值。
+    fn dividers(&self, layout: &MainLayout) -> Vec<(ResizeTarget, DividerHit)> {
+        let mut out = Vec::new();
         if layout.wide {
-            let vertical = layout.left.right().saturating_sub(1);
-            if x.abs_diff(vertical) <= RESIZE_GRAB_RADIUS
-                && y >= layout.left.y
-                && y < layout.left.bottom()
-            {
-                return Some(ResizeTarget::WideColumns);
+            if layout.left.width > 0 && layout.queue.width > 0 {
+                out.push((
+                    ResizeTarget::WideColumns,
+                    DividerHit::new(
+                        SplitAxis::Vertical,
+                        layout.left.right().saturating_sub(1),
+                        (layout.left.y, layout.left.bottom()),
+                    ),
+                ));
             }
-            let horizontal = layout.cover.bottom().saturating_sub(1);
-            if layout.cover.height > 0
-                && layout.lyric.height > 0
-                && y.abs_diff(horizontal) <= RESIZE_GRAB_RADIUS
-                && x >= layout.left.x
-                && x < layout.left.right()
-            {
-                return Some(ResizeTarget::WideCoverLyrics);
+            if layout.cover.height > 0 && layout.lyric.height > 0 {
+                out.push((
+                    ResizeTarget::WideCoverLyrics,
+                    DividerHit::new(
+                        SplitAxis::Horizontal,
+                        layout.cover.bottom().saturating_sub(1),
+                        (layout.left.x, layout.left.right()),
+                    ),
+                ));
             }
-        } else {
-            let horizontal = layout.queue.bottom().saturating_sub(1);
-            if layout.queue.height > 0
-                && layout.lyric.height > 0
-                && y.abs_diff(horizontal) <= RESIZE_GRAB_RADIUS
-                && x >= layout.queue.x
-                && x < layout.queue.right()
-            {
-                return Some(ResizeTarget::NarrowQueueLyrics);
-            }
+        } else if layout.queue.height > 0 && layout.lyric.height > 0 {
+            out.push((
+                ResizeTarget::NarrowQueueLyrics,
+                DividerHit::new(
+                    SplitAxis::Horizontal,
+                    layout.queue.bottom().saturating_sub(1),
+                    (layout.queue.x, layout.queue.right()),
+                ),
+            ));
         }
-        None
+        out
+    }
+
+    fn resize_target_at(&self, event: MouseEvent, layout: &MainLayout) -> Option<ResizeTarget> {
+        self.dividers(layout)
+            .into_iter()
+            .find(|(_, hit)| hit.matches(event.column, event.row))
+            .map(|(target, _)| target)
     }
 
     fn committed_ratio(&self, target: ResizeTarget) -> f32 {
@@ -764,28 +885,56 @@ impl MainPage {
     ) {
         let raw_ratio = match target {
             ResizeTarget::WideColumns if area.width > 0 => {
-                (event.column.saturating_sub(area.x) as f32) / area.width as f32
+                ratio_within(area.x, area.width, event.column)
             }
             ResizeTarget::WideCoverLyrics if layout.left.height > 0 => {
-                (event.row.saturating_sub(layout.left.y) as f32) / layout.left.height as f32
+                ratio_within(layout.left.y, layout.left.height, event.row)
             }
             ResizeTarget::NarrowQueueLyrics if area.height > 0 => {
-                (event.row.saturating_sub(area.y) as f32) / area.height as f32
+                ratio_within(area.y, area.height, event.row)
             }
             _ => return,
         };
-        self.resize_preview = Some((target, Self::clamp_resize_ratio(target, raw_ratio)));
+        self.splitter
+            .drag(Self::clamp_resize_ratio(target, raw_ratio));
     }
 
-    fn commit_resize(&mut self) {
-        if let Some((target, ratio)) = self.resize_preview.take() {
-            match target {
-                ResizeTarget::WideColumns => self.wide_columns_ratio = ratio,
-                ResizeTarget::WideCoverLyrics => self.wide_cover_ratio = ratio,
-                ResizeTarget::NarrowQueueLyrics => self.narrow_queue_ratio = ratio,
+    /// 鼠标抬起：提交比例并返回需要持久化的 `(ratio_key, ratio)`。
+    fn commit_resize(&mut self) -> Option<(&'static str, f32)> {
+        let (target, ratio) = self.splitter.commit()?;
+        let key = match target {
+            ResizeTarget::WideColumns => {
+                self.wide_columns_ratio = ratio;
+                "wide_columns"
             }
+            ResizeTarget::WideCoverLyrics => {
+                self.wide_cover_ratio = ratio;
+                "wide_cover"
+            }
+            ResizeTarget::NarrowQueueLyrics => {
+                self.narrow_queue_ratio = ratio;
+                "narrow_queue"
+            }
+        };
+        Some((key, ratio))
+    }
+
+    /// 从 Config 恢复用户拖拽过的比例（页面构造后调用一次）。
+    pub fn apply_pane_ratios(&mut self, ratios: &std::collections::HashMap<String, f32>) {
+        if let Some(value) = ratios.get("wide_columns").copied() {
+            self.wide_columns_ratio = Self::clamp_resize_ratio(ResizeTarget::WideColumns, value);
         }
-        self.resize_target = None;
+        if let Some(value) = ratios.get("wide_cover").copied() {
+            self.wide_cover_ratio = Self::clamp_resize_ratio(ResizeTarget::WideCoverLyrics, value);
+        }
+        if let Some(value) = ratios.get("narrow_queue").copied() {
+            self.narrow_queue_ratio =
+                Self::clamp_resize_ratio(ResizeTarget::NarrowQueueLyrics, value);
+        }
+    }
+
+    pub fn pane_page_key(&self) -> &'static str {
+        MP_PAGE_KEY
     }
 
     fn render_queue(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -804,6 +953,15 @@ impl MainPage {
                 },
             );
         let inner = block.inner(area);
+        // 拖拽期间以页面状态为准，否则拖拽结果会被每帧重载覆盖。
+        if self.column_resize.is_none() {
+            let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+            self.queue_columns = super::components::song_table::load_columns_for_page(
+                &cfg.ui.table_columns,
+                "queue",
+                inner.width,
+            );
+        }
         block.render(area, buf);
         if self.queue_filter_active {
             // 筛选串画在边框标题里，插入点跟着标题文本走（去掉左右边框各一列）。
@@ -825,12 +983,11 @@ impl MainPage {
             return;
         }
 
-        Paragraph::new(Line::from(Span::styled(
-            super::components::song_table::header(inner.width),
-            Style::new()
-                .fg(crate::theme::muted(ctx))
-                .add_modifier(Modifier::BOLD),
-        )))
+        super::components::song_table::header_paragraph(
+            inner.width,
+            &self.queue_columns,
+            super::components::song_table::TablePalette::from_theme(ctx),
+        )
         .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
         let list = Rect::new(
             inner.x,
@@ -868,10 +1025,14 @@ impl MainPage {
                     .bg(accent)
                     .add_modifier(Modifier::BOLD);
             }
-            Paragraph::new(Line::from(Span::styled(
-                super::components::song_table::row(&songs[index], index, list.width),
-                style,
-            )))
+            super::components::song_table::row_paragraph(
+                &songs[index],
+                index,
+                list.width,
+                &self.queue_columns,
+                super::components::song_table::TablePalette::from_theme(ctx),
+            )
+            .style(style)
             .render(Rect::new(list.x, list.y + row as u16, list.width, 1), buf);
         }
     }

@@ -126,6 +126,23 @@ pub enum AppAction {
     ShowArtistDetails(Box<SongInfo>),
     /// 打开专辑详情页（从歌曲右键菜单或歌手页专辑列表进入）。
     ShowAlbumDetails(Box<crate::model::playlist::Album>),
+    /// 用户提交某页面的列宽调整结果，需要持久化到 Config。
+    CommitColumnResize {
+        page_key: String,
+        columns: Vec<crate::model::config::TableColumnConfig>,
+    },
+    /// 用户请求恢复某页面的默认列宽（删除该页面的 table_columns 配置）。
+    ResetColumnWidths {
+        page_key: String,
+    },
+    /// 键盘请求打开当前选中项的上下文菜单（无鼠标环境下的右键替代入口）。
+    OpenContextMenu,
+    /// 用户拖拽面板分隔条结束，需要把该比例持久化到 Config。
+    CommitPaneRatio {
+        page_key: String,
+        ratio_key: String,
+        ratio: f32,
+    },
     None,
 }
 

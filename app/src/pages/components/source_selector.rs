@@ -139,32 +139,69 @@ impl SourceSelector {
         )
     }
 
+    /// 标签条前缀：`" 音源："` 含全角冒号，终端显示宽度 **7** 列。
+    ///
+    /// 以前的命中算法按 4 列估算，导致命中区整体左移 3 列、并逐项累积漂移，
+    /// 点左侧 tab 会选中隔壁音源。现在渲染与命中都从 [`Self::tab_rects`] 取几何。
+    const TAB_PREFIX: &'static str = " 音源：";
+    /// 标签条尾部提示。
+    const TAB_SUFFIX: &'static str = "  P 切换";
+    /// 相邻两个 tab 之间的空白。
+    const TAB_GAP: u16 = 2;
+
+    fn tab_prefix_width() -> u16 {
+        UnicodeWidthStr::width(Self::TAB_PREFIX) as u16
+    }
+
+    fn tab_suffix_width() -> u16 {
+        UnicodeWidthStr::width(Self::TAB_SUFFIX) as u16
+    }
+
+    /// 单个 tab 占用的显示宽度：`" label "`。
+    fn tab_cell_width(label: &str) -> u16 {
+        UnicodeWidthStr::width(label) as u16 + 2
+    }
+
+    /// 标签条上每个 tab 的矩形（含它在 `items` 里的下标）。
+    ///
+    /// **渲染与鼠标命中共用这一份几何**，右侧要给尾部提示留位置，
+    /// 放不下的 tab 直接不参与排布（渲染也不画）。
+    pub fn tab_rects(&self, area: Rect) -> Vec<(usize, SourceSelectorKey, Rect)> {
+        let mut rects = Vec::new();
+        if area.width == 0 || area.height == 0 || self.items.is_empty() {
+            return rects;
+        }
+        let y = area.y;
+        let mut x = area
+            .x
+            .saturating_add(Self::tab_prefix_width())
+            .min(area.right());
+        for (index, (key, label)) in self.items.iter().enumerate() {
+            if index > 0 {
+                x = x.saturating_add(Self::TAB_GAP);
+            }
+            let width = Self::tab_cell_width(label);
+            // 放不下的 tab 不再排布（渲染也不画）；尾部提示在渲染时按剩余宽度决定
+            // 是否绘制，因此这里不预先扣掉它，窄终端也能把 tab 排出来。
+            if x.saturating_add(width) > area.right() {
+                break;
+            }
+            rects.push((index, *key, Rect::new(x, y, width, 1)));
+            x = x.saturating_add(width);
+        }
+        rects
+    }
+
+    /// 命中标签条上的某个 tab。
     pub fn tab_at(
         &self,
         area: Rect,
         position: ratatui::layout::Position,
     ) -> Option<SourceSelectorKey> {
-        if !area.contains(position) || area.height == 0 || self.items.is_empty() {
-            return None;
-        }
-        let mut x = area.x + 4;
-        let mut used = 4usize;
-        for (index, (key, label)) in self.items.iter().enumerate() {
-            if index > 0 {
-                x = x.saturating_add(2);
-                used = used.saturating_add(2);
-            }
-            let width = label.width() as u16 + 3;
-            if used + width as usize + 10 > area.width as usize {
-                break;
-            }
-            if position.x >= x && position.x < x.saturating_add(width) {
-                return Some(*key);
-            }
-            x = x.saturating_add(width);
-            used = used.saturating_add(width as usize);
-        }
-        None
+        self.tab_rects(area)
+            .into_iter()
+            .find(|(_, _, rect)| rect.contains(position))
+            .map(|(_, key, _)| key)
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<SourceSelectorKey> {
@@ -197,21 +234,25 @@ impl SourceSelector {
         if area.width == 0 || area.height == 0 || self.items.is_empty() {
             return;
         }
-        let mut spans = vec![Span::styled(
-            " 音源：",
-            Style::new().fg(crate::theme::muted(ctx)),
-        )];
-        let mut used = 4usize;
-        for (index, (_, label)) in self.items.iter().enumerate() {
-            let width = label.width() + 3;
-            if used + width + 10 > area.width as usize {
-                break;
-            }
-            if index > 0 {
-                spans.push(Span::raw("  "));
-                used += 2;
-            }
-            let style = if index == self.selected {
+        let rects = self.tab_rects(area);
+        if rects.is_empty() {
+            return;
+        }
+
+        let prefix_width = Self::tab_prefix_width().min(area.width);
+        if prefix_width > 0 {
+            Paragraph::new(Span::styled(
+                Self::TAB_PREFIX,
+                Style::new().fg(crate::theme::muted(ctx)),
+            ))
+            .render(Rect::new(area.x, area.y, prefix_width, 1), buf);
+        }
+
+        for (index, _, rect) in &rects {
+            let Some((_, label)) = self.items.get(*index) else {
+                continue;
+            };
+            let style = if *index == self.selected {
                 Style::new()
                     .fg(crate::theme::selection_fg(ctx))
                     .bg(crate::theme::accent(ctx))
@@ -219,16 +260,24 @@ impl SourceSelector {
             } else {
                 Style::new().fg(crate::theme::muted(ctx))
             };
-            spans.push(Span::styled(format!(" {} ", label), style));
-            used += width;
+            Paragraph::new(Span::styled(format!(" {label} "), style)).render(*rect, buf);
         }
-        spans.push(Span::styled(
-            "  P 切换",
-            Style::new()
-                .fg(crate::theme::accent(ctx))
-                .add_modifier(Modifier::BOLD),
-        ));
-        Paragraph::new(Line::from(spans)).render(Rect::new(area.x, area.y, area.width, 1), buf);
+
+        // 尾部提示紧跟在最后一个 tab 之后
+        let suffix_start = rects
+            .last()
+            .map(|(_, _, rect)| rect.right())
+            .unwrap_or(area.x);
+        let suffix_width = Self::tab_suffix_width().min(area.right().saturating_sub(suffix_start));
+        if suffix_width > 0 {
+            Paragraph::new(Span::styled(
+                Self::TAB_SUFFIX,
+                Style::new()
+                    .fg(crate::theme::accent(ctx))
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .render(Rect::new(suffix_start, area.y, suffix_width, 1), buf);
+        }
     }
 
     pub fn render_popup(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext, title: &str) {
@@ -341,9 +390,8 @@ mod tests {
     use super::*;
     use ratatui::layout::{Position, Rect};
 
-    #[test]
-    fn tab_hit_test_uses_terminal_display_width_for_cjk_labels() {
-        let selector = SourceSelector::new(
+    fn selector() -> SourceSelector {
+        SourceSelector::new(
             vec![
                 (SourceSelectorKey::Custom, "自建".to_string()),
                 (SourceSelectorKey::Favorites, "已收藏".to_string()),
@@ -353,20 +401,70 @@ mod tests {
                 ),
             ],
             0,
-        );
+        )
+    }
+
+    /// 命中几何必须与渲染几何同源：前缀 `" 音源："` 实宽 7 列，
+    /// 每个 tab 是 `" label "`（CJK 按 2 列计），项间 2 列空白。
+    #[test]
+    fn tab_rects_follow_the_rendered_prefix_and_cell_widths() {
+        let s = selector();
+        let rects = s.tab_rects(Rect::new(0, 0, 80, 1));
+
+        let x: Vec<u16> = rects.iter().map(|(_, _, rect)| rect.x).collect();
+        let w: Vec<u16> = rects.iter().map(|(_, _, rect)| rect.width).collect();
+        assert_eq!(x, vec![7, 15, 25], "首项从 7 列开始（前缀宽度）");
+        assert_eq!(w, vec![6, 8, 8], "自建=4+2、已收藏=6+2、网易云=6+2");
+    }
+
+    #[test]
+    fn tab_hit_test_matches_the_drawn_cells() {
+        let s = selector();
         let area = Rect::new(0, 0, 80, 1);
-        assert_eq!(
-            selector.tab_at(area, Position::new(5, 0)),
-            Some(SourceSelectorKey::Custom)
-        );
-        assert_eq!(
-            selector.tab_at(area, Position::new(14, 0)),
-            Some(SourceSelectorKey::Favorites)
-        );
-        assert_eq!(
-            selector.tab_at(area, Position::new(25, 0)),
-            Some(SourceSelectorKey::Source(SourceId::Wy))
-        );
-        assert_eq!(selector.tab_at(area, Position::new(79, 0)), None);
+        let rects = s.tab_rects(area);
+
+        for (_, key, rect) in &rects {
+            // 格子首列与末列都必须命中自己
+            assert_eq!(s.tab_at(area, Position::new(rect.x, 0)), Some(*key));
+            assert_eq!(
+                s.tab_at(area, Position::new(rect.right() - 1, 0)),
+                Some(*key)
+            );
+        }
+        // 前缀区不再是"第一个 tab"
+        assert_eq!(s.tab_at(area, Position::new(0, 0)), None);
+        assert_eq!(s.tab_at(area, Position::new(6, 0)), None);
+        // 相邻 tab 之间的空白不属于任何一个
+        assert_eq!(s.tab_at(area, Position::new(13, 0)), None);
+        assert_eq!(s.tab_at(area, Position::new(23, 0)), None);
+        // 最后一个 tab 之后再无命中
+        assert_eq!(s.tab_at(area, Position::new(33, 0)), None);
+    }
+
+    /// 每点必中：标签条上**任何**一个 tab 的每个可见列都映射到它自己，
+    /// 这正是旧实现（前缀 4 列、每项 +3 列）做不到的。
+    #[test]
+    fn clicking_any_visible_column_of_a_tab_selects_that_tab() {
+        let s = selector();
+        let area = Rect::new(0, 0, 80, 1);
+        for (_, key, rect) in s.tab_rects(area) {
+            for column in rect.x..rect.right() {
+                assert_eq!(
+                    s.tab_at(area, Position::new(column, 0)),
+                    Some(key),
+                    "第 {column} 列应属于 {}",
+                    rect.x
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tabs_that_do_not_fit_are_not_laid_out() {
+        let s = selector();
+        // 宽度只够前缀 + 第一个 tab
+        let rects = s.tab_rects(Rect::new(0, 0, 14, 1));
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].2.x, 7);
     }
 }
