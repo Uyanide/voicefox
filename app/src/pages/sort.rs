@@ -213,7 +213,11 @@ fn modified_nanos(song: &SongInfo) -> u128 {
         .unwrap_or_default()
 }
 
-fn compare_text(left: &str, right: &str) -> Ordering {
+/// 逐字符小写后比较：与 `str::to_lowercase()` 不同，**不分配**。
+///
+/// 列表排序的比较器里调用 `to_lowercase()` 会产生 `O(n log n)` 次临时字符串
+/// （每帧重排一次列表时尤其明显），这里统一用免分配版本。
+pub fn compare_text(left: &str, right: &str) -> Ordering {
     left.chars()
         .flat_map(char::to_lowercase)
         .cmp(right.chars().flat_map(char::to_lowercase))

@@ -532,6 +532,15 @@ impl LeaderboardPage {
         LB_PAGE_KEY
     }
 
+    /// 把两处分栏比例恢复成内置默认值（与 `apply_pane_ratios` 对称）。
+    ///
+    /// 调用方同时要删掉持久化的 `pane_ratios` 条目，否则下次启动又被旧值覆盖。
+    pub fn reset_pane_ratios(&mut self) {
+        self.boards_ratio_wide = LB_DEFAULT_BOARDS_RATIO_WIDE;
+        self.boards_ratio_narrow = LB_DEFAULT_BOARDS_RATIO_NARROW;
+        self.splitter.cancel();
+    }
+
     fn render_resize_dividers(&self, layout: &PageChunks, buf: &mut Buffer, ctx: &AppContext) {
         use ratatui::style::Style;
         let base = Style::new().fg(crate::theme::accent(ctx));
@@ -1264,6 +1273,24 @@ mod tests {
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
     use ratatui::layout::{Position, Rect};
+
+    /// 恢复默认布局必须把两处分栏比例都写回内置默认（否则"恢复默认面板布局"
+    /// 只删了配置，界面要重启才变）。
+    #[test]
+    fn reset_pane_ratios_restores_both_defaults() {
+        let mut page = LeaderboardPage::new(vec![SourceId::Kw]);
+        page.apply_pane_ratios(&std::collections::HashMap::from([
+            ("boards_wide".to_string(), 0.75_f32),
+            ("boards_narrow".to_string(), 0.7_f32),
+        ]));
+        assert_ne!(page.boards_ratio_wide, super::LB_DEFAULT_BOARDS_RATIO_WIDE);
+
+        page.reset_pane_ratios();
+
+        assert_eq!(page.boards_ratio_wide, super::LB_DEFAULT_BOARDS_RATIO_WIDE);
+        assert_eq!(page.boards_ratio_narrow, super::LB_DEFAULT_BOARDS_RATIO_NARROW);
+        assert!(!page.splitter.is_dragging());
+    }
 
     #[test]
     fn caches_each_source_and_refreshes_the_current_view() {

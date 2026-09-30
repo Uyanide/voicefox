@@ -55,6 +55,8 @@ pub enum Action {
     GlobalDownloadsPanel,
     /// 强制重绘，并把封面重新传输给终端（Ctrl+R）
     GlobalRedraw,
+    /// 把当前页面的面板布局恢复成默认比例（Ctrl+G）
+    GlobalResetLayout,
 
     // --- 通用列表动作（多个页面共用） ---
     /// 选择上一项
@@ -181,6 +183,7 @@ impl Action {
             Action::GlobalDownloadCurrent => "下载当前播放歌曲",
             Action::GlobalDownloadsPanel => "打开 / 关闭下载面板",
             Action::GlobalRedraw => "强制重绘界面",
+            Action::GlobalResetLayout => "恢复当前页面默认面板布局",
             Action::ListSelectUp => "选择上一项",
             Action::ListSelectDown => "选择下一项",
             Action::ListSelectFirst => "跳到第一项",
@@ -229,7 +232,7 @@ impl Action {
     }
 
     /// 动作的规范展示顺序，帮助浮层按此排序。
-    pub const ALL: [Action; 60] = [
+    pub const ALL: [Action; 61] = [
         Action::GlobalQuit,
         Action::GlobalPlayPause,
         Action::GlobalNextTrack,
@@ -246,6 +249,7 @@ impl Action {
         Action::GlobalDownloadCurrent,
         Action::GlobalDownloadsPanel,
         Action::GlobalRedraw,
+        Action::GlobalResetLayout,
         Action::ListSelectUp,
         Action::ListSelectDown,
         Action::ListSelectFirst,
@@ -450,6 +454,10 @@ fn default_global_bindings() -> HashMap<Action, String> {
     m.insert(Action::GlobalDownloadCurrent, "Ctrl+s".to_string());
     m.insert(Action::GlobalDownloadsPanel, "Ctrl+o".to_string());
     m.insert(Action::GlobalRedraw, "Ctrl+r".to_string());
+    // 面板布局复位：与强制重绘同源（都只影响界面），但用另一个键区分。
+    // 不用 Ctrl+Shift+R：多数终端把 Ctrl+Shift+<字母> 报成和 Ctrl+<字母> 同样的
+    // 字节，拿不到 SHIFT 修饰位，按下去会变成强制重绘。
+    m.insert(Action::GlobalResetLayout, "Ctrl+g".to_string());
     m
 }
 
@@ -867,6 +875,43 @@ pub fn colemak_preset() -> KeybindingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 面板布局复位必须有一键入口，而且不能和强制重绘撞键。
+    ///
+    /// 这条绑定以前只存在于表头右键菜单里，无鼠标环境（SSH / tmux 键盘流）
+    /// 根本按不到；`Ctrl+Shift+R` 也不能用——多数终端把 `Ctrl+Shift+<字母>`
+    /// 报成与 `Ctrl+<字母>` 相同的字节，拿不到 SHIFT 修饰位。
+    #[test]
+    fn resetting_the_pane_layout_has_its_own_keyboard_binding() {
+        let config = KeybindingConfig::default();
+        let reset = config
+            .global
+            .get(&Action::GlobalResetLayout)
+            .expect("布局复位应有默认全局键位");
+        let redraw = config
+            .global
+            .get(&Action::GlobalRedraw)
+            .expect("强制重绘应有默认全局键位");
+        assert_ne!(reset, redraw, "复位布局不能和强制重绘共用同一个键");
+        assert_eq!(reset, "Ctrl+g");
+
+        // 展示名与动作清单都要跟上（帮助浮层按 ALL 顺序渲染）。
+        assert!(Action::ALL.contains(&Action::GlobalResetLayout));
+        assert_eq!(
+            Action::GlobalResetLayout.label(),
+            "恢复当前页面默认面板布局"
+        );
+
+        // 这个键真的能解析出"Ctrl+G"，不会被别的绑定抢先匹配
+        let resolver = KeybindingResolver::from_config(&config);
+        let event = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(
+            resolver
+                .resolve_global(&event)
+                .is_some_and(|action| action == Action::GlobalResetLayout),
+            "Ctrl+G 应解析为布局复位"
+        );
+    }
 
     /// 无鼠标环境下的右键替代入口：所有歌曲列表页都必须绑上 `ListContextMenu`，
     /// 否则"清空历史/删除本地/查看歌手/播放控制"这些只在菜单里的功能不可达。

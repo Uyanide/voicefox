@@ -18,11 +18,42 @@ pub trait PlaybackEffects: Send + Sync {
     fn prepare_cover(&self, song: &SongInfo, show_cover: bool) -> Option<String>;
     async fn load_cover(&self, url: Option<String>) -> Result<(), String>;
     async fn cache_cover(&self, url: Option<String>) -> Option<String>;
+    /// 地址体检（不发网络请求）：音源常回残缺地址（只剩域名之类），
+    /// 这类地址请求只会拿到 400/403 或 HTML 首页，必须提前挡掉。
+    fn cover_url_is_usable(&self, url: &str) -> bool;
     fn album_cover_notification(&self) -> bool;
     fn track_change_notification(&self) -> bool;
     fn fade_in_ms(&self) -> u64;
     fn quality(&self) -> Quality;
     fn auto_toggle(&self) -> bool;
+}
+
+/// 解析「最终可用的封面地址」，播放解析与 app 侧播放路径共用一份：
+///
+/// - 队列里的地址优先；播放地址自带的封面次之；
+/// - 地址不合格时跨源重找一次（带 `timeout` 预算）；
+/// - 都拿不到合格地址时**保留原值**，让封面面板把失败原因显示出来。
+pub async fn resolve_cover_url(
+    sources: &SourceManager,
+    song: &SongInfo,
+    from_song_url: Option<String>,
+    usable: impl Fn(&str) -> bool,
+    timeout: Duration,
+) -> Option<String> {
+    let mut resolved = song.cover_url.clone().or(from_song_url);
+    if resolved.as_deref().is_some_and(&usable) {
+        return resolved;
+    }
+    let original = resolved.take();
+    // 换源请求要看得到候选来源的字段，因此传原始 song
+    if let Ok(Ok(candidate)) = tokio::time::timeout(timeout, sources.get_cover_url(song)).await
+        && usable(&candidate)
+    {
+        resolved = Some(candidate);
+    } else {
+        resolved = original;
+    }
+    resolved
 }
 
 #[derive(Clone)]
@@ -108,16 +139,14 @@ impl PlaybackService {
         if resolved_song.cover_url.is_none() {
             resolved_song.cover_url = url.cover_url.clone();
         }
-        if resolved_song.cover_url.is_none() {
-            if let Ok(Ok(cover)) = tokio::time::timeout(
-                Duration::from_secs(10),
-                self.sources.get_cover_url(&resolved_song),
-            )
-            .await
-            {
-                resolved_song.cover_url = Some(cover);
-            }
-        }
+        resolved_song.cover_url = resolve_cover_url(
+            &self.sources,
+            &resolved_song,
+            resolved_song.cover_url.clone(),
+            |url| self.effects.cover_url_is_usable(url),
+            Duration::from_secs(10),
+        )
+        .await;
         if initial_cover != resolved_song.cover_url {
             let _ = self
                 .effects

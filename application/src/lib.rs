@@ -18,6 +18,7 @@ pub use state::{ApplicationState, PlaybackSnapshot, QueueState, SearchState};
 
 pub use services::{
     LyricsService, PlaybackEffects, PlaybackService, PlaylistService, QueueService, SearchService,
+    resolve_cover_url,
 };
 
 mod services;

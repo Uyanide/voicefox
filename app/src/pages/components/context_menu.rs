@@ -54,6 +54,8 @@ pub enum ColumnMenuAction {
     Apply(Vec<TableColumnConfig>),
     /// 删除该页面的列配置，恢复默认档位与可见性。
     Reset,
+    /// 删除该页面的面板分隔比例，恢复默认布局（队列的左右栏与封面/歌词分栏）。
+    ResetLayout,
 }
 
 /// 菜单条目要执行的动作。
