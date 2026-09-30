@@ -473,6 +473,7 @@ fn build_column_menu(
         ColumnMenuAction::Apply(auto_fit_columns(&columns, samples, width)),
     ));
     items.push(MenuItem::new("恢复默认列宽", ColumnMenuAction::Reset));
+    items.push(MenuItem::new("恢复默认面板布局", ColumnMenuAction::ResetLayout));
     Some(SongContextMenu::from_entries(
         origin,
         " 列设置 ",
@@ -1024,6 +1025,9 @@ fn dispatch_menu_action(
                     AppAction::CommitColumnResize { page_key, columns }
                 }
                 ColumnMenuAction::Reset => AppAction::ResetColumnWidths { page_key },
+                // 内存态复位交给主循环统一处理（那里同时持有队列 / 榜单 /
+                // 歌单 / 设置四个页面，能按 page_key 正确分发）。
+                ColumnMenuAction::ResetLayout => AppAction::ResetPaneLayout { page_key },
             };
             execute_action(
                 action,
@@ -1466,6 +1470,14 @@ fn run_app(
         &cover_protocol,
         cover_enabled,
     ));
+    // 封面协议能力只探测这一次（与 `CoverRenderer::detect` 同一口径）：设置页
+    // 的 `Shift+P` 循环据它跳过本终端画不出的协议，并在行内显示已纠正的原因。
+    settings_page
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_cover_capabilities(cover::CoverCapabilities::detect(
+            main_page.cover_protocol(),
+        ));
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -2086,6 +2098,8 @@ fn run_app(
             );
         }
         if active_tab == NavTab::Playlists {
+            // 远程歌单刷新是异步的：先把入口列表同步到最新缓存，再决定请求
+            playlists.sync_scopes();
             playlists.sync_saved_playlists(&ctx);
             maybe_spawn_playlist_load(
                 &mut playlists,
@@ -2884,6 +2898,33 @@ fn run_app(
                         last_cover_redraw = Instant::now();
                         retransmit_cover(terminal, &mut main_page)?;
                         needs_render = true;
+                        continue;
+                    }
+                    // 一键把**当前页面**的面板布局恢复默认：原入口只在表头右键
+                    // 菜单里（列设置 → 恢复默认面板布局），无鼠标环境按不到。
+                    Action::GlobalResetLayout if !text_input_active => {
+                        let page_key = match active_tab {
+                            NavTab::Main => Some("queue"),
+                            NavTab::Leaderboard => Some("leaderboard"),
+                            NavTab::Playlists => Some("playlists"),
+                            NavTab::Settings => Some("settings"),
+                            // 其余页面没有可拖拽的面板比例
+                            _ => None,
+                        };
+                        if let Some(page_key) = page_key {
+                            execute_action(
+                                AppAction::ResetPaneLayout {
+                                    page_key: page_key.to_string(),
+                                },
+                                &ctx,
+                                rt,
+                                &action_tx,
+                                &search_page,
+                                &settings_page,
+                                &search_seq,
+                            );
+                            needs_render = true;
+                        }
                         continue;
                     }
                     Action::GlobalDownloadCurrent if !text_input_active => {
@@ -3960,6 +4001,8 @@ fn run_app(
             );
         }
         if active_tab == NavTab::Playlists {
+            // 远程歌单刷新是异步的：先把入口列表同步到最新缓存，再决定请求
+            playlists.sync_scopes();
             playlists.sync_saved_playlists(&ctx);
             maybe_spawn_playlist_load(
                 &mut playlists,
@@ -3988,6 +4031,28 @@ fn run_app(
                 }
                 StatusBarCommand::ClearQueue => {
                     main_page.clear_queue(&ctx);
+                    needs_render = true;
+                }
+                StatusBarCommand::OpenAccountPlaylist(remote_id) => {
+                    active_tab = NavTab::Playlists;
+                    playlists.focus_account_playlist(&remote_id, &ctx);
+                    needs_render = true;
+                }
+                StatusBarCommand::ResetPaneLayout(page_key) => {
+                    // 每个页面自己的"默认比例"只有它知道，这里持有全部页面引用，
+                    // 因此是唯一能一次分发到位的时机。
+                    match page_key.as_str() {
+                        "queue" => main_page.reset_pane_ratios(),
+                        "leaderboard" => leaderboard.reset_pane_ratios(),
+                        "playlists" => playlists.reset_pane_ratios(),
+                        "settings" => {
+                            let mut settings =
+                                settings_page.lock().unwrap_or_else(|e| e.into_inner());
+                            settings.reset_pane_ratios();
+                        }
+                        _ => {}
+                    }
+                    ctx.notify(Notification::success("已恢复默认面板布局"));
                     needs_render = true;
                 }
                 StatusBarCommand::OpenStatusBarMenu(slot) => {
@@ -5338,6 +5403,10 @@ fn execute_action(
         // 键盘菜单入口在 run_app 里就地处理（菜单状态是那里的局部变量），
         // 走到这里说明没有可作用的页面，忽略即可。
         AppAction::OpenContextMenu => {}
+        // 远程歌单窗口的回车：切页与选中是循环本地状态，排给主循环执行。
+        AppAction::OpenAccountPlaylist(remote_id) => {
+            ctx.queue_status_bar_command(StatusBarCommand::OpenAccountPlaylist(remote_id));
+        }
         AppAction::CommitPaneRatio {
             page_key,
             ratio_key,
@@ -5365,6 +5434,19 @@ fn execute_action(
             };
             if let Err(e) = save_result {
                 ctx.notify(Notification::error(format!("恢复默认列宽失败: {}", e)));
+            }
+        }
+        AppAction::ResetPaneLayout { page_key } => {
+            // 删掉持久化比例；内存里的那一份由主循环按页面复位
+            // （否则用户要重启才看得到变化）。
+            let save_result = {
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                config.ui.pane_ratios.remove(&page_key);
+                crate::config::loader::save(&config, &ctx.config_path)
+            };
+            ctx.queue_status_bar_command(StatusBarCommand::ResetPaneLayout(page_key));
+            if let Err(e) = save_result {
+                ctx.notify(Notification::error(format!("恢复默认布局失败: {}", e)));
             }
         }
         AppAction::Navigate(_)
@@ -5725,18 +5807,17 @@ fn start_song_playback(
             let _ = lyric_tx.send(AppAction::None);
         });
 
-        if resolved_song.cover_url.is_none() {
-            resolved_song.cover_url = song_url.cover_url.clone();
-        }
-        if resolved_song.cover_url.is_none()
-            && let Ok(Ok(url)) = tokio::time::timeout(
-                Duration::from_secs(10),
-                source_mgr.get_cover_url(&resolved_song),
-            )
-            .await
-        {
-            resolved_song.cover_url = Some(url);
-        }
+        // 封面地址统一走 `resolve_cover_url`：残缺地址（只剩域名之类）会被
+        // 挡下并跨源重找一次，找不到合格地址时保留原值，由封面面板显示原因。
+        let from_song_url = song_url.cover_url.clone();
+        resolved_song.cover_url = voicefox_runtime::resolve_cover_url(
+            &source_mgr,
+            &resolved_song,
+            from_song_url,
+            voicefox_runtime::is_usable_remote_url,
+            Duration::from_secs(10),
+        )
+        .await;
         if !set_current_song_if_current(
             &current_song,
             &play_request_id,
@@ -6387,16 +6468,19 @@ fn spawn_playlist_request(
                 page,
                 append,
             } => {
-                // 网易云远程缓存就绪时，歌单页以缓存为唯一数据源：缓存里已经是
-                // 全部用户歌单，既不该再翻页（会重复请求），也不该退回公开的
-                // 热门歌单接口 —— 那是别人的歌单，会把用户的歌单顶掉。
-                let cached = if source == SourceId::Wy {
+                // 账号歌单（「我的歌单」入口）是远程缓存的只读镜像：列表全在
+                // 内存里，既不翻页也不发请求。
+                //
+                // 音源入口（网易云）仍然走音源自己的歌单接口：登录之后用户
+                // 既需要账号歌单，也需要音源提供的推荐歌单，两者是两套数据，
+                // 以前用缓存顶掉音源列表会让推荐歌单彻底不可见。
+                let account = if source == SourceId::Wy {
                     crate::remote_cache::with_netease(|collections| {
                         collections
                             .iter()
                             .filter(|c| c.kind == lx_core::sync::SyncCollectionKind::Playlist)
                             .map(|c| lx_core::model::playlist::Playlist {
-                                id: c.id.clone(),
+                                id: format!("netease-account:{}", c.id),
                                 name: c.name.clone(),
                                 source: SourceId::Wy,
                                 cover_url: c.songs.first().and_then(|s| s.cover_url.clone()),
@@ -6412,18 +6496,22 @@ fn spawn_playlist_request(
                 } else {
                     Vec::new()
                 };
-                let result = if !cached.is_empty() {
-                    // 第 1 页给全量；后续页返回空列表表示「没有更多」，
-                    // 不再发一次注定重复的请求。
-                    Ok(if page <= 1 { cached } else { Vec::new() })
-                } else {
-                    tokio::time::timeout(
-                        Duration::from_secs(12),
-                        source_manager.playlists(source, "", page),
-                    )
-                    .await
-                    .map(|r| r.map_err(|e| e.to_string()))
-                    .unwrap_or_else(|_| Err("请求超时，请稍后重试".to_string()))
+                let result = tokio::time::timeout(
+                    Duration::from_secs(12),
+                    source_manager.playlists(source, "", page),
+                )
+                .await
+                .map(|r| r.map_err(|e| e.to_string()))
+                .unwrap_or_else(|_| Err("请求超时，请稍后重试".to_string()));
+                // 音源歌单接口失败但本地有账号歌单时，至少把账号歌单给出去，
+                // 不让页面停在空列表 + 报错态。
+                let result = match result {
+                    Ok(items) => Ok(items),
+                    Err(error) if !account.is_empty() && page <= 1 => {
+                        tracing::debug!("playlist list failed, falling back to account cache: {error}");
+                        Ok(account)
+                    }
+                    Err(error) => Err(error),
                 };
                 PlaylistResponse::List {
                     request_id,
@@ -6467,8 +6555,17 @@ fn spawn_playlist_request(
                     Duration::from_secs(15)
                 };
                 let result = if source == SourceId::Wy {
-                    if let Some(collection) = crate::remote_cache::playlist(&playlist_id) {
+                    // 「我的歌单」入口的 id 带虚拟前缀，取缓存前要还原成远端 id
+                    let cached = crate::remote_cache::playlist(
+                        playlist_id
+                            .strip_prefix("netease-account:")
+                            .unwrap_or(&playlist_id),
+                    );
+                    if let Some(collection) = cached {
                         Ok(collection.songs)
+                    } else if playlist_id.starts_with("netease-account:") {
+                        // 账号歌单只存在于缓存里，缓存没有就是真没有
+                        Err("该歌单不在本地缓存中，请先在设置里刷新远程歌单".to_string())
                     } else {
                         tokio::time::timeout(
                             timeout,

@@ -99,7 +99,7 @@ pub struct JsSourceFailure {
 /// 这类操作需要主循环的本地状态（`active_tab`、下载面板实例），没法走
 /// `execute_action`，因此排队后由主循环取走执行 —— 与项目既有的
 /// "共享状态放在 ctx、由主循环消费"写法保持一致。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusBarCommand {
     /// 开关下载面板（等价 Ctrl+O）。
     ToggleDownloadsPanel,
@@ -109,6 +109,10 @@ pub enum StatusBarCommand {
     ClearQueue,
     /// 打开某个底栏段的菜单（「更多」里点回具体段时用）。
     OpenStatusBarMenu(crate::pages::components::status_bar::StatusBarSlot),
+    /// 跳到「歌单 · 我的歌单」并定位到指定远端歌单（远程歌单窗口的回车动作）。
+    OpenAccountPlaylist(String),
+    /// 把某页面的分栏比例恢复成内置默认（配置项已删，这里复位内存里的那一份）。
+    ResetPaneLayout(String),
 }
 
 /// JS 音源的整体加载状态，供状态栏与音源菜单展示。

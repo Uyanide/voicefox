@@ -153,8 +153,14 @@ pub enum AppAction {
     ResetColumnWidths {
         page_key: String,
     },
+    /// 用户请求恢复某页面的默认面板布局（删除该页面的 pane_ratios 配置）。
+    ResetPaneLayout {
+        page_key: String,
+    },
     /// 键盘请求打开当前选中项的上下文菜单（无鼠标环境下的右键替代入口）。
     OpenContextMenu,
+    /// 跳到「歌单 · 我的歌单」并定位到指定远端歌单（远程歌单窗口的回车动作）。
+    OpenAccountPlaylist(String),
     /// 用户拖拽面板分隔条结束，需要把该比例持久化到 Config。
     CommitPaneRatio {
         page_key: String,

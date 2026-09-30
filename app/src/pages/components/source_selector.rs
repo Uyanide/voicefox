@@ -14,6 +14,8 @@ pub enum SourceSelectorKey {
     All,
     Custom,
     Favorites,
+    /// 登录账号下的个人歌单（与同音源的公开/推荐入口并存，因此必须区分）。
+    Account(SourceId),
     Source(SourceId),
 }
 

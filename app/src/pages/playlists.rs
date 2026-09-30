@@ -30,7 +30,53 @@ use crate::storage::{CustomPlaylistSummary, local_song_matches_path, same_song_i
 enum PlaylistScope {
     Custom,
     Favorites,
+    /// 登录账号下的个人歌单（只读镜像自远程缓存，当前仅网易云）。
+    Account(SourceId),
     Source(SourceId),
+}
+
+/// 网易云远程歌单在页面内的**虚拟音源标识**。
+///
+/// 账号歌单不是任何网络音源的公开歌单，但下游（歌曲加载、提示文案）只需要
+/// 一个能配对的 id，因此用这个前缀把「来自远程缓存的账号歌单」和
+/// 「当前音源接口返回的歌单」区分开，避免再去改一遍 `SourceId`。
+const NETEASE_ACCOUNT_ID_PREFIX: &str = "netease-account:";
+
+/// 远程缓存里的网易云账号歌单是否可用（登录并刷新过才有内容）。
+///
+/// 这一条只做"有没有"的判断：以前这里把整个缓存深拷贝一遍只为 `is_empty()`，
+/// 缓存里有几千首歌时是白拷贝（借用判断即可）。
+fn has_netease_account_collections() -> bool {
+    crate::remote_cache::with_netease(|collections| {
+        collections
+            .iter()
+            .any(|collection| collection.kind == lx_core::sync::SyncCollectionKind::Playlist)
+    })
+}
+
+/// 「我的歌单」列表：取数与设置页的远程歌单窗口**同源**
+/// （`remote_collections::account_collections`），一边显示 23 个、一边 22 个
+/// 这类不一致不会再出现。
+fn account_playlist_list() -> Vec<Playlist> {
+    crate::pages::components::remote_collections::account_collections()
+        .iter()
+        .map(account_playlist)
+        .collect()
+}
+
+fn account_playlist(collection: &lx_core::sync::SyncCollection) -> Playlist {
+    Playlist {
+        id: format!("{NETEASE_ACCOUNT_ID_PREFIX}{}", collection.id),
+        name: collection.name.clone(),
+        source: SourceId::Wy,
+        cover_url: collection.songs.first().and_then(|song| song.cover_url.clone()),
+        song_count: collection.songs.len() as u32,
+        description: None,
+        play_count: None,
+        creator: None,
+        link: None,
+        extra: Default::default(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +163,13 @@ pub struct PlaylistsPage {
     name_input_value: String,
     pending_delete: Option<CustomDeleteTarget>,
     scope_selector: Option<SourceSelector>,
+    /// 上次同步「我的歌单」入口时的远程缓存 generation。
+    ///
+    /// 远程歌单是异步刷新进缓存的：刷新完成前页面里不该出现空的「我的歌单」，
+    /// 刷新完成后又必须立刻出现，因此入口列表要跟着 generation 重建。
+    account_scope_generation: u64,
+    /// 构造时用的音源列表，重建 scope 入口时复用。
+    browse_sources: Vec<SourceId>,
     playlists_ratio_wide: f32,
     playlists_ratio_narrow: f32,
     splitter: Splitter<PPResizeTarget>,
@@ -126,26 +179,12 @@ pub struct PlaylistsPage {
 
 impl PlaylistsPage {
     pub fn new(sources: Vec<SourceId>) -> Self {
-        let scopes: Vec<PlaylistScope> = [PlaylistScope::Custom, PlaylistScope::Favorites]
-            .into_iter()
-            .chain(
-                sources
-                    .into_iter()
-                    .filter(|source| supports_playlist_browse(*source))
-                    .map(PlaylistScope::Source),
-            )
-            .collect();
-        let selector_items = scopes
+        let browse_sources: Vec<SourceId> = sources
             .iter()
-            .map(|scope| {
-                let key = match scope {
-                    PlaylistScope::Custom => SourceSelectorKey::Custom,
-                    PlaylistScope::Favorites => SourceSelectorKey::Favorites,
-                    PlaylistScope::Source(source) => SourceSelectorKey::Source(*source),
-                };
-                (key, scope_label(*scope, true).to_string())
-            })
+            .copied()
+            .filter(|source| supports_playlist_browse(*source))
             .collect();
+        let (scopes, selector_items) = Self::build_scopes(&browse_sources);
         Self {
             scopes,
             scope_index: 0,
@@ -171,6 +210,8 @@ impl PlaylistsPage {
             name_input_value: String::new(),
             pending_delete: None,
             scope_selector: Some(SourceSelector::new(selector_items, 0)),
+            account_scope_generation: crate::remote_cache::generation(),
+            browse_sources,
             playlists_ratio_wide: PP_DEFAULT_PLAYLISTS_RATIO_WIDE,
             playlists_ratio_narrow: PP_DEFAULT_PLAYLISTS_RATIO_NARROW,
             splitter: Splitter::default(),
@@ -179,11 +220,97 @@ impl PlaylistsPage {
         }
     }
 
+    /// scope 入口列表 + 选择器条目：**只在这一处构造**，因此两者永远一一对应
+    /// （点击/循环切换用下标定位 scope 时不会错位）。
+    fn build_scopes(
+        browse_sources: &[SourceId],
+    ) -> (Vec<PlaylistScope>, Vec<(SourceSelectorKey, String)>) {
+        let scopes: Vec<PlaylistScope> = [PlaylistScope::Custom, PlaylistScope::Favorites]
+            .into_iter()
+            .chain(browse_sources.iter().copied().map(PlaylistScope::Source))
+            // 「我的歌单」只在远程缓存真有内容时出现，避免登录了但没刷新时
+            // 多出一个永远空着的入口。
+            .chain(
+                has_netease_account_collections()
+                    .then_some(PlaylistScope::Account(SourceId::Wy)),
+            )
+            .collect();
+        let items = scopes
+            .iter()
+            .map(|scope| {
+                let key = match scope {
+                    PlaylistScope::Custom => SourceSelectorKey::Custom,
+                    PlaylistScope::Favorites => SourceSelectorKey::Favorites,
+                    PlaylistScope::Account(source) => SourceSelectorKey::Account(*source),
+                    PlaylistScope::Source(source) => SourceSelectorKey::Source(*source),
+                };
+                (key, scope_label(*scope, true).to_string())
+            })
+            .collect();
+        (scopes, items)
+    }
+
+    /// 远程歌单刷新完成后补齐/移除「我的歌单」入口。
+    ///
+    /// 远程刷新是异步的：只在启动时构造一次 scope，会让「刷新远程歌单」之后
+    /// 必须重启才看得到自己的歌单。
+    pub fn sync_scopes(&mut self) {
+        let generation = crate::remote_cache::generation();
+        if generation == self.account_scope_generation {
+            return;
+        }
+        self.account_scope_generation = generation;
+
+        let current = self.current_scope();
+        let (scopes, items) = Self::build_scopes(&self.browse_sources);
+        if scopes == self.scopes {
+            return;
+        }
+        // 保持用户当前停留的 scope：入口数量变化后下标会漂移
+        let index = current
+            .and_then(|scope| scopes.iter().position(|item| *item == scope))
+            .unwrap_or_else(|| self.scope_index.min(scopes.len().saturating_sub(1)));
+        self.scopes = scopes;
+        self.scope_index = index;
+        self.scope_selector = Some(SourceSelector::new(items, index));
+    }
+
     pub fn current_source(&self) -> Option<SourceId> {
         match self.scopes.get(self.scope_index).copied() {
             Some(PlaylistScope::Source(source)) => Some(source),
             _ => None,
         }
+    }
+
+    /// 跳到「我的歌单」入口，并可选地定位到某个远端歌单。
+    ///
+    /// 供设置页的远程歌单窗口回车使用：窗口只做浏览，"管理"在歌单页里做。
+    pub fn focus_account_playlist(&mut self, remote_id: &str, ctx: &AppContext) {
+        self.sync_scopes();
+        let Some(index) = self
+            .scopes
+            .iter()
+            .position(|scope| matches!(scope, PlaylistScope::Account(_)))
+        else {
+            return;
+        };
+        if index != self.scope_index {
+            self.select_scope(index, ctx);
+        }
+        self.selected_playlist = None;
+        self.sync_saved_playlists(ctx);
+        if let Some(position) = self
+            .playlists
+            .iter()
+            .position(|playlist| playlist.id == format!("{NETEASE_ACCOUNT_ID_PREFIX}{remote_id}"))
+        {
+            self.selected = position;
+        }
+    }
+
+    /// 当前是否停在「我的歌单」（账号只读镜像）上。
+    fn is_account_scope(&self) -> bool {
+        matches!(self.current_scope(), Some(PlaylistScope::Account(_)))
     }
 
     pub fn search_keyword(&self) -> Option<&str> {
@@ -299,6 +426,9 @@ impl PlaylistsPage {
                 .map(custom_playlist_metadata)
                 .collect(),
             Some(PlaylistScope::Favorites) => ctx.storage.load_favorite_playlists(),
+            // 账号歌单只在刷新过之后才有内容，进入时重新读一次缓存，
+            // 刷新完成后的 generation 变化会触发这条路径重建列表。
+            Some(PlaylistScope::Account(_)) => account_playlist_list(),
             _ => return,
         };
         self.list_loaded = true;
@@ -307,7 +437,31 @@ impl PlaylistsPage {
         self.selected = self.selected.min(self.playlists.len().saturating_sub(1));
     }
 
+    /// 「我的歌单」是只读镜像：列表已经全在内存里，不需要发任何网络请求。
+    fn account_next_load_request(&self) -> Option<PlaylistLoadRequest> {
+        if let Some(playlist) = self.current_playlist() {
+            if self.songs_loaded || self.songs_loading {
+                return None;
+            }
+            return Some(PlaylistLoadRequest::Songs {
+                source: playlist.source,
+                playlist_id: playlist.id.clone(),
+            });
+        }
+        if self.list_loaded || self.list_loading {
+            return None;
+        }
+        Some(PlaylistLoadRequest::List {
+            source: SourceId::Wy,
+            page: 1,
+            append: false,
+        })
+    }
+
     pub fn next_load_request(&self) -> Option<PlaylistLoadRequest> {
+        if self.is_account_scope() {
+            return self.account_next_load_request();
+        }
         if let Some(playlist) = self.current_playlist() {
             if self.is_custom_scope() {
                 return None;
@@ -932,6 +1086,9 @@ impl PlaylistsPage {
                 if let Some(index) = self.scopes.iter().position(|scope| match (scope, key) {
                     (PlaylistScope::Custom, SourceSelectorKey::Custom)
                     | (PlaylistScope::Favorites, SourceSelectorKey::Favorites) => true,
+                    (PlaylistScope::Account(source), SourceSelectorKey::Account(selected)) => {
+                        *source == selected
+                    }
                     (PlaylistScope::Source(source), SourceSelectorKey::Source(selected)) => {
                         *source == selected
                     }
@@ -1080,6 +1237,9 @@ impl PlaylistsPage {
                     if let Some(index) = self.scopes.iter().position(|scope| match (scope, key) {
                         (PlaylistScope::Custom, SourceSelectorKey::Custom)
                         | (PlaylistScope::Favorites, SourceSelectorKey::Favorites) => true,
+                        (PlaylistScope::Account(source), SourceSelectorKey::Account(selected)) => {
+                            *source == selected
+                        }
                         (PlaylistScope::Source(source), SourceSelectorKey::Source(selected)) => {
                             *source == selected
                         }
@@ -1326,6 +1486,13 @@ impl PlaylistsPage {
 
     pub fn pane_page_key(&self) -> &'static str {
         PP_PAGE_KEY
+    }
+
+    /// 把两处分栏比例恢复成内置默认值（与 `apply_pane_ratios` 对称）。
+    pub fn reset_pane_ratios(&mut self) {
+        self.playlists_ratio_wide = PP_DEFAULT_PLAYLISTS_RATIO_WIDE;
+        self.playlists_ratio_narrow = PP_DEFAULT_PLAYLISTS_RATIO_NARROW;
+        self.splitter.cancel();
     }
 
     fn render_resize_dividers(&self, layout: &PageChunks, buf: &mut Buffer, ctx: &AppContext) {
@@ -1904,6 +2071,7 @@ impl PlaylistsPage {
                     .map(custom_playlist_metadata)
                     .collect(),
                 Some(PlaylistScope::Favorites) => ctx.storage.load_favorite_playlists(),
+                Some(PlaylistScope::Account(_)) => account_playlist_list(),
                 Some(PlaylistScope::Source(_)) | None => Vec::new(),
             };
             self.list_loaded = true;
@@ -2008,6 +2176,10 @@ fn centered_dialog(area: Rect, max_width: u16, height: u16) -> Rect {
 /// 只返回文本本身：光标由终端绘制（见 `ui_cursor`），这样输入法候选框才会跟着
 /// 插入点走；以前这里额外拼一个 `█` 当软件光标，会和终端光标重影。
 /// 仍然保留最后一列不用，避免插入点落在最右侧列上。
+///
+/// 注意这里**不能**直接用 [`crate::pages::components::text::truncate_width`]：
+/// 它保留的是字符串**开头**并加省略号，而输入框要显示的是**末尾**（插入点附近），
+/// 两者语义不同，因此保留这份反向累计的实现。
 fn name_input_display(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -2069,6 +2241,8 @@ fn scope_label(scope: PlaylistScope, full: bool) -> &'static str {
     match (scope, full) {
         (PlaylistScope::Custom, _) => "自建",
         (PlaylistScope::Favorites, _) => "已收藏",
+        // 账号歌单与音源推荐必须分开呈现：登录后两者是两套完全不同的数据
+        (PlaylistScope::Account(_), _) => "我的歌单",
         (PlaylistScope::Source(source), true) => source.display_label(),
         (PlaylistScope::Source(source), false) => source.as_str(),
     }
@@ -2111,6 +2285,65 @@ mod tests {
             .iter()
             .position(|scope| *scope == PlaylistScope::Source(source))
             .unwrap();
+    }
+
+    /// 账号歌单（「我的歌单」）与同音源的推荐歌单必须能同时存在：
+    /// 它们的 selector key 不同，因此不会互相顶掉。
+    #[test]
+    fn account_scope_and_source_scope_coexist_for_the_same_source() {
+        use crate::pages::components::source_selector::SourceSelectorKey;
+
+        let mut page = PlaylistsPage::new(vec![SourceId::Wy]);
+        page.scopes
+            .push(PlaylistScope::Account(SourceId::Wy));
+        let account_index = page.scopes.len() - 1;
+
+        let source_key = SourceSelectorKey::Source(SourceId::Wy);
+        let account_key = SourceSelectorKey::Account(SourceId::Wy);
+        assert_ne!(source_key, account_key);
+
+        page.scope_index = account_index;
+        assert!(page.is_account_scope());
+        assert_eq!(page.current_source(), None, "账号入口不是音源入口");
+
+        // 「我的歌单」不发网络列表请求，直接读缓存；没有选集时只请求列表
+        page.list_loaded = false;
+        assert_eq!(
+            page.next_load_request(),
+            Some(PlaylistLoadRequest::List {
+                source: SourceId::Wy,
+                page: 1,
+                append: false,
+            })
+        );
+    }
+
+    /// 账号歌单的条目用虚拟 id 前缀标记，下游据此还原成远端歌单 id。
+    #[test]
+    fn account_playlists_carry_the_virtual_id_prefix() {
+        let collection = lx_core::sync::SyncCollection {
+            kind: lx_core::sync::SyncCollectionKind::Playlist,
+            id: "5270339257".to_string(),
+            name: "7".to_string(),
+            source: SourceId::Wy,
+            songs: vec![SongInfo::new(
+                "27731362".to_string(),
+                SourceId::Wy,
+                "背对背拥抱".to_string(),
+                "林俊杰".to_string(),
+            )],
+        };
+        let playlist = super::account_playlist(&collection);
+
+        assert_eq!(playlist.id, "netease-account:5270339257");
+        assert_eq!(playlist.song_count, 1);
+        assert_eq!(
+            playlist
+                .id
+                .strip_prefix(super::NETEASE_ACCOUNT_ID_PREFIX)
+                .unwrap(),
+            "5270339257"
+        );
     }
 
     fn playlist(id: &str, source: SourceId) -> Playlist {
