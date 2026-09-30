@@ -2,7 +2,9 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::model::config::SourcePolicy;
 use crate::model::song::SongInfo;
+use crate::model::source::Quality;
 use crate::model::source::SourceHealth;
 use crate::model::source::SourceId;
 
@@ -30,6 +32,22 @@ pub enum AppAction {
     Navigate(PageId),
     GoBack,
     Quit,
+    /// 播放 / 暂停（底栏「播放状态」段与菜单共用）。
+    TogglePlayPause,
+    /// 精确设置播放模式；取值是配置里的字符串（`list-loop` / `single-loop` / …）。
+    ///
+    /// 用字符串而不是枚举，是因为 `PlayMode` 属于 app 层的播放列表实现，
+    /// 这里只做"用户点了哪一个"的搬运，转换留在 app 侧。
+    SetPlayMode(String),
+    /// 精确设置音质偏好（只改偏好，不打断正在播放的歌）。
+    SetQuality(Quality),
+    /// 设置解析策略：`auto` / `prefer` / `only` + 目标平台。
+    SetSourcePolicy {
+        policy: SourcePolicy,
+        platform: Option<SourceId>,
+    },
+    /// 重新加载配置里的全部 JS 音源（复用设置页保存时的那条路径）。
+    ReloadJsSources,
     PlaySong {
         songs: Vec<SongInfo>,
         index: usize,

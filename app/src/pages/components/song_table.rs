@@ -26,18 +26,22 @@ pub struct TablePalette {
 impl TablePalette {
     pub fn from_theme(ctx: &AppContext) -> Self {
         Self {
+            // 分隔符用 overlay1（比 overlay0 亮一档）：几列挨在一起时，
+            // "哪一列到哪一列结束"必须一眼看得出来。
             separator: crate::theme::overlay1(ctx),
-            header_fg: crate::theme::subtext0(ctx),
-            header_bg: crate::theme::surface0(ctx),
+            // 表头文字比数据行亮一档 + 色带更亮一档，与数据行分层。
+            header_fg: crate::theme::subtext1(ctx),
+            header_bg: crate::theme::surface1(ctx),
         }
     }
 
     /// 表头文字的样式（加粗 + 色带底色）。
-    pub fn header_style(&self) -> Style {
+    /// 表头单元格样式：按列层级再加粗，和下面的数据列一一对应。
+    pub fn header_cell_style(&self, key: &str) -> Style {
         Style::new()
             .fg(self.header_fg)
             .bg(self.header_bg)
-            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::BOLD | column_emphasis(key))
     }
 
     /// 表头整行底色，用于 `Paragraph::style`，让色带横贯整行。
@@ -378,7 +382,7 @@ fn header_line(width: u16, columns: &[TableColumnConfig], palette: TablePalette)
         let (text_width, with_separator) = cell_budget(rc.width, i == last);
         spans.push(Span::styled(
             cell_aligned(&column.label, text_width, align_for_key(&column.key)),
-            palette.header_style(),
+            palette.header_cell_style(&column.key),
         ));
         if with_separator {
             spans.push(Span::styled(
@@ -419,13 +423,12 @@ fn row_line(
             "source" => source_text,
             _ => "",
         };
-        // 文本用 `Span::raw`，让页面通过 `Paragraph::style` 施加的行样式
-        // （选中行的强调底色等）能生效；分隔符只覆盖前景色。
-        spans.push(Span::raw(cell_aligned(
-            text,
-            text_width,
-            align_for_key(&column.key),
-        )));
+        // 只加 modifier（层级），前景色/底色仍由页面通过 `Paragraph::style`
+        // 施加 —— 否则选中行的强调底色会被列样式盖掉。
+        spans.push(Span::styled(
+            cell_aligned(text, text_width, align_for_key(&column.key)),
+            Style::new().add_modifier(column_emphasis(&column.key)),
+        ));
         if with_separator {
             spans.push(Span::styled(COLUMN_SEPARATOR, palette.separator_style()));
         }
@@ -546,6 +549,20 @@ pub fn row_paragraph_default(
     row_paragraph(song, index, width, &default_columns(width), palette)
 }
 
+/// 列的视觉层级：主列（歌名）加粗，次要列（专辑 / 来源 / 音质 / 数字）压暗。
+///
+/// 故意用 modifier 而不是写死前景色：行样式（尤其选中行的强调底色 + 高亮文字）
+/// 由页面通过 `Paragraph::style` 施加，这里若设定 fg 会把选中行盖掉。
+/// modifier 会与页面样式叠加，所以选中行依旧清晰，同时列与列之间有层次。
+fn column_emphasis(key: &str) -> Modifier {
+    match key {
+        "name" => Modifier::BOLD,
+        "singer" => Modifier::empty(),
+        "album" | "source" | "quality" | "index" | "duration" => Modifier::DIM,
+        _ => Modifier::empty(),
+    }
+}
+
 fn format_duration(duration: std::time::Duration) -> String {
     if duration.is_zero() {
         return "--:--".to_string();
@@ -657,7 +674,7 @@ mod tests {
             .expect("默认列里有 # 列");
         let (text_width, with_sep) = cell_budget(index_rc.width, false);
         let rendered = cell_aligned("7", text_width, CellAlign::Right);
-        assert_eq!(with_sep, true);
+        assert!(with_sep);
         assert!(
             rendered.starts_with(' '),
             "右对齐的序号应当在左侧补空格（实际 {rendered:?}）"
@@ -790,5 +807,39 @@ mod tests {
         assert_eq!(column.label, "name", "空 label 回落到 key");
         // 校正后拖拽不应 panic
         let _ = super::adjust_widths(&columns, 0, 80, 5);
+    }
+
+    /// 列的视觉层级：主列加粗、次要列压暗，且**不写死前景色**。
+    ///
+    /// 写死 fg 会把页面的选中行样式（强调底 + 高亮文字）盖掉，所以这里
+    /// 只允许用 modifier。
+    #[test]
+    fn columns_have_a_visual_hierarchy_without_hardcoding_colors() {
+        assert_eq!(column_emphasis("name"), Modifier::BOLD, "歌名是主列");
+        assert_eq!(column_emphasis("singer"), Modifier::empty(), "歌手不压暗");
+        for key in ["album", "source", "quality", "index", "duration"] {
+            assert_eq!(
+                column_emphasis(key),
+                Modifier::DIM,
+                "{key} 属于次要信息，应当压暗"
+            );
+        }
+        // 未知列不改变任何东西
+        assert_eq!(column_emphasis("unknown"), Modifier::empty());
+    }
+
+    /// 表头单元格样式必须带上"色带底 + 加粗"，这样表头与数据行才分层。
+    #[test]
+    fn header_cells_keep_the_band_and_add_per_column_emphasis() {
+        let palette = TablePalette {
+            separator: ratatui::style::Color::Reset,
+            header_fg: ratatui::style::Color::Reset,
+            header_bg: ratatui::style::Color::Reset,
+        };
+        let name = palette.header_cell_style("name");
+        assert!(name.add_modifier.contains(Modifier::BOLD));
+        let album = palette.header_cell_style("album");
+        assert!(album.add_modifier.contains(Modifier::BOLD));
+        assert!(album.add_modifier.contains(Modifier::DIM));
     }
 }

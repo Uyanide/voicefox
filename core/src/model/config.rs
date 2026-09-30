@@ -70,6 +70,22 @@ impl StatusBarItem {
     ];
 }
 
+/// 状态栏高度上限（行）。
+///
+/// 默认 1 行；上限 6 行 —— 把 `ui.status_bar_items` 全开时，一行放不下的段
+/// 可以折到下面几行，而不是被收进「更多」。鼠标拖底栏顶边的把手即可在
+/// 1..=6 之间调整（见 `pages::components::status_bar`）。
+pub const STATUS_BAR_MAX_HEIGHT: u8 = 6;
+
+/// 默认主题名：保持历史观感。
+pub fn default_theme_name() -> String {
+    "voicefox".to_string()
+}
+
+fn default_status_bar_height() -> u8 {
+    1
+}
+
 fn default_status_bar_items() -> Vec<StatusBarItem> {
     // 默认只保留用户播放时真正有用的信息；音源/JS 音源状态等诊断信息
     // 仍可在设置中手动打开，但不应该挤占每个页面的底部空间。
@@ -161,6 +177,40 @@ impl Default for PlayerConfig {
     }
 }
 
+/// 播放地址解析策略。
+///
+/// 只影响"这首歌去哪里拿播放地址"，不影响搜索默认音源（`source.default`）——
+/// 两者混在一起会让用户分不清"换的是这首歌"还是"以后都用它"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourcePolicy {
+    /// 现状：JS 音源（配置顺序）→ 内置原平台 → 跨平台严格匹配兜底。
+    #[default]
+    Auto,
+    /// 跨平台兜底时，把指定平台的同曲排到候选最前；其余顺序不变。
+    Prefer,
+    /// 只用指定平台解析（声明支持该平台的 JS 音源仍参与），不做跨平台兜底。
+    Only,
+}
+
+impl SourcePolicy {
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Prefer => "prefer",
+            Self::Only => "only",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动",
+            Self::Prefer => "优先指定平台",
+            Self::Only => "只用指定平台",
+        }
+    }
+}
+
 /// 音源配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -171,6 +221,12 @@ pub struct SourceConfig {
     /// JS 音源脚本 URL 或本地路径列表（lx-music user API 协议）
     #[serde(default)]
     pub js_sources: Vec<String>,
+    /// 解析策略；默认 `auto` 与历史行为完全一致。
+    #[serde(default)]
+    pub policy: SourcePolicy,
+    /// 解析策略作用的平台；`auto` 时忽略。
+    #[serde(default)]
+    pub policy_platform: Option<SourceId>,
 }
 
 impl Default for SourceConfig {
@@ -180,6 +236,8 @@ impl Default for SourceConfig {
             default: SourceId::Kw,
             auto_toggle: true,
             js_sources: vec![],
+            policy: SourcePolicy::Auto,
+            policy_platform: None,
         }
     }
 }
@@ -224,6 +282,15 @@ impl Default for NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
+    /// 界面主题名。
+    ///
+    /// - `voicefox`（默认）：使用下面这套手工调好的 Catppuccin 槽位，观感与历史版本一致；
+    /// - 其它取值：来自 `ratatui-themes` 的具名主题（kebab-case，如 `dracula` /
+    ///   `tokyo-night` / `nord` / `catppuccin-mocha`），整份皮肤由该主题的语义色推导。
+    ///
+    /// 名字不合法时回退到 `voicefox`，不会让界面变成读不清的颜色。
+    #[serde(default = "default_theme_name")]
+    pub name: String,
     /// 兼容旧配置的主强调色。
     pub accent: String,
     pub text: String,
@@ -261,6 +328,7 @@ pub struct ThemeConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
+            name: default_theme_name(),
             accent: "#cba6f7".to_string(),
             text: "#cdd6f4".to_string(),
             muted: "#a6adc8".to_string(),
@@ -357,6 +425,14 @@ pub struct UiConfig {
         deserialize_with = "deserialize_status_bar_items"
     )]
     pub status_bar_items: Vec<StatusBarItem>,
+    /// 底部状态栏高度（行数）：1..=6，默认 1。
+    ///
+    /// 默认 1 —— 默认只开 5 个字段，一行足够。把 `ui.status_bar_items` 全开、
+    /// 想一眼看到全部可交互控件时再调大；也可以在界面上直接拖底栏顶边的
+    /// 拖拽把手改（鼠标拖拽/落盘见 `pages::components::status_bar`）。
+    /// 取值会被夹到 1..=[`STATUS_BAR_MAX_HEIGHT`]。
+    #[serde(default = "default_status_bar_height")]
+    pub status_bar_height: u8,
     /// 用户自定义的歌曲列表列配置，按页面 key 存储。
     /// 空 HashMap 表示所有页面都使用默认档位公式。
     #[serde(default)]
@@ -368,6 +444,13 @@ pub struct UiConfig {
     /// 缺省（或页面没拖过）时各页面走自己的内置默认比例。
     #[serde(default)]
     pub pane_ratios: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
+}
+
+impl UiConfig {
+    /// 实际使用的状态栏行数（写坏配置也不会让布局失真）。
+    pub fn status_bar_rows(&self) -> u16 {
+        self.status_bar_height.clamp(1, STATUS_BAR_MAX_HEIGHT) as u16
+    }
 }
 
 impl Default for UiConfig {
@@ -385,6 +468,7 @@ impl Default for UiConfig {
             notification_timeout: None,
             max_fps: 20,
             status_bar_items: default_status_bar_items(),
+            status_bar_height: default_status_bar_height(),
             table_columns: std::collections::HashMap::new(),
             pane_ratios: std::collections::HashMap::new(),
         }
@@ -654,7 +738,10 @@ fn legacy_config_version() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadConfig, LocalMusicConfig, StatusBarItem, UiConfig, WebdavConfig};
+    use super::{
+        Config, DownloadConfig, LocalMusicConfig, STATUS_BAR_MAX_HEIGHT, SourceId, SourcePolicy,
+        StatusBarItem, UiConfig, WebdavConfig,
+    };
 
     #[test]
     fn webdav_defaults_are_disabled_and_parse_from_partial_toml() {
@@ -783,5 +870,55 @@ mod tests {
             value["status_bar_items"],
             serde_json::json!(["play-mode", "js-source-state"])
         );
+    }
+
+    /// 旧配置（没有 status_bar_height / policy 字段）必须照旧加载，
+    /// 且新字段落到"零行为变化"的默认值上。
+    #[test]
+    fn new_status_bar_and_policy_fields_are_backward_compatible() {
+        // 用 JSON 表达"旧配置文件里没有这两个字段"（core 不依赖 toml；
+        // 真实 TOML 加载路径由 app 的配置加载测试覆盖）。
+        let config: Config =
+            serde_json::from_str("{\"ui\":{\"enable_mouse\":true}}").expect("旧配置应当能解析");
+        assert_eq!(config.ui.status_bar_height, 1, "默认仍是一行");
+        assert_eq!(config.ui.status_bar_rows(), 1);
+        assert_eq!(
+            config.source.policy,
+            SourcePolicy::Auto,
+            "默认必须等价于历史行为"
+        );
+        assert_eq!(config.source.policy_platform, None);
+    }
+
+    #[test]
+    fn status_bar_height_is_clamped_to_a_sane_range() {
+        let mut config = Config::default();
+        config.ui.status_bar_height = 0;
+        assert_eq!(config.ui.status_bar_rows(), 1, "0 行夹回 1 行");
+        config.ui.status_bar_height = 2;
+        assert_eq!(config.ui.status_bar_rows(), 2);
+        config.ui.status_bar_height = STATUS_BAR_MAX_HEIGHT;
+        assert_eq!(
+            config.ui.status_bar_rows(),
+            u16::from(STATUS_BAR_MAX_HEIGHT),
+            "上限本身必须可用"
+        );
+        config.ui.status_bar_height = 99;
+        assert_eq!(
+            config.ui.status_bar_rows(),
+            u16::from(STATUS_BAR_MAX_HEIGHT)
+        );
+        assert_eq!(STATUS_BAR_MAX_HEIGHT, 6, "上限就是拖拽能拖到的最大行数");
+    }
+
+    #[test]
+    fn policies_round_trip_through_config_text() {
+        let config: Config =
+            serde_json::from_str("{\"source\":{\"policy\":\"only\",\"policy_platform\":\"wy\"}}")
+                .expect("策略配置应当能解析");
+        assert_eq!(config.source.policy, SourcePolicy::Only);
+        assert_eq!(config.source.policy_platform, Some(SourceId::Wy));
+        assert_eq!(config.source.policy.as_config(), "only");
+        assert_eq!(SourcePolicy::Prefer.label(), "优先指定平台");
     }
 }

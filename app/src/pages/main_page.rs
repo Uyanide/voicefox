@@ -9,13 +9,15 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::cover::{CoverGeometry, CoverRenderer, CoverState};
 use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::hit_test::{PANEL_BORDERS, panel_inner};
 use crate::pages::components::splitter::{
-    DividerHit, SplitAxis, Splitter, clamp_ratio, ratio_within,
+    DividerHit, GUTTER, SplitAxis, Splitter, clamp_extent, clamp_ratio, divider_line, ratio_within,
+    split_with_gutter,
 };
 
 /// “D 清空整个队列”的确认窗口：首次按下武装，窗口内再按一次才执行。
@@ -67,6 +69,77 @@ struct MainLayout {
     cover: Rect,
     lyric: Rect,
     cover_geometry: Option<CoverGeometry>,
+}
+
+/// 当前布局下可拖拽的分割线。
+///
+/// 方向由 `layout.wide` 明确决定：宽布局只有"左栏|队列"竖线和"封面|歌词"横线，
+/// 窄布局只有"队列|歌词"横线。**不要**把横竖判定串行无条件求值。
+///
+/// 坐标一律来自 [`divider_line`]（= 第一块的 `right()`/`bottom()`），也就是
+/// `split_with_gutter` 留在两块之间的那 1 格 gutter：渲染 [`MainPage::render`]
+/// 与命中 [`MainPage::resize_target_at`] 都走这里，两边不可能不同步。
+fn dividers(layout: &MainLayout) -> Vec<(ResizeTarget, DividerHit)> {
+    let mut out = Vec::new();
+    if layout.wide {
+        if layout.left.width > 0 && layout.queue.width > 0 {
+            out.push((
+                ResizeTarget::WideColumns,
+                DividerHit::new(
+                    SplitAxis::Vertical,
+                    divider_line(layout.left, SplitAxis::Vertical),
+                    (layout.left.y, layout.left.bottom()),
+                ),
+            ));
+        }
+        if layout.cover.height > 0 && layout.lyric.height > 0 {
+            out.push((
+                ResizeTarget::WideCoverLyrics,
+                DividerHit::new(
+                    SplitAxis::Horizontal,
+                    divider_line(layout.cover, SplitAxis::Horizontal),
+                    (layout.left.x, layout.left.right()),
+                ),
+            ));
+        }
+    } else if layout.queue.height > 0 && layout.lyric.height > 0 {
+        out.push((
+            ResizeTarget::NarrowQueueLyrics,
+            DividerHit::new(
+                SplitAxis::Horizontal,
+                divider_line(layout.queue, SplitAxis::Horizontal),
+                (layout.queue.x, layout.queue.right()),
+            ),
+        ));
+    }
+    out
+}
+
+/// 窄布局的两个面板：队列在上、歌词在下，中间留 1 行 gutter 给横分割线。
+///
+/// 公式（`usable = area.height - GUTTER` 是两块面板能用的总行数）：
+///
+/// - `queue.height = clamp_extent(round(area.height * ratio), min_queue, max_queue)`
+///   —— 比例仍然按**整个内容区高度**算，与拖拽时的
+///   [`ratio_within`] 口径一致，指针落在哪一行分隔线就跟到哪一行；
+/// - `min_queue = min(7, usable - 1)`（窗口再矮也给歌词留 1 行）、
+///   `min_lyric = min(5, usable - min_queue)`、`max_queue = usable - min_lyric`；
+/// - `lyric.height = usable - queue.height`，分隔线占 `queue.bottom()` 那一行。
+///
+/// 渲染与命中（`queue_index_at` / `table_header_rect`）都从 `compute_layout`
+/// 拿这两个矩形，所以 gutter 一定不属于任何面板的内容区。
+fn narrow_panes(area: Rect, ratio: f32) -> (Rect, Rect) {
+    let usable = area.height.saturating_sub(GUTTER);
+    let min_queue = 7.min(usable.saturating_sub(1));
+    let min_lyric = 5.min(usable.saturating_sub(min_queue));
+    let max_queue = usable.saturating_sub(min_lyric);
+    let min_queue = min_queue.min(max_queue);
+    let desired = ((area.height as f32) * ratio).round() as u16;
+    split_with_gutter(
+        area,
+        SplitAxis::Horizontal,
+        clamp_extent(desired, min_queue, max_queue),
+    )
 }
 
 pub struct MainPage {
@@ -259,18 +332,7 @@ impl MainPage {
                         ));
                     }
                     self.clear_armed = None;
-                    ctx.playlist.clear();
-                    // 显式清空队列才丢弃已保存的播放会话；否则「队列为空」不再
-                    // 触发删除，下次启动会把这次清掉的队列又恢复回来。
-                    if let Err(error) = ctx.forget_playback_session() {
-                        tracing::warn!("清空已保存的播放会话失败: {error}");
-                    }
-                    ctx.stop_player();
-                    ctx.cover_service.clear();
-                    ctx.lyric_service.clear();
-                    *ctx.current_song.write().unwrap_or_else(|e| e.into_inner()) = None;
-                    self.selected = 0;
-                    self.scroll = 0;
+                    self.clear_queue(ctx);
                     AppAction::None
                 }
             };
@@ -443,13 +505,9 @@ impl MainPage {
                 .effective(&ResizeTarget::WideColumns, self.wide_columns_ratio);
             let left_width = ((area.width as f32) * columns_ratio).round() as u16;
             let left_width = left_width.clamp(24, area.width.saturating_sub(24).max(24));
-            let left = Rect::new(area.x, area.y, left_width.min(area.width), area.height);
-            let queue = Rect::new(
-                left.right().min(area.right()),
-                area.y,
-                area.right().saturating_sub(left.right()),
-                area.height,
-            );
+            // 左右两栏之间留 1 列 gutter：竖分割线占 left.right()，不压任何一栏的
+            // 最后一列（左栏的右边框、右栏的左边框）。
+            let (left, queue) = split_with_gutter(area, SplitAxis::Vertical, left_width);
             let geometry = ctx
                 .config
                 .read()
@@ -462,11 +520,12 @@ impl MainPage {
                         ctx.cover_service.image_aspect(),
                     )
                 });
+            // 封面与歌词之间也要留 1 行 gutter，歌词的最小高度不能被它挤掉。
+            let max_cover = left
+                .height
+                .saturating_sub(GUTTER + super::components::lyric::MIN_HEIGHT);
             if !self.layout_initialized {
                 if let Some(geometry) = geometry {
-                    let max_cover = left
-                        .height
-                        .saturating_sub(super::components::lyric::MIN_HEIGHT);
                     let old_cover = geometry.box_height(left.width, max_cover);
                     if left.height > 0 {
                         self.wide_cover_ratio =
@@ -475,9 +534,6 @@ impl MainPage {
                 }
                 self.layout_initialized = true;
             }
-            let max_cover = left
-                .height
-                .saturating_sub(super::components::lyric::MIN_HEIGHT);
             let cover_ratio = self
                 .splitter
                 .effective(&ResizeTarget::WideCoverLyrics, self.wide_cover_ratio);
@@ -488,13 +544,15 @@ impl MainPage {
             } else {
                 0
             };
-            let cover = Rect::new(left.x, left.y, left.width, cover_height);
-            let lyric = Rect::new(
-                left.x,
-                cover.bottom().min(left.bottom()),
-                left.width,
-                left.height.saturating_sub(cover.height),
-            );
+            // 没有封面时不要白白吃掉一行 gutter：整栏都留给歌词。
+            let (cover, lyric) = if cover_height == 0 {
+                (
+                    Rect::new(left.x, left.y, left.width, 0),
+                    Rect::new(left.x, left.y, left.width, left.height),
+                )
+            } else {
+                split_with_gutter(left, SplitAxis::Horizontal, cover_height)
+            };
             MainLayout {
                 wide: true,
                 left,
@@ -504,21 +562,10 @@ impl MainPage {
                 cover_geometry: geometry,
             }
         } else {
-            let min_queue = 7.min(area.height);
-            let min_lyric = 5.min(area.height.saturating_sub(min_queue));
             let queue_ratio = self
                 .splitter
                 .effective(&ResizeTarget::NarrowQueueLyrics, self.narrow_queue_ratio);
-            let queue_height = ((area.height as f32) * queue_ratio).round() as u16;
-            let max_queue = area.height.saturating_sub(min_lyric);
-            let queue_height = queue_height.clamp(min_queue, max_queue.max(min_queue));
-            let queue = Rect::new(area.x, area.y, area.width, queue_height.min(area.height));
-            let lyric = Rect::new(
-                area.x,
-                queue.bottom().min(area.bottom()),
-                area.width,
-                area.height.saturating_sub(queue.height),
-            );
+            let (queue, lyric) = narrow_panes(area, queue_ratio);
             MainLayout {
                 wide: false,
                 left: Rect::default(),
@@ -538,7 +585,7 @@ impl MainPage {
             base
         };
         // 绘制坐标与命中共用 `dividers()`，不会再出现"看得到却抓不住"。
-        for (_, hit) in self.dividers(layout) {
+        for (_, hit) in dividers(layout) {
             match hit.axis {
                 SplitAxis::Vertical => {
                     for y in hit.span.0..hit.span.1 {
@@ -554,10 +601,34 @@ impl MainPage {
         }
     }
 
+    /// 清空队列并做完整收尾（键位 `Shift+D` 与底栏菜单共用）。
+    ///
+    /// 只有显式清空才丢弃已保存的播放会话；否则「队列为空」不再触发删除，
+    /// 下次启动会把这次清掉的队列又恢复回来。
+    pub fn clear_queue(&mut self, ctx: &AppContext) {
+        ctx.playlist.clear();
+        if let Err(error) = ctx.forget_playback_session() {
+            tracing::warn!("清空已保存的播放会话失败: {error}");
+        }
+        ctx.stop_player();
+        ctx.cover_service.clear();
+        ctx.lyric_service.clear();
+        *ctx.current_song.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// 把选中项定位到队列里的某一首（底栏「队列」段左键用）。
+    ///
+    /// `len` 由调用方从播放列表取（页面本身不持有队列，队列在 `ctx.playlist`）。
+    pub fn select_current(&mut self, index: usize, len: usize) {
+        self.selected = index.min(len.saturating_sub(1));
+    }
+
     /// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
     pub fn table_header_rect(&mut self, area: Rect, ctx: &AppContext) -> Option<Rect> {
         let layout = self.compute_layout(area, ctx);
-        let inner = Block::default().borders(Borders::ALL).inner(layout.queue);
+        let inner = panel_inner(layout.queue);
         Some(Rect::new(inner.x, inner.y, inner.width, 1))
     }
 
@@ -611,8 +682,7 @@ impl MainPage {
             }
         }
 
-        let block = Block::default().borders(Borders::ALL);
-        let queue_inner = block.inner(layout.queue);
+        let queue_inner = panel_inner(layout.queue);
         let header_row = queue_inner.y;
         let table_width = queue_inner.width;
 
@@ -813,48 +883,8 @@ impl MainPage {
         }
     }
 
-    /// 当前布局下可拖拽的分割线。
-    ///
-    /// 方向由 `layout.wide` 明确决定：宽布局只有"左栏|队列"竖线和"封面|歌词"横线，
-    /// 窄布局只有"队列|歌词"横线。**不要**把横竖判定串行无条件求值。
-    fn dividers(&self, layout: &MainLayout) -> Vec<(ResizeTarget, DividerHit)> {
-        let mut out = Vec::new();
-        if layout.wide {
-            if layout.left.width > 0 && layout.queue.width > 0 {
-                out.push((
-                    ResizeTarget::WideColumns,
-                    DividerHit::new(
-                        SplitAxis::Vertical,
-                        layout.left.right().saturating_sub(1),
-                        (layout.left.y, layout.left.bottom()),
-                    ),
-                ));
-            }
-            if layout.cover.height > 0 && layout.lyric.height > 0 {
-                out.push((
-                    ResizeTarget::WideCoverLyrics,
-                    DividerHit::new(
-                        SplitAxis::Horizontal,
-                        layout.cover.bottom().saturating_sub(1),
-                        (layout.left.x, layout.left.right()),
-                    ),
-                ));
-            }
-        } else if layout.queue.height > 0 && layout.lyric.height > 0 {
-            out.push((
-                ResizeTarget::NarrowQueueLyrics,
-                DividerHit::new(
-                    SplitAxis::Horizontal,
-                    layout.queue.bottom().saturating_sub(1),
-                    (layout.queue.x, layout.queue.right()),
-                ),
-            ));
-        }
-        out
-    }
-
     fn resize_target_at(&self, event: MouseEvent, layout: &MainLayout) -> Option<ResizeTarget> {
-        self.dividers(layout)
+        dividers(layout)
             .into_iter()
             .find(|(_, hit)| hit.matches(event.column, event.row))
             .map(|(target, _)| target)
@@ -943,7 +973,7 @@ impl MainPage {
         let songs = ctx.playlist.borrow();
         let current = ctx.playlist.current_index();
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(PANEL_BORDERS)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(
                 if self.queue_filter_active || !self.queue_filter.is_empty() {
@@ -1074,7 +1104,7 @@ impl MainPage {
         geometry: CoverGeometry,
     ) {
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(PANEL_BORDERS)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(" 封面 ");
         let inner = block.inner(area);
@@ -1145,7 +1175,12 @@ fn render_cover_text(inner: Rect, buf: &mut Buffer, ctx: &AppContext) {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{QueueEditCommand, queue_edit_command, queue_index_at};
+    use super::{
+        MainLayout, QueueEditCommand, ResizeTarget, dividers, narrow_panes, queue_edit_command,
+        queue_index_at,
+    };
+    use crate::pages::components::hit_test::panel_inner;
+    use crate::pages::components::splitter::{GUTTER, SplitAxis, divider_line, split_with_gutter};
 
     #[test]
     fn queue_click_rows_align_with_rendered_rows() {
@@ -1172,6 +1207,7 @@ mod tests {
         assert_eq!(click(2, 0, 100), Some(0));
         assert_eq!(click(11, 0, 100), Some(9));
         assert_eq!(click(2, 7, 100), Some(7));
+        // 下边框那一行不属于列表
         assert_eq!(click(19, 0, 100), None);
     }
 
@@ -1215,5 +1251,119 @@ mod tests {
         ] {
             assert_eq!(queue_edit_command(&key), Some(QueueEditCommand::Clear));
         }
+    }
+
+    /// 回归（窄布局）：横分割线只占自己那一行 gutter，队列面板**最后一行内容**
+    /// 既没有被它覆盖，也仍然能被鼠标点中（滚到底时最后一首歌点不到）。
+    #[test]
+    fn narrow_gutter_owns_a_row_and_the_last_queue_row_stays_clickable() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::{Position, Rect};
+
+        let area = Rect::new(0, 0, 100, 20);
+        let (queue, lyric) = narrow_panes(area, 0.62);
+        let gutter = divider_line(queue, SplitAxis::Horizontal);
+
+        // 公式：两块面板 + 1 行 gutter 恰好铺满内容区
+        assert_eq!(gutter, queue.bottom());
+        assert_eq!(lyric.y, gutter + GUTTER);
+        assert_eq!(queue.height + GUTTER + lyric.height, area.height);
+
+        let inner = panel_inner(queue);
+        let last_content_row = inner.bottom() - 1;
+        // 分隔线所在的那一行不属于任何面板的内容区
+        assert!(inner.bottom() < gutter, "队列内容区必须在 gutter 之上");
+        assert!(
+            panel_inner(lyric).y > gutter,
+            "歌词内容区必须在 gutter 之下"
+        );
+
+        let visible = inner.height as usize - 1; // 列表区去掉表头
+        let click = |row: u16, len: usize| {
+            queue_index_at(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 50,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                queue,
+                0,
+                len,
+            )
+        };
+        // 滚到底：最后一首歌（下标 len-1）就在面板最后一行内容上，必须点得中
+        assert_eq!(click(last_content_row, visible), Some(visible - 1));
+        // gutter 自己那一行、以及面板的下边框行，都不属于列表
+        assert_eq!(click(gutter, visible), None);
+        assert_eq!(click(inner.bottom(), visible), None);
+
+        // 拖拽命中落在 gutter 上，且容差不会吃掉最后一行内容
+        let hit = crate::pages::components::splitter::DividerHit::new(
+            SplitAxis::Horizontal,
+            gutter,
+            (queue.x, queue.right()),
+        );
+        assert!(hit.matches(50, gutter));
+        assert!(!hit.matches(50, last_content_row));
+        assert_eq!(
+            crate::pages::components::hit_test::row_at(
+                queue,
+                Position::new(50, last_content_row),
+                0,
+                visible,
+                1
+            ),
+            Some(visible - 1)
+        );
+    }
+
+    /// 宽布局：竖分割线占"左栏右边的 1 列 gutter"，横分割线占封面与歌词之间的
+    /// 1 行 gutter；两条线互不占位，且都不压面板最后一行/最后一列内容。
+    #[test]
+    fn wide_dividers_live_in_their_own_gutter_row_and_column() {
+        use ratatui::layout::Rect;
+
+        let area = Rect::new(0, 0, 120, 40);
+        let (left, queue) = split_with_gutter(area, SplitAxis::Vertical, 44);
+        let (cover, lyric) = split_with_gutter(left, SplitAxis::Horizontal, 20);
+        let layout = MainLayout {
+            wide: true,
+            left,
+            queue,
+            cover,
+            lyric,
+            cover_geometry: None,
+        };
+
+        let found = dividers(&layout);
+        let vertical = found
+            .iter()
+            .find(|(target, _)| *target == ResizeTarget::WideColumns)
+            .expect("宽布局必须有左栏|队列竖线")
+            .1;
+        let horizontal = found
+            .iter()
+            .find(|(target, _)| *target == ResizeTarget::WideCoverLyrics)
+            .expect("宽布局必须有封面|歌词横线")
+            .1;
+
+        // 竖线 = 左栏 right()，横线 = 封面 bottom()，两条线各自占一格
+        assert_eq!(vertical.divider, left.right());
+        assert_eq!(horizontal.divider, cover.bottom());
+        assert_eq!(queue.x, vertical.divider + GUTTER);
+        assert_eq!(lyric.y, horizontal.divider + GUTTER);
+
+        // 容差范围不碰两侧面板的最后/最前一列内容
+        assert!(vertical.matches(vertical.divider, left.y));
+        assert!(!vertical.matches(panel_inner(left).right() - 1, left.y));
+        assert!(!vertical.matches(panel_inner(queue).x, left.y));
+        // 容差范围不碰封面最后一行内容、也不碰歌词第一行内容
+        assert!(horizontal.matches(left.x, horizontal.divider));
+        assert!(!horizontal.matches(left.x, panel_inner(cover).bottom() - 1));
+        assert!(!horizontal.matches(left.x, panel_inner(lyric).y));
+        // 横线的跨度止于竖线的 gutter 列，两条分割线不会互相擦掉
+        assert_eq!(horizontal.span.1, vertical.divider);
+        assert!(!horizontal.matches(vertical.divider, horizontal.divider));
     }
 }

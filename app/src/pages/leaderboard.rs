@@ -12,13 +12,15 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::hit_test::{PANEL_BORDERS, panel_inner};
 use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 use crate::pages::components::splitter::{
-    DividerHit, SplitAxis, Splitter, clamp_ratio, ratio_within,
+    DividerHit, GUTTER, SplitAxis, Splitter, clamp_extent, clamp_ratio, divider_line, ratio_within,
+    split_with_gutter,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,41 +393,34 @@ impl LeaderboardPage {
         let min_songs_rows: u16 = 5;
 
         if !wide {
+            // 上下分栏：分割线占独立 1 行 gutter，两块面板只能用 `usable` 行。
+            // 比例仍按整个内容区高度算，拖拽时指针落在哪一行线就跟到哪一行。
+            let usable = area.height.saturating_sub(GUTTER);
             let ratio = self
                 .splitter
                 .effective(&LBResizeTarget::NarrowBoards, self.boards_ratio_narrow);
-            let boards_height = ((area.height as f32) * ratio).round() as u16;
-            let boards_height =
-                boards_height.clamp(min_boards_rows, area.height.saturating_sub(min_songs_rows));
-            let boards_height =
-                boards_height.min(area.height.saturating_sub(min_songs_rows.max(1)));
-            let boards = Rect::new(area.x, area.y, area.width, boards_height);
-            let songs = Rect::new(
-                area.x,
-                boards.bottom().min(area.bottom()),
-                area.width,
-                area.height.saturating_sub(boards.height),
-            );
+            let desired = ((area.height as f32) * ratio).round() as u16;
+            let max_boards = usable.saturating_sub(min_songs_rows);
+            // 窗口太矮时先降低下限，别把歌曲面板挤成 0（那样分割线也没了）。
+            let min_boards = min_boards_rows.min(max_boards);
+            let boards_height = clamp_extent(desired, min_boards, max_boards);
+            let (boards, songs) = split_with_gutter(area, SplitAxis::Horizontal, boards_height);
             PageChunks {
                 boards,
                 songs,
                 wide: false,
             }
         } else {
+            // 左右分栏：同理，中间留 1 列 gutter，歌曲面板不再少一列边框。
+            let usable = area.width.saturating_sub(GUTTER);
             let ratio = self
                 .splitter
                 .effective(&LBResizeTarget::WideBoards, self.boards_ratio_wide);
-            let boards_width = ((area.width as f32) * ratio).round() as u16;
-            let boards_width =
-                boards_width.clamp(min_boards_cols, area.width.saturating_sub(min_songs_cols));
-            let boards_width = boards_width.min(area.width.saturating_sub(min_songs_cols.max(1)));
-            let boards = Rect::new(area.x, area.y, boards_width, area.height);
-            let songs = Rect::new(
-                boards.right().min(area.right()),
-                area.y,
-                area.width.saturating_sub(boards.width),
-                area.height,
-            );
+            let desired = ((area.width as f32) * ratio).round() as u16;
+            let max_boards = usable.saturating_sub(min_songs_cols);
+            let min_boards = min_boards_cols.min(max_boards);
+            let boards_width = clamp_extent(desired, min_boards, max_boards);
+            let (boards, songs) = split_with_gutter(area, SplitAxis::Vertical, boards_width);
             PageChunks {
                 boards,
                 songs,
@@ -435,12 +430,15 @@ impl LeaderboardPage {
     }
 
     /// 当前布局下**唯一**可拖拽的那条分割线（方向由布局决定，不靠几何猜）。
+    ///
+    /// 坐标来自 [`divider_line`]，也就是 `split_with_gutter` 留出的那 1 格
+    /// gutter：`render_resize_dividers` 与 `resize_target_at` 共用这一份结果。
     fn divider(&self, layout: &PageChunks) -> Option<(LBResizeTarget, DividerHit)> {
         if layout.wide {
             if layout.boards.width == 0 || layout.songs.width == 0 {
                 return None;
             }
-            let x = layout.boards.right().saturating_sub(1);
+            let x = divider_line(layout.boards, SplitAxis::Vertical);
             Some((
                 LBResizeTarget::WideBoards,
                 DividerHit::new(
@@ -453,7 +451,7 @@ impl LeaderboardPage {
             if layout.boards.height == 0 || layout.songs.height == 0 {
                 return None;
             }
-            let y = layout.boards.bottom().saturating_sub(1);
+            let y = divider_line(layout.boards, SplitAxis::Horizontal);
             Some((
                 LBResizeTarget::NarrowBoards,
                 DividerHit::new(
@@ -581,7 +579,7 @@ impl LeaderboardPage {
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
         let page = self.compute_layout(shell[1], self.boards.len());
-        let inner = Block::default().borders(Borders::ALL).inner(page.songs);
+        let inner = panel_inner(page.songs);
         (inner.height > 0).then(|| Rect::new(inner.x, inner.y, inner.width, 1))
     }
 
@@ -667,8 +665,7 @@ impl LeaderboardPage {
         }
 
         if self.selected_board.is_some() {
-            let block = Block::default().borders(Borders::ALL);
-            let songs_inner = block.inner(page.songs);
+            let songs_inner = panel_inner(page.songs);
             let header_row = songs_inner.y;
             let table_width = songs_inner.width;
 
@@ -851,7 +848,7 @@ impl LeaderboardPage {
 
     fn render_boards(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(PANEL_BORDERS)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(format!(
                 "榜单 · {} · {} 个 · P 切换音源",
@@ -937,7 +934,7 @@ impl LeaderboardPage {
             .map(|board| format!("{} · {}", source_name(board.source), board.name))
             .unwrap_or_else(|| "歌曲列表".to_string());
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(PANEL_BORDERS)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(title);
         let inner = block.inner(area);
@@ -1261,9 +1258,12 @@ fn truncate_chars(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{LeaderboardLoadRequest, LeaderboardPage};
+    use crate::pages::components::hit_test::{panel_inner, row_at};
+    use crate::pages::components::splitter::{GUTTER, SplitAxis, divider_line};
     use lx_core::model::leaderboard::LeaderboardInfo;
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
+    use ratatui::layout::{Position, Rect};
 
     #[test]
     fn caches_each_source_and_refreshes_the_current_view() {
@@ -1334,5 +1334,141 @@ mod tests {
                 board_id: "second".to_string(),
             })
         );
+    }
+
+    /// 回归（窄布局）：横分割线占**自己**那一行 gutter，榜单与歌曲面板的
+    /// 最后一行内容既不被它覆盖，也仍然能被鼠标点中。
+    #[test]
+    fn narrow_divider_row_is_a_gutter_and_the_last_song_row_stays_clickable() {
+        let page = LeaderboardPage::new(Vec::new());
+        let area = Rect::new(0, 0, 60, 24);
+        let chunks = page.compute_layout(area, 0);
+        let (_, hit) = page.divider(&chunks).expect("窄布局必须有横分割线");
+
+        // 两块面板 + 1 行 gutter 恰好铺满内容区
+        assert_eq!(
+            hit.divider,
+            divider_line(chunks.boards, SplitAxis::Horizontal)
+        );
+        assert_eq!(chunks.songs.y, hit.divider + GUTTER);
+        assert_eq!(
+            chunks.boards.height + GUTTER + chunks.songs.height,
+            area.height
+        );
+
+        let boards_inner = panel_inner(chunks.boards);
+        let songs_inner = panel_inner(chunks.songs);
+        // 分隔线所在的那一行不属于任何面板的内容区
+        assert!(
+            boards_inner.bottom() < hit.divider,
+            "榜单内容区必须在 gutter 之上"
+        );
+        assert!(songs_inner.y > hit.divider, "歌曲内容区必须在 gutter 之下");
+
+        // 滚到底：榜单面板最后一行内容能命中最后一条榜单
+        let visible_boards = boards_inner.height as usize;
+        assert_eq!(
+            row_at(
+                chunks.boards,
+                Position::new(boards_inner.x + 1, boards_inner.bottom() - 1),
+                0,
+                visible_boards,
+                0,
+            ),
+            Some(visible_boards - 1)
+        );
+        // 歌曲面板最后一行内容能命中最后一首歌（表格占 1 行表头）
+        let visible_songs = songs_inner.height as usize - 1;
+        assert_eq!(
+            row_at(
+                chunks.songs,
+                Position::new(songs_inner.x + 1, songs_inner.bottom() - 1),
+                0,
+                visible_songs,
+                1,
+            ),
+            Some(visible_songs - 1)
+        );
+        // gutter 那一行不是内容区，点它不会选中列表项
+        assert_eq!(
+            row_at(
+                chunks.boards,
+                Position::new(boards_inner.x + 1, hit.divider),
+                0,
+                99,
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            row_at(
+                chunks.songs,
+                Position::new(songs_inner.x + 1, hit.divider),
+                0,
+                99,
+                1
+            ),
+            None
+        );
+        // 拖拽命中落在 gutter 上，±GRAB_RADIUS 的容差也不会吃掉最后一行内容
+        assert!(hit.matches(boards_inner.x, hit.divider));
+        assert!(!hit.matches(boards_inner.x, boards_inner.bottom() - 1));
+        assert!(!hit.matches(songs_inner.x, songs_inner.y));
+    }
+
+    /// 回归（宽布局）：竖分割线占左侧面板右边的那 1 列 gutter，
+    /// 歌曲面板的最后一列内容照样点得中。
+    #[test]
+    fn wide_divider_column_is_a_gutter_and_the_last_song_column_stays_clickable() {
+        let page = LeaderboardPage::new(Vec::new());
+        let area = Rect::new(0, 0, 120, 30);
+        let chunks = page.compute_layout(area, 0);
+        let (_, hit) = page.divider(&chunks).expect("宽布局必须有竖分割线");
+
+        assert_eq!(
+            hit.divider,
+            divider_line(chunks.boards, SplitAxis::Vertical)
+        );
+        assert_eq!(chunks.songs.x, hit.divider + GUTTER);
+        assert_eq!(
+            chunks.boards.width + GUTTER + chunks.songs.width,
+            area.width
+        );
+
+        let boards_inner = panel_inner(chunks.boards);
+        let songs_inner = panel_inner(chunks.songs);
+        assert!(
+            boards_inner.right() <= hit.divider,
+            "榜单内容区必须在 gutter 之左"
+        );
+        assert!(songs_inner.x > hit.divider, "歌曲内容区必须在 gutter 之右");
+
+        // 歌曲面板最后一列内容（第一首歌那一行）能命中
+        let visible_songs = songs_inner.height as usize - 1;
+        assert_eq!(
+            row_at(
+                chunks.songs,
+                Position::new(songs_inner.right() - 1, songs_inner.y + 1),
+                0,
+                visible_songs,
+                1,
+            ),
+            Some(0)
+        );
+        // gutter 那一列不是内容区
+        assert_eq!(
+            row_at(
+                chunks.songs,
+                Position::new(hit.divider, songs_inner.y + 1),
+                0,
+                visible_songs,
+                1,
+            ),
+            None
+        );
+        // 拖拽命中落在 gutter 上，容差不碰两侧面板的最后一列/最前一列
+        assert!(hit.matches(hit.divider, songs_inner.y));
+        assert!(!hit.matches(boards_inner.right() - 1, songs_inner.y));
+        assert!(!hit.matches(songs_inner.x, songs_inner.y));
     }
 }

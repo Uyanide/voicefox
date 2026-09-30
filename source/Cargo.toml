@@ -34,3 +34,7 @@ walkdir.workspace = true
 notify.workspace = true
 cue-rw.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# 仅测试目标需要：用虚拟时间验证"每源超时"而不用真的等 8 秒。
+tokio = { workspace = true, features = ["test-util"] }

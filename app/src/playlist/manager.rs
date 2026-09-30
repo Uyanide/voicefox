@@ -288,6 +288,15 @@ impl PlaylistManager {
         *mode = mode.next_mode();
         *mode
     }
+
+    /// 直接指定播放模式（底栏菜单里的"精确选择"用）。
+    pub fn set_mode(
+        &self,
+        mode: crate::playlist::mode::PlayMode,
+    ) -> crate::playlist::mode::PlayMode {
+        *self.play_mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+        mode
+    }
 }
 
 #[cfg(test)]

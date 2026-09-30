@@ -356,27 +356,18 @@ voicefox 支持通过配置文件自定义快捷键，无需修改代码。未�
 | `local_filter` | `"/"` | 进入过滤模式 |
 | `list_cycle_sort` | `"s"` | 切换排序方式 |
 
-**设置页面的播放与数据动作**：
+**设置页的操作方式**：
 
-这些动作默认使用功能键和 `Shift+功能键`；数字键 `1` 到 `8` 保留给侧边栏标签页。可以在 `[keybindings.pages.settings]` 中逐项重绑。设置页会显示重绑后的按键，鼠标点击对应行与按键执行相同动作。
+设置页不再把每个设置项绑到一个字母或功能键上，而是**分类 + 行光标**：
 
-| 配置项 | 默认值 | 功能 |
-|--------|--------|------|
-| `settings_cycle_playback_speed` | `"F1"` | 循环播放速度 |
-| `settings_edit_audio_device` | `"F2"` | 编辑 libmpv 音频设备名 |
-| `settings_cycle_replay_gain_mode` | `"F3"` | 切换 ReplayGain 模式 |
-| `settings_cycle_channel_mode` | `"F4"` | 切换自动 / 立体声 / 单声道 / 左 / 右 |
-| `settings_cycle_replay_gain_preamp` | `"F5"` | 调整 ReplayGain 预放大 |
-| `settings_cycle_balance` | `"F6"` | 调整左右平衡 |
-| `settings_toggle_replay_gain_clip` | `"F7"` | 切换削波保护 |
-| `settings_cycle_fade_in_duration` | `"F8"` | 循环淡入时长 |
-| `settings_cycle_fade_out_duration` | `"F9"` | 循环淡出时长 |
-| `settings_cycle_equalizer_preset` | `"F10"` | 循环均衡器预设 |
-| `settings_run_fade_in` / `settings_run_fade_out` | `"Shift+F1"` / `"Shift+F2"` | 立即淡入 / 淡出当前歌曲 |
-| `settings_set_ab_loop_start` / `settings_set_ab_loop_end` | `"Shift+F3"` / `"Shift+F4"` | 设置 A / B 点 |
-| `settings_clear_ab_loop` | `"Shift+F5"` | 清除 A-B 循环 |
-| `settings_export_data` / `settings_import_data` | `"Shift+F6"` / `"Shift+F7"` | 导出 / 导入版本化数据备份 |
-| `settings_import_playlist` | `"Shift+F8"` | 输入路径并导入 M3U、LX Music 或网易云歌单 |
+- `←` / `→`：切换分类（窄屏先选分类、`Enter` 进入、`Esc` 返回）
+- `↑` / `↓`：移动设置行光标；`Enter` 执行 / 打开取值菜单；`Space` 快速切换开关
+- 鼠标：点分类切换、点行激活、点开关切换、点取值行打开菜单、点内嵌列表条目选中
+- 取值类设置（主题 / 音质 / 播放模式 / 默认音源 / 解析策略 / 均衡器 / 状态栏字段 / 音源开关 / 歌词偏移）统一弹出带 `✓` 当前值的选择菜单
+
+只有分类、导航与极少数内嵌列表操作键留在本页（`a` / `d` / `h` / `r`，且仅在对应列表获得焦点时生效）。
+`[keybindings.pages.settings]` 里的 `settings_*` 键位仍然被配置系统接受（用于兼容既有配置文件与公共 API），
+但设置页不再拦截它们，因此这些绑定不会再在设置页触发动作。
 
 ### 配置示例
 

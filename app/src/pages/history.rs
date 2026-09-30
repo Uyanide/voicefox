@@ -11,11 +11,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::pages::components::context_menu::MenuHitSource;
-use crate::pages::components::hit_test::PanelRows;
+use crate::pages::components::hit_test::{PANEL_BORDERS, PanelRows};
 use crate::pages::components::list_filter::ListFilter;
 use crate::pages::sort::{SortState, SortTarget, SortedListCache};
 
@@ -67,7 +67,7 @@ pub fn render(
     };
 
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(PANEL_BORDERS)
         .border_style(Style::new().fg(crate::theme::border(ctx)))
         .title(format!(
             "播放历史 ({} 首) · 排序 {} · s 切换{}",

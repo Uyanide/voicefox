@@ -34,8 +34,10 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
+use lx_core::events::PageId;
 use lx_core::events::{AppAction, InsertPosition, Notification};
 use lx_core::keybinding::{Action, KeybindingResolver};
+use lx_core::model::config::SourcePolicy;
 use lx_core::model::leaderboard::LeaderboardInfo;
 use lx_core::model::login::{QrLoginResult, QrLoginStatus};
 use lx_core::model::playlist::Playlist;
@@ -48,14 +50,16 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::Style;
 use tokio::sync::mpsc;
 
-use context::AppContext;
+use context::{AppContext, JsSourceFailure, JsSourceStatus, StatusBarCommand};
 use data_cache::DataCache;
 use pages::components;
+use pages::components::context_menu::StatusBarMenuAction;
 use pages::components::context_menu::{
     ColumnMenuAction, MenuAction, MenuHitSource, MenuItem, MenuOutcome, PlaybackMenuAction,
     PlaybackMenuState, SongContextMenu, SongContextMenuOptions, SongMenuAction, SongMenuKind,
 };
 use pages::components::list_filter::ListFilter;
+use pages::components::status_bar::StatusBarSlot;
 use pages::sidebar::NavTab;
 use pages::sort::{SortMode, SortState, SortTarget, SortedListCache};
 use storage::SavedPlayerState;
@@ -98,7 +102,7 @@ enum PlaylistResponse {
     },
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct UiAreas {
     /// 整屏区域。整屏浮层（详情页/帮助页等）的渲染与命中都以它为基准。
     screen: Rect,
@@ -106,6 +110,18 @@ struct UiAreas {
     content: Rect,
     progress: Rect,
     notification: Rect,
+    /// 底部状态栏（快速控制栏）矩形。
+    status: Rect,
+    /// 底栏本帧实际排布出来的可点区段（渲染与命中共用同一份几何）。
+    status_hits: Vec<pages::components::status_bar::StatusBarHit>,
+    /// 底栏被宽度收纳进「更多」的段（顺序同配置）。
+    status_collapsed: Vec<pages::components::status_bar::StatusBarSlot>,
+    /// 底栏顶边的拖拽把手矩形（渲染时写入，命中直接用它 —— 同源）。
+    status_handle: Option<Rect>,
+    /// 鼠标是否停在拖拽把手上（含"正在拖"），用于 hover 提示。
+    status_handle_hover: bool,
+    /// 底栏当前悬停的段；只在这个值变化时重绘。
+    status_hover: Option<pages::components::status_bar::StatusBarSlot>,
 }
 
 #[derive(Debug, Default)]
@@ -465,6 +481,506 @@ fn build_column_menu(
     ))
 }
 
+/// 底栏左键的一次性结果。
+///
+/// 能直接变成 `AppAction` 的就走 `AppAction`；需要主循环本地状态
+/// （标签页、下载面板）的排队成 `StatusBarCommand`。
+enum StatusBarPrimary {
+    Action(AppAction),
+    Command(StatusBarCommand),
+    /// 该段的左键就是展开它自己的菜单（音源、自定义音源、当前歌曲…）。
+    OpenMenu,
+    /// 纯展示段（时间、排序），点了什么也不做。
+    None,
+}
+
+/// 底栏各段的左键行为 —— "快速切换"优先。
+fn status_bar_primary(slot: StatusBarSlot, ctx: &AppContext) -> StatusBarPrimary {
+    use lx_core::model::config::StatusBarItem;
+    match slot {
+        StatusBarSlot::Download => {
+            StatusBarPrimary::Command(StatusBarCommand::ToggleDownloadsPanel)
+        }
+        StatusBarSlot::More => StatusBarPrimary::OpenMenu,
+        StatusBarSlot::Item(item) => match item {
+            StatusBarItem::State => StatusBarPrimary::Action(AppAction::TogglePlayPause),
+            StatusBarItem::Song => StatusBarPrimary::OpenMenu,
+            StatusBarItem::Volume => StatusBarPrimary::OpenMenu,
+            // 左键循环切换（与 `m` 同一套顺序），右键才是精确选择。
+            StatusBarItem::PlayMode => {
+                let next = ctx.playlist.mode().next_mode();
+                StatusBarPrimary::Action(AppAction::SetPlayMode(next.as_config().to_string()))
+            }
+            // 音质左键循环切换；只改偏好，不打断正在播放的歌。
+            StatusBarItem::Quality => {
+                let current = ctx
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .player
+                    .quality;
+                StatusBarPrimary::Action(AppAction::SetQuality(pages::settings::next_quality(
+                    current,
+                )))
+            }
+            StatusBarItem::Queue => StatusBarPrimary::Command(StatusBarCommand::JumpToQueue),
+            StatusBarItem::Source | StatusBarItem::JsSourceState => StatusBarPrimary::OpenMenu,
+            StatusBarItem::Time | StatusBarItem::Sort => StatusBarPrimary::None,
+        },
+    }
+}
+
+/// 底栏鼠标事件的单一分派结果。
+///
+/// 判定顺序写死在一处 —— **高度拖拽 > 段点击**：拖拽一旦开始，任何鼠标事件
+/// 都只用来改行数，绝不会顺手触发某个段的主操作（项目里"拖拽把别的控件一起
+/// 点了"那类问题就是这么来的）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusBarMouseRoute {
+    /// 按在把手（顶边最右端）上：开始一次高度拖拽。
+    BeginResize,
+    /// 拖拽中：把行数预览成这个值（只改内存，不落盘）。
+    Resize(u16),
+    /// 松开左键：提交这个行数并落盘。
+    CommitResize(u16),
+    /// 命中某个段：左键 = 主操作，右键 = 精确选择菜单。
+    Click { slot: StatusBarSlot, right: bool },
+    /// 在底栏上但无事可做（段间分隔符、纯悬停…）。
+    None,
+}
+
+/// 底栏鼠标分派（纯函数）。
+///
+/// `handle` 必须是渲染那一帧写进 `UiAreas` 的把手矩形，`hits` 也必须来自
+/// 同一帧 —— 命中与渲染同源才不会"看得到却拖不动"。
+fn route_status_bar_mouse(
+    mouse: crossterm::event::MouseEvent,
+    bottom: u16,
+    handle: Option<Rect>,
+    hits: &[pages::components::status_bar::StatusBarHit],
+    dragging: bool,
+) -> StatusBarMouseRoute {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    // 拖拽中：优先于一切（包括"指针正好压在某个段上"）。
+    if dragging {
+        return match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                StatusBarMouseRoute::Resize(pages::components::status_bar::rows_for_pointer(
+                    bottom, mouse.row,
+                ))
+            }
+            MouseEventKind::Up(MouseButton::Left) => StatusBarMouseRoute::CommitResize(
+                pages::components::status_bar::rows_for_pointer(bottom, mouse.row),
+            ),
+            _ => StatusBarMouseRoute::None,
+        };
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && handle.is_some_and(|handle| handle.contains(Position::new(mouse.column, mouse.row)))
+    {
+        return StatusBarMouseRoute::BeginResize;
+    }
+
+    let Some(slot) = pages::components::status_bar::hit_test(hits, mouse.column, mouse.row) else {
+        return StatusBarMouseRoute::None;
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            StatusBarMouseRoute::Click { slot, right: false }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            StatusBarMouseRoute::Click { slot, right: true }
+        }
+        _ => StatusBarMouseRoute::None,
+    }
+}
+
+/// 把底栏行数写进内存配置（拖拽预览用）；返回是否真的变了。
+fn set_status_bar_rows(ctx: &AppContext, rows: u16) -> bool {
+    let rows = rows.clamp(1, u16::from(lx_core::model::config::STATUS_BAR_MAX_HEIGHT));
+    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+    if config.ui.status_bar_height == rows as u8 {
+        return false;
+    }
+    config.ui.status_bar_height = rows as u8;
+    true
+}
+
+/// 松开鼠标：写内存并立刻落盘（沿用 `CommitPaneRatio` 的写法）。
+fn commit_status_bar_rows(ctx: &AppContext, rows: u16) {
+    set_status_bar_rows(ctx, rows);
+    let save_result = {
+        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+        crate::config::loader::save(&config, &ctx.config_path)
+    };
+    if let Err(error) = save_result {
+        ctx.notify(Notification::error(format!("保存底栏高度失败: {error}")));
+    }
+}
+
+/// 底栏右键菜单（左键对"打开菜单"型段也复用同一份构造）。
+fn build_status_bar_menu(
+    slot: StatusBarSlot,
+    origin: Position,
+    ctx: &AppContext,
+    playlists: &pages::playlists::PlaylistsPage,
+    collapsed: &[StatusBarSlot],
+) -> Option<SongContextMenu> {
+    use lx_core::model::config::StatusBarItem;
+    use pages::components::context_menu::submenu;
+
+    let (title, items) = match slot {
+        StatusBarSlot::More => (" 更多 ".to_string(), collapsed_slot_items(collapsed, ctx)),
+        StatusBarSlot::Download => (
+            " 下载 ".to_string(),
+            vec![
+                MenuItem::new("打开下载面板", StatusBarMenuAction::OpenDownloadsPanel)
+                    .with_hint("Ctrl+O"),
+            ],
+        ),
+        StatusBarSlot::Item(item) => match item {
+            StatusBarItem::State => (
+                " 播放控制 ".to_string(),
+                vec![
+                    MenuItem::new("播放 / 暂停", StatusBarMenuAction::TogglePlayPause)
+                        .with_hint("Space"),
+                    MenuItem::new("上一首", StatusBarMenuAction::PreviousTrack).with_hint("b"),
+                    MenuItem::new("下一首", StatusBarMenuAction::NextTrack).with_hint("n"),
+                ],
+            ),
+            // 当前歌曲直接复用歌曲菜单，避免两套歌曲操作。
+            StatusBarItem::Song => {
+                let song = ctx
+                    .current_song
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()?;
+                return build_song_menu(
+                    ((vec![song], 0), SongMenuKind::Standard, None),
+                    origin,
+                    NavTab::Main,
+                    ctx,
+                    playlists,
+                );
+            }
+            StatusBarItem::Volume => (
+                " 音量 ".to_string(),
+                vec![
+                    MenuItem::new("音量 +5%", StatusBarMenuAction::VolumeDelta(5)).with_hint("."),
+                    MenuItem::new("音量 -5%", StatusBarMenuAction::VolumeDelta(-5)).with_hint(","),
+                    MenuItem::new("静音 / 恢复", StatusBarMenuAction::ToggleMute),
+                    MenuItem::new("设为 50%", StatusBarMenuAction::SetVolume(50)),
+                    MenuItem::new("设为 100%", StatusBarMenuAction::SetVolume(100)),
+                ],
+            ),
+            StatusBarItem::PlayMode => {
+                let current = ctx.playlist.mode();
+                let mut items = Vec::new();
+                for mode in [
+                    crate::playlist::mode::PlayMode::ListLoop,
+                    crate::playlist::mode::PlayMode::SingleLoop,
+                    crate::playlist::mode::PlayMode::Random,
+                    crate::playlist::mode::PlayMode::List,
+                    crate::playlist::mode::PlayMode::None,
+                ] {
+                    let mark = if mode == current { "✓" } else { "○" };
+                    items.push(MenuItem::new(
+                        format!("{mark} {}", mode.label()),
+                        StatusBarMenuAction::SetPlayMode(mode.as_config().to_string()),
+                    ));
+                }
+                (" 播放模式 ".to_string(), items)
+            }
+            StatusBarItem::Quality => {
+                let (preference, actual) = {
+                    let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                    (config.player.quality, ctx.audio_info.borrow().label())
+                };
+                let mut items = Vec::new();
+                for quality in [
+                    Quality::Low128,
+                    Quality::High320,
+                    Quality::Flac,
+                    Quality::Flac24,
+                ] {
+                    let mark = if quality == preference { "✓" } else { "○" };
+                    items.push(MenuItem::new(
+                        format!("{mark} {}", quality.label()),
+                        StatusBarMenuAction::SetQuality(quality),
+                    ));
+                }
+                // 偏好与实际分开显示，避免"点了 FLAC 就一定有 FLAC"的误解。
+                items.push(MenuItem::disabled(format!(
+                    "偏好 {} · 当前 {}",
+                    preference.label(),
+                    actual.unwrap_or_else(|| "未知".to_string())
+                )));
+                items.push(MenuItem::new(
+                    "用当前音质重新解析这首歌",
+                    StatusBarMenuAction::ReparseCurrentSong,
+                ));
+                (" 音质 ".to_string(), items)
+            }
+            StatusBarItem::Queue => {
+                let len = ctx.playlist.len();
+                let index = ctx.playlist.current_index();
+                (
+                    " 播放队列 ".to_string(),
+                    vec![
+                        MenuItem::new("上一首", StatusBarMenuAction::PreviousTrack),
+                        MenuItem::new("下一首", StatusBarMenuAction::NextTrack),
+                        MenuItem::disabled(format!(
+                            "当前 {} / {}",
+                            if len == 0 { 0 } else { index + 1 },
+                            len
+                        )),
+                        MenuItem::new("跳到队列页并定位当前歌", StatusBarMenuAction::JumpToQueue),
+                        MenuItem::new("清空队列", StatusBarMenuAction::ClearQueue),
+                    ],
+                )
+            }
+            StatusBarItem::Source => {
+                let (policy, platform, source_name) = {
+                    let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                    let name = current_source_label(ctx);
+                    (config.source.policy, config.source.policy_platform, name)
+                };
+                let enabled = ctx.source_manager.enabled_sources();
+                let mut policy_items = Vec::new();
+                for (mode, label) in [(SourcePolicy::Prefer, "优先"), (SourcePolicy::Only, "只用")]
+                {
+                    let mut targets = Vec::new();
+                    for id in &enabled {
+                        let mark = if policy == mode && platform == Some(*id) {
+                            "✓"
+                        } else {
+                            "○"
+                        };
+                        let name = ctx
+                            .source_manager
+                            .get(*id)
+                            .map(|source| source.name().to_string())
+                            .unwrap_or_else(|| id.as_str().to_string());
+                        targets.push(MenuItem::new(
+                            format!("{mark} {name}"),
+                            StatusBarMenuAction::SetSourcePolicy {
+                                policy: mode,
+                                platform: Some(*id),
+                            },
+                        ));
+                    }
+                    policy_items.push(MenuItem::new(
+                        label,
+                        submenu(format!(" {label}指定平台 "), targets),
+                    ));
+                }
+                (
+                    " 音源 ".to_string(),
+                    vec![
+                        // 当前播放来源是只读信息，与下面的"策略"严格分开：
+                        // 否则用户分不清"换的是这首歌"还是"以后都用它"。
+                        MenuItem::disabled(format!("当前播放来源: {source_name}")),
+                        MenuItem::new(
+                            if policy == SourcePolicy::Auto {
+                                "✓ 自动（默认）"
+                            } else {
+                                "○ 自动（默认）"
+                            },
+                            StatusBarMenuAction::SetSourcePolicy {
+                                policy: SourcePolicy::Auto,
+                                platform: None,
+                            },
+                        ),
+                        policy_items.remove(0),
+                        policy_items.remove(0),
+                        MenuItem::new("重新加载 JS 音源", StatusBarMenuAction::ReloadJsSources),
+                        MenuItem::new(
+                            "打开设置·音源面板",
+                            StatusBarMenuAction::OpenSettingsSources,
+                        ),
+                    ],
+                )
+            }
+            StatusBarItem::JsSourceState => {
+                let status = ctx.js_source_status();
+                let mut items: Vec<MenuItem> = ctx
+                    .source_manager
+                    .js_source_names()
+                    .into_iter()
+                    .map(|name| MenuItem::disabled(format!("✓ {name}")))
+                    .collect();
+                for failure in &status.failures {
+                    items.push(MenuItem::disabled(format!(
+                        "✗ {} — {}",
+                        failure.name, failure.reason
+                    )));
+                }
+                if status.total == 0 {
+                    items.push(MenuItem::disabled("未配置 JS 音源"));
+                }
+                items.push(MenuItem::new(
+                    "重新加载",
+                    StatusBarMenuAction::ReloadJsSources,
+                ));
+                items.push(MenuItem::new(
+                    "打开设置·音源面板",
+                    StatusBarMenuAction::OpenSettingsSources,
+                ));
+                (" 自定义音源 ".to_string(), items)
+            }
+            StatusBarItem::Time | StatusBarItem::Sort => return None,
+        },
+    };
+    Some(SongContextMenu::from_status_items(origin, title, items))
+}
+
+/// 当前播放来源的可读名称（JS 音源名优先，否则内置平台名）。
+fn current_source_label(ctx: &AppContext) -> String {
+    let song = ctx
+        .current_song
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(song) = song else {
+        return "-".to_string();
+    };
+    let js_index = *ctx
+        .play_js_source_index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    js_index
+        .and_then(|index| ctx.source_manager.js_source_name(index))
+        .or_else(|| {
+            ctx.source_manager
+                .get(song.source)
+                .map(|source| source.name().to_string())
+        })
+        .unwrap_or_else(|| song.source.as_str().to_string())
+}
+
+/// 「更多」菜单：列出被宽度挤掉的可交互段，点进去仍是它们各自的菜单。
+fn collapsed_slot_items(collapsed: &[StatusBarSlot], ctx: &AppContext) -> Vec<MenuItem> {
+    use lx_core::model::config::StatusBarItem;
+    if collapsed.is_empty() {
+        return vec![MenuItem::disabled("没有更多字段")];
+    }
+    let mut items = Vec::new();
+    for slot in collapsed {
+        let label = match slot {
+            StatusBarSlot::Download => {
+                format!("下载 ({})", ctx.downloads.snapshot().len())
+            }
+            StatusBarSlot::More => continue,
+            StatusBarSlot::Item(item) => match item {
+                StatusBarItem::State => "播放控制".to_string(),
+                StatusBarItem::Song => "当前歌曲".to_string(),
+                StatusBarItem::Volume => format!("音量 {}%", ctx.player.volume()),
+                StatusBarItem::PlayMode => format!("播放模式 {}", ctx.playlist.mode().label()),
+                StatusBarItem::Quality => "音质".to_string(),
+                StatusBarItem::Queue => "播放队列".to_string(),
+                StatusBarItem::Source => format!("音源 {}", current_source_label(ctx)),
+                StatusBarItem::JsSourceState => ctx.js_source_status().summary(),
+                StatusBarItem::Time | StatusBarItem::Sort => continue,
+            },
+        };
+        items.push(MenuItem::new(label, StatusBarMenuAction::OpenSlot(*slot)));
+    }
+    items
+}
+
+/// 执行底栏菜单动作。
+///
+/// 能落到 `AppAction` 的一律复用（模式、音质、策略、重载、跳设置）；
+/// 音量/播放暂停/上一首下一首直接操作 `ctx`；需要循环本地状态或要开新菜单的
+/// 排队成 `StatusBarCommand`，由主循环消费。
+#[allow(clippy::too_many_arguments)]
+fn execute_status_bar_action(
+    action: StatusBarMenuAction,
+    ctx: &AppContext,
+    rt: &tokio::runtime::Runtime,
+    action_tx: &mpsc::UnboundedSender<AppAction>,
+    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
+    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
+    search_seq: &Arc<AtomicU64>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let forward = |action: AppAction| {
+        execute_action(
+            action,
+            ctx,
+            rt,
+            action_tx,
+            search_page,
+            settings_page,
+            search_seq,
+        );
+    };
+    match action {
+        StatusBarMenuAction::TogglePlayPause => forward(AppAction::TogglePlayPause),
+        StatusBarMenuAction::SetPlayMode(value) => forward(AppAction::SetPlayMode(value)),
+        StatusBarMenuAction::SetQuality(quality) => forward(AppAction::SetQuality(quality)),
+        StatusBarMenuAction::SetSourcePolicy { policy, platform } => {
+            forward(AppAction::SetSourcePolicy { policy, platform });
+        }
+        StatusBarMenuAction::ReloadJsSources => forward(AppAction::ReloadJsSources),
+        StatusBarMenuAction::OpenSettingsSources => forward(AppAction::Navigate(PageId::Settings)),
+        StatusBarMenuAction::VolumeDelta(delta) => {
+            let next = (ctx.player.volume() as i32 + delta).clamp(0, 100) as u32;
+            persist_volume(ctx, next);
+        }
+        StatusBarMenuAction::SetVolume(volume) => persist_volume(ctx, volume.min(100)),
+        StatusBarMenuAction::ToggleMute => {
+            let current = ctx.player.volume();
+            if current == 0 {
+                let restore = ctx
+                    .mute_restore_volume
+                    .load(Ordering::Relaxed)
+                    .clamp(1, 100);
+                persist_volume(ctx, restore);
+            } else {
+                ctx.mute_restore_volume.store(current, Ordering::Relaxed);
+                persist_volume(ctx, 0);
+            }
+        }
+        StatusBarMenuAction::NextTrack => {
+            if let Some((songs, index)) = ctx.playlist.next_manual_entry_arc() {
+                forward(AppAction::PlayFromQueue { songs, index });
+            }
+        }
+        StatusBarMenuAction::PreviousTrack => {
+            if let Some((songs, index)) = ctx.playlist.prev_manual_entry_arc() {
+                forward(AppAction::PlayFromQueue { songs, index });
+            }
+        }
+        StatusBarMenuAction::ReparseCurrentSong => {
+            let song = ctx
+                .current_song
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(song) = song {
+                // 重置解析状态：换音质后要重新走一遍完整换源链路。
+                start_song_playback(song, false, None, true, ctx, rt, action_tx);
+            }
+        }
+        StatusBarMenuAction::JumpToQueue => {
+            ctx.queue_status_bar_command(StatusBarCommand::JumpToQueue);
+        }
+        StatusBarMenuAction::ClearQueue => {
+            ctx.queue_status_bar_command(StatusBarCommand::ClearQueue);
+        }
+        StatusBarMenuAction::OpenDownloadsPanel => {
+            ctx.queue_status_bar_command(StatusBarCommand::ToggleDownloadsPanel);
+        }
+        StatusBarMenuAction::OpenSlot(slot) => {
+            ctx.queue_status_bar_command(StatusBarCommand::OpenStatusBarMenu(slot));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_menu_action(
     action: MenuAction,
@@ -519,8 +1035,19 @@ fn dispatch_menu_action(
                 search_seq,
             );
         }
+        MenuAction::StatusBar(status_action) => execute_status_bar_action(
+            status_action,
+            ctx,
+            rt,
+            action_tx,
+            search_page,
+            settings_page,
+            search_seq,
+        ),
         // 子菜单与返回上级由菜单自身消费，不会走到这里。
         MenuAction::Submenu { .. } | MenuAction::Back => {}
+        // 设置页自己消费的菜单动作（设置页持有并处理自己的菜单，主循环无需理解其语义）。
+        MenuAction::SettingChoice { .. } => {}
     }
 }
 
@@ -984,6 +1511,8 @@ fn run_app(
     let mut help_page: Option<pages::help::HelpPage> = None;
     // 下载面板浮层（Ctrl+o 开关）
     let mut downloads_panel = pages::downloads::DownloadsPanel::new();
+    // 底栏高度拖拽会话：拖动中只改内存，松开才落盘（行数真值始终在 config 里）。
+    let mut status_bar_resizing = false;
     let mut qr_poll_deadline: Instant = Instant::now();
     let mut qr_generate_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut qr_poll_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1046,6 +1575,7 @@ fn run_app(
         js_source_generation,
         action_tx.clone(),
         rt,
+        Arc::clone(&ctx.js_source_status),
     );
 
     if ctx
@@ -1388,10 +1918,9 @@ fn run_app(
                             .unwrap_or_else(|e| e.into_inner())
                             .source
                             .auto_toggle;
-                        if auto_toggle
-                            && retry_song
-                                .as_ref()
-                                .is_some_and(|song| song.source != SourceId::Local)
+                        if retry_song
+                            .as_ref()
+                            .is_some_and(|song| should_retry_with_other_source(song, auto_toggle))
                         {
                             tracing::warn!("current source playback failed: {}", error);
                             if let Some(song) = retry_song {
@@ -3107,6 +3636,87 @@ fn run_app(
                 needs_render = true;
                 continue;
             }
+            // 底栏高度拖拽：一旦开始，指针可以离开底栏（往上拖到屏幕中部），
+            // 所以必须先于"按位置分派"的整条链处理；拖拽期间不吃滚轮、不吃段点击。
+            if status_bar_resizing {
+                let route = route_status_bar_mouse(
+                    mouse,
+                    ui_areas.status.bottom(),
+                    ui_areas.status_handle,
+                    &ui_areas.status_hits,
+                    true,
+                );
+                match route {
+                    StatusBarMouseRoute::Resize(rows) => {
+                        set_status_bar_rows(&ctx, rows);
+                    }
+                    StatusBarMouseRoute::CommitResize(rows) => {
+                        status_bar_resizing = false;
+                        ui_areas.status_handle_hover = false;
+                        commit_status_bar_rows(&ctx, rows);
+                    }
+                    _ => {}
+                }
+                needs_render = true;
+                continue;
+            }
+            // 底栏悬停高亮：鼠标一动就整屏重画太浪费，只在悬停段变化时重绘。
+            if matches!(mouse.kind, MouseEventKind::Moved) {
+                let pointer = Position::new(mouse.column, mouse.row);
+                let hovered = if ui_areas.status.contains(pointer) {
+                    pages::components::status_bar::hit_test(
+                        &ui_areas.status_hits,
+                        mouse.column,
+                        mouse.row,
+                    )
+                } else {
+                    None
+                };
+                let handle_hovered = ui_areas
+                    .status_handle
+                    .is_some_and(|handle| handle.contains(pointer));
+                if hovered != ui_areas.status_hover
+                    || handle_hovered != ui_areas.status_handle_hover
+                {
+                    ui_areas.status_hover = hovered;
+                    ui_areas.status_handle_hover = handle_hovered;
+                    needs_render = true;
+                }
+                // 设置页的分界线悬停高亮：页面收不到 `Moved`（上面已经 continue），
+                // 只有这一处把移动转给它；返回值 = 悬停的分界线变了。
+                if active_tab == NavTab::Settings
+                    && settings_page
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .update_divider_hover(pointer)
+                {
+                    needs_render = true;
+                }
+                continue;
+            }
+            // 底栏滚轮：悬停在「音量」段上就是调音量；底栏上其它位置不吃滚轮，
+            // 避免"在状态栏滚动却把上面的列表滚走"。
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) && ui_areas.status.contains(position)
+            {
+                if ui_areas.status_hover
+                    == Some(StatusBarSlot::Item(
+                        lx_core::model::config::StatusBarItem::Volume,
+                    ))
+                {
+                    let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        5
+                    } else {
+                        -5
+                    };
+                    let next = (ctx.player.volume() as i32 + delta).clamp(0, 100) as u32;
+                    persist_volume(&ctx, next);
+                }
+                needs_render = true;
+                continue;
+            }
             if ui_areas.notification.contains(position)
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             {
@@ -3141,6 +3751,75 @@ fn run_app(
                     duration,
                 ) {
                     ctx.seek(position);
+                }
+            } else if ui_areas.status.contains(position)
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Down(MouseButton::Right)
+                )
+            {
+                // 底栏是"快速控制栏"：左键 = 主操作，右键 = 精确选择菜单。
+                // 顶边右侧的把手另有用途 —— 高度拖拽（见 route_status_bar_mouse），
+                // 它占的列已经不在任何段的命中矩形里。
+                match route_status_bar_mouse(
+                    mouse,
+                    ui_areas.status.bottom(),
+                    ui_areas.status_handle,
+                    &ui_areas.status_hits,
+                    false,
+                ) {
+                    StatusBarMouseRoute::BeginResize => {
+                        status_bar_resizing = true;
+                        ui_areas.status_handle_hover = true;
+                        needs_render = true;
+                    }
+                    StatusBarMouseRoute::Click { slot, right } => {
+                        if right {
+                            if let Some(menu) = build_status_bar_menu(
+                                slot,
+                                position,
+                                &ctx,
+                                &playlists,
+                                &ui_areas.status_collapsed,
+                            ) {
+                                song_menu = Some(menu);
+                            }
+                        } else {
+                            match status_bar_primary(slot, &ctx) {
+                                StatusBarPrimary::Action(action) => {
+                                    execute_action(
+                                        action,
+                                        &ctx,
+                                        rt,
+                                        &action_tx,
+                                        &search_page,
+                                        &settings_page,
+                                        &search_seq,
+                                    );
+                                }
+                                StatusBarPrimary::Command(command) => {
+                                    ctx.queue_status_bar_command(command);
+                                }
+                                StatusBarPrimary::OpenMenu => {
+                                    if let Some(menu) = build_status_bar_menu(
+                                        slot,
+                                        position,
+                                        &ctx,
+                                        &playlists,
+                                        &ui_areas.status_collapsed,
+                                    ) {
+                                        song_menu = Some(menu);
+                                    }
+                                }
+                                StatusBarPrimary::None => {}
+                            }
+                        }
+                        needs_render = true;
+                    }
+                    StatusBarMouseRoute::Resize(_)
+                    | StatusBarMouseRoute::CommitResize(_)
+                    | StatusBarMouseRoute::None => {}
                 }
             } else if ui_areas.content.contains(position) {
                 // 表头右键 → 列设置菜单。与歌曲菜单共用同一个槽位与交互
@@ -3265,6 +3944,9 @@ fn run_app(
                 &mut history_state,
                 &mut local_state,
             );
+            // 底栏也一样：屏幕高度变了，拖拽中的行数映射已经不对了。
+            status_bar_resizing = false;
+            ui_areas.status_handle_hover = false;
             needs_render = true;
         }
 
@@ -3286,6 +3968,41 @@ fn run_app(
                 playlist_tx.clone(),
                 rt,
             );
+        }
+
+        // 底栏排队的一次性命令：需要 `active_tab` / 下载面板这类循环本地状态，
+        // 没法在 execute_action 里做，统一在这里消费。
+        for command in ctx.take_status_bar_commands() {
+            match command {
+                StatusBarCommand::ToggleDownloadsPanel => {
+                    let count = ctx.downloads.snapshot().len();
+                    downloads_panel.toggle(count);
+                    terminal.clear()?;
+                    needs_render = true;
+                }
+                StatusBarCommand::JumpToQueue => {
+                    active_tab = NavTab::Main;
+                    let queue_len = ctx.playlist.len();
+                    main_page.select_current(ctx.playlist.current_index(), queue_len);
+                    needs_render = true;
+                }
+                StatusBarCommand::ClearQueue => {
+                    main_page.clear_queue(&ctx);
+                    needs_render = true;
+                }
+                StatusBarCommand::OpenStatusBarMenu(slot) => {
+                    if let Some(menu) = build_status_bar_menu(
+                        slot,
+                        Position::new(ui_areas.status.x + 2, ui_areas.status.y),
+                        &ctx,
+                        &playlists,
+                        &ui_areas.status_collapsed,
+                    ) {
+                        song_menu = Some(menu);
+                        needs_render = true;
+                    }
+                }
+            }
         }
 
         // === 3. 当前事件未提前 continue 时立即渲染 ===
@@ -3360,26 +4077,44 @@ fn draw_app(
             ),
             area,
         );
+        let status_rows = ctx
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .status_bar_rows()
+            .max(1);
+        // 顶部的层次：Now Playing 头部（无外框，3 行）→ 标签栏（背景色带，1 行）
+        // → 内容 → 进度条 → 底部快速控制栏。
+        // 头部与标签栏的行数（回退到原始布局：头部 4 行带框 + 标签栏 3 行）。
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4), // header
-                Constraint::Length(3), // tabs
-                Constraint::Min(3),    // tab content
-                Constraint::Length(1), // progress bar
-                Constraint::Length(1), // status bar
+                Constraint::Length(4),           // 头部
+                Constraint::Length(3),           // 标签栏
+                Constraint::Min(3),              // tab content
+                Constraint::Length(1),           // progress bar
+                Constraint::Length(status_rows), // status bar（可配 1~2 行）
             ])
             .split(area);
 
         components::header::render(main_chunks[0], frame.buffer_mut(), ctx);
         pages::sidebar::render(main_chunks[1], frame.buffer_mut(), active_tab, ctx);
         let content_area = main_chunks[2];
+        let kept_hover = ui_areas.status_hover;
+        let kept_handle_hover = ui_areas.status_handle_hover;
         *ui_areas = UiAreas {
             screen: area,
             tabs: main_chunks[1],
             content: content_area,
             progress: main_chunks[3],
             notification: Rect::default(),
+            status: main_chunks[4],
+            status_hits: Vec::new(),
+            status_collapsed: Vec::new(),
+            status_handle: None,
+            status_handle_hover: kept_handle_hover,
+            status_hover: kept_hover,
         };
 
         match active_tab {
@@ -3450,7 +4185,7 @@ fn draw_app(
                         String::new()
                     };
                     let block = Block::default()
-                        .borders(Borders::ALL)
+                        .borders(components::hit_test::PANEL_BORDERS)
                         .border_style(Style::new().fg(crate::theme::muted(ctx)))
                         .title(if is_scanning {
                             format!(
@@ -3674,7 +4409,24 @@ fn draw_app(
             NavTab::LocalMusic => Some(local_state.mode.label(SortTarget::Local)),
             _ => None,
         };
-        components::status_bar::render(main_chunks[4], frame.buffer_mut(), ctx, sort_status);
+        let status_frame = components::status_bar::render(
+            main_chunks[4],
+            frame.buffer_mut(),
+            ctx,
+            sort_status,
+            ui_areas.status_hover,
+            ui_areas.status_handle_hover,
+        );
+        ui_areas.status_hits = status_frame.hits;
+        ui_areas.status_collapsed = status_frame.collapsed;
+        ui_areas.status_handle = status_frame.handle;
+        // 命中用它画出来的实际矩形：布局把底栏挤矮时也不会"画 1 行、命中 3 行"。
+        ui_areas.status = Rect::new(
+            main_chunks[4].x,
+            main_chunks[4].y,
+            main_chunks[4].width,
+            status_frame.rows,
+        );
         ui_areas.notification = components::notification::area(area, ctx).unwrap_or_default();
         components::notification::render(area, frame.buffer_mut(), ctx);
         if let Some(menu) = song_menu {
@@ -3966,6 +4718,91 @@ fn execute_action(
     search_seq: &Arc<AtomicU64>,
 ) {
     match action {
+        // ── 底栏（快速控制栏）─────────────────────────────
+        AppAction::TogglePlayPause => {
+            toggle_or_start_current(ctx, rt, action_tx, search_page, settings_page, search_seq);
+        }
+        AppAction::SetPlayMode(value) => {
+            let mode = crate::playlist::mode::PlayMode::from_config(&value);
+            ctx.playlist.set_mode(mode);
+            let save_result = {
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                config.player.play_mode = mode.as_config().to_string();
+                crate::config::loader::save(&config, &ctx.config_path)
+            };
+            match save_result {
+                Ok(()) => ctx.notify(Notification::success(format!("播放模式: {}", mode.label()))),
+                Err(error) => ctx.notify(Notification::warning(format!(
+                    "播放模式已切换，但保存失败: {error}"
+                ))),
+            }
+        }
+        AppAction::SetQuality(quality) => {
+            let save_result = {
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                config.player.quality = quality;
+                crate::config::loader::save(&config, &ctx.config_path)
+            };
+            // 只改偏好，不打断正在播放的歌：正在播的那首走"用当前音质重新解析"。
+            match save_result {
+                Ok(()) => ctx.notify(Notification::success(format!(
+                    "音质偏好: {}",
+                    quality.label()
+                ))),
+                Err(error) => ctx.notify(Notification::warning(format!(
+                    "音质偏好已切换，但保存失败: {error}"
+                ))),
+            }
+        }
+        AppAction::SetSourcePolicy { policy, platform } => {
+            let save_result = {
+                let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                config.source.policy = policy;
+                config.source.policy_platform = platform;
+                crate::config::loader::save(&config, &ctx.config_path)
+            };
+            let label = match (policy, platform) {
+                (SourcePolicy::Auto, _) => "解析策略: 自动".to_string(),
+                (mode, Some(id)) => format!("解析策略: {} {}", mode.label(), id.as_str()),
+                (mode, None) => format!("解析策略: {}", mode.label()),
+            };
+            match save_result {
+                Ok(()) => ctx.notify(Notification::success(label)),
+                Err(error) => ctx.notify(Notification::warning(format!(
+                    "{label}，但保存失败: {error}"
+                ))),
+            }
+            // 立即按新策略重新解析当前歌：否则用户点了"只用网易"在界面上
+            // 看不出任何变化，会以为"点了没反应"。
+            let song = ctx
+                .current_song
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(song) = song {
+                start_song_playback(song, false, None, true, ctx, rt, action_tx);
+            }
+        }
+        AppAction::ReloadJsSources => {
+            let (urls, default_source) = {
+                let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                (
+                    config.source.js_sources.clone(),
+                    config.source.default.as_str().to_string(),
+                )
+            };
+            let generation = ctx.source_manager.begin_js_source_request(true);
+            spawn_js_source_loader(
+                urls,
+                default_source,
+                Arc::clone(&ctx.source_manager),
+                generation,
+                action_tx.clone(),
+                rt,
+                Arc::clone(&ctx.js_source_status),
+            );
+            ctx.notify(Notification::info("正在重新加载 JS 音源"));
+        }
         AppAction::Search { keyword, source } => {
             let mut sp = search_page.lock().unwrap_or_else(|e| e.into_inner());
             sp.begin_search(&keyword, false);
@@ -4261,6 +5098,7 @@ fn execute_action(
                     generation,
                     action_tx.clone(),
                     rt,
+                    Arc::clone(&ctx.js_source_status),
                 );
                 ctx.notify(Notification::success("JS 音源配置已更新，正在加载全部脚本"));
             }
@@ -4334,6 +5172,7 @@ fn execute_action(
                 generation,
                 action_tx.clone(),
                 rt,
+                Arc::clone(&ctx.js_source_status),
             );
             let _ = action_tx.send(AppAction::ShowNotification(Notification::success(
                 "已移除音源",
@@ -4670,6 +5509,19 @@ fn begin_song_from_arc(
     start_song_playback(song, true, None, true, ctx, rt, action_tx);
 }
 
+/// 播放器报错后，是否值得换源重试这首歌。
+///
+/// 只有**真本地文件**不该重试：文件本身有问题，换到任何在线音源都没有意义。
+///
+/// 不能写成 `song.source != SourceId::Local`：JS 音源搜到的歌同样标记为
+/// `SourceId::Local`（靠 `extra["source"]` 记录真实平台），那样会把它们和真本地
+/// 文件一起排除掉 —— 表现就是"JS 音源搜到的歌播放失败后直接跳下一首，不换源"。
+/// 项目里已有 `is_local_file_song()` 承担这份区分，这里直接复用，保证与播放地址
+/// 解析路径（`get_song_url_inner`）是同一份判定。
+fn should_retry_with_other_source(song: &SongInfo, auto_toggle: bool) -> bool {
+    auto_toggle && !lx_source::manager::is_local_file_song(song)
+}
+
 fn start_song_playback(
     song: SongInfo,
     add_history: bool,
@@ -4762,12 +5614,14 @@ fn start_song_playback(
     let play_request_id = Arc::clone(&ctx.play_request_id);
     let attempted_sources = Arc::clone(&ctx.play_attempted_sources);
     let js_source_index = Arc::clone(&ctx.play_js_source_index);
-    let (quality, auto_toggle, fade_in_ms) = {
+    let (quality, auto_toggle, fade_in_ms, policy, policy_platform) = {
         let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (
             config.player.quality,
             config.source.auto_toggle,
             config.player.fade_in_ms,
+            config.source.policy,
+            config.source.policy_platform,
         )
     };
     let tx = action_tx.clone();
@@ -4785,6 +5639,8 @@ fn start_song_playback(
                     attempted_sources: Arc::clone(&attempted_sources),
                     js_source_index: Arc::clone(&js_source_index),
                     request_id,
+                    policy,
+                    policy_platform,
                 },
             ),
         )
@@ -4985,6 +5841,10 @@ struct PlaybackResolveRequest {
     attempted_sources: Arc<std::sync::Mutex<std::collections::HashSet<SourceId>>>,
     js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
     request_id: u64,
+    /// 解析策略（`auto` 时与历史行为完全一致）。
+    policy: SourcePolicy,
+    /// 策略作用的平台。
+    policy_platform: Option<SourceId>,
 }
 
 async fn resolve_playable_song(
@@ -4999,6 +5859,8 @@ async fn resolve_playable_song(
         attempted_sources,
         js_source_index,
         request_id,
+        policy,
+        policy_platform,
     } = request;
     let next_js_source_index = js_source_index
         .lock()
@@ -5044,7 +5906,16 @@ async fn resolve_playable_song(
         return Err(format!("获取播放地址失败: {}", direct_error));
     }
 
-    let candidates = source_manager.find_music(&song).await;
+    // `only X`：解析集合收窄为 {X} —— 直接去 X 上找同曲，找不到就失败，
+    // 不去别的平台兜底。`prefer X` 只调整下面的候选顺序，来源集合不变。
+    let candidates = match only_platform(&song, policy, policy_platform) {
+        Some(platform) => source_manager.find_music_on(&song, &[platform]).await,
+        None => {
+            let mut candidates = source_manager.find_music(&song).await;
+            order_fallback_candidates(&mut candidates, policy, policy_platform);
+            candidates
+        }
+    };
     if play_request_id.load(Ordering::SeqCst) != request_id {
         return Ok(None);
     }
@@ -5099,6 +5970,35 @@ async fn resolve_song_url(
         .map_err(|error| error.to_string())
 }
 
+/// `prefer`：把指定平台的候选排到最前，其余保持原顺序（稳定排序）。
+///
+/// 只改"先试谁"，不改来源集合、不改匹配规则 —— `only` 的收窄在调用处完成。
+fn order_fallback_candidates(
+    candidates: &mut [lx_core::model::song::SongInfo],
+    policy: SourcePolicy,
+    platform: Option<SourceId>,
+) {
+    if policy != SourcePolicy::Prefer {
+        return;
+    }
+    let Some(platform) = platform else {
+        return;
+    };
+    candidates.sort_by_key(|candidate| u8::from(candidate.source != platform));
+}
+
+/// `only X` 是否适用（歌曲本身已经来自 X 时无需收窄）。
+fn only_platform(
+    song: &lx_core::model::song::SongInfo,
+    policy: SourcePolicy,
+    platform: Option<SourceId>,
+) -> Option<SourceId> {
+    match (policy, platform) {
+        (SourcePolicy::Only, Some(platform)) if song.source != platform => Some(platform),
+        _ => None,
+    }
+}
+
 /// 标记音源已尝试。持锁校验请求代次：换歌后旧任务不得把过期源写进
 /// 新请求的集合（否则新歌会“未试先败”）。对过期任务返回 true，让它
 /// 跳过无谓的解析并在随后的代次校验处终止。
@@ -5122,6 +6022,81 @@ fn prepare_player(ctx: &AppContext) -> u64 {
     generation
 }
 
+type LoadedJsSources = Vec<(String, Arc<dyn lx_core::traits::source::MusicSource>)>;
+
+/// 逐个加载 JS 音源，返回（成功的音源，失败记录）。
+///
+/// - 单个失败**只记录、不中断**，其它音源照常加载（原有行为，保持不变）；
+/// - 成功列表保持配置顺序 —— 这个顺序就是播放时的尝试顺序，即优先级；
+/// - 失败记录同样保持配置顺序，便于和配置逐行对照；
+/// - 期间若出现更新的加载请求（代次变化），返回 `None` 表示本次结果作废。
+async fn load_js_sources(
+    urls: Vec<String>,
+    default_source: &str,
+    source_manager: &lx_source::manager::SourceManager,
+    generation: u64,
+) -> Option<(LoadedJsSources, Vec<JsSourceFailure>)> {
+    let mut loaded: LoadedJsSources = Vec::with_capacity(urls.len());
+    let mut failures = Vec::new();
+    for url in urls {
+        match lx_source::js::loader::load_source(&url, default_source).await {
+            Ok(source) => loaded.push((url, Arc::new(source))),
+            Err(reason) => {
+                if !source_manager.is_js_source_request_current(generation) {
+                    return None;
+                }
+                // 日志保留：通知会随超时消失，日志是事后排查的依据。
+                tracing::warn!("load JS source failed ({url}): {reason}");
+                let name = lx_source::js::loader::source_display_name(
+                    &lx_source::js::loader::cached_source_path(&url),
+                    &url,
+                );
+                failures.push(JsSourceFailure {
+                    name,
+                    origin: url,
+                    reason,
+                });
+            }
+        }
+    }
+    Some((loaded, failures))
+}
+
+/// 把失败记录拼成一行给用户看的文本：`名称（来源）：原因`。
+///
+/// 用 `；` 连接而不是换行 —— 应用内通知正文是单行 `Line`，换行符不会被拆开，
+/// 折行交给 `Paragraph` 自己处理。
+fn describe_js_failures(failures: &[JsSourceFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| format!("{}（{}）：{}", failure.name, failure.origin, failure.reason))
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
+/// 组装 JS 音源加载结果的应用内通知。
+///
+/// 部分失败时**必须点名**是哪些音源、为什么失败，只报数量用户无从下手。
+fn js_source_load_notification(
+    loaded_count: usize,
+    total: usize,
+    failures: &[JsSourceFailure],
+) -> Notification {
+    if loaded_count == 0 {
+        return Notification::error(format!(
+            "JS 音源全部加载失败（共 {total} 个）：{}",
+            describe_js_failures(failures)
+        ));
+    }
+    if failures.is_empty() {
+        return Notification::success(format!("{loaded_count} 个 JS 音源已就绪"));
+    }
+    Notification::warning(format!(
+        "已加载 {loaded_count}/{total} 个 JS 音源，失败：{}",
+        describe_js_failures(failures)
+    ))
+}
+
 fn spawn_js_source_loader(
     urls: Vec<String>,
     default_source: String,
@@ -5129,6 +6104,7 @@ fn spawn_js_source_loader(
     generation: u64,
     tx: mpsc::UnboundedSender<AppAction>,
     rt: &tokio::runtime::Runtime,
+    js_status: Arc<std::sync::Mutex<JsSourceStatus>>,
 ) {
     let urls: Vec<String> = urls
         .into_iter()
@@ -5141,43 +6117,28 @@ fn spawn_js_source_loader(
 
     rt.spawn(async move {
         let total = urls.len();
-        let mut loaded =
-            Vec::<(String, Arc<dyn lx_core::traits::source::MusicSource>)>::with_capacity(total);
-        let mut errors = Vec::new();
-        for url in urls {
-            match lx_source::js::loader::load_source(&url, &default_source).await {
-                Ok(source) => {
-                    loaded.push((url.clone(), Arc::new(source)));
-                }
-                Err(error) => {
-                    if !source_manager.is_js_source_request_current(generation) {
-                        return;
-                    }
-                    tracing::warn!("load JS source failed ({}): {}", url, error);
-                    errors.push(format!("{url}: {error}"));
-                }
-            }
-        }
+        let Some((loaded, failures)) =
+            load_js_sources(urls, &default_source, &source_manager, generation).await
+        else {
+            return;
+        };
 
         let loaded_count = loaded.len();
         if !source_manager.set_named_js_sources_if_current(generation, loaded) {
             return;
         }
-        if loaded_count == 0 {
-            let _ = tx.send(AppAction::ShowNotification(Notification::error(format!(
-                "没有可用的 JS 音源: {}",
-                errors.join("; ")
-            ))));
-        } else if errors.is_empty() {
-            let _ = tx.send(AppAction::ShowNotification(Notification::success(format!(
-                "{} 个 JS 音源已就绪",
-                loaded_count
-            ))));
-        } else {
-            let _ = tx.send(AppAction::ShowNotification(Notification::warning(format!(
-                "已加载 {loaded_count}/{total} 个 JS 音源"
-            ))));
-        }
+        // 留存逐项状态：状态栏与音源菜单都要显示"3 个里坏了哪个、为什么"，
+        // 只发一条会消失的通知是不够的。
+        *js_status.lock().unwrap_or_else(|e| e.into_inner()) = JsSourceStatus {
+            total,
+            loaded: loaded_count,
+            failures: failures.clone(),
+        };
+        let _ = tx.send(AppAction::ShowNotification(js_source_load_notification(
+            loaded_count,
+            total,
+            &failures,
+        )));
     });
 }
 
@@ -5544,13 +6505,18 @@ mod tests {
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
+    use super::JsSourceStatus;
     use super::{
-        DeleteConfirmationAction, delete_confirmation_action, next_list_index,
-        playback_restore_flags, previous_list_index, should_expand_bili_parts, should_go_to_main,
+        DeleteConfirmationAction, JsSourceFailure, delete_confirmation_action,
+        describe_js_failures, js_source_load_notification, load_js_sources, next_list_index,
+        only_platform, order_fallback_candidates, playback_restore_flags, previous_list_index,
+        should_expand_bili_parts, should_go_to_main, should_retry_with_other_source,
         should_scan_local_music_on_entry,
     };
     use crate::pages::sidebar::NavTab;
     use crate::storage::SavedPlayerState;
+    use lx_core::events::NotificationLevel;
+    use lx_core::model::config::SourcePolicy;
 
     #[test]
     fn local_list_navigation_wraps_at_both_ends() {
@@ -5668,5 +6634,480 @@ mod tests {
             "歌手".to_string(),
         );
         assert!(!should_expand_bili_parts(&online_song));
+    }
+
+    // ── 播放器级重试判定 ──
+    //
+    // 旧判断是 `song.source != SourceId::Local`，它把"JS 音源搜到的歌"和
+    // "真本地文件"混在一起（两者 source 都是 Local），于是 JS 搜到的歌
+    // 播放失败后会被直接跳过而不是换源重试。
+
+    #[test]
+    fn only_real_local_files_skip_the_remote_retry() {
+        // JS 音源搜到的歌：source=Local + extra["source"]=真实平台
+        let mut js_song = SongInfo::new("1".into(), SourceId::Local, "歌".into(), "手".into());
+        js_song.extra.insert("source".into(), "wy".into());
+        assert!(
+            should_retry_with_other_source(&js_song, true),
+            "JS 音源搜到的歌必须换源重试"
+        );
+
+        // JS 搜到的歌即使后来落到本地路径，也仍然是可换源的歌
+        let mut downloaded = js_song.clone();
+        downloaded.file_path = Some(std::path::PathBuf::from("/music/b.flac"));
+        assert!(should_retry_with_other_source(&downloaded, true));
+
+        // 真本地文件：不该换源重试
+        let mut local = SongInfo::new("2".into(), SourceId::Local, "歌".into(), "手".into());
+        local.file_path = Some(std::path::PathBuf::from("/music/a.flac"));
+        assert!(!should_retry_with_other_source(&local, true));
+
+        // 没有 file_path 的中间态同样是本地文件（扫描器是后补 file_path 的）
+        let bare_local = SongInfo::new("3".into(), SourceId::Local, "歌".into(), "手".into());
+        assert!(!should_retry_with_other_source(&bare_local, true));
+
+        // 在线歌曲：应当重试
+        for source in [SourceId::Wy, SourceId::Kw, SourceId::Kg, SourceId::Bili] {
+            let online = SongInfo::new("4".into(), source, "歌".into(), "手".into());
+            assert!(
+                should_retry_with_other_source(&online, true),
+                "{source:?} 播放失败应当换源重试"
+            );
+        }
+
+        // 关闭自动换源时谁都不重试
+        assert!(!should_retry_with_other_source(&js_song, false));
+    }
+
+    // ── JS 音源加载失败的可观测性 ──
+
+    fn js_failure(name: &str, origin: &str, reason: &str) -> JsSourceFailure {
+        JsSourceFailure {
+            name: name.to_string(),
+            origin: origin.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn failure_text_names_the_source_its_origin_and_the_reason() {
+        let failures = vec![
+            js_failure(
+                "huibq",
+                "https://example.com/pdone/huibq/latest.js",
+                "下载 JS 音源失败（HTTP 500）",
+            ),
+            js_failure("grass", "/home/me/grass.js", "读取本地 JS 音源失败"),
+        ];
+        let text = describe_js_failures(&failures);
+        for expected in [
+            "huibq",
+            "https://example.com/pdone/huibq/latest.js",
+            "HTTP 500",
+            "grass",
+            "/home/me/grass.js",
+            "读取本地 JS 音源失败",
+        ] {
+            assert!(text.contains(expected), "失败文本缺少 {expected}：{text}");
+        }
+    }
+
+    #[test]
+    fn partial_failure_notification_points_at_the_failing_sources() {
+        let failures = vec![js_failure(
+            "huibq",
+            "https://example.com/huibq/latest.js",
+            "HTTP 500",
+        )];
+        let notification = js_source_load_notification(2, 3, &failures);
+        assert_eq!(notification.level, NotificationLevel::Warn);
+        assert!(
+            notification.message.contains("2/3"),
+            "{}",
+            notification.message
+        );
+        assert!(
+            notification.message.contains("huibq"),
+            "{}",
+            notification.message
+        );
+        assert!(
+            notification.message.contains("HTTP 500"),
+            "{}",
+            notification.message
+        );
+    }
+
+    #[test]
+    fn total_failure_is_an_error_and_success_is_a_success() {
+        let failures = vec![js_failure("a", "https://example.com/a.js", "HTTP 404")];
+        let all_failed = js_source_load_notification(0, 1, &failures);
+        assert_eq!(all_failed.level, NotificationLevel::Error);
+        assert!(
+            all_failed.message.contains("HTTP 404"),
+            "{}",
+            all_failed.message
+        );
+
+        let ready = js_source_load_notification(3, 3, &[]);
+        assert_eq!(ready.level, NotificationLevel::Success);
+    }
+
+    /// 每个音源都要有独立的失败记录，且顺序与配置一致（脱网、确定性）。
+    #[tokio::test]
+    async fn every_failing_js_source_gets_its_own_record_in_config_order() {
+        let urls = vec![
+            "/nonexistent/voicefox-missing-a.js".to_string(),
+            "/nonexistent/voicefox-missing-b.js".to_string(),
+        ];
+        let manager = lx_source::manager::SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let generation = manager.begin_js_source_request(true);
+        let (loaded, failures) = load_js_sources(urls.clone(), "kw", &manager, generation)
+            .await
+            .expect("代次未变化，应当返回结果");
+
+        assert!(loaded.is_empty());
+        assert_eq!(failures.len(), 2, "每个音源都要有自己的记录：{failures:?}");
+        assert_eq!(failures[0].origin, urls[0], "失败记录必须保持配置顺序");
+        assert_eq!(failures[1].origin, urls[1]);
+        for failure in &failures {
+            assert!(!failure.name.is_empty(), "必须给出可读的音源名称");
+            assert!(!failure.reason.is_empty(), "必须保留真实失败原因");
+        }
+    }
+
+    /// 加载期间出现更新的请求时，本次结果作废，不能用旧结果覆盖新音源列表。
+    #[tokio::test]
+    async fn a_superseded_js_source_load_is_discarded() {
+        let manager = lx_source::manager::SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let stale = manager.begin_js_source_request(true);
+        // 模拟用户在加载途中又保存了一次配置
+        manager.begin_js_source_request(true);
+
+        let result = load_js_sources(
+            vec!["/nonexistent/voicefox-missing.js".to_string()],
+            "kw",
+            &manager,
+            stale,
+        )
+        .await;
+        assert!(result.is_none(), "过期请求必须作废");
+    }
+
+    /// 环境是否具备加载 JS 音源的条件：node 可用 + 两个缓存目录可写。
+    ///
+    /// 显式探测而不去匹配错误串：这样环境不满足时明确跳过，一旦真的跑起来，
+    /// 断言就是严格的（不会因为环境问题假绿）。
+    fn js_source_runtime_ready() -> bool {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("跳过：node 不可用");
+            return false;
+        }
+        // loader 写脚本缓存用 dirs::config_dir()/lx-tui/sources；
+        // engine 写 wrapper.js 用 dirs::cache_dir()/voicefox/js。
+        let script_cache = lx_source::js::loader::cached_source_path("voicefox-probe");
+        let engine_cache = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("voicefox")
+            .join("js");
+        for dir in [script_cache.parent(), Some(engine_cache.as_path())]
+            .into_iter()
+            .flatten()
+        {
+            if std::fs::create_dir_all(dir).is_err()
+                || std::fs::write(dir.join(".voicefox-write-probe"), b"probe").is_err()
+            {
+                eprintln!("跳过：缓存目录不可写（{}）", dir.display());
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 一个音源失败不影响其它音源：中间的有效音源照常加载，顺序保持。
+    #[tokio::test]
+    async fn one_failing_js_source_does_not_block_the_others() {
+        if !js_source_runtime_ready() {
+            return;
+        }
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../source/tests/fixtures/user_api_v3.js"
+        );
+
+        let urls = vec![
+            "/nonexistent/voicefox-missing-first.js".to_string(),
+            fixture.to_string(),
+            "/nonexistent/voicefox-missing-last.js".to_string(),
+        ];
+        let manager = lx_source::manager::SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let generation = manager.begin_js_source_request(true);
+        let (loaded, failures) = load_js_sources(urls.clone(), "kw", &manager, generation)
+            .await
+            .expect("代次未变化，应当返回结果");
+
+        assert_eq!(loaded.len(), 1, "中间的有效音源应当加载成功");
+        assert_eq!(loaded[0].0, fixture, "成功列表必须保持配置顺序");
+        assert_eq!(failures.len(), 2, "两侧的无效音源各有一条失败记录");
+        assert_eq!(failures[0].origin, urls[0]);
+        assert_eq!(failures[1].origin, urls[2]);
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|failure| failure.reason.is_empty())
+                .count(),
+            0,
+            "失败记录必须带原因"
+        );
+    }
+
+    // ── 解析策略（auto / prefer / only）──
+
+    fn fallback_candidate(source: SourceId) -> SongInfo {
+        SongInfo::new("1".into(), source, "晴天".into(), "周杰伦".into())
+    }
+
+    /// `auto` 必须与历史行为完全一致：候选顺序一根手指都不动。
+    #[test]
+    fn auto_policy_leaves_the_candidate_order_untouched() {
+        let mut candidates = vec![
+            fallback_candidate(SourceId::Kw),
+            fallback_candidate(SourceId::Wy),
+            fallback_candidate(SourceId::Kg),
+        ];
+        let before: Vec<SourceId> = candidates.iter().map(|song| song.source).collect();
+        order_fallback_candidates(&mut candidates, SourcePolicy::Auto, Some(SourceId::Wy));
+        let after: Vec<SourceId> = candidates.iter().map(|song| song.source).collect();
+        assert_eq!(before, after, "auto 不允许改变候选顺序");
+    }
+
+    /// `prefer X`：X 的候选排到最前，其余保持相对顺序（稳定排序）。
+    #[test]
+    fn prefer_policy_moves_the_platform_to_the_front_stably() {
+        let mut candidates = vec![
+            fallback_candidate(SourceId::Kw),
+            fallback_candidate(SourceId::Wy),
+            fallback_candidate(SourceId::Kg),
+            fallback_candidate(SourceId::Wy),
+        ];
+        order_fallback_candidates(&mut candidates, SourcePolicy::Prefer, Some(SourceId::Wy));
+        let order: Vec<SourceId> = candidates.iter().map(|song| song.source).collect();
+        assert_eq!(
+            order,
+            vec![SourceId::Wy, SourceId::Wy, SourceId::Kw, SourceId::Kg],
+            "指定平台排最前，其余保持原相对顺序"
+        );
+    }
+
+    #[test]
+    fn prefer_without_a_platform_is_a_no_op() {
+        let mut candidates = vec![
+            fallback_candidate(SourceId::Kw),
+            fallback_candidate(SourceId::Wy),
+        ];
+        order_fallback_candidates(&mut candidates, SourcePolicy::Prefer, None);
+        let order: Vec<SourceId> = candidates.iter().map(|song| song.source).collect();
+        assert_eq!(order, vec![SourceId::Kw, SourceId::Wy]);
+    }
+
+    /// `only X`：只对"不是来自 X"的歌收窄来源集合。
+    #[test]
+    fn only_policy_applies_to_songs_from_other_platforms() {
+        let song = fallback_candidate(SourceId::Kw);
+        assert_eq!(
+            only_platform(&song, SourcePolicy::Only, Some(SourceId::Wy)),
+            Some(SourceId::Wy)
+        );
+        // 歌曲本来就来自 X：直接走原路径，无需收窄
+        let same = fallback_candidate(SourceId::Wy);
+        assert_eq!(
+            only_platform(&same, SourcePolicy::Only, Some(SourceId::Wy)),
+            None
+        );
+        // 其它策略不收窄
+        assert_eq!(
+            only_platform(&song, SourcePolicy::Auto, Some(SourceId::Wy)),
+            None
+        );
+        assert_eq!(
+            only_platform(&song, SourcePolicy::Prefer, Some(SourceId::Wy)),
+            None
+        );
+        // 没指定平台时不收窄
+        assert_eq!(only_platform(&song, SourcePolicy::Only, None), None);
+    }
+
+    // ── JS 音源状态摘要 ──
+
+    #[test]
+    fn js_source_status_summary_reports_partial_failures() {
+        let healthy = JsSourceStatus {
+            total: 3,
+            loaded: 3,
+            failures: Vec::new(),
+        };
+        assert_eq!(healthy.summary(), "● 自定义音源 3/3");
+        assert!(healthy.is_healthy());
+
+        let partial = JsSourceStatus {
+            total: 3,
+            loaded: 2,
+            failures: vec![JsSourceFailure {
+                name: "huibq".to_string(),
+                origin: "https://example.com/huibq/latest.js".to_string(),
+                reason: "HTTP 500".to_string(),
+            }],
+        };
+        assert_eq!(partial.summary(), "▲ 自定义音源 2/3");
+        assert!(!partial.is_healthy(), "缺一个就不该显示为健康");
+
+        let none = JsSourceStatus::default();
+        assert_eq!(none.summary(), "自定义音源 未配置");
+        assert!(none.is_healthy(), "没配置不该报红");
+    }
+
+    // ── 底栏高度拖拽 ──
+
+    /// 底栏鼠标分派：拖拽优先于段点击，且把手不会被当成段。
+    #[test]
+    fn status_bar_resize_drag_never_routes_to_a_segment_click() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use lx_core::model::config::StatusBarItem;
+        use ratatui::layout::Rect;
+
+        use super::{StatusBarMouseRoute, route_status_bar_mouse};
+        use crate::pages::components::status_bar::{
+            StatusBarHit, StatusBarSlot, resize_handle, rows_for_pointer,
+        };
+
+        let mouse = |kind: MouseEventKind, column: u16, row: u16| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 屏幕 24 行：底栏占 2 行（y=22..24），把手在顶行最右端。
+        let status = Rect::new(0, 22, 80, 2);
+        let handle = resize_handle(status);
+        let hits = vec![
+            StatusBarHit {
+                slot: StatusBarSlot::Item(StatusBarItem::Volume),
+                rect: Rect::new(0, 22, 10, 1),
+            },
+            StatusBarHit {
+                slot: StatusBarSlot::Item(StatusBarItem::Queue),
+                rect: Rect::new(0, 23, 10, 1),
+            },
+        ];
+
+        // 未拖拽时：按在把手上 = 开始拖高度（不是点段）
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 79, 22),
+                24,
+                handle,
+                &hits,
+                false
+            ),
+            StatusBarMouseRoute::BeginResize
+        );
+        // 未拖拽时：把手以外的左键 / 右键仍然是段点击
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 3, 22),
+                24,
+                handle,
+                &hits,
+                false
+            ),
+            StatusBarMouseRoute::Click {
+                slot: StatusBarSlot::Item(StatusBarItem::Volume),
+                right: false,
+            }
+        );
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Right), 3, 23),
+                24,
+                handle,
+                &hits,
+                false
+            ),
+            StatusBarMouseRoute::Click {
+                slot: StatusBarSlot::Item(StatusBarItem::Queue),
+                right: true,
+            }
+        );
+        // 纯悬停（没有按键）不会开始拖拽，也不会当成点击
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Moved, 3, 22),
+                24,
+                handle,
+                &hits,
+                false
+            ),
+            StatusBarMouseRoute::None
+        );
+        // 段间分隔符上什么也不做
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 40, 22),
+                24,
+                handle,
+                &hits,
+                false
+            ),
+            StatusBarMouseRoute::None
+        );
+
+        // 拖拽中：即使指针正压在「音量」段上，也只能更新行数 —— 绝不能变成点击
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            assert_eq!(
+                route_status_bar_mouse(mouse(kind, 3, 21), 24, handle, &hits, true),
+                StatusBarMouseRoute::Resize(3),
+                "拖拽期间的段上事件必须只改高度"
+            );
+        }
+        // 拖拽中：往上拖到 y=18 → 6 行（上限）
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), 3, 18),
+                24,
+                handle,
+                &hits,
+                true
+            ),
+            StatusBarMouseRoute::Resize(rows_for_pointer(24, 18))
+        );
+        // 松开左键 → 提交（写盘在事件循环里做）
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), 3, 20),
+                24,
+                handle,
+                &hits,
+                true
+            ),
+            StatusBarMouseRoute::CommitResize(4)
+        );
+        // 拖拽中的右键不会被当成菜单
+        assert_eq!(
+            route_status_bar_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Right), 3, 22),
+                24,
+                handle,
+                &hits,
+                true
+            ),
+            StatusBarMouseRoute::None
+        );
     }
 }

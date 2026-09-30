@@ -2,8 +2,11 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lx_core::keybinding::{Action, KeybindingResolver};
-use lx_core::model::config::TableColumnConfig;
+use lx_core::model::config::{SourcePolicy, TableColumnConfig};
 use lx_core::model::song::SongInfo;
+use lx_core::model::source::{Quality, SourceId};
+
+use super::status_bar::StatusBarSlot;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -62,6 +65,17 @@ pub enum ColumnMenuAction {
 pub enum MenuAction {
     Song(SongMenuAction),
     Column(ColumnMenuAction),
+    StatusBar(StatusBarMenuAction),
+    /// 设置页的枚举取值：`row` 是设置行标识、`value` 是取值标识。
+    ///
+    /// 设置页自己构造、自己解释这个动作（它持有取值菜单并在模态输入里分派），
+    /// 因此主循环不需要认识 `row` / `value` 的含义；两个字段都用字符串，
+    /// 是为了让"任意设置行 + 任意取值"都能通过同一个通用菜单表达，
+    /// 不必为每个枚举再扩一个 `StatusBarMenuAction` 变体。
+    SettingChoice {
+        row: String,
+        value: String,
+    },
     /// 打开子菜单（条目在构造时确定）。
     Submenu {
         title: String,
@@ -81,6 +95,53 @@ impl From<ColumnMenuAction> for MenuAction {
     fn from(action: ColumnMenuAction) -> Self {
         Self::Column(action)
     }
+}
+
+impl From<StatusBarMenuAction> for MenuAction {
+    fn from(action: StatusBarMenuAction) -> Self {
+        Self::StatusBar(action)
+    }
+}
+
+/// 底部状态栏（快速控制栏）菜单的动作。
+///
+/// 一律只描述"用户选了什么"，具体执行留在 app 侧 —— 与列菜单同样的分工。
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatusBarMenuAction {
+    /// 播放 / 暂停。
+    TogglePlayPause,
+    /// 上一首 / 下一首（队列手动导航）。
+    PreviousTrack,
+    NextTrack,
+    /// 精确设置播放模式；取值是配置字符串（`list-loop` / `single-loop` / …）。
+    SetPlayMode(String),
+    /// 精确设置音质偏好。
+    SetQuality(Quality),
+    /// 用当前音质重新解析正在播放的歌（音质偏好只影响以后，这一项才立即生效）。
+    ReparseCurrentSong,
+    /// 音量增减（百分点）。
+    VolumeDelta(i32),
+    /// 直接把音量设为某个值。
+    SetVolume(u32),
+    /// 静音 / 恢复。
+    ToggleMute,
+    /// 跳到队列页并定位当前播放的那首。
+    JumpToQueue,
+    /// 清空队列。
+    ClearQueue,
+    /// 设置解析策略。
+    SetSourcePolicy {
+        policy: SourcePolicy,
+        platform: Option<SourceId>,
+    },
+    /// 重新加载配置里的全部 JS 音源。
+    ReloadJsSources,
+    /// 打开设置页的音源面板。
+    OpenSettingsSources,
+    /// 打开下载面板。
+    OpenDownloadsPanel,
+    /// 打开被「更多」收纳的某个段自己的菜单。
+    OpenSlot(StatusBarSlot),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +266,19 @@ impl MenuItem {
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
+    }
+}
+
+#[cfg(test)]
+impl MenuItem {
+    /// 测试辅助：菜单项显示文本。
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// 测试辅助：菜单项动作。
+    pub(crate) fn action(&self) -> &MenuAction {
+        &self.action
     }
 }
 
@@ -384,6 +458,23 @@ impl SongContextMenu {
             scroll_offset: 0,
             stack: vec![MenuLevel::new(title, items)],
             page_key: Some(page_key.into()),
+        }
+    }
+
+    /// 打开一个"不属于任何页面"的菜单（底部状态栏用）。
+    pub fn from_status_items(
+        origin: Position,
+        title: impl Into<String>,
+        items: Vec<MenuItem>,
+    ) -> Self {
+        Self {
+            origin,
+            songs: Vec::new(),
+            index: 0,
+            selected: 0,
+            scroll_offset: 0,
+            stack: vec![MenuLevel::new(title, items)],
+            page_key: None,
         }
     }
 

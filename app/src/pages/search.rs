@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::pages::components::context_menu::MenuHitSource;
+use crate::pages::components::hit_test::{PANEL_BORDERS, panel_inner};
 use crate::pages::components::song_table::{self, ColumnResizeState};
 use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 use lx_core::model::config::TableColumnConfig;
@@ -728,7 +729,7 @@ impl SearchPage {
             .unwrap_or_else(|| "全部音源".to_string());
         let mode = if self.input_mode { "INSERT" } else { "NORMAL" };
         let input_block = Block::default()
-            .borders(Borders::ALL)
+            .borders(PANEL_BORDERS)
             .border_style(Style::new().fg(if self.input_mode {
                 crate::theme::green(ctx)
             } else {
@@ -781,7 +782,7 @@ impl SearchPage {
                 filters
             )
         };
-        let result_block = Block::default().borders(Borders::ALL).title(result_title);
+        let result_block = Block::default().borders(PANEL_BORDERS).title(result_title);
         let result_block = result_block.border_style(Style::new().fg(crate::theme::border(ctx)));
 
         let inner_area = result_block.inner(chunks[2]);
@@ -1043,7 +1044,7 @@ impl SearchPage {
                 Constraint::Min(0),
             ])
             .split(area);
-        let inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
+        let inner = panel_inner(chunks[2]);
         (inner.height > 0).then(|| Rect::new(inner.x, inner.y, inner.width, 1))
     }
 
@@ -1102,7 +1103,7 @@ impl SearchPage {
                 Constraint::Min(0),
             ])
             .split(area);
-        let result_block = Block::default().borders(Borders::ALL);
+        let result_block = Block::default().borders(PANEL_BORDERS);
         let inner = result_block.inner(chunks[2]);
         let header_row = inner.y;
         let table_width = inner.width;
@@ -1196,7 +1197,7 @@ impl SearchPage {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
+                let inner = panel_inner(chunks[2]);
                 let list_y = inner.y.saturating_add(1);
                 if event.row >= list_y && event.row < inner.bottom() {
                     let index = self.scroll_offset + event.row.saturating_sub(list_y) as usize;
@@ -1233,7 +1234,7 @@ impl SearchPage {
                 Constraint::Min(0),
             ])
             .split(area);
-        let inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
+        let inner = panel_inner(chunks[2]);
         let index = source.resolve_index(
             |event| {
                 let list_y = inner.y.saturating_add(1);

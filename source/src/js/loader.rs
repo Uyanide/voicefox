@@ -324,7 +324,13 @@ async fn load_source_with_policy(
     Err(format!("JS 音源加载失败（已重试 3 次）: {last_error}"))
 }
 
-fn source_display_name(path: &std::path::Path, origin: &str) -> String {
+/// JS 音源的展示名称：优先读脚本里的 `@name`，否则从来源 URL / 本地路径推导。
+///
+/// 加载成功时用作 `JsSource` 的名字；加载失败时调用方也用它给用户一个可读的
+/// 名称（而不是一长串 ghproxy URL）。两处必须是同一份逻辑，否则名称对不上。
+///
+/// `path` 不存在时（例如首次下载就失败）会退回按 `origin` 推导，不会 panic。
+pub fn source_display_name(path: &std::path::Path, origin: &str) -> String {
     if let Ok(code) = std::fs::read_to_string(path)
         && let Some(name) = metadata_value(&code, "name")
     {

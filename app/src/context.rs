@@ -55,6 +55,12 @@ pub struct AppContext {
     pub pending_ab_loop_start: std::sync::Mutex<Option<Duration>>,
     pub play_attempted_sources: Arc<std::sync::Mutex<HashSet<lx_core::model::source::SourceId>>>,
     pub play_js_source_index: Arc<std::sync::Mutex<Option<usize>>>,
+    /// JS 音源最近一次加载的结果（成功几个、哪些失败、为什么）。
+    pub js_source_status: Arc<std::sync::Mutex<JsSourceStatus>>,
+    /// 底栏排队等待主循环执行的命令。
+    pub status_bar_commands: Arc<std::sync::Mutex<Vec<StatusBarCommand>>>,
+    /// 静音前的音量，用于"静音 / 恢复"。
+    pub mute_restore_volume: Arc<std::sync::atomic::AtomicU32>,
     pub local_scan_request_id: Arc<AtomicU64>,
     /// 配置延迟落盘：音量/播放控制等高频修改先标记，主循环稍后统一写盘
     config_dirty_since: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
@@ -74,6 +80,65 @@ pub struct AppContext {
 
     // --- 存储 ---
     pub storage: Arc<Storage>,
+}
+
+/// 单个 JS 音源的加载失败记录。
+///
+/// 三样都留着：`name` 让用户一眼认出是哪个音源（复用 loader 的命名逻辑，
+/// 与加载成功时 `JsSource` 的名字同源），`origin` 是配置里的原始 URL / 本地路径
+/// （用户可以直接照着改配置），`reason` 是真实失败原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsSourceFailure {
+    pub name: String,
+    pub origin: String,
+    pub reason: String,
+}
+
+/// 底栏请求的一次性命令。
+///
+/// 这类操作需要主循环的本地状态（`active_tab`、下载面板实例），没法走
+/// `execute_action`，因此排队后由主循环取走执行 —— 与项目既有的
+/// "共享状态放在 ctx、由主循环消费"写法保持一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusBarCommand {
+    /// 开关下载面板（等价 Ctrl+O）。
+    ToggleDownloadsPanel,
+    /// 跳到队列页并定位到当前播放的那首。
+    JumpToQueue,
+    /// 清空队列（复用队列页那套"显式清空"的完整收尾）。
+    ClearQueue,
+    /// 打开某个底栏段的菜单（「更多」里点回具体段时用）。
+    OpenStatusBarMenu(crate::pages::components::status_bar::StatusBarSlot),
+}
+
+/// JS 音源的整体加载状态，供状态栏与音源菜单展示。
+///
+/// 之前这类信息只写 tracing，用户完全看不到"3 个里坏了 1 个、坏的是哪个"，
+/// 而实测加载失败是偶发的（同脚本同环境一次 3 个、一次 2 个）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsSourceStatus {
+    /// 配置里配了几个（本次加载的总数）。
+    pub total: usize,
+    /// 实际加载成功几个。
+    pub loaded: usize,
+    /// 每个失败音源的名称 / 来源 / 原因。
+    pub failures: Vec<JsSourceFailure>,
+}
+
+impl JsSourceStatus {
+    /// 状态栏上的摘要，例如 `● 自定义音源 3/3`。
+    pub fn summary(&self) -> String {
+        if self.total == 0 {
+            return "自定义音源 未配置".to_string();
+        }
+        let mark = if self.is_healthy() { "●" } else { "▲" };
+        format!("{mark} 自定义音源 {}/{}", self.loaded, self.total)
+    }
+
+    /// 全部加载成功才算健康（没配置也算健康，状态栏不应报红）。
+    pub fn is_healthy(&self) -> bool {
+        self.loaded == self.total
+    }
 }
 
 impl AppContext {
@@ -147,6 +212,9 @@ impl AppContext {
             pending_ab_loop_start: std::sync::Mutex::new(None),
             play_attempted_sources: Arc::new(std::sync::Mutex::new(HashSet::new())),
             play_js_source_index: Arc::new(std::sync::Mutex::new(None)),
+            js_source_status: Arc::new(std::sync::Mutex::new(JsSourceStatus::default())),
+            status_bar_commands: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mute_restore_volume: Arc::new(std::sync::atomic::AtomicU32::new(80)),
             local_scan_request_id: Arc::new(AtomicU64::new(0)),
             config_dirty_since: Arc::new(std::sync::Mutex::new(None)),
             details_page: Arc::new(std::sync::Mutex::new(None)),
@@ -205,6 +273,32 @@ impl AppContext {
             .unwrap_or_else(|e| e.into_inner())
             .pop_back()
             .is_some()
+    }
+
+    /// 排队一个底栏命令（菜单动作里没有循环本地状态时用）。
+    pub fn queue_status_bar_command(&self, command: StatusBarCommand) {
+        self.status_bar_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(command);
+    }
+
+    /// 取走待执行的底栏命令。
+    pub fn take_status_bar_commands(&self) -> Vec<StatusBarCommand> {
+        std::mem::take(
+            &mut *self
+                .status_bar_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    /// 读取 JS 音源加载状态（状态栏每帧都会问，克隆一份即可）。
+    pub fn js_source_status(&self) -> JsSourceStatus {
+        self.js_source_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn notification_timeout(&self) -> Duration {
@@ -472,49 +566,76 @@ impl AppContext {
     }
 }
 
+/// 均衡器预设的**唯一来源**：`(取值标识, 显示标签, 频段)`。
+///
+/// 设置页的「均衡器」菜单、[`equalizer_label`] 与 `next_equalizer_preset`
+/// 全部从这张表读：取值、标签、频段不可能再出现"同源重复声明"。
+/// 顺序与 `next_equalizer_preset` 的循环一致。
+pub const EQUALIZER_PRESETS: [(&str, &str, [EqualizerBand; 6]); 2] = [
+    (
+        "bass",
+        "低音增强",
+        [
+            EqualizerBand::new(60.0, 5.0),
+            EqualizerBand::new(150.0, 3.0),
+            EqualizerBand::new(400.0, 0.0),
+            EqualizerBand::new(1_000.0, -1.0),
+            EqualizerBand::new(4_000.0, 0.0),
+            EqualizerBand::new(12_000.0, 1.0),
+        ],
+    ),
+    (
+        "vocal",
+        "人声",
+        [
+            EqualizerBand::new(60.0, -2.0),
+            EqualizerBand::new(150.0, -1.0),
+            EqualizerBand::new(400.0, 1.0),
+            EqualizerBand::new(1_000.0, 3.0),
+            EqualizerBand::new(4_000.0, 2.0),
+            EqualizerBand::new(12_000.0, -1.0),
+        ],
+    ),
+];
+
+/// 「均衡器」菜单的取值顺序：关闭 + 各预设（`off` 不是预设，没有频段）。
+///
+/// 直接从 [`EQUALIZER_PRESETS`] 派生，增加一个预设只需改那一张表。
+pub const EQUALIZER_CHOICE_VALUES: [&str; 3] =
+    ["off", EQUALIZER_PRESETS[0].0, EQUALIZER_PRESETS[1].0];
+
+/// 均衡器预设的取值标识 → 频段（`off` = 关闭，返回空频段）。
+///
+/// 生产（设置页菜单）与测试共用这一个入口，取值与频段永远同源。
+pub fn equalizer_preset_bands(value: &str) -> Option<Vec<EqualizerBand>> {
+    if value == "off" {
+        return Some(Vec::new());
+    }
+    EQUALIZER_PRESETS
+        .iter()
+        .find(|(id, _, _)| *id == value)
+        .map(|(_, _, bands)| bands.to_vec())
+}
+
 pub(crate) fn equalizer_label(bands: &[EqualizerBand]) -> &'static str {
     if bands.is_empty() {
-        "关闭"
-    } else if bands == equalizer_bass().as_slice() {
-        "低音增强"
-    } else if bands == equalizer_vocal().as_slice() {
-        "人声"
-    } else {
-        "自定义"
+        return "关闭";
     }
-}
-
-fn equalizer_bass() -> Vec<EqualizerBand> {
-    vec![
-        EqualizerBand::new(60.0, 5.0),
-        EqualizerBand::new(150.0, 3.0),
-        EqualizerBand::new(400.0, 0.0),
-        EqualizerBand::new(1_000.0, -1.0),
-        EqualizerBand::new(4_000.0, 0.0),
-        EqualizerBand::new(12_000.0, 1.0),
-    ]
-}
-
-fn equalizer_vocal() -> Vec<EqualizerBand> {
-    vec![
-        EqualizerBand::new(60.0, -2.0),
-        EqualizerBand::new(150.0, -1.0),
-        EqualizerBand::new(400.0, 1.0),
-        EqualizerBand::new(1_000.0, 3.0),
-        EqualizerBand::new(4_000.0, 2.0),
-        EqualizerBand::new(12_000.0, -1.0),
-    ]
+    EQUALIZER_PRESETS
+        .iter()
+        .find(|(_, _, preset)| bands == preset.as_slice())
+        .map(|(_, label, _)| *label)
+        .unwrap_or("自定义")
 }
 
 fn next_equalizer_preset(bands: &[EqualizerBand]) -> Vec<EqualizerBand> {
-    let bass = equalizer_bass();
     if bands.is_empty() {
-        bass
-    } else if bands == bass.as_slice() {
-        equalizer_vocal()
-    } else {
-        Vec::new()
+        return EQUALIZER_PRESETS[0].2.to_vec();
     }
+    if bands == EQUALIZER_PRESETS[0].2.as_slice() {
+        return EQUALIZER_PRESETS[1].2.to_vec();
+    }
+    Vec::new()
 }
 
 fn next_playback_speed(speed: f64) -> f64 {

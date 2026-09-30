@@ -1,15 +1,21 @@
 //! 可拖拽分割条（Splitter）的通用件：命中判定 + 拖拽状态机 + 比例夹取。
 //!
-//! 以前 Queue / Leaderboard / Playlists 各写了一套同构实现，并因此分叉出两类问题：
+//! 以前 Queue / Leaderboard / Playlists 各写了一套同构实现，并因此分叉出三类问题：
 //!
 //! 1. **方向靠几何猜**：Queue 用 `layout.wide` 明确决定"这次只看竖线还是只看横线"，
 //!    另外两个页面把横/竖两个 `if` 串行无条件求值，于是窄屏下"每行最右一列"、
 //!    宽屏下"面板最后一行"都会被当成分割条抓走，正常点击被吞、拖拽方向还是错的。
 //!    这里用 [`DividerHit`] 把"方向"变成入参，逼调用方先决定方向再命中。
 //! 2. **预览/提交/取消各写一遍**：这里用 [`Splitter`] 统一。
+//! 3. **分割线与面板抢格子**：分割线压在"上/左面板的最后一行/列"上，那一格同时
+//!    还想当面板内容（或边框），于是面板的最后一行内容既看不见也点不到。
+//!    现在分割线占**它自己**的 1 行/1 列（[`GUTTER`]）：分栏一律走
+//!    [`split_with_gutter`]，分割线位置一律走 [`divider_line`]。
 //!
 //! 分割条的绘制由各页面负责（颜色/字符与主题相关），但**绘制坐标必须是**
 //! 这里命中用的同一个 `divider` 值，否则又会出现"看得到却抓不住"。
+
+use ratatui::layout::Rect;
 
 /// 分割条方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +148,75 @@ pub fn ratio_within(start: u16, extent: u16, pointer: u16) -> f32 {
     (pointer.saturating_sub(start) as f32) / extent as f32
 }
 
+/// 分割线**自己**占的 1 格 gutter：夹在两个面板之间，既不属于上/左面板的
+/// 内容区、也不属于它的边框，更不覆盖下/右面板的边框。
+pub const GUTTER: u16 = 1;
+
+/// 把 `desired` 夹进 `[min, max]`；`max < min`（可用空间不够）时取 `min`。
+///
+/// 与 `u16::clamp` 的区别只有一个：**不 panic**。窗口被压得很小时
+/// （例如榜单条数多、`min_boards_rows` 顶到 11 而内容区只有 7 行）原先的
+/// `clamp(min, max)` 会因为 `min > max` 直接 panic；这里退化成"给最小尺寸"，
+/// 剩下的由 [`split_with_gutter`] 保证：宁可面板变小，也绝不让分割线压内容。
+pub fn clamp_extent(desired: u16, min: u16, max: u16) -> u16 {
+    desired.min(max).max(min)
+}
+
+/// 沿 `axis` 把 `area` 切成「第一块 · 1 格 gutter · 第二块」。
+///
+/// `axis` 是**分割线**的方向：[`SplitAxis::Horizontal`] 是上下分栏
+/// （gutter 占 1 **行**），[`SplitAxis::Vertical`] 是左右分栏（gutter 占 1 **列**）。
+///
+/// `first_extent` 是第一块在分栏方向上的长度，会被夹到 `可用长度 - GUTTER`
+/// 以内，因此 **gutter 一定存在**：即使 `area` 只剩 1 格，也宁可把第一块压成
+/// 0 尺寸（那一块本来也画不出内容），而不是回头去借用它的最后一格。
+///
+/// 第二块吃掉剩下的全部长度。空间不够时两块都可能退化成 0 尺寸的空矩形
+/// （此时调用方按"两块都不 > 0"跳过绘制与命中，见各页 `dividers`/`divider`）。
+pub fn split_with_gutter(area: Rect, axis: SplitAxis, first_extent: u16) -> (Rect, Rect) {
+    match axis {
+        SplitAxis::Horizontal => {
+            let first_height = first_extent.min(area.height.saturating_sub(GUTTER));
+            let first = Rect::new(area.x, area.y, area.width, first_height);
+            let second = Rect::new(
+                area.x,
+                area.y.saturating_add(first_height).saturating_add(GUTTER),
+                area.width,
+                area.height
+                    .saturating_sub(first_height)
+                    .saturating_sub(GUTTER),
+            );
+            (first, second)
+        }
+        SplitAxis::Vertical => {
+            let first_width = first_extent.min(area.width.saturating_sub(GUTTER));
+            let first = Rect::new(area.x, area.y, first_width, area.height);
+            let second = Rect::new(
+                area.x.saturating_add(first_width).saturating_add(GUTTER),
+                area.y,
+                area.width
+                    .saturating_sub(first_width)
+                    .saturating_sub(GUTTER),
+                area.height,
+            );
+            (first, second)
+        }
+    }
+}
+
+/// 第一块与第二块之间那条分割线所在的行（[`SplitAxis::Horizontal`]）
+/// 或列（[`SplitAxis::Vertical`]）。
+///
+/// gutter 紧跟在第一块之后，所以它就是第一块的 `bottom()` / `right()`。
+/// **渲染与命中都必须经过这个函数**，不要再各自写 `bottom() - 1` ——
+/// 那正是"分割线压住面板最后一格"的来源。
+pub fn divider_line(first: Rect, axis: SplitAxis) -> u16 {
+    match axis {
+        SplitAxis::Horizontal => first.bottom(),
+        SplitAxis::Vertical => first.right(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +317,65 @@ mod tests {
         assert_eq!(ratio_within(10, 100, 10), 0.0);
         assert_eq!(ratio_within(10, 100, 60), 0.5);
         assert_eq!(ratio_within(10, 0, 60), 0.0);
+    }
+
+    /// 分隔线占**自己**的那一格：两块面板在分栏方向上被 gutter 隔开，
+    /// 面板的最后一格（内容或边框）都不再落在这条线上。
+    #[test]
+    fn divider_owns_a_gutter_cell_between_the_two_panes() {
+        use crate::pages::components::hit_test::panel_inner;
+
+        let area = Rect::new(4, 6, 40, 20);
+
+        let (top, bottom) = split_with_gutter(area, SplitAxis::Horizontal, 7);
+        assert_eq!(top, Rect::new(4, 6, 40, 7));
+        // 横线占 top.bottom() 那一行，下方面板从它的下一行开始
+        assert_eq!(divider_line(top, SplitAxis::Horizontal), 13);
+        assert_eq!(bottom.y, 14);
+        assert_eq!(bottom.height, 20 - 7 - GUTTER);
+        // 面板内容区（去掉四周全框）与 gutter 严格不重叠
+        assert!(panel_inner(top).bottom() <= divider_line(top, SplitAxis::Horizontal));
+        assert!(panel_inner(bottom).y > divider_line(top, SplitAxis::Horizontal));
+        // 下方面板的边框也不与 gutter 重叠（gutter 是独立的一行）
+        assert!(bottom.y > divider_line(top, SplitAxis::Horizontal));
+
+        let (left, right) = split_with_gutter(area, SplitAxis::Vertical, 12);
+        assert_eq!(left, Rect::new(4, 6, 12, 20));
+        assert_eq!(divider_line(left, SplitAxis::Vertical), 16);
+        assert_eq!(right.x, 17);
+        assert_eq!(right.width, 40 - 12 - GUTTER);
+        assert_eq!(left.y, right.y, "左右分栏时两块都占满整个高度");
+        assert!(panel_inner(left).right() <= divider_line(left, SplitAxis::Vertical));
+        assert!(panel_inner(right).x > divider_line(left, SplitAxis::Vertical));
+        assert!(right.x > divider_line(left, SplitAxis::Vertical));
+
+        // 两块长度之和 + 1 格 gutter 恰好用满分栏方向
+        assert_eq!(top.height + bottom.height + GUTTER, area.height);
+        assert_eq!(left.width + right.width + GUTTER, area.width);
+    }
+
+    /// 空间不足时 `split_with_gutter` 也不能把 gutter 还给面板：
+    /// 宁可第一块退化成 0 尺寸，也不与第二块紧贴。
+    #[test]
+    fn gutter_survives_a_squeezed_area() {
+        let (first, second) = split_with_gutter(Rect::new(0, 0, 10, 1), SplitAxis::Horizontal, 9);
+        assert_eq!(first.height, 0);
+        assert_eq!(second.height, 0);
+        assert_eq!(divider_line(first, SplitAxis::Horizontal), 0);
+
+        // 一点空间都没有时不 panic，也不产生负数尺寸
+        let (first, second) = split_with_gutter(Rect::new(0, 0, 0, 0), SplitAxis::Vertical, 5);
+        assert_eq!(first.width, 0);
+        assert_eq!(second.width, 0);
+    }
+
+    #[test]
+    fn clamp_extent_does_not_panic_when_the_min_does_not_fit() {
+        assert_eq!(clamp_extent(5, 2, 8), 5);
+        assert_eq!(clamp_extent(1, 2, 8), 2);
+        assert_eq!(clamp_extent(9, 2, 8), 8);
+        // min > max（可用空间不足）：取 min，而不是 `clamp` 那样 panic
+        assert_eq!(clamp_extent(9, 11, 7), 11);
+        assert_eq!(clamp_extent(0, 11, 7), 11);
     }
 }

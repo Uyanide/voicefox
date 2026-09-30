@@ -2136,7 +2136,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lx-core"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "lx-lyric"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2163,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "lx-player"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "libmpv2",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "lx-source"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "aes",
  "anyhow",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "lx-test"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "lx-core",
  "lx-player",
@@ -3246,6 +3246,16 @@ checksum = "faf03e0380b7744054d6cb74224fe3adf062a029754933f575ca1e3b4c2ce977"
 dependencies = [
  "ratatui-core",
  "termwiz",
+]
+
+[[package]]
+name = "ratatui-themes"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5f0e39dd81d72b4dc154604beea0153be73096b32333e08152f3a44c57816f8"
+dependencies = [
+ "ratatui",
+ "serde",
 ]
 
 [[package]]
@@ -4543,7 +4553,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voicefox-app"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "base64",
@@ -4565,6 +4575,7 @@ dependencies = [
  "qrcode",
  "ratatui",
  "ratatui-image",
+ "ratatui-themes",
  "reqwest",
  "serde",
  "serde_json",
@@ -4582,7 +4593,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-application"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4597,7 +4608,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-ffi"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "async-trait",
  "flutter_rust_bridge",
@@ -4609,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "voicefox-runtime"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "async-trait",

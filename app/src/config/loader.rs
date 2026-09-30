@@ -435,23 +435,29 @@ mod tests {
             ..Config::default()
         };
         let settings = config.keybindings.pages.get_mut("settings").unwrap();
+        // 旧版逐行动作的裸数字绑定：动作本身已经删除，迁移只负责把它们清掉。
         settings.insert(Action::SettingsCyclePlaybackSpeed, "1".to_string());
         settings.insert(Action::SettingsCycleBalance, "6".to_string());
+        // 仍然存在的导航键被裸数字占用：必须迁回默认（数字键留给侧边栏）。
+        settings.insert(Action::ListSelectUp, "8".to_string());
 
         assert!(migrate_legacy_config(&mut config));
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         let settings = config.keybindings.pages.get("settings").unwrap();
+        for action in [
+            Action::SettingsCyclePlaybackSpeed,
+            Action::SettingsCycleBalance,
+        ] {
+            assert_eq!(
+                settings.get(&action).map(String::as_str),
+                None,
+                "{action:?} 的行内快捷键已经删除，旧绑定必须被清理掉"
+            );
+        }
         assert_eq!(
-            settings
-                .get(&Action::SettingsCyclePlaybackSpeed)
-                .map(String::as_str),
-            Some("F1")
-        );
-        assert_eq!(
-            settings
-                .get(&Action::SettingsCycleBalance)
-                .map(String::as_str),
-            Some("F6")
+            settings.get(&Action::ListSelectUp).map(String::as_str),
+            Some("k"),
+            "仍在使用的导航键要从裸数字迁回默认"
         );
     }
 

@@ -8,7 +8,7 @@ use ratatui::layout::Alignment;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Paragraph, Widget};
 
 /// 歌词区最小可用高度（含边框）。
 ///
@@ -22,7 +22,7 @@ pub const MIN_HEIGHT: u16 = 7;
 /// 显示当前行前后各 N 行，使当前行尽量居中
 pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(crate::pages::components::hit_test::PANEL_BORDERS)
         .border_style(Style::new().fg(crate::theme::border(ctx)))
         .title(" 歌词 ");
     let inner = block.inner(area);

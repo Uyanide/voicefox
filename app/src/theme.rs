@@ -2,8 +2,115 @@
 
 use lx_core::model::config::ThemeConfig;
 use ratatui::style::Color;
+use ratatui_themes::{ThemeName, ThemePalette};
 
 use crate::context::AppContext;
+
+/// 默认皮肤：使用 `[theme]` 里手工调好的槽位（与历史版本观感一致）。
+pub const SKIN_VOICEFOX: &str = "voicefox";
+
+/// 可选的界面主题名：`voicefox` + 主题库的全部主题，顺序即循环顺序。
+pub fn skin_names() -> Vec<String> {
+    let mut names = vec![SKIN_VOICEFOX.to_string()];
+    names.extend(ThemeName::all().iter().map(|name| skin_key(*name)));
+    names
+}
+
+/// 主题在配置里的名字。
+///
+/// 直接用主题库的 serde 表现（kebab-case，如 `tokyo-night`），
+/// 而不是自己按显示名拼，避免两边命名规则漂移。
+fn skin_key(name: ThemeName) -> String {
+    serde_json::to_value(name)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// 主题名的可读标签（设置页显示用）。
+pub fn skin_label(name: &str) -> String {
+    match library_theme(name) {
+        Some(theme) => theme.display_name().to_string(),
+        None => "Voicefox".to_string(),
+    }
+}
+
+/// 循环到下一个主题名。
+pub fn next_skin_name(current: &str) -> String {
+    let names = skin_names();
+    let index = names.iter().position(|name| name == current).unwrap_or(0);
+    names[(index + 1) % names.len()].clone()
+}
+
+/// 主题名 → 主题库主题；未知名字返回 `None`（调用方回退到 voicefox 槽位）。
+fn library_theme(value: &str) -> Option<ThemeName> {
+    let wanted = value.trim().to_ascii_lowercase();
+    ThemeName::all()
+        .iter()
+        .copied()
+        .find(|name| skin_key(*name) == wanted)
+}
+
+/// 两个颜色按比例混合：`t = 0` 全取 `a`，`t = 1` 全取 `b`。
+///
+/// 非 RGB 颜色（终端默认色 / ANSI 名）无法参与混合，原样返回 `a`。
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let mix = |x: u8, y: u8| {
+                (f32::from(x) + (f32::from(y) - f32::from(x)) * t)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+        }
+        _ => a,
+    }
+}
+
+/// 把主题库的 10 个语义色展开成项目在用的 24 个槽位。
+///
+/// 项目现有 294 处调用点用的是 Catppuccin 的槽位名（surface/overlay/peach…）。
+/// 与其把它们全部改写成语义名（高风险大重构），不如在这里做一次映射：
+/// 层次色由 `bg → fg` 的插值生成，色相槽位折叠到主题库的
+/// `error/warning/success/info/accent/secondary` 上。
+///
+/// 未知槽位返回 `None`，由调用方回退到配置里的十六进制色。
+fn slot_color(palette: ThemePalette, slot: &str) -> Option<Color> {
+    // 层次色一律朝前景色方向插值：深色主题是"提亮"，浅色主题是"压暗"，
+    // 两边都能得到正确的分层方向。
+    let layer = |t: f32| blend(palette.bg, palette.fg, t);
+    Some(match slot {
+        "base" => palette.bg,
+        "mantle" => layer(0.04),
+        "crust" => layer(0.08),
+        "surface_0" => layer(0.10),
+        "surface_1" => layer(0.16),
+        "surface_2" => layer(0.24),
+        "overlay_0" => blend(palette.muted, palette.bg, 0.35),
+        "overlay_1" => palette.muted,
+        "overlay_2" => blend(palette.muted, palette.fg, 0.35),
+        "text" => palette.fg,
+        "subtext_0" => blend(palette.fg, palette.bg, 0.30),
+        "subtext_1" => blend(palette.fg, palette.bg, 0.18),
+        "accent" => palette.accent,
+        "border" => layer(0.28),
+        // 语义色直接对应
+        "yellow" => palette.warning,
+        "red" => palette.error,
+        "green" => palette.success,
+        "blue" => palette.info,
+        // 主题库没有这么多色相：次要槽位折叠到最近的语义色上，保持"颜色含义"不丢
+        "peach" => palette.secondary,
+        "mauve" | "lavender" | "rosewater" | "flamingo" | "pink" => palette.accent,
+        "sapphire" | "sky" => palette.info,
+        "teal" => palette.success,
+        "maroon" => palette.error,
+        // 选中行上的文字：用主题背景色，在强调色底上一定读得清
+        "selection_fg" => palette.bg,
+        _ => return None,
+    })
+}
 
 const ROSEWATER: Color = Color::Rgb(245, 224, 220);
 const FLAMINGO: Color = Color::Rgb(242, 205, 205);
@@ -33,25 +140,25 @@ const MANTLE: Color = Color::Rgb(24, 24, 37);
 const CRUST: Color = Color::Rgb(17, 17, 27);
 
 pub fn accent(ctx: &AppContext) -> Color {
-    configured(ctx, |theme| &theme.accent, MAUVE)
+    configured(ctx, "accent", |theme| &theme.accent, MAUVE)
 }
 
 pub fn border(ctx: &AppContext) -> Color {
-    configured(ctx, |theme| &theme.border, SURFACE_2)
+    configured(ctx, "border", |theme| &theme.border, SURFACE_2)
 }
 
 pub fn text(ctx: &AppContext) -> Color {
-    configured(ctx, |theme| &theme.text, TEXT)
+    configured(ctx, "text", |theme| &theme.text, TEXT)
 }
 
 pub fn muted(ctx: &AppContext) -> Color {
-    configured(ctx, |theme| &theme.muted, SUBTEXT_0)
+    configured(ctx, "muted", |theme| &theme.muted, SUBTEXT_0)
 }
 
 macro_rules! palette_color {
     ($name:ident, $field:ident, $fallback:ident) => {
         pub fn $name(ctx: &AppContext) -> Color {
-            configured(ctx, |theme| &theme.$field, $fallback)
+            configured(ctx, stringify!($field), |theme| &theme.$field, $fallback)
         }
     };
 }
@@ -83,11 +190,26 @@ palette_color!(mantle, mantle, MANTLE);
 palette_color!(crust, crust, CRUST);
 
 pub fn selection_fg(ctx: &AppContext) -> Color {
-    crust(ctx)
+    configured(ctx, "selection_fg", |theme| &theme.crust, CRUST)
 }
 
-fn configured(ctx: &AppContext, value: fn(&ThemeConfig) -> &String, fallback: Color) -> Color {
+/// 取一个槽位的颜色。
+///
+/// 两条来源，优先级从高到低：
+/// 1. `theme.name` 选了主题库里的具名主题 → 由它的语义色推导（整界面一起换肤）；
+/// 2. 否则（默认 `voicefox`）→ 用 `[theme]` 里手工调好的十六进制色，观感与历史一致。
+fn configured(
+    ctx: &AppContext,
+    slot: &str,
+    value: fn(&ThemeConfig) -> &String,
+    fallback: Color,
+) -> Color {
     let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(theme) = library_theme(&config.theme.name)
+        && let Some(color) = slot_color(theme.palette(), slot)
+    {
+        return color;
+    }
     parse(value(&config.theme), fallback)
 }
 
@@ -237,9 +359,12 @@ pub fn warn_unrecognized(theme: &ThemeConfig) {
 
 #[cfg(test)]
 mod tests {
+    use super::SKIN_VOICEFOX;
+    use super::{blend, library_theme, next_skin_name, skin_label, skin_names, slot_color};
     use super::{parse, parse_value};
     use lx_core::model::config::ThemeConfig;
     use ratatui::style::Color;
+    use ratatui_themes::ThemeName;
 
     #[test]
     fn parses_hex_color() {
@@ -306,5 +431,151 @@ mod tests {
         assert_eq!(parse(&theme.base, super::BASE), Color::Reset);
         // 没配的字段仍然用 Mocha 默认值。
         assert_eq!(theme.accent, "#cba6f7");
+    }
+
+    // ── 多主题：槽位映射 ──
+
+    const ALL_SLOTS: [&str; 25] = [
+        "base",
+        "mantle",
+        "crust",
+        "surface_0",
+        "surface_1",
+        "surface_2",
+        "overlay_0",
+        "overlay_1",
+        "overlay_2",
+        "text",
+        "subtext_0",
+        "subtext_1",
+        "accent",
+        "border",
+        "yellow",
+        "red",
+        "green",
+        "blue",
+        "peach",
+        "mauve",
+        "lavender",
+        "sapphire",
+        "sky",
+        "teal",
+        "selection_fg",
+    ];
+
+    #[test]
+    fn blend_hits_both_ends_and_the_middle() {
+        let black = Color::Rgb(0, 0, 0);
+        let white = Color::Rgb(255, 255, 255);
+        assert_eq!(blend(black, white, 0.0), black);
+        assert_eq!(blend(black, white, 1.0), white);
+        let mid = blend(black, white, 0.5);
+        assert_eq!(mid, Color::Rgb(128, 128, 128));
+        // 非 RGB 颜色无法插值，原样返回起点（终端默认色 / ANSI 名）
+        assert_eq!(blend(Color::Reset, white, 0.5), Color::Reset);
+        assert_eq!(blend(Color::Red, white, 0.5), Color::Red);
+    }
+
+    /// 每个在用的槽位都要能从主题库推导出来，未知槽位返回 None 由调用方回退。
+    #[test]
+    fn every_slot_used_by_the_ui_maps_to_a_library_theme() {
+        let palette = ThemeName::Dracula.palette();
+        for slot in ALL_SLOTS {
+            assert!(
+                slot_color(palette, slot).is_some(),
+                "槽位 {slot} 必须有映射，否则该处会退回过时的十六进制默认色"
+            );
+        }
+        assert_eq!(slot_color(palette, "not_a_slot"), None);
+    }
+
+    /// 层次色必须按"离背景越来越远"排序，深色与浅色主题都要成立。
+    #[test]
+    fn surface_layers_are_ordered_for_dark_and_light_themes() {
+        let luminance = |color: Color| match color {
+            Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+            _ => 0,
+        };
+        for name in [ThemeName::Dracula, ThemeName::CatppuccinLatte] {
+            let palette = name.palette();
+            let bg = luminance(palette.bg);
+            let fg = luminance(palette.fg);
+            let surfaces = ["surface_0", "surface_1", "surface_2"]
+                .map(|slot| luminance(slot_color(palette, slot).unwrap()));
+            // 深浅方向由 bg/fg 决定，层与层之间必须单调
+            if fg >= bg {
+                assert!(
+                    surfaces[0] < surfaces[1] && surfaces[1] < surfaces[2],
+                    "{name:?}"
+                );
+            } else {
+                assert!(
+                    surfaces[0] > surfaces[1] && surfaces[1] > surfaces[2],
+                    "{name:?}"
+                );
+            }
+            // 每一层都要落在 bg 与 fg 之间（不能跑到更极端，否则会过曝/糊掉）
+            let (low, high) = (bg.min(fg), bg.max(fg));
+            for value in surfaces {
+                assert!(value >= low && value <= high, "{name:?}: {value} 越界");
+            }
+        }
+    }
+
+    /// 语义色必须真的对得上：错误红、成功绿、警告黄。
+    #[test]
+    fn semantic_slots_take_the_matching_semantic_color() {
+        let palette = ThemeName::Nord.palette();
+        assert_eq!(slot_color(palette, "red").unwrap(), palette.error);
+        assert_eq!(slot_color(palette, "green").unwrap(), palette.success);
+        assert_eq!(slot_color(palette, "yellow").unwrap(), palette.warning);
+        assert_eq!(slot_color(palette, "blue").unwrap(), palette.info);
+        // 选中行文字用主题背景色，才能压在强调色底上读清
+        assert_eq!(slot_color(palette, "selection_fg").unwrap(), palette.bg);
+    }
+
+    /// 浅色主题也要可用：文字比背景暗。
+    #[test]
+    fn light_themes_stay_readable() {
+        let palette = ThemeName::CatppuccinLatte.palette();
+        assert!(palette.is_light(), "这个主题应当是浅色的");
+        let text = slot_color(palette, "text").unwrap();
+        assert_eq!(text, palette.fg);
+        assert_ne!(text, palette.bg, "文字不能和背景同色");
+    }
+
+    #[test]
+    fn voicefox_is_the_default_and_keeps_the_hand_tuned_slots() {
+        // 默认名不走主题库；`configured()` 会用配置里的十六进制色
+        assert_eq!(library_theme(SKIN_VOICEFOX), None);
+        assert_eq!(library_theme(""), None);
+        assert_eq!(library_theme("不存在的主题"), None);
+        // 名字大小写/空格不敏感
+        assert_eq!(library_theme(" Tokyo-Night "), Some(ThemeName::TokyoNight));
+    }
+
+    #[test]
+    fn skin_names_cover_voicefox_plus_the_library_and_cycle() {
+        let names = skin_names();
+        assert_eq!(names[0], SKIN_VOICEFOX, "默认皮肤排第一");
+        assert_eq!(names.len(), ThemeName::all().len() + 1);
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "主题名不能重复");
+
+        // 循环一圈回到起点，且每一步都不一样
+        let mut current = SKIN_VOICEFOX.to_string();
+        for _ in 0..names.len() {
+            current = next_skin_name(&current);
+        }
+        assert_eq!(current, SKIN_VOICEFOX, "循环一轮应当回到起点");
+        // 未知名字也要能接上（回退到第二个）
+        assert_eq!(next_skin_name("未知"), names[1]);
+    }
+
+    #[test]
+    fn skin_labels_are_human_readable() {
+        assert_eq!(skin_label("tokyo-night"), "Tokyo Night");
+        assert_eq!(skin_label(SKIN_VOICEFOX), "Voicefox");
+        assert_eq!(skin_label("未知"), "Voicefox");
     }
 }

@@ -340,9 +340,40 @@ impl Default for KeybindingConfig {
     }
 }
 
-/// 将旧版设置页快捷键迁移到不占用标签页数字键的默认绑定。
+/// 设置页的"逐行动作"绑定：这些动作已经删除（设置项改为 `Enter` 激活）。
 ///
-/// 裸数字键在设置页始终保留给侧边栏；带 Ctrl/Alt/Shift 的用户绑定不受影响。
+/// 保留这份清单有两个用途：迁移时把旧配置里的残留绑定清掉，以及测试里断言
+/// 设置页的默认键位不再包含任何逐行快捷键。
+pub const SETTINGS_ROW_ACTIONS: [Action; 19] = [
+    Action::SettingsToggle,
+    Action::SettingsCyclePlaybackSpeed,
+    Action::SettingsEditAudioDevice,
+    Action::SettingsCycleReplayGainMode,
+    Action::SettingsCycleReplayGainPreamp,
+    Action::SettingsCycleChannelMode,
+    Action::SettingsCycleBalance,
+    Action::SettingsToggleReplayGainClip,
+    Action::SettingsCycleFadeInDuration,
+    Action::SettingsCycleFadeOutDuration,
+    Action::SettingsCycleEqualizerPreset,
+    Action::SettingsRunFadeIn,
+    Action::SettingsRunFadeOut,
+    Action::SettingsSetAbLoopStart,
+    Action::SettingsSetAbLoopEnd,
+    Action::SettingsClearAbLoop,
+    Action::SettingsExportData,
+    Action::SettingsImportData,
+    Action::SettingsImportPlaylist,
+];
+
+/// 旧版设置页键位的迁移。
+///
+/// 两件事：
+/// 1. **删除**已经消失的逐行动作绑定（`SETTINGS_ROW_ACTIONS`）。这些动作不再被
+///    设置页处理，留在配置里只会变成"按下去没反应"的死键 —— 旧版把裸数字改成
+///    `F1` 之类的做法在动作本身被删掉之后已经没有意义。
+/// 2. 仍然存在的键位（列表导航 / 返回）如果被裸数字占用，迁回默认绑定。
+///    裸数字键在设置页始终保留给侧边栏；用户自己改过的组合键不受影响。
 pub fn migrate_legacy_settings_bindings(config: &mut KeybindingConfig) -> bool {
     let Some(settings) = config.pages.get_mut("settings") else {
         return false;
@@ -350,34 +381,21 @@ pub fn migrate_legacy_settings_bindings(config: &mut KeybindingConfig) -> bool {
     let defaults = default_page_bindings()
         .remove("settings")
         .expect("default settings bindings must exist");
-    let legacy_defaults = [
-        (Action::SettingsCyclePlaybackSpeed, "1"),
-        (Action::SettingsEditAudioDevice, "2"),
-        (Action::SettingsCycleReplayGainMode, "3"),
-        (Action::SettingsCycleChannelMode, "4"),
-        (Action::SettingsCycleReplayGainPreamp, "5"),
-        (Action::SettingsCycleBalance, "6"),
-        (Action::SettingsToggleReplayGainClip, "7"),
-        (Action::SettingsCycleFadeInDuration, "8"),
-        (Action::SettingsCycleFadeOutDuration, "9"),
-        (Action::SettingsCycleEqualizerPreset, "0"),
-        (Action::SettingsRunFadeIn, "F"),
-        (Action::SettingsRunFadeOut, "G"),
-        (Action::SettingsSetAbLoopStart, "L"),
-        (Action::SettingsSetAbLoopEnd, "U"),
-        (Action::SettingsClearAbLoop, "C"),
-        (Action::SettingsExportData, "E"),
-        (Action::SettingsImportData, "I"),
-        (Action::SettingsImportPlaylist, "J"),
-    ];
 
     let mut changed = false;
+    let stale: Vec<Action> = settings
+        .keys()
+        .copied()
+        .filter(|action| SETTINGS_ROW_ACTIONS.contains(action))
+        .collect();
+    for action in stale {
+        settings.remove(&action);
+        changed = true;
+    }
+
     for (action, binding) in settings.iter_mut() {
         let is_bare_digit = binding.len() == 1 && binding.as_bytes()[0].is_ascii_digit();
-        let is_legacy_default = legacy_defaults
-            .iter()
-            .any(|(legacy_action, legacy_key)| action == legacy_action && binding == legacy_key);
-        if (is_bare_digit || is_legacy_default)
+        if is_bare_digit
             && let Some(default) = defaults.get(action)
             && binding != default
         {
@@ -572,29 +590,16 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
     pages.insert("local".to_string(), local);
 
     // --- 设置 ---
+    //
+    // 设置页只保留"分类 / 导航 / 激活"三类键：设置项本身一律靠 `Enter`
+    // （`Space` 对开关与取值行等价）或鼠标点击激活，因此这里**只有**列表导航
+    // 与返回，不再有任何逐行动作的默认绑定。`Action::Settings*` 那些变体仍然
+    // 存在（用户配置里的旧绑定会被保留，但设置页不再拦截它们，见
+    // `app/src/pages/settings.rs` 的 `settings_action_is_page_owned`）。
     let mut settings = HashMap::new();
     settings.insert(Action::ListSelectUp, "k".to_string());
     settings.insert(Action::ListSelectDown, "j".to_string());
     settings.insert(Action::ListGoBack, "Esc".to_string());
-    // 数字键留给侧边栏的 1-8 标签页快捷键；设置动作统一使用功能键。
-    settings.insert(Action::SettingsCyclePlaybackSpeed, "F1".to_string());
-    settings.insert(Action::SettingsEditAudioDevice, "F2".to_string());
-    settings.insert(Action::SettingsCycleReplayGainMode, "F3".to_string());
-    settings.insert(Action::SettingsCycleChannelMode, "F4".to_string());
-    settings.insert(Action::SettingsCycleReplayGainPreamp, "F5".to_string());
-    settings.insert(Action::SettingsCycleBalance, "F6".to_string());
-    settings.insert(Action::SettingsToggleReplayGainClip, "F7".to_string());
-    settings.insert(Action::SettingsCycleFadeInDuration, "F8".to_string());
-    settings.insert(Action::SettingsCycleFadeOutDuration, "F9".to_string());
-    settings.insert(Action::SettingsCycleEqualizerPreset, "F10".to_string());
-    settings.insert(Action::SettingsRunFadeIn, "Shift+F1".to_string());
-    settings.insert(Action::SettingsRunFadeOut, "Shift+F2".to_string());
-    settings.insert(Action::SettingsSetAbLoopStart, "Shift+F3".to_string());
-    settings.insert(Action::SettingsSetAbLoopEnd, "Shift+F4".to_string());
-    settings.insert(Action::SettingsClearAbLoop, "Shift+F5".to_string());
-    settings.insert(Action::SettingsExportData, "Shift+F6".to_string());
-    settings.insert(Action::SettingsImportData, "Shift+F7".to_string());
-    settings.insert(Action::SettingsImportPlaylist, "Shift+F8".to_string());
     pages.insert("settings".to_string(), settings);
 
     // --- B站登录 ---
@@ -1046,33 +1051,35 @@ mod tests {
         );
     }
 
+    /// 设置页的默认键位只剩"列表导航 + 返回"：逐行动作快捷键已全部删除。
     #[test]
-    fn settings_defaults_cover_extended_playback_and_data_actions() {
+    fn settings_defaults_only_keep_navigation_keys() {
         let config = KeybindingConfig::default();
         let settings = config.pages.get("settings").unwrap();
-        let expected = [
-            (Action::SettingsCyclePlaybackSpeed, "F1"),
-            (Action::SettingsEditAudioDevice, "F2"),
-            (Action::SettingsCycleReplayGainMode, "F3"),
-            (Action::SettingsCycleChannelMode, "F4"),
-            (Action::SettingsCycleReplayGainPreamp, "F5"),
-            (Action::SettingsCycleBalance, "F6"),
-            (Action::SettingsToggleReplayGainClip, "F7"),
-            (Action::SettingsCycleFadeInDuration, "F8"),
-            (Action::SettingsCycleFadeOutDuration, "F9"),
-            (Action::SettingsCycleEqualizerPreset, "F10"),
-            (Action::SettingsRunFadeIn, "Shift+F1"),
-            (Action::SettingsRunFadeOut, "Shift+F2"),
-            (Action::SettingsSetAbLoopStart, "Shift+F3"),
-            (Action::SettingsSetAbLoopEnd, "Shift+F4"),
-            (Action::SettingsClearAbLoop, "Shift+F5"),
-            (Action::SettingsExportData, "Shift+F6"),
-            (Action::SettingsImportData, "Shift+F7"),
-            (Action::SettingsImportPlaylist, "Shift+F8"),
-        ];
+        assert_eq!(
+            settings.get(&Action::ListSelectUp).map(String::as_str),
+            Some("k")
+        );
+        assert_eq!(
+            settings.get(&Action::ListSelectDown).map(String::as_str),
+            Some("j")
+        );
+        assert_eq!(
+            settings.get(&Action::ListGoBack).map(String::as_str),
+            Some("Esc")
+        );
+        assert_eq!(
+            settings.len(),
+            3,
+            "设置页默认键位只剩导航（实际 {settings:?}）"
+        );
 
-        for (action, key) in expected {
-            assert_eq!(settings.get(&action).map(String::as_str), Some(key));
+        // 任何一个 `Settings*` 逐行动作都不许再有默认绑定
+        for action in SETTINGS_ROW_ACTIONS {
+            assert!(
+                settings.get(&action).is_none(),
+                "{action:?} 的行内快捷键已经删除，不该再有默认绑定"
+            );
         }
     }
 
@@ -1080,32 +1087,26 @@ mod tests {
     fn migrates_legacy_settings_keys_without_overwriting_modified_combinations() {
         let mut config = KeybindingConfig::default();
         let settings = config.pages.get_mut("settings").unwrap();
+        // 逐行动作已经从默认表里删除：它们在旧配置里的残留绑定会被清掉
+        // （留着只会是"按下去没反应"的死键），无论用户当初把它绑到什么键上。
         settings.insert(Action::SettingsCyclePlaybackSpeed, "1".to_string());
         settings.insert(Action::SettingsRunFadeIn, "F".to_string());
         settings.insert(Action::SettingsImportData, "Ctrl+7".to_string());
+        // 裸数字占用了仍然存在的导航键 → 迁回默认
         settings.insert(Action::ListSelectUp, "8".to_string());
 
         assert!(migrate_legacy_settings_bindings(&mut config));
         let settings = config.pages.get("settings").unwrap();
-        assert_eq!(
-            settings
-                .get(&Action::SettingsCyclePlaybackSpeed)
-                .map(String::as_str),
-            Some("F1")
-        );
-        assert_eq!(
-            settings.get(&Action::SettingsRunFadeIn).map(String::as_str),
-            Some("Shift+F1")
-        );
-        assert_eq!(
-            settings
-                .get(&Action::SettingsImportData)
-                .map(String::as_str),
-            Some("Ctrl+7")
-        );
+        for action in SETTINGS_ROW_ACTIONS {
+            assert!(
+                settings.get(&action).is_none(),
+                "{action:?} 已经删除，旧绑定必须被清掉"
+            );
+        }
         assert_eq!(
             settings.get(&Action::ListSelectUp).map(String::as_str),
-            Some("k")
+            Some("k"),
+            "仍在使用的导航键从裸数字迁回默认"
         );
         assert!(!migrate_legacy_settings_bindings(&mut config));
     }

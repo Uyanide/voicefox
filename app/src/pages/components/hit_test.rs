@@ -14,6 +14,22 @@
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{Block, Borders};
 
+/// 页面级面板的外框：**四周全框**（可带标题）。
+///
+/// 渲染侧必须写 `Block::default().borders(PANEL_BORDERS)`，命中侧必须写
+/// [`panel_inner`]：两边同源，才不会出现"画到哪儿"和"点到哪儿"分家。
+/// 弹窗 / 对话框 / 通知这类真正的浮层同样用 `Borders::ALL`。
+pub const PANEL_BORDERS: Borders = Borders::ALL;
+
+/// 页面级面板去掉外框后的可用区（渲染与命中同源）。
+///
+/// 与 `Block::default().borders(Borders::ALL).inner(x)` 完全等价：左右各让一列、
+/// 底部让一行。凡是把"面板内区"写进鼠标命中算术的地方，都必须改用它，
+/// 免得渲染与命中各算一套内缩。
+pub fn panel_inner(area: Rect) -> Rect {
+    Block::default().borders(PANEL_BORDERS).inner(area)
+}
+
 /// Return the absolute list index for a one-line-per-row list inside `area`.
 /// `header_rows` is the number of non-list rows inside the block.
 pub fn row_at(
@@ -23,7 +39,7 @@ pub fn row_at(
     len: usize,
     header_rows: u16,
 ) -> Option<usize> {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let inner = panel_inner(area);
     let list = Rect::new(
         inner.x,
         inner.y.saturating_add(header_rows),
@@ -67,7 +83,7 @@ impl PanelRows {
         toolbar_visible: bool,
         header_visible: bool,
     ) -> Self {
-        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let inner = panel_inner(area);
         let bottom = inner.bottom();
         let mut y = inner.y;
 
@@ -116,8 +132,13 @@ mod tests {
     #[test]
     fn row_hit_test_uses_the_same_rect_boundaries_as_rendering() {
         let area = Rect::new(10, 5, 40, 12);
-        assert_eq!(row_at(area, Position::new(11, 7), 3, 20, 1), Some(3));
+        // 四周全框：area.y 是上边框，其下一行是表头，都不属于列表
+        assert_eq!(row_at(area, Position::new(11, 5), 3, 20, 1), None);
+        assert_eq!(row_at(area, Position::new(11, 6), 3, 20, 1), None);
+        // 左边框那一列不可命中
         assert_eq!(row_at(area, Position::new(10, 7), 3, 20, 1), None);
+        assert_eq!(row_at(area, Position::new(11, 7), 3, 20, 1), Some(3));
+        // 面板底部之外（下边框同样不属于列表）
         assert_eq!(row_at(area, Position::new(20, 17), 3, 20, 1), None);
     }
 

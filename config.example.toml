@@ -24,6 +24,11 @@ history_limit = 200
 enabled = ["kw", "kg", "tx", "wy", "mg", "bili"]
 default = "kw"
 auto_toggle = true          # 播放失败时自动尝试其它音源的同曲匹配
+# 解析策略：auto（默认，JS→内置原平台→跨平台兜底）/ prefer（跨平台时优先指定平台）
+# / only（只用指定平台解析，做不到就失败，不做跨平台兜底）
+# policy = "auto"
+# policy_platform = "wy"    # prefer / only 时生效
+
 # JS 音源脚本 URL 或本地路径（lx-music user API 协议）
 # 数组顺序即播放地址解析优先级，例如：
 # js_sources = ["https://ghproxy.net/raw.githubusercontent.com/pdone/lx-music-source/main/juhe/latest.js"]
@@ -39,6 +44,20 @@ offset = 0                  # 歌词整体偏移毫秒，正数提前，负数�
 proxy_url = ""              # 例如 "http://127.0.0.1:7890"
 timeout = 15                # HTTP 超时秒数
 
+# 界面主题名。voicefox = 本项目手工调好的那套槽位（默认，观感与历史版本一致）；
+# 其余取值来自 ratatui-themes 的具名主题，整个界面会一起换肤：
+#   dracula / one-dark-pro / nord / catppuccin-mocha / catppuccin-latte /
+#   gruvbox-dark / gruvbox-light / tokyo-night / solarized-dark / solarized-light /
+#   monokai-pro / rose-pine / kanagawa / everforest / cyberpunk / midnight-commander
+# 也可以在设置页「界面」分类第一行「界面主题」点击/Enter 打开主题菜单，
+# 或按 p 循环切换（立刻生效并落盘，无需重启）。注意：P 是「账号与扫码」面板，
+# Shift+P 是「封面协议」的循环键。
+#
+# 设置页本身只保留分类 / 导航 / 激活键（←/→ 换分类、↑/↓ 选行、Enter 激活、
+# Esc 返回），其余设置项都在分类里选中后按 Enter 操作，没有逐行字母快捷键。
+[theme]
+# name = "tokyo-night"
+
 [ui]
 enable_mouse = true
 wrap_navigation = true
@@ -46,7 +65,12 @@ scroll_amount = 3
 aggregate_search = true
 show_cover = true
 cover_protocol = "auto"     # auto / kitty / sixel / iterm2 / halfblocks
+                           # 设置页「界面」分类里选中「封面协议」按 Enter，或按 Shift+P 循环切换
 max_fps = 20                # 1-60，越小越省电
+# 底部状态栏高度：1（默认）..6。把 status_bar_items 全开、想一眼看到所有
+# 可点击控件时调大；一行放不下的控件会自动收进状态栏的「⋯ 更多」入口。
+# 界面上直接拖底栏顶边右侧的 ⇕ 把手即可调整（松开自动落盘，写回本项）。
+status_bar_height = 1
 # 底部状态栏内容；数组顺序即从左到右的显示顺序，删除某项可将其隐藏
 status_bar_items = [
     "state",
@@ -102,7 +126,11 @@ embed_cover = true
 # 保存歌词：同时写出同名 .lrc 并内嵌到音频标签
 save_lyric = true
 
-# [theme] 主题（可选，默认 Catppuccin Mocha；省略该节即使用默认配色）
+# [theme] 主题（可选，默认 voicefox：手工调好的 Catppuccin 槽位；省略该节即使用它）
+#
+# `name` 选主题库里的具名主题时，强调色等 10 个语义色**由该主题决定**，
+# 下面这些手工色值只在 `name` 为 voicefox（或未设）时生效 —— 想换强调色
+# 直接换主题即可，不要在这里改。
 #
 # 颜色值支持四种写法：
 #   - 跟随终端： "default"（也接受 reset / terminal / none / transparent / -）

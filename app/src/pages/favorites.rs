@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::context::AppContext;
 use crate::pages::components::context_menu::MenuHitSource;
-use crate::pages::components::hit_test::PanelRows;
+use crate::pages::components::hit_test::{PANEL_BORDERS, PanelRows};
 use crate::pages::components::song_table::{self, ColumnResizeState};
 use crate::pages::components::source_selector::{SourceSelector, SourceSelectorKey};
 use crate::pages::sort::{SortMode, SortTarget, SortedListCache};
@@ -544,7 +544,7 @@ impl FavoritesPage {
         self.last_area = area;
 
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(PANEL_BORDERS)
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(format!(
                 " {}收藏 {}/{} · {} · 排序 {} · P 音源 · 右键管理网易云 · / 筛选 ",

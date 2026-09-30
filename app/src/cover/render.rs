@@ -6,12 +6,10 @@ use std::sync::mpsc::{
 };
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui_image::errors::Errors;
-use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
@@ -33,7 +31,6 @@ const MAX_DECODED_EDGE: u32 = 640;
 const DECODED_COVER_CACHE_CAP: usize = 8;
 
 /// 等待终端应答能力查询的超时上限
-const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 主线程发给解码线程的请求
 struct DecodeJob {
@@ -81,18 +78,47 @@ impl CoverRenderer {
     pub fn detect(cover_protocol: &str, cover_enabled: bool) -> Self {
         let configured = parse_protocol(cover_protocol);
         let picker = match (configured, cover_enabled) {
-            (Some(protocol), _) => picker_for_protocol(protocol),
-            (None, false) => Picker::halfblocks(),
-            (None, true) => {
-                let options = QueryStdioOptions {
-                    timeout: QUERY_TIMEOUT,
-                    ..QueryStdioOptions::default()
-                };
-                Picker::from_query_stdio_with_options(options).unwrap_or_else(|error| {
-                    tracing::debug!("query terminal graphics capabilities failed: {error}");
-                    Picker::halfblocks()
-                })
+            (Some(protocol), _) => {
+                let in_kitty = kitty_signal(
+                    std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+                    std::env::var("TERM").ok().as_deref(),
+                );
+                let corrected = corrected_protocol(protocol, in_kitty);
+                if corrected != protocol {
+                    tracing::warn!(
+                        "ui.cover_protocol = \"sixel\" 在 kitty 终端下不被支持（kitty 只实现自己的图形协议），已改用 kitty 协议"
+                    );
+                }
+                picker_for_protocol(corrected)
             }
+            (None, false) => Picker::halfblocks(),
+            (None, true) => match protocol_from_env(
+                std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+                std::env::var("TERM_PROGRAM").ok().as_deref(),
+                // tmux 用 $TMUX、screen 用 $STY：它们会吞掉或**原样打印**图形序列
+                std::env::var("TMUX")
+                    .ok()
+                    .or_else(|| std::env::var("STY").ok())
+                    .as_deref(),
+            ) {
+                Some(protocol) => picker_for_protocol(protocol),
+                None => {
+                    // 环境无法**正向确认**终端支持图像协议 → 保守用半格。
+                    //
+                    // 这里刻意不再调用 `Picker::from_query_stdio*`：它要发查询并直接读 stdin，
+                    // 而本函数在事件循环启动前调用（此刻还没进 raw 模式，终端回显是开的），
+                    // 自己的查询会被回显回来当成"终端回复"，在 tmux/SSH/裸 pty 下极容易误判。
+                    // 实测（120x36 裸 pty, TERM=xterm-256color）：该查询会得出 kitty，
+                    // 强制 sixel 时单个封面载荷达 227157 字节、98.8% 是可打印 ASCII ——
+                    // 一旦选中的协议终端其实不支持，这些字节会被当文本打印、刷满整屏。
+                    // 误判的代价是"满屏花屏"，保守的代价只是封面用半格渲染，因此不确定就保守。
+                    tracing::info!(
+                        "cover protocol auto → halfblocks（终端未被正向识别；需要图像可显式设 ui.cover_protocol）"
+                    );
+                    Picker::halfblocks()
+                }
+            },
         };
 
         let mut renderer = Self::spawn(picker);
@@ -403,6 +429,68 @@ fn shrink(image: image::DynamicImage) -> image::DynamicImage {
 }
 
 /// 解析配置里的 ui.cover_protocol，None 表示由终端探测决定
+/// 环境是否明确是 kitty 终端。
+fn kitty_signal(kitty_window_id: Option<&str>, term: Option<&str>) -> bool {
+    kitty_window_id.is_some_and(|value| !value.trim().is_empty())
+        || term.is_some_and(|value| value.to_ascii_lowercase().contains("kitty"))
+}
+
+/// 核对显式配置与环境是否**不可能成立**。
+///
+/// kitty 终端只实现 kitty 图形协议、**不支持 sixel**；若配置写死 `sixel`，照发只会让
+/// kitty 把整幅载荷当文本打印（实测：单个封面 sixel 载荷 227157 字节、98.8% 可打印 ASCII
+/// → 满屏 `?`）。这是唯一能确定"配错了"的组合，所以在这里纠正为 kitty 协议并告警；
+/// 其它组合一律尊重用户显式配置。
+fn corrected_protocol(protocol: ProtocolType, in_kitty: bool) -> ProtocolType {
+    match (protocol, in_kitty) {
+        (ProtocolType::Sixel, true) => ProtocolType::Kitty,
+        (protocol, _) => protocol,
+    }
+}
+
+/// 由环境变量**正向**识别终端支持的图像协议。
+///
+/// 只认能确定的情况：认不出来就返回 `None`，由调用方退到 `halfblocks`。
+/// 抽成纯函数是为了能测（不依赖真实环境变量）。
+fn protocol_from_env(
+    kitty_window_id: Option<&str>,
+    term: Option<&str>,
+    term_program: Option<&str>,
+    multiplexer: Option<&str>,
+) -> Option<ProtocolType> {
+    // 多路复用器优先级最高：`$TMUX`/`$STY` 会从外层终端**继承**（`KITTY_WINDOW_ID`、
+    // `TERM_PROGRAM` 因此在 tmux/ssh 里也可能"假的为真"）。图形序列要穿过 tmux 需要
+    // >=3.3 且 `allow-passthrough on`，screen 完全不支持，而这里无法确认 —— 一旦猜错，
+    // 整套载荷会被原样当文本打印（实测 kitty 协议每帧重发，6 秒即约 1MB 垃圾）。
+    // 代价对比：猜错=满屏花屏，保守=封面用半格渲染。所以有复用器就保守。
+    if multiplexer.is_some_and(|value| !value.trim().is_empty()) {
+        return None;
+    }
+    if kitty_signal(kitty_window_id, term) {
+        return Some(ProtocolType::Kitty);
+    }
+    if let Some(term) = term {
+        let term = term.to_ascii_lowercase();
+        if term.contains("kitty") {
+            return Some(ProtocolType::Kitty);
+        }
+        // foot / contour / mlterm / yaft 等以 TERM 直接声明 sixel
+        if term.contains("sixel") || term.starts_with("foot") || term.starts_with("contour") {
+            return Some(ProtocolType::Sixel);
+        }
+    }
+    match term_program
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "iterm.app" => Some(ProtocolType::Iterm2),
+        // WezTerm 实现了 kitty 图形协议
+        "wezterm" => Some(ProtocolType::Kitty),
+        _ => None,
+    }
+}
+
 fn parse_protocol(value: &str) -> Option<ProtocolType> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "auto" => None,
@@ -427,7 +515,7 @@ mod tests {
     use ratatui_image::FontSize;
     use ratatui_image::picker::{Picker, ProtocolType};
 
-    use super::{CoverRenderer, DecodeJob, parse_protocol, queue_decode};
+    use super::{CoverRenderer, DecodeJob, parse_protocol, protocol_from_env, queue_decode};
 
     const AREA: Rect = Rect {
         x: 0,
@@ -633,5 +721,100 @@ mod tests {
         let latest = pending.as_ref().unwrap();
         assert_eq!(latest.path, "latest.png");
         assert_eq!(latest.id, 2);
+    }
+
+    /// 协议识别必须是"正向"的：认不出来就返回 None（调用方退 halfblocks），
+    /// 绝不能猜一个终端可能不支持的协议 —— 猜错的代价是整幅载荷被当文本刷屏。
+    #[test]
+    fn protocol_detection_is_positive_only() {
+        use super::ProtocolType;
+
+        let kitty = protocol_from_env(Some("1"), None, None, None);
+        assert_eq!(
+            kitty,
+            Some(ProtocolType::Kitty),
+            "KITTY_WINDOW_ID 是确定信号"
+        );
+        assert_eq!(
+            protocol_from_env(None, Some("xterm-kitty"), None, None),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(
+            protocol_from_env(None, Some("foot"), None, None),
+            Some(ProtocolType::Sixel),
+            "foot 声明支持 sixel"
+        );
+        assert_eq!(
+            protocol_from_env(None, Some("xterm-256color"), Some("iTerm.app"), None),
+            Some(ProtocolType::Iterm2)
+        );
+        assert_eq!(
+            protocol_from_env(None, Some("xterm-256color"), Some("WezTerm"), None),
+            Some(ProtocolType::Kitty)
+        );
+
+        // 认不出来 → None（调用方退 halfblocks）
+        assert_eq!(
+            protocol_from_env(None, Some("xterm-256color"), None, None),
+            None
+        );
+        assert_eq!(
+            protocol_from_env(None, Some("linux"), Some("Apple_Terminal"), None),
+            None
+        );
+        assert_eq!(protocol_from_env(None, None, None, None), None);
+        assert_eq!(
+            protocol_from_env(Some("   "), Some("dumb"), Some("Unknown"), None),
+            None,
+            "空白/未知信号不能当成支持"
+        );
+
+        // 关键回归：环境变量会穿透 tmux/ssh，复用器里发图形序列会被原样打印成文本
+        assert_eq!(
+            protocol_from_env(
+                Some("1"),
+                Some("xterm-kitty"),
+                None,
+                Some("/tmp/tmux-1000/default,123,0")
+            ),
+            None,
+            "tmux 里不能发 kitty 图形（passthrough 无法确认）"
+        );
+        assert_eq!(
+            protocol_from_env(
+                None,
+                Some("xterm-256color"),
+                Some("WezTerm"),
+                Some("/tmp/screen.123")
+            ),
+            None,
+            "screen 里一律保守"
+        );
+    }
+
+    /// kitty 终端不支持 sixel：显式配成 sixel 时若不纠正，整幅载荷会被当文本打印。
+    #[test]
+    fn sixel_is_corrected_on_kitty_terminals() {
+        use super::{ProtocolType, corrected_protocol};
+
+        assert_eq!(
+            corrected_protocol(ProtocolType::Sixel, true),
+            ProtocolType::Kitty,
+            "kitty 下 sixel 不可能成立，必须纠正"
+        );
+        assert_eq!(
+            corrected_protocol(ProtocolType::Sixel, false),
+            ProtocolType::Sixel,
+            "非 kitty 终端尊重显式配置"
+        );
+        // 其它组合一律不动
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Halfblocks,
+        ] {
+            assert_eq!(corrected_protocol(protocol, true), protocol);
+            assert_eq!(corrected_protocol(protocol, false), protocol);
+        }
     }
 }

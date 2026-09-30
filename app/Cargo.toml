@@ -20,6 +20,7 @@ voicefox-runtime = { path = "../runtime", default-features = false }
 
 tokio.workspace = true
 ratatui.workspace = true
+ratatui-themes.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
 image.workspace = true

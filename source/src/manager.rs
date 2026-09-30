@@ -62,7 +62,13 @@ pub struct SourceManager {
 
 /// 判断是否为真本地文件歌曲：JS 音源的搜索结果同样标记为 `SourceId::Local`，
 /// 但额外带有 `extra["source"]` 平台标记，两者据此区分。
-fn is_local_file_song(song: &SongInfo) -> bool {
+///
+/// 不能用 `file_path` 判定：本地扫描是在 `metadata::read_metadata` 之后才补上
+/// `file_path` 的，存在只有 `source` / `id` 的中间态。
+///
+/// 播放地址解析（`get_song_url_inner`）与「播放失败后是否换源重试」（app 侧）
+/// 必须共用这一份判定，否则同一首歌会出现"解析按本地文件、重试按在线歌曲"的分裂。
+pub fn is_local_file_song(song: &SongInfo) -> bool {
     song.source == SourceId::Local && !song.extra.contains_key("source")
 }
 
@@ -1065,6 +1071,22 @@ impl SourceManager {
     /// 跨源匹配：在其他音源中搜索同名歌曲
     /// 参考 lx-music findMusic 算法
     pub async fn find_music(&self, song: &SongInfo) -> Vec<SongInfo> {
+        self.find_music_within(song, None).await
+    }
+
+    /// 只在指定平台里找同曲（解析策略 `only` 用）。
+    ///
+    /// 匹配规则与 [`Self::find_music`] 完全一致，只是把候选来源收窄 —— 这样
+    /// "只用某个平台"不会顺带改变严格匹配的行为。
+    pub async fn find_music_on(&self, song: &SongInfo, platforms: &[SourceId]) -> Vec<SongInfo> {
+        self.find_music_within(song, Some(platforms)).await
+    }
+
+    async fn find_music_within(
+        &self,
+        song: &SongInfo,
+        restrict: Option<&[SourceId]>,
+    ) -> Vec<SongInfo> {
         let exclude = song.source;
         let keyword = format!("{} {}", song.name, song.singer);
 
@@ -1077,6 +1099,11 @@ impl SourceManager {
             .clone();
         for id in SourceId::all_online() {
             if *id == exclude || !enabled.contains(id) {
+                continue;
+            }
+            if let Some(platforms) = restrict
+                && !platforms.contains(id)
+            {
                 continue;
             }
             if let Some(source) = self.sources.get(id) {
@@ -1220,7 +1247,7 @@ fn match_score(s: &SongInfo, t_name: &str, t_singer: &str, t_intv: i64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceManager, lyric_has_content};
+    use super::{SourceManager, is_local_file_song, lyric_has_content};
     use async_trait::async_trait;
     use lx_core::model::lyric::LyricData;
     use lx_core::model::song::SongInfo;
@@ -1566,5 +1593,286 @@ mod tests {
         assert_eq!(data.lyric, "[00:01.00]本地外挂歌词");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 本地文件判定 ──
+    //
+    // 这组用例锁定的是"app 侧播放失败重试"与"解析路径 get_song_url_inner"
+    // 必须共用同一份判定：JS 音源搜到的歌也是 `SourceId::Local`，
+    // 绝不能因为它 source 是 Local 就被当成真本地文件而跳过换源重试。
+
+    fn song_with(source: SourceId) -> SongInfo {
+        SongInfo::new(
+            "id".to_string(),
+            source,
+            "歌名".to_string(),
+            "歌手".to_string(),
+        )
+    }
+
+    #[test]
+    fn local_song_with_file_path_is_a_local_file() {
+        let mut song = song_with(SourceId::Local);
+        song.file_path = Some(std::path::PathBuf::from("/music/a.flac"));
+        assert!(is_local_file_song(&song));
+    }
+
+    #[test]
+    fn local_song_without_file_path_is_still_a_local_file() {
+        // 本地扫描器是在 metadata::read_metadata 之后才补 file_path 的，
+        // 因此"source=Local 且没有 extra[source]"这个中间态也算本地文件。
+        let song = song_with(SourceId::Local);
+        assert!(song.file_path.is_none());
+        assert!(is_local_file_song(&song));
+    }
+
+    #[test]
+    fn js_sourced_song_is_not_a_local_file_even_with_file_path() {
+        // JS 音源搜索结果：source=Local + extra["source"]=平台。
+        let mut song = song_with(SourceId::Local);
+        song.extra.insert("source".to_string(), "wy".to_string());
+        assert!(!is_local_file_song(&song), "JS 搜到的歌必须可换源重试");
+
+        // 即使它后来被下载落到本地路径，也仍然是"可换源的歌"而不是本地文件。
+        song.file_path = Some(std::path::PathBuf::from("/music/b.flac"));
+        assert!(!is_local_file_song(&song));
+    }
+
+    #[test]
+    fn remote_songs_are_never_local_files() {
+        for source in [
+            SourceId::Wy,
+            SourceId::Kw,
+            SourceId::Kg,
+            SourceId::Tx,
+            SourceId::Mg,
+            SourceId::Bili,
+        ] {
+            assert!(
+                !is_local_file_song(&song_with(source)),
+                "{source:?} 不是本地文件"
+            );
+        }
+    }
+
+    // ── 跨平台回退 ──
+
+    /// 跨平台搜索的行为可配置桩音源。
+    enum SearchBehavior {
+        /// 立即失败（模拟 tx 那种"快速失败"的坏源）
+        Fail,
+        /// 立即返回给定结果
+        Items(Vec<SongInfo>),
+        /// 永不返回（模拟挂死的源）
+        Hang,
+    }
+
+    struct StubSearchSource {
+        id: SourceId,
+        behavior: SearchBehavior,
+    }
+
+    #[async_trait]
+    impl MusicSource for StubSearchSource {
+        fn id(&self) -> SourceId {
+            self.id
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        async fn search(
+            &self,
+            _keyword: &str,
+            _page: u32,
+            _limit: u32,
+        ) -> Result<SearchResult, SearchError> {
+            match &self.behavior {
+                SearchBehavior::Fail => Err(SearchError::Other("stub failure".to_string())),
+                SearchBehavior::Items(items) => Ok(SearchResult {
+                    items: items.clone(),
+                    total: items.len() as u32,
+                    has_more: false,
+                }),
+                SearchBehavior::Hang => {
+                    std::future::pending::<()>().await;
+                    unreachable!("Hang 分支永不返回")
+                }
+            }
+        }
+
+        async fn get_song_url(
+            &self,
+            _song: &SongInfo,
+            _quality: Quality,
+        ) -> Result<SongUrl, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        async fn get_lyric(&self, _song: &SongInfo) -> Result<LyricData, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        async fn get_cover_url(&self, _song: &SongInfo) -> Result<String, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        fn supported_qualities(&self) -> Vec<Quality> {
+            vec![Quality::High320]
+        }
+    }
+
+    fn fallback_target() -> SongInfo {
+        let mut song = song_with(SourceId::Wy);
+        song.name = "晴天(深情版)".to_string();
+        song.singer = "Lucky小爱".to_string();
+        song.duration = Duration::from_secs(278);
+        song
+    }
+
+    fn candidate(name: &str, singer: &str, seconds: u64, source: SourceId) -> SongInfo {
+        let mut song = song_with(source);
+        song.name = name.to_string();
+        song.singer = singer.to_string();
+        song.duration = Duration::from_secs(seconds);
+        song
+    }
+
+    /// 一个立即失败的源不能拖慢整体搜索，也不能贡献候选。
+    #[tokio::test]
+    async fn find_music_ignores_a_failing_source_without_delaying() {
+        let mut manager = SourceManager::new(SourceId::Kw, &[SourceId::Kw, SourceId::Kg]);
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kw,
+            behavior: SearchBehavior::Fail,
+        }));
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kg,
+            behavior: SearchBehavior::Items(vec![candidate(
+                "晴天(深情版)",
+                "Lucky小爱",
+                278,
+                SourceId::Kg,
+            )]),
+        }));
+
+        let started = std::time::Instant::now();
+        let candidates = manager.find_music(&fallback_target()).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(candidates.len(), 1, "失败的源不应产生候选");
+        assert_eq!(candidates[0].source, SourceId::Kg);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "立即失败的源不应拖慢整体搜索，实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 挂死的源必须被每源超时切断，而不是让整体搜索无限等待。
+    ///
+    /// 用 `start_paused` 让 tokio 虚拟时间自动推进，8 秒上限不会真的等 8 秒。
+    #[tokio::test(start_paused = true)]
+    async fn find_music_cuts_off_a_hanging_source() {
+        let mut manager = SourceManager::new(SourceId::Kw, &[SourceId::Kw, SourceId::Kg]);
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kw,
+            behavior: SearchBehavior::Hang,
+        }));
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kg,
+            behavior: SearchBehavior::Items(vec![candidate(
+                "晴天(深情版)",
+                "Lucky小爱",
+                278,
+                SourceId::Kg,
+            )]),
+        }));
+
+        let started = std::time::Instant::now();
+        let candidates = manager.find_music(&fallback_target()).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(candidates.len(), 1, "挂死的源被切断后仍应返回其它源的候选");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "每源超时应当立即生效（虚拟时间），实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 锁定跨平台匹配的严格性（本次不做任何放宽）：
+    /// 同名不同歌手、同名同歌手但时长差 ≥5 秒都不能顶替。
+    #[tokio::test]
+    async fn find_music_keeps_strict_matching() {
+        let mut manager = SourceManager::new(SourceId::Kw, &[SourceId::Kw, SourceId::Kg]);
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kw,
+            behavior: SearchBehavior::Fail,
+        }));
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kg,
+            behavior: SearchBehavior::Items(vec![
+                // 原曲同名但歌手不同（"晴天" 也不等于 "晴天(深情版)"）
+                candidate("晴天", "周杰伦", 269, SourceId::Kg),
+                // 同名同歌手但时长差 ≥5 秒
+                candidate("晴天(深情版)", "Lucky小爱", 400, SourceId::Kg),
+                // 严格同曲
+                candidate("晴天(深情版)", "Lucky小爱", 278, SourceId::Kg),
+            ]),
+        }));
+
+        let candidates = manager.find_music(&fallback_target()).await;
+        assert_eq!(
+            candidates.len(),
+            1,
+            "只有严格同曲应当通过过滤，实际: {:?}",
+            candidates
+                .iter()
+                .map(|c| format!("{} - {} {}s", c.name, c.singer, c.duration.as_secs()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(candidates[0].singer, "Lucky小爱");
+        assert_eq!(candidates[0].duration, Duration::from_secs(278));
+    }
+
+    /// `find_music_on` 只搜指定平台，且不改变严格匹配规则。
+    #[tokio::test]
+    async fn find_music_on_restricts_the_platform_set() {
+        let mut manager = SourceManager::new(SourceId::Tx, &[SourceId::Kw, SourceId::Kg]);
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kw,
+            behavior: SearchBehavior::Items(vec![candidate(
+                "晴天(深情版)",
+                "Lucky小爱",
+                278,
+                SourceId::Kw,
+            )]),
+        }));
+        manager.register(Arc::new(StubSearchSource {
+            id: SourceId::Kg,
+            behavior: SearchBehavior::Items(vec![candidate(
+                "晴天(深情版)",
+                "Lucky小爱",
+                278,
+                SourceId::Kg,
+            )]),
+        }));
+
+        // 不限定：两个平台都会命中
+        let all = manager.find_music(&fallback_target()).await;
+        assert_eq!(all.len(), 2, "两个平台各一条同曲");
+
+        // 限定只用酷狗：酷我的候选必须消失
+        let only_kg = manager
+            .find_music_on(&fallback_target(), &[SourceId::Kg])
+            .await;
+        assert_eq!(only_kg.len(), 1);
+        assert_eq!(only_kg[0].source, SourceId::Kg);
+
+        // 限定到没有候选的平台：直接为空，不会回退到别的平台
+        let only_tx = manager
+            .find_music_on(&fallback_target(), &[SourceId::Tx])
+            .await;
+        assert!(only_tx.is_empty());
     }
 }
