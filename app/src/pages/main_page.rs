@@ -967,6 +967,24 @@ impl MainPage {
         MP_PAGE_KEY
     }
 
+    /// 本次实际生效的封面协议（启动时注入设置页，供 `Shift+P` 循环判断）。
+    pub fn cover_protocol(&self) -> ratatui_image::picker::ProtocolType {
+        self.cover.protocol_type()
+    }
+
+    /// 把三处分栏比例恢复成内置默认值（封面/歌词分栏下次布局重新自适应）。
+    ///
+    /// 与 `apply_pane_ratios` 对称：调用方同时要删掉持久化的 `pane_ratios`
+    /// 条目，否则下次启动又会被旧值覆盖回来。
+    pub fn reset_pane_ratios(&mut self) {
+        self.wide_columns_ratio = DEFAULT_WIDE_COLUMNS_RATIO;
+        self.wide_cover_ratio = DEFAULT_WIDE_COVER_RATIO;
+        self.narrow_queue_ratio = DEFAULT_NARROW_QUEUE_RATIO;
+        // 让封面高度重新按图片宽高比自适应一次
+        self.layout_initialized = false;
+        self.splitter.cancel();
+    }
+
     fn render_queue(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         let accent = crate::theme::accent(ctx);
         // 借用队列快照，每帧渲染不再复制整张播放列表。
@@ -1118,8 +1136,25 @@ impl MainPage {
     }
 }
 
+/// 封面框在「画不出图」时的文字状态。
+///
+/// 这些文案是排查封面问题的唯一线索：以前 `Empty` / `Ready`（协议不支持）
+/// 会渲染成空行，用户只看到一个空框，既不知道是没拿到地址、还是拿到了但
+/// 终端画不出来。现在每种状态都给出可区分的文字。
+fn cover_status_hint(state: &CoverState) -> &'static str {
+    match state {
+        CoverState::Loading => "封面加载中...",
+        CoverState::Unavailable(_) => "封面不可用",
+        // current_song 非 None 但无封面地址（音源没返回，或被判定为残缺地址）
+        CoverState::Empty => "音源未返回封面地址",
+        // 地址已就绪，但当前终端协议画不出来（例如被识别成 halfblocks）
+        CoverState::Ready => "封面无法显示（终端协议不支持）",
+    }
+}
+
 fn render_cover_text(inner: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let cover_state = ctx.cover_service.state();
+    let hint = cover_status_hint(&cover_state);
     let song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
     let lines = song.as_ref().map_or_else(
         || {
@@ -1146,19 +1181,21 @@ fn render_cover_text(inner: Rect, buf: &mut Buffer, ctx: &AppContext) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    match &cover_state {
-                        CoverState::Loading => "封面加载中...",
-                        CoverState::Unavailable(_) => "封面不可用",
-                        // current_song 非 None 但无封面 <-> 封面被禁用
-                        CoverState::Empty => "",
-                        // 封面就绪但是终端无法显示
-                        CoverState::Ready => "封面无法显示",
-                    },
+                    hint,
                     Style::new().fg(crate::theme::muted(ctx)),
                 )),
                 match &cover_state {
                     CoverState::Unavailable(error) => Line::from(Span::styled(
-                        error.chars().take(inner.width as usize).collect::<String>(),
+                        // 按**显示宽度**截断（错误信息是中文，chars() 会超宽撑出面板）
+                        crate::pages::components::text::truncate_width(
+                            error,
+                            inner.width as usize,
+                        )
+                        .into_owned(),
+                        Style::new().fg(crate::theme::overlay0(ctx)),
+                    )),
+                    CoverState::Empty => Line::from(Span::styled(
+                        "可在「设置 · 界面」里关闭封面显示以给歌词让位",
                         Style::new().fg(crate::theme::overlay0(ctx)),
                     )),
                     _ => Line::from(""),

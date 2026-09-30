@@ -79,14 +79,18 @@ impl CoverRenderer {
         let configured = parse_protocol(cover_protocol);
         let picker = match (configured, cover_enabled) {
             (Some(protocol), _) => {
-                let in_kitty = kitty_signal(
-                    std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-                    std::env::var("TERM").ok().as_deref(),
+                let corrected = corrected_protocol(
+                    protocol,
+                    kitty_signal(
+                        std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+                        std::env::var("TERM").ok().as_deref(),
+                    ),
                 );
-                let corrected = corrected_protocol(protocol, in_kitty);
                 if corrected != protocol {
                     tracing::warn!(
-                        "ui.cover_protocol = \"sixel\" 在 kitty 终端下不被支持（kitty 只实现自己的图形协议），已改用 kitty 协议"
+                        "ui.cover_protocol = {} 在本终端不被支持，已改用 {}",
+                        protocol_label(protocol),
+                        protocol_label(corrected)
                     );
                 }
                 picker_for_protocol(corrected)
@@ -161,6 +165,11 @@ impl CoverRenderer {
     /// 终端单元格的像素尺寸
     pub fn font_size(&self) -> FontSize {
         self.picker.font_size()
+    }
+
+    /// 本次实际生效的封面协议（设置页据此显示"配置值 vs 生效值"）。
+    pub fn protocol_type(&self) -> ProtocolType {
+        self.picker.protocol_type()
     }
 
     /// 把渲染器同步到给定的封面路径，路径变化时才向后台线程发起解码
@@ -437,14 +446,135 @@ fn kitty_signal(kitty_window_id: Option<&str>, term: Option<&str>) -> bool {
 
 /// 核对显式配置与环境是否**不可能成立**。
 ///
-/// kitty 终端只实现 kitty 图形协议、**不支持 sixel**；若配置写死 `sixel`，照发只会让
-/// kitty 把整幅载荷当文本打印（实测：单个封面 sixel 载荷 227157 字节、98.8% 可打印 ASCII
-/// → 满屏 `?`）。这是唯一能确定"配错了"的组合，所以在这里纠正为 kitty 协议并告警；
-/// 其它组合一律尊重用户显式配置。
+/// kitty 终端只实现自己的 kitty 图形协议：既不支持 sixel，**也不支持 iTerm2 的
+/// `OSC 1337;File=`**（那是 iTerm2 / WezTerm 一类的扩展）。两种配错的表现不同：
+///
+/// - `sixel` 配错：整幅载荷被当文本打印（实测单个封面 227157 字节、98.8% 可打印
+///   ASCII → 满屏 `?`）；
+/// - `iterm2` 配错：kitty 直接**丢弃**该序列，封面区域什么都不画 —— 因为
+///   `has_image` 为真、占位文字被跳过，用户只看到一个空框，最难自查。
+///
+/// 这两种组合都能由环境确定"配错了"，因此纠正为 kitty 协议并告警；其它组合一律
+/// 尊重用户显式配置。
 fn corrected_protocol(protocol: ProtocolType, in_kitty: bool) -> ProtocolType {
     match (protocol, in_kitty) {
-        (ProtocolType::Sixel, true) => ProtocolType::Kitty,
+        (ProtocolType::Sixel | ProtocolType::Iterm2, true) => ProtocolType::Kitty,
         (protocol, _) => protocol,
+    }
+}
+
+/// 本终端上"哪些封面协议真的能画出图"的**唯一判定点**。
+///
+/// 之前只有"发送前纠正"（[`corrected_protocol`]）：配置写错会被静默换成可用协议，
+/// 但设置页的 `Shift+P` 仍然把画不出来的选项摆在循环里，用户会一直选到空框。
+/// 现在把环境探测结果收敛成这个类型，两处都从它取答案：
+///
+/// - **运行期**：`CoverRenderer::detect` 用它决定真正使用的协议（配错则纠正 + 告警）；
+/// - **界面**：设置页的 `Shift+P` 循环按 [`Self::supported`] 跳过画不出的协议，
+///   并在行内显示"配置值与生效值不一致"的原因。
+///
+/// 注意它**不发查询、不读 stdin**（只读环境变量），因此可以随时构造。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoverCapabilities {
+    /// 固定顺序的候选（用于循环切换与展示）
+    supported: &'static [ProtocolType],
+    /// 本次实际生效的协议
+    active: ProtocolType,
+}
+
+impl CoverCapabilities {
+    /// 循环切换的固定顺序；`filtered` 是"本终端支持"的子集。
+    const CYCLE: [ProtocolType; 4] = [
+        ProtocolType::Kitty,
+        ProtocolType::Sixel,
+        ProtocolType::Iterm2,
+        ProtocolType::Halfblocks,
+    ];
+
+    /// 只做环境探测（与 `detect` 同一口径），不做任何 IO。
+    pub fn detect(active: ProtocolType) -> Self {
+        let detected = protocol_from_env(
+            std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var("TMUX")
+                .ok()
+                .or_else(|| std::env::var("STY").ok())
+                .as_deref(),
+        );
+        Self::from_detected(detected, active)
+    }
+
+    /// 纯函数版本（可测）：`detected` 为环境正向识别出的协议，`None` 表示认不出。
+    pub fn from_detected(detected: Option<ProtocolType>, active: ProtocolType) -> Self {
+        // 认不出终端时只有 halfblocks 敢保证画得出来（不发送任何图形序列）。
+        let supported: &'static [ProtocolType] = match detected {
+            Some(ProtocolType::Kitty) => &[ProtocolType::Kitty, ProtocolType::Halfblocks],
+            Some(ProtocolType::Sixel) => &[ProtocolType::Sixel, ProtocolType::Halfblocks],
+            Some(ProtocolType::Iterm2) => &[ProtocolType::Iterm2, ProtocolType::Halfblocks],
+            _ => &[ProtocolType::Halfblocks],
+        };
+        Self { supported, active }
+    }
+
+    pub fn active(&self) -> ProtocolType {
+        self.active
+    }
+
+    pub fn supported(&self) -> &'static [ProtocolType] {
+        self.supported
+    }
+
+    /// 这个协议在本终端能否画出图。
+    pub fn can_render(&self, protocol: ProtocolType) -> bool {
+        self.supported.contains(&protocol)
+    }
+
+    /// 按固定顺序找到下一个**能画出来**的协议。
+    pub fn next_supported(&self, current: ProtocolType) -> ProtocolType {
+        let start = Self::CYCLE
+            .iter()
+            .position(|candidate| *candidate == current)
+            .map_or(0, |index| index + 1);
+        Self::CYCLE
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(Self::CYCLE.len())
+            .find(|candidate| self.can_render(**candidate))
+            .copied()
+            // 理论上不可能走到：`supported` 至少含 Halfblocks
+            .unwrap_or(ProtocolType::Halfblocks)
+    }
+
+    /// 配置值与生效值不一致时返回原因，用于在设置行里直接显示。
+    ///
+    /// 带上"本终端支持哪些"，用户才知道该改成什么。
+    pub fn correction_note(&self) -> Option<String> {
+        (!self.can_render(self.active)).then(|| {
+            let names: Vec<&str> = self.supported().iter().copied().map(protocol_label).collect();
+            format!(
+                "本终端不支持该协议，已改用 {}；可选 {}",
+                protocol_label(self.active),
+                names.join(" / ")
+            )
+        })
+    }
+
+    /// 能力表的展示文案（仅测试断言用）。
+    #[cfg(test)]
+    pub fn supported_labels(&self) -> Vec<&'static str> {
+        self.supported().iter().copied().map(protocol_label).collect()
+    }
+}
+
+/// 协议的中文短名（设置行展示用）。
+pub fn protocol_label(protocol: ProtocolType) -> &'static str {
+    match protocol {
+        ProtocolType::Kitty => "kitty",
+        ProtocolType::Sixel => "sixel",
+        ProtocolType::Iterm2 => "iterm2",
+        ProtocolType::Halfblocks => "halfblocks",
     }
 }
 
@@ -489,6 +619,14 @@ fn protocol_from_env(
         "wezterm" => Some(ProtocolType::Kitty),
         _ => None,
     }
+}
+
+/// 把配置里的 `ui.cover_protocol` 文案解析成协议；`auto`/空/未知都返回 `None`。
+///
+/// 公开给设置页使用：`Shift+P` 循环要先知道"现在配的是哪个"，才能在本终端
+/// 支持的子集里找下一个。
+pub fn protocol_from_config(value: &str) -> Option<ProtocolType> {
+    parse_protocol(value)
 }
 
 fn parse_protocol(value: &str) -> Option<ProtocolType> {
@@ -792,27 +930,103 @@ mod tests {
         );
     }
 
-    /// kitty 终端不支持 sixel：显式配成 sixel 时若不纠正，整幅载荷会被当文本打印。
+    /// 能力表决定 `Shift+P` 循环里出现哪些协议：画不出的不再摆给用户。
+    ///
+    /// 这条把"终端能力"与"设置页能选什么"钉在一起 —— 之前两者各写一套，
+    /// kitty 上仍能循环到 sixel / iterm2，选完只会得到一个空框。
     #[test]
-    fn sixel_is_corrected_on_kitty_terminals() {
-        use super::{ProtocolType, corrected_protocol};
+    fn capabilities_drive_the_protocol_cycle() {
+        use super::{CoverCapabilities, ProtocolType};
 
+        // kitty 终端：只认自己的协议 + 保底半格
+        let kitty = CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
+        assert_eq!(kitty.supported_labels(), ["kitty", "halfblocks"]);
+        assert!(kitty.can_render(ProtocolType::Kitty));
+        assert!(!kitty.can_render(ProtocolType::Sixel));
+        assert!(!kitty.can_render(ProtocolType::Iterm2));
         assert_eq!(
-            corrected_protocol(ProtocolType::Sixel, true),
+            kitty.next_supported(ProtocolType::Kitty),
+            ProtocolType::Halfblocks,
+            "kitty 下应跳过 sixel / iterm2 直接到 halfblocks"
+        );
+        assert_eq!(
+            kitty.next_supported(ProtocolType::Halfblocks),
             ProtocolType::Kitty,
-            "kitty 下 sixel 不可能成立，必须纠正"
+            "循环要能绕回来"
         );
+        // 配错时给出可读原因（含"可选哪些"）
+        let corrected = CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Iterm2);
+        assert!(!corrected.can_render(ProtocolType::Iterm2));
+        let note = corrected.correction_note().expect("配错必须有说明");
+        assert!(note.contains("iterm2") && note.contains("kitty"), "{note}");
+        // 配置与生效一致时不该有噪声
+        assert!(kitty.correction_note().is_none());
+
+        // iTerm2 终端：iterm2 有效，kitty 协议无效
+        let iterm = CoverCapabilities::from_detected(Some(ProtocolType::Iterm2), ProtocolType::Iterm2);
+        assert_eq!(iterm.supported_labels(), ["iterm2", "halfblocks"]);
+        assert_eq!(iterm.next_supported(ProtocolType::Iterm2), ProtocolType::Halfblocks);
+        assert!(!iterm.can_render(ProtocolType::Sixel));
+
+        // 认不出终端：只有 halfblocks 敢保证画得出来
+        let unknown = CoverCapabilities::from_detected(None, ProtocolType::Halfblocks);
+        assert_eq!(unknown.supported_labels(), ["halfblocks"]);
         assert_eq!(
-            corrected_protocol(ProtocolType::Sixel, false),
-            ProtocolType::Sixel,
-            "非 kitty 终端尊重显式配置"
+            unknown.next_supported(ProtocolType::Halfblocks),
+            ProtocolType::Halfblocks
         );
-        // 其它组合一律不动
+        assert!(unknown.correction_note().is_none(), "halfblocks 一定能画");
+    }
+
+    /// `protocol_from_config` 是设置页循环的入口：`auto`/空/未知都要能识别。
+    #[test]
+    fn protocol_config_parsing_round_trips() {
+        use super::{ProtocolType, protocol_from_config, protocol_label};
+
+        assert_eq!(protocol_from_config("kitty"), Some(ProtocolType::Kitty));
+        assert_eq!(protocol_from_config("Iterm2"), Some(ProtocolType::Iterm2));
+        assert_eq!(protocol_from_config("sixel"), Some(ProtocolType::Sixel));
+        assert_eq!(protocol_from_config("halfblocks"), Some(ProtocolType::Halfblocks));
+        assert_eq!(protocol_from_config("auto"), None);
+        assert_eq!(protocol_from_config(""), None);
+        assert_eq!(protocol_from_config("nonsense"), None);
+
+        // 循环写回配置用的是 label，必须能被解析回来
         for protocol in [
             ProtocolType::Kitty,
+            ProtocolType::Sixel,
             ProtocolType::Iterm2,
             ProtocolType::Halfblocks,
         ] {
+            assert_eq!(protocol_from_config(protocol_label(protocol)), Some(protocol));
+        }
+    }
+
+    /// kitty 终端既不支持 sixel，也不支持 iTerm2 协议：显式配错时必须纠正。
+    ///
+    /// sixel 配错是"整幅载荷被当文本打印"（花屏），iTerm2 配错则是 kitty 静默丢弃
+    /// 序列 —— 封面区只留一个空框，用户完全看不出是协议选错了。
+    #[test]
+    fn unsupported_protocols_are_corrected_on_kitty_terminals() {
+        use super::{ProtocolType, corrected_protocol};
+
+        for configured in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            assert_eq!(
+                corrected_protocol(configured, true),
+                ProtocolType::Kitty,
+                "kitty 下 {configured:?} 不可能成立，必须纠正"
+            );
+            assert_eq!(
+                corrected_protocol(configured, false),
+                configured,
+                "非 kitty 终端尊重显式配置"
+            );
+        }
+        // 其它组合一律不动
+        for protocol in [ProtocolType::Kitty, ProtocolType::Halfblocks] {
             assert_eq!(corrected_protocol(protocol, true), protocol);
             assert_eq!(corrected_protocol(protocol, false), protocol);
         }
