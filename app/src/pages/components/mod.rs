@@ -11,6 +11,7 @@ pub mod list_filter;
 pub mod lyric;
 pub mod notification;
 pub mod progress_bar;
+pub mod remote_collections;
 pub mod scroll;
 pub mod song_table;
 pub mod source_selector;
