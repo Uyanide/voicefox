@@ -109,7 +109,7 @@ fn build_client(options: &NetworkOptions, redirect: RedirectMode) -> reqwest::Cl
 }
 
 /// 默认重试次数：仅连接/超时类瞬时错误，最多再试 1 次。
-pub(crate) const RETRY_ATTEMPTS: usize = 1;
+pub const RETRY_ATTEMPTS: usize = 1;
 const RETRY_BASE_DELAY_MS: u64 = 300;
 const RETRY_MAX_DELAY_MS: u64 = 2_000;
 
@@ -126,7 +126,7 @@ fn retryable_error(error: &reqwest::Error) -> bool {
 ///
 /// 仅对连接失败/超时这类瞬时网络错误做有限次重试，4xx/5xx 响应不重试，
 /// 由调用方自行判断业务语义。
-pub(crate) trait SendWithRetry {
+pub trait SendWithRetry {
     fn send_with_retry(
         self,
         retries: usize,

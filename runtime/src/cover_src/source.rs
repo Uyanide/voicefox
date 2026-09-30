@@ -1,73 +1,18 @@
 //! 封面的获取与本地缓存
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::OnceLock;
 
+use lx_source::cover_cache;
+use lx_source::http::{RETRY_ATTEMPTS, SendWithRetry};
+use regex::Regex;
 use reqwest::header::{ACCEPT, REFERER};
 
-/// 临时文件名的流水号
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// 临时文件名中的标记
-const TEMP_INFIX: &str = ".part.";
-
-/// 临时文件在此时长内被视为其他实例正在写入
-const TEMP_GRACE: Duration = Duration::from_secs(60);
-
-/// 封面缓存目录
-fn cache_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "voicefox")
-        .map(|project| project.cache_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            dirs::cache_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("voicefox")
-        })
-        .join("covers")
-}
-
-/// 缓存文件数量上限，超过后按最旧访问时间淘汰
-const CACHE_LIMIT: usize = 512;
-
-/// 清理进程异常退出后残留在缓存目录里的临时文件，并按 LRU 约束缓存总量
+/// 清理进程异常退出后残留在缓存目录里的临时文件，并按缓存总量上限淘汰旧文件。
+///
+/// 目录、命名、校验与淘汰规则都在 [`cover_cache`] 里：本地文件的内嵌封面
+/// 缓存共用同一份，避免两个模块各自维护一份 512 的预算。
 pub async fn sweep_temp_files() {
-    let Ok(mut entries) = tokio::fs::read_dir(cache_dir()).await else {
-        return;
-    };
-    // (访问时间, 路径)，非缓存文件（临时文件）跳过
-    let mut cached: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if entry.file_name().to_string_lossy().contains(TEMP_INFIX) {
-            if let Ok(metadata) = entry.metadata().await
-                && metadata
-                    .modified()
-                    .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < TEMP_GRACE))
-            {
-                continue;
-            }
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => tracing::debug!("removed stale cover temp file {path:?}"),
-                Err(error) => tracing::debug!("remove stale cover temp file failed: {error}"),
-            }
-            continue;
-        }
-        if let Ok(metadata) = entry.metadata().await
-            && let Ok(atime) = metadata.accessed()
-        {
-            cached.push((atime, path));
-        }
-    }
-    if cached.len() > CACHE_LIMIT {
-        cached.sort_by_key(|(atime, _)| *atime);
-        for (_, path) in &cached[..cached.len() - CACHE_LIMIT] {
-            match tokio::fs::remove_file(path).await {
-                Ok(()) => tracing::debug!("evicted cover cache {path:?}"),
-                Err(error) => tracing::debug!("evict cover cache failed: {error}"),
-            }
-        }
-    }
+    cover_cache::sweep().await;
 }
 
 /// 已就绪的封面
@@ -80,11 +25,9 @@ pub struct CoverImage {
 
 /// 下载封面到本地缓存，返回缓存路径与像素宽高比
 pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<CoverImage, String> {
-    let cache_dir = cache_dir();
-
-    if !cache_dir.exists() {
+    if !cover_cache::cache_dir().exists() {
         // async 上下文里避免阻塞 worker 的同步文件系统调用
-        let _ = tokio::fs::create_dir_all(&cache_dir).await;
+        let _ = tokio::fs::create_dir_all(cover_cache::cache_dir()).await;
     }
 
     // 本地文件直接返回路径
@@ -103,8 +46,12 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
     }
 
     // 远程文件：下载到缓存
-    let hash = simple_hash(url.as_bytes());
-    let cache_path = cache_dir.join(format!("{}.jpg", hash));
+    let url = validate_remote_url(url).map_err(|error| {
+        tracing::debug!("cover url rejected: {url:?}: {error}");
+        format!("封面地址无效: {}（{url}）", error)
+    })?;
+
+    let cache_path = cover_cache::remote_cache_path(&url);
 
     match probe_aspect(&cache_path).await {
         Some(aspect) => {
@@ -124,13 +71,13 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
 
     // HTTP 下载
     let mut request = client
-        .get(url)
+        .get(&url)
         .header(ACCEPT, "image/webp,image/apng,image/*,*/*;q=0.8");
-    if let Some(referer) = cover_referer(url) {
+    if let Some(referer) = cover_referer(&url) {
         request = request.header(REFERER, referer);
     }
     let bytes = request
-        .send()
+        .send_with_retry(RETRY_ATTEMPTS)
         .await
         .map_err(|error| error.to_string())?
         .error_for_status()
@@ -139,11 +86,15 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
         .await
         .map_err(|error| error.to_string())?;
 
+    // 解码校验留在重试之外：重试只针对发送阶段的瞬时网络错误，
+    // 4xx/5xx 与损坏图片立刻失败（不再白白重试三次）。
     let target = cache_path.clone();
-    let aspect = tokio::task::spawn_blocking(move || write_cache_file(&target, &bytes))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| format!("写入封面缓存失败: {error}"))?;
+    let (width, height) =
+        tokio::task::spawn_blocking(move || cover_cache::store_bytes(&target, &bytes))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("写入封面缓存失败: {error}"))?;
+    let aspect = width as f32 / height as f32;
 
     Ok(CoverImage {
         path: cache_path.to_string_lossy().to_string(),
@@ -151,64 +102,65 @@ pub async fn download_and_cache(client: &reqwest::Client, url: &str) -> Result<C
     })
 }
 
-/// 同目录下的临时文件路径
-fn temp_path_for(target: &Path) -> PathBuf {
-    let mut name = target.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(
-        "{TEMP_INFIX}{}.{}",
-        std::process::id(),
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    target.with_file_name(name)
-}
-
-/// 写入临时文件，完整解码验证后再原子替换缓存
-fn write_cache_file(target: &Path, bytes: &[u8]) -> std::io::Result<f32> {
-    let temp_path = temp_path_for(target);
-    let result = (|| {
-        std::fs::write(&temp_path, bytes)?;
-        let aspect = probe_aspect_blocking(&temp_path).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "cover image is corrupt")
-        })?;
-        std::fs::rename(&temp_path, target)?;
-        Ok(aspect)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
-}
-
-/// 完整解码图片并取像素宽高比，失败返回 None
-fn probe_aspect_blocking(path: &std::path::Path) -> Option<f32> {
-    let image = image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
-    let (width, height) = (image.width(), image.height());
-    if width == 0 || height == 0 {
-        return None;
-    }
-    Some(width as f32 / height as f32)
-}
-
+/// 完整解码图片并取像素宽高比，失败返回 None（同步实现走共享缓存模块）。
 pub async fn probe_aspect(path: impl AsRef<std::path::Path>) -> Option<f32> {
     let path = path.as_ref().to_path_buf();
-    tokio::task::spawn_blocking(move || probe_aspect_blocking(&path))
+    tokio::task::spawn_blocking(move || cover_cache::probe_aspect(&path))
         .await
         .ok()
         .flatten()
 }
 
+/// 规整音源返回的封面地址：去空白、补 `//` 前缀、剥掉包裹引号。
 pub fn normalize_url(url: &str) -> String {
-    let url = url.trim();
+    let url = url.trim().trim_matches(['"', '\'']).trim();
     if url.starts_with("//") {
         format!("https:{url}")
     } else {
         url.to_string()
     }
+}
+
+/// 校验远程封面地址是否可能是一张图。
+///
+/// 音源经常返回残缺地址（例如只剩域名 `https://p`、`https://y.gtimg.cn`），
+/// 直接请求只会拿到 400/403 或 HTML 首页，随后以「封面不可用」的面目出现，
+/// 很难定位。这里提前挡掉，并把原始地址带进错误信息。
+pub fn validate_remote_url(url: &str) -> Result<String, &'static str> {
+    static HOST: OnceLock<Regex> = OnceLock::new();
+    let url = normalize_url(url);
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return Err("缺少 http(s) 前缀");
+    };
+    if url.chars().any(char::is_whitespace) {
+        return Err("地址包含空白字符");
+    }
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    // 只保留主机名部分，丢掉端口与可能的 userinfo
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    if !HOST
+        .get_or_init(|| {
+            Regex::new(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$")
+                .expect("valid cover host regex")
+        })
+        .is_match(host)
+    {
+        return Err("主机名不完整");
+    }
+    // 没有路径说明音源只给出了域名，不可能指向具体图片
+    if path.trim_matches('/').is_empty() {
+        return Err("只有域名、没有图片路径");
+    }
+    Ok(url)
+}
+
+/// 地址是否是一个可能指向图片的远程 URL（不发起网络请求）。
+pub fn is_usable_remote_url(url: &str) -> bool {
+    validate_remote_url(url).is_ok()
 }
 
 fn cover_referer(url: &str) -> Option<&'static str> {
@@ -224,105 +176,39 @@ fn cover_referer(url: &str) -> Option<&'static str> {
         None
     }
 }
-
-fn simple_hash(data: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read};
-    use std::path::{Path, PathBuf};
+    use super::{is_usable_remote_url, validate_remote_url};
 
-    use super::{probe_aspect_blocking, write_cache_file};
-
-    /// 创建一个空的临时目录，返回路径
-    fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("voicefox-cache-{name}"));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    /// 目录里的文件名，已排序
-    fn names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
-        names.sort();
-        names
-    }
-
-    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height));
-        let mut bytes = Cursor::new(Vec::new());
-        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        bytes.into_inner()
+    #[test]
+    fn truncated_cover_urls_are_rejected_with_a_reason() {
+        // 音源只回一个残缺主机名时，请求只会拿到 400/403 或 HTML 首页
+        assert!(validate_remote_url("https://p").is_err());
+        assert!(validate_remote_url("https://y.gtimg.cn").is_err());
+        assert!(validate_remote_url("https://p1.music.126.net/").is_err());
+        assert!(validate_remote_url("https://").is_err());
+        assert!(validate_remote_url("p1.music.126.net/x.jpg").is_err());
     }
 
     #[test]
-    fn a_cache_write_replaces_the_target_instead_of_truncating_it() {
-        let dir = temp_dir("replace");
-        let target = dir.join("cover.jpg");
-        std::fs::write(&target, b"old").unwrap();
-        let new = png_bytes(20, 10);
-
-        // 先持有旧文件的句柄，rename 替换的只是目录项
-        let mut old_handle = std::fs::File::open(&target).unwrap();
-        assert_eq!(write_cache_file(&target, &new).unwrap(), 2.0);
-
-        let mut old = Vec::new();
-        old_handle.read_to_end(&mut old).unwrap();
-        assert_eq!(old, b"old", "写入前打开的句柄应仍读到旧内容");
-        assert_eq!(std::fs::read(&target).unwrap(), new, "新内容应已就位");
-    }
-
-    #[test]
-    fn a_finished_cache_write_leaves_no_temp_file() {
-        let dir = temp_dir("finished");
-        let target = dir.join("cover.jpg");
-        write_cache_file(&target, &png_bytes(1, 1)).unwrap();
-        assert_eq!(names(&dir), ["cover.jpg"], "目录里应只剩目标文件");
-    }
-
-    #[test]
-    fn a_failed_cache_write_leaves_no_temp_file() {
-        let dir = temp_dir("failed");
-        // 目标是目录，rename 无法完成
-        let target = dir.join("cover.jpg");
-        std::fs::create_dir(&target).unwrap();
-
-        assert!(
-            write_cache_file(&target, &png_bytes(1, 1)).is_err(),
-            "应该报错"
+    fn well_formed_cover_urls_survive_normalization() {
+        assert_eq!(
+            validate_remote_url("//p1.music.126.net/abc/x.jpg").unwrap(),
+            "https://p1.music.126.net/abc/x.jpg"
         );
-        assert_eq!(names(&dir), ["cover.jpg"], "临时文件应已清掉");
+        assert_eq!(
+            validate_remote_url("  \"https://y.gtimg.cn/music/photo/T002.jpg\"  ").unwrap(),
+            "https://y.gtimg.cn/music/photo/T002.jpg"
+        );
+        assert!(
+            validate_remote_url("http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&rid=1").is_ok()
+        );
     }
 
     #[test]
-    fn probe_reads_dimensions_even_when_the_extension_lies() {
-        // 缓存文件名一律是 .jpg，实际内容却可能是任何格式
-        let path = std::env::temp_dir().join("voicefox-cover-probe.jpg");
-        image::DynamicImage::ImageRgba8(image::RgbaImage::new(20, 10))
-            .save_with_format(&path, image::ImageFormat::Png)
-            .unwrap();
-        assert_eq!(probe_aspect_blocking(&path), Some(2.0));
-    }
-
-    #[test]
-    fn a_header_only_image_is_rejected_before_it_reaches_the_cache() {
-        let dir = temp_dir("corrupt");
-        let target = dir.join("cover.jpg");
-        let mut bytes = png_bytes(20, 10);
-        bytes.truncate(33);
-
-        assert!(write_cache_file(&target, &bytes).is_err());
-        assert!(!target.exists());
-        assert!(names(&dir).is_empty(), "损坏文件和临时文件都不应保留");
+    fn usability_probe_never_requests_the_network() {
+        assert!(is_usable_remote_url("https://p1.music.126.net/a/b.jpg"));
+        assert!(!is_usable_remote_url("https://p"));
+        assert!(!is_usable_remote_url(""));
     }
 }

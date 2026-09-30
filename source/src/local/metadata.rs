@@ -1,8 +1,7 @@
 //! 音频元数据读取（使用 lofty）
 
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
@@ -12,8 +11,7 @@ use lofty::tag::{Accessor, ItemKey, Tag};
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::{AudioProperties, Quality};
 
-static COVER_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-const COVER_TEMP_INFIX: &str = ".part.";
+use crate::cover_cache;
 
 /// 可写入音频文件的标签字段。
 ///
@@ -206,91 +204,35 @@ fn extract_cover(tagged: &lofty::file::TaggedFile, audio_path: &Path) -> Option<
     // 尝试读取封面
     let picture = tag.pictures().first()?;
 
-    // 缓存目录
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("voicefox")
-        .join("covers");
-
-    if !cache_dir.exists() {
-        let _ = std::fs::create_dir_all(&cache_dir);
-    }
-
+    // 缓存目录、命名与原子写入规则与远程封面**共用**一份实现
+    // （见 `crate::cover_cache`）：以前两边各写一套，还在同一个目录里
+    // 互相按各自的 512 预算淘汰对方的文件。
+    //
     // 路径相同的文件可能被重新嵌入了封面。将图片内容纳入缓存键，避免标签编辑后
     // 继续显示旧封面；未变化的文件仍会命中缓存。
-    let mut cache_key = audio_path.to_string_lossy().as_bytes().to_vec();
-    cache_key.extend_from_slice(picture.data());
-    let hash = simple_hash(&cache_key);
-    let cover_path = cache_dir.join(format!("{}.jpg", hash));
+    let cover_path = cover_cache::embedded_cover_path(audio_path, picture.data());
 
     if cover_path.exists() {
-        if validate_cover(&cover_path) {
+        if cover_cache::probe_dimensions(&cover_path).is_some() {
             return Some(cover_path.to_string_lossy().to_string());
         }
         tracing::debug!("local cover cache {cover_path:?} is corrupt, rebuilding");
         let _ = std::fs::remove_file(&cover_path);
     }
 
-    let data = picture.data();
-    if write_cover_cache(&cover_path, data).is_ok() {
+    if cover_cache::store_bytes(&cover_path, picture.data()).is_ok() {
         Some(cover_path.to_string_lossy().to_string())
     } else {
         None
     }
 }
 
-fn validate_cover(path: &Path) -> bool {
-    image::ImageReader::open(path)
-        .and_then(|reader| reader.with_guessed_format())
-        .map_err(|error| error.to_string())
-        .and_then(|reader| reader.decode().map_err(|error| error.to_string()))
-        .is_ok_and(|image| image.width() > 0 && image.height() > 0)
-}
-
-fn cover_temp_path(target: &Path) -> PathBuf {
-    let mut name = target.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(
-        "{COVER_TEMP_INFIX}{}.{}",
-        std::process::id(),
-        COVER_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    target.with_file_name(name)
-}
-
-fn write_cover_cache(target: &Path, data: &[u8]) -> std::io::Result<()> {
-    let temp_path = cover_temp_path(target);
-    let result = (|| {
-        std::fs::write(&temp_path, data)?;
-        if !validate_cover(&temp_path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "embedded cover image is corrupt",
-            ));
-        }
-        std::fs::rename(&temp_path, target)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
-}
-
-/// 简单的字符串哈希
-fn simple_hash(data: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
-    use super::{
-        classify, embedded_lyric_from_tag, is_lossless, validate_cover, write_cover_cache,
-    };
+    use super::{classify, embedded_lyric_from_tag, is_lossless, read_metadata};
+    use crate::cover_cache;
     use lofty::file::FileType;
     use lofty::tag::{ItemKey, Tag, TagType};
     use lx_core::model::song::SongInfo;
@@ -429,6 +371,45 @@ mod tests {
         );
     }
 
+    /// 用**真实**的本地曲库验证内嵌封面链路：读标签 → 提取图片 → 落盘 → 能解码。
+    ///
+    /// 默认 `#[ignore]`：需要机器上真的有带封面的音频文件。用
+    /// `VOICEFOX_LOCAL_MUSIC_DIR=/path/to/music cargo test -p lx-source --lib \
+    ///   -- --ignored embedded_cover_survives_the_read_path` 跑。
+    #[test]
+    #[ignore = "需要真实的本地音乐目录"]
+    fn embedded_cover_survives_the_read_path() {
+        let dir = std::env::var("VOICEFOX_LOCAL_MUSIC_DIR")
+            .expect("请设置 VOICEFOX_LOCAL_MUSIC_DIR 指向含内嵌封面的音乐目录");
+        let mut checked = 0;
+        for entry in walkdir::WalkDir::new(&dir).max_depth(2) {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(song) = read_metadata(path) else {
+                continue;
+            };
+            let Some(cover) = song.cover_url.as_deref() else {
+                continue;
+            };
+            assert!(
+                std::path::Path::new(cover).exists(),
+                "{path:?} 的 cover_url 指向的文件不存在: {cover}"
+            );
+            assert!(
+                cover_cache::probe_dimensions(cover).is_some(),
+                "{path:?} 的封面缓存无法解码: {cover}"
+            );
+            checked += 1;
+            if checked >= 5 {
+                break;
+            }
+        }
+        assert!(checked > 0, "在 {dir} 下没有找到带内嵌封面的音频文件");
+    }
+
     fn png_bytes() -> Vec<u8> {
         let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(8, 4));
         let mut bytes = Cursor::new(Vec::new());
@@ -444,9 +425,9 @@ mod tests {
         let target = dir.join("cover.jpg");
         std::fs::write(&target, b"corrupt").unwrap();
 
-        write_cover_cache(&target, &png_bytes()).unwrap();
+        cover_cache::store_bytes(&target, &png_bytes()).unwrap();
 
-        assert!(validate_cover(&target));
+        assert!(cover_cache::probe_dimensions(&target).is_some());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 
@@ -459,7 +440,7 @@ mod tests {
         let mut bytes = png_bytes();
         bytes.truncate(33);
 
-        assert!(write_cover_cache(&target, &bytes).is_err());
+        assert!(cover_cache::store_bytes(&target, &bytes).is_err());
         assert!(!target.exists());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }

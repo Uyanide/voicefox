@@ -11,7 +11,8 @@ use voicefox_application::{ApplicationService, PlaybackEffects};
 
 mod cover;
 pub mod storage;
-pub use cover::{CoverService, CoverState, sweep_temp_files};
+pub use cover::{CoverService, CoverState, is_usable_remote_url, sweep_temp_files};
+pub use voicefox_application::resolve_cover_url;
 pub use storage::{SavedPlayerState, Storage};
 
 struct RuntimePlaybackEffects {
@@ -63,6 +64,9 @@ impl PlaybackEffects for RuntimePlaybackEffects {
     }
     async fn cache_cover(&self, url: Option<String>) -> Option<String> {
         self.cover.cache_path(url).await.ok().flatten()
+    }
+    fn cover_url_is_usable(&self, url: &str) -> bool {
+        is_usable_remote_url(url)
     }
     fn album_cover_notification(&self) -> bool {
         self.config
