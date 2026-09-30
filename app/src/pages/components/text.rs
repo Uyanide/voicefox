@@ -8,6 +8,22 @@ use std::borrow::Cow;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// 右侧补空格到指定显示宽度（CJK 按 2 列计算）。
+///
+/// 与 [`truncate_width`] 是配套的“定宽列”原语：一个截断、一个补齐。
+/// 此前 `settings.rs::pad_display`、`remote_collections` 的 `pad_right`
+/// 各写了一份逐字相同的实现。
+pub fn pad_display(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+/// 左侧补空格到指定显示宽度（数字右对齐用）。
+pub fn pad_display_left(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+    format!("{}{value}", " ".repeat(padding))
+}
+
 /// 按显示宽度截断字符串；超宽时保留 `max_cols - 1` 列并以省略号结尾。
 ///
 /// 返回 `Cow`：未超宽时零拷贝借用原串。宽字符在边界放不下（会溢出

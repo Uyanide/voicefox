@@ -14,7 +14,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+
+use crate::pages::components::text::truncate_width;
 
 use crate::context::AppContext;
 
@@ -763,25 +765,9 @@ fn separator_width() -> usize {
     UnicodeWidthStr::width(SEGMENT_SEPARATOR)
 }
 
+/// 按显示宽度截断（复用共享实现；这里只需要 `String`）。
 fn truncate(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
-        return value.to_string();
-    }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
-    }
-    let mut result = String::new();
-    let mut rendered = 0;
-    for character in value.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if rendered + character_width > width - 1 {
-            break;
-        }
-        result.push(character);
-        rendered += character_width;
-    }
-    result.push('…');
-    result
+    truncate_width(value, width).into_owned()
 }
 
 fn format_duration(duration: std::time::Duration) -> String {

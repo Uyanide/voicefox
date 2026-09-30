@@ -412,22 +412,9 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// 按显示宽度截断（复用共享实现，避免再写一份"逐字符累计 + 省略号"的循环）。
 fn truncate_to_width(value: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= max_width || max_width <= 1 {
-        return value.to_string();
-    }
-    let mut result = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-        if used + character_width + 1 > max_width {
-            break;
-        }
-        result.push(character);
-        used += character_width;
-    }
-    result.push('…');
-    result
+    crate::pages::components::text::truncate_width(value, max_width).into_owned()
 }
 
 #[cfg(test)]

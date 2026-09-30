@@ -12,13 +12,17 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::context::AppContext;
 use crate::pages::components::context_menu::{
     MenuAction, MenuItem, MenuOutcome, SongContextMenu, StatusBarMenuAction, submenu,
 };
 use crate::pages::components::hit_test::{PANEL_BORDERS, panel_inner};
+use crate::pages::components::remote_collections::{
+    RemoteCollectionsOutcome, RemoteCollectionsWindow,
+};
+use crate::pages::components::text::pad_display;
 use crate::pages::components::splitter::{
     DividerHit, GUTTER, SplitAxis, Splitter, clamp_extent, clamp_ratio, divider_line,
     split_with_gutter,
@@ -33,6 +37,11 @@ fn is_source_cached(url: &str) -> bool {
     lx_source::js::loader::is_source_cached(url)
 }
 
+/// 压缩音源地址用于一行的展示栏（超长时保留开头 + `...`）。
+///
+/// 与 [`truncate_display`] / [`truncate_width`] 刻意不同：这里用三个点而不是
+/// 省略号 `…`，且**不补齐**（返回值宽度可变）。它是历史展示格式，改动会波及
+/// 多处快照式断言，因此保留现状，只在文档里写清区别。
 fn shorten_source(value: &str, max_chars: usize) -> String {
     let count = value.chars().count();
     if count <= max_chars {
@@ -48,27 +57,20 @@ fn shorten_source(value: &str, max_chars: usize) -> String {
     )
 }
 
+/// 把 `value` 压进**恰好** `max_chars` 显示列：超宽截断加省略号，然后补空格。
+///
+/// 调用点都靠它对齐（名称列 + `· N 首` 同一行、固定 18 列的本地文件行），
+/// 所以输出宽度必须恒定。旧实现只在"没超宽"的分支补空格，截断分支直接返回，
+/// 于是 `truncate_display("晴晴晴", 4)` 只有 3 列（`"晴…"`）——宽字符边界上
+/// 整行会向左串一列。现在统一走 [`truncate_width`] + [`pad_display`]。
 fn truncate_display(value: &str, max_chars: usize) -> String {
-    let width = UnicodeWidthStr::width(value);
-    if width <= max_chars {
-        return format!("{value}{}", " ".repeat(max_chars - width));
+    if max_chars == 0 {
+        return String::new();
     }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    let available = max_chars - 1;
-    let mut result = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used + character_width > available {
-            break;
-        }
-        result.push(character);
-        used += character_width;
-    }
-    result.push('…');
-    result
+    pad_display(
+        crate::pages::components::text::truncate_width(value, max_chars).as_ref(),
+        max_chars,
+    )
 }
 
 /// 方向键 / 激活键当前归谁。
@@ -336,7 +338,7 @@ impl RowPlan {
     /// 因此这里一律显示 `Enter`，不再广告任何已删除的字母键。
     fn key_hint(&self) -> &'static str {
         match self {
-            Self::Menu(_) | Self::Direct(_) => "Enter",
+            Self::Menu(_) | Self::Direct(_) => DEFAULT_ACTIVATION_KEY,
             Self::Inert => "-",
         }
     }
@@ -586,6 +588,8 @@ impl SettingsCategory {
 }
 
 pub struct SettingsPage {
+    /// 本终端能用哪些封面协议（启动时探测一次，`Shift+P` 循环据它跳过画不出的项）。
+    cover_capabilities: crate::cover::CoverCapabilities,
     /// 输入中的 JS 源 URL 或本地路径
     pub input_url: String,
     /// 是否在输入模式
@@ -664,6 +668,10 @@ pub struct SettingsPage {
     last_area: Rect,
     /// 设置页自己持有的枚举取值菜单（不占用主循环的 `song_menu` 槽位）。
     menu: Option<SongContextMenu>,
+    /// 「网易云远程歌单」独立窗口；`Some` 时模态独占按键与鼠标。
+    remote_window: Option<RemoteCollectionsWindow>,
+    /// 打开窗口时的远程缓存 generation：刷新完成后要就地更新窗口内容。
+    remote_window_generation: u64,
     /// 删除 JS 音源的武装时刻：首次按 d 只武装，窗口内再按一次才删除
     delete_source_armed: Option<Instant>,
     /// 删除本地目录的武装时刻，机制同上
@@ -761,6 +769,7 @@ fn build_settings_rows(
     config: &lx_core::model::config::Config,
     inputs: &RowInputs,
     palette: RowPalette,
+    cover_capabilities: crate::cover::CoverCapabilities,
 ) {
     use SettingsCategory as C;
     use SettingsRowDirectAction as D;
@@ -828,7 +837,7 @@ fn build_settings_rows(
         "封面协议",
         RowPlan::Direct(D::CycleCoverProtocol),
         COVER_PROTOCOL_ROW_KEY,
-        &config.ui.cover_protocol,
+        &cover_protocol_display(&config.ui.cover_protocol, cover_capabilities),
         palette,
     );
     rows.value(
@@ -1352,14 +1361,16 @@ impl SettingsPage {
         }
         match character {
             'p' | 'P' => true,
+            // `v`：查看远程歌单窗口（账号分类的只读浏览入口）
+            'v' | 'V' => true,
             _ => embedded_command(self.focus, character).is_some(),
         }
     }
 
     pub fn consumes_key(&self, key: &KeyEvent, resolver: &KeybindingResolver) -> bool {
-        // 设置页自己打开的取值菜单是模态的：打开期间全部按键先给它，
-        // 否则 `q`（全局退出）会在菜单还开着的时候直接退出程序。
-        if self.menu.is_some() {
+        // 远程歌单窗口 / 取值菜单都是模态的：打开期间全部按键先给它们，
+        // 否则 `q`（全局退出）会在窗口还开着的时候直接退出程序。
+        if self.remote_window.is_some() || self.menu.is_some() {
             return true;
         }
         // Bare number keys are reserved for navigation (1-8 select sidebar
@@ -1410,6 +1421,10 @@ impl SettingsPage {
 
     pub fn new() -> Self {
         Self {
+            cover_capabilities: crate::cover::CoverCapabilities::from_detected(
+                None,
+                crate::cover::ProtocolType::Halfblocks,
+            ),
             input_url: String::new(),
             input_mode: false,
             status_msg: None,
@@ -1447,9 +1462,16 @@ impl SettingsPage {
             embedded_area: None,
             last_area: Rect::default(),
             menu: None,
+            remote_window: None,
+            remote_window_generation: 0,
             delete_source_armed: None,
             delete_local_path_armed: None,
         }
+    }
+
+    /// 注入启动时探测到的封面协议能力（`Ctrl+G` 之外的封面入口都据它判断）。
+    pub fn set_cover_capabilities(&mut self, capabilities: crate::cover::CoverCapabilities) {
+        self.cover_capabilities = capabilities;
     }
 
     fn qr_login_sources(&self, ctx: &AppContext) -> Vec<SourceId> {
@@ -1466,6 +1488,24 @@ impl SettingsPage {
         ctx: &AppContext,
         resolver: &KeybindingResolver,
     ) -> AppAction {
+        // 「远程歌单」窗口是模态的：打开期间它独占按键（Esc 关窗、Enter 跳转）。
+        if self.remote_window.is_some() {
+            let outcome = self
+                .remote_window
+                .as_mut()
+                .map(|window| window.handle_key(key));
+            return match outcome {
+                Some(RemoteCollectionsOutcome::Open(id)) => {
+                    self.remote_window = None;
+                    AppAction::OpenAccountPlaylist(id)
+                }
+                Some(RemoteCollectionsOutcome::Closed) => {
+                    self.remote_window = None;
+                    AppAction::None
+                }
+                _ => AppAction::None,
+            };
+        }
         // 枚举取值菜单是模态的：打开期间它独占按键。
         if let Some(action) = self.handle_menu_key(&key, ctx, resolver) {
             return action;
@@ -1550,6 +1590,15 @@ impl SettingsPage {
                 self.update_config(ctx, |config| {
                     config.theme.name = crate::theme::next_skin_name(&config.theme.name);
                 });
+                return AppAction::None;
+            }
+
+            // `v`：查看网易云远程歌单窗口（账号分类下的只读浏览入口）。
+            // 缓存还没拉过时也打开，把"要先去刷新"的引导写在窗口里。
+            if key.modifiers == KeyModifiers::NONE
+                && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            {
+                self.open_remote_collections_window();
                 return AppAction::None;
             }
 
@@ -1861,9 +1910,15 @@ impl SettingsPage {
                 AppAction::None
             }
             D::CycleCoverProtocol => {
+                // 只在本终端**画得出来**的协议之间循环：kitty 下不再把
+                // sixel / iterm2 摆给用户选（选了也只会得到空框）。
+                let capabilities = self.cover_capabilities;
                 self.update_config(ctx, |config| {
+                    let current = crate::cover::protocol_from_config(&config.ui.cover_protocol)
+                        .unwrap_or(capabilities.active());
                     config.ui.cover_protocol =
-                        next_cover_protocol(&config.ui.cover_protocol).to_string();
+                        crate::cover::protocol_label(capabilities.next_supported(current))
+                            .to_string();
                 });
                 if self.status_msg.as_deref() == Some("设置已保存") {
                     self.status_msg = Some("封面协议已保存，下次启动生效".to_string());
@@ -2916,7 +2971,7 @@ impl SettingsPage {
             } else {
                 crate::theme::border(ctx)
             }))
-            .title(" 扫码登录 · ↑/↓选择 · Enter/P 登录或退出 · 刷新见「刷新远程歌单」行 ");
+            .title(" 扫码登录 · ↑/↓选择 · Enter/P 登录或退出 · v 查看远程歌单窗口 ");
         let inner = panel_inner(area);
         block.render(area, buf);
         let mut hits = EmbeddedHits::default();
@@ -3385,6 +3440,7 @@ impl SettingsPage {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         // 本帧的页面矩形：窄屏判定与设置页菜单边界都读它（输入处理拿不到 area）。
         self.last_area = area;
+        self.sync_remote_window();
         let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         let sources = &config.source.js_sources;
         let local_paths = &config.local_music.paths;
@@ -3395,7 +3451,13 @@ impl SettingsPage {
         let palette = RowPalette { accent, muted };
         let mut rows = SettingsRows::new();
         let inputs = RowInputs::from_context(ctx);
-        build_settings_rows(&mut rows, &config, &inputs, palette);
+        build_settings_rows(
+            &mut rows,
+            &config,
+            &inputs,
+            palette,
+            self.cover_capabilities,
+        );
 
         // 2. 布局：整个设置页只有一个面板 ——
         //    分类栏（宽屏）/ 分类列表（窄屏）+ 该分类的内容。
@@ -3618,6 +3680,43 @@ impl SettingsPage {
         if let Some(menu) = self.menu.as_ref() {
             menu.render(area, buf, ctx);
         }
+
+        // 远程歌单窗口比菜单更上层：它打开时菜单不可能同时开着。
+        if let Some(window) = self.remote_window.as_mut() {
+            window.render(area, buf, ctx);
+        }
+    }
+
+    /// 打开「网易云远程歌单」窗口（用当前缓存内容）。
+    ///
+    /// 允许缓存为空时打开：窗口里会给出"还没有缓存任何远程歌单"的引导，
+    /// 比按了没反应更好。
+    pub fn open_remote_collections_window(&mut self) {
+        let collections = crate::pages::components::remote_collections::account_collections();
+        self.remote_window_generation = crate::remote_cache::generation();
+        match self.remote_window.as_mut() {
+            Some(window) => window.refresh(collections),
+            None => {
+                self.remote_window = Some(RemoteCollectionsWindow::new(collections));
+            }
+        }
+    }
+
+    /// 窗口开着时，远程刷新完成（缓存 generation 变化）要就地更新列表，
+    /// 否则用户得关掉再开才看得到刚拉回来的歌单。
+    fn sync_remote_window(&mut self) {
+        if self.remote_window.is_none() {
+            return;
+        }
+        let generation = crate::remote_cache::generation();
+        if generation == self.remote_window_generation {
+            return;
+        }
+        self.remote_window_generation = generation;
+        let collections = crate::pages::components::remote_collections::account_collections();
+        if let Some(window) = self.remote_window.as_mut() {
+            window.refresh(collections);
+        }
     }
 
     /// 兜底取消进行中的拖拽会话（两条分界线 + 状态栏条目拖拽排序）。
@@ -3653,6 +3752,17 @@ impl SettingsPage {
     }
 
     /// 从 Config 恢复用户拖出来的分类栏宽度与内嵌列表高度份额（构造后调用一次）。
+    /// 把分类栏宽度与内嵌列表高度恢复成内置默认（与 `apply_pane_ratios` 对称）。
+    ///
+    /// `embedded_ratio_fixed` 也要复位：它表示"用户拖过、高度按比例给足"，
+    /// 复位后重新回到"够用就好"的自动高度。
+    pub fn reset_pane_ratios(&mut self) {
+        self.embedded_ratio = EMBEDDED_RATIO_DEFAULT;
+        self.embedded_ratio_fixed = false;
+        self.categories_width = CATEGORY_SIDEBAR_WIDTH;
+        self.splitter.cancel();
+    }
+
     pub fn apply_pane_ratios(&mut self, ratios: &std::collections::HashMap<String, f32>) {
         if let Some(value) = ratios.get(SETTINGS_EMBEDDED_RATIO_KEY).copied() {
             self.embedded_ratio = clamp_ratio(value, EMBEDDED_RATIO_MIN, EMBEDDED_RATIO_MAX);
@@ -3917,6 +4027,16 @@ impl SettingsPage {
             self.audio_device_input_mode = false;
             self.playlist_import_mode = false;
             self.download_input_target = None;
+        }
+        // 远程歌单窗口也是模态的：打开期间鼠标只在窗口内生效，
+        // 点窗口外等价于关窗（与取值菜单一致）。
+        if self.remote_window.is_some() {
+            let popup = RemoteCollectionsWindow::window_rect(self.last_area);
+            let inside = popup.contains((event.column, event.row).into());
+            if !inside && matches!(event.kind, MouseEventKind::Down(_)) {
+                self.remote_window = None;
+            }
+            return AppAction::None;
         }
         // 设置页自己的枚举取值菜单是模态的：打开期间鼠标事件先给它。
         if self.menu.is_some() {
@@ -4225,23 +4345,22 @@ fn reorder_status_bar_items(
 ///
 /// 最长按键提示的显示宽度 (组合键在界面中使用 C/S/A 缩写)
 const KEY_COLUMN_WIDTH: usize = 7;
+
+/// 绝大多数设置行的激活键：键位列对它只留占位符，不逐行重复。
+const DEFAULT_ACTIVATION_KEY: &str = "Enter";
+
 /// 最长标签的显示宽度 (当前为 保留播放状态)
 const LABEL_COLUMN_WIDTH: usize = 12;
 
-/// 在右侧补空格至指定显示宽度，宽字符按两列计算
-fn pad_display(value: &str, width: usize) -> String {
-    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
-    format!("{}{}", value, " ".repeat(padding))
-}
-
-/// 组装一行设置项：按键提示、标签与取值分别占固定宽度的列
+/// 组装一行设置项：按键提示、标签与取值分别占固定宽度的列。
+///
+/// 键位列只在**这一行有专属快捷键**时才写出来（当前只有「封面协议」的
+/// `Shift+P`）：每行都印一遍 `[Enter]` 只是噪声，"Enter 激活"这条共性已经写在
+/// 面板标题里（见 `SettingsPage::render`）。
 fn setting_row(label: &str, value: Span<'static>, key: &str, muted: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!(
-                " {} ",
-                pad_display(&format!("[{}]", compact_key_label(key)), KEY_COLUMN_WIDTH)
-            ),
+            format!(" {} ", pad_display(&key_label(key), KEY_COLUMN_WIDTH)),
             Style::new().fg(muted),
         ),
         Span::raw(pad_display(label, LABEL_COLUMN_WIDTH)),
@@ -4252,16 +4371,30 @@ fn setting_row(label: &str, value: Span<'static>, key: &str, muted: Color) -> Li
 
 /// 键位列的显示文本。
 ///
-/// 删掉逐行快捷键之后，行的键位列直接就是 [`RowPlan::key_hint`] 给出的
-/// `Enter`；只有刻意保留的页面级组合键会走到这里做缩写（`Shift+P` → `S+P`）。
+/// 删掉逐行快捷键之后，绝大多数行的激活键就是 `Enter`（`RowPlan::key_hint`
+/// 原样返回 `Enter`），键位列对它只留一个安静的圆点，不再逐行重复广告同一个键；
+/// 只有刻意保留的页面级组合键会走到这里做缩写（`Shift+P` → `S+P`）。
 /// 空键位（只读说明行）显示为 `-`。
 fn compact_key_label(key: &str) -> String {
     if key.is_empty() {
         return "-".to_string();
     }
+    if key == DEFAULT_ACTIVATION_KEY {
+        return String::new();
+    }
     key.replace("Ctrl+", "C+")
         .replace("Shift+", "S+")
         .replace("Alt+", "A+")
+}
+
+/// 键位列单元格：空的（Enter 激活）行用 `[·]` 占位，保持列对齐但不喧宾夺主。
+fn key_label(key: &str) -> String {
+    let compact = compact_key_label(key);
+    if compact.is_empty() {
+        "[·]".to_string()
+    } else {
+        format!("[{compact}]")
+    }
 }
 
 fn setting_line(label: &str, value: bool, key: &str, accent: Color, muted: Color) -> Line<'static> {
@@ -5068,13 +5201,14 @@ fn next_network_timeout(timeout: u64) -> u64 {
     }
 }
 
-fn next_cover_protocol(protocol: &str) -> &'static str {
-    match protocol {
-        "auto" => "kitty",
-        "kitty" => "sixel",
-        "sixel" => "iterm2",
-        "iterm2" => "halfblocks",
-        _ => "auto",
+/// 封面协议行的显示值：配置值与生效值不一致时把原因带上，用户不用翻日志。
+fn cover_protocol_display(
+    configured: &str,
+    capabilities: crate::cover::CoverCapabilities,
+) -> String {
+    match capabilities.correction_note() {
+        Some(note) => format!("{configured}（{note}）"),
+        None => configured.to_string(),
     }
 }
 
@@ -5175,7 +5309,7 @@ const STATUS_BAR_CHECKBOX_WIDTH: u16 = 5;
 ///
 /// 列表导航键（默认 `k`/`j`）来自页面级绑定，由 `consumes_key` 查表解析，
 /// 不列在这里。
-const SETTINGS_PAGE_CHAR_KEYS: &[char] = &['a', 'd', 'h', 'r', 'p', 'P'];
+const SETTINGS_PAGE_CHAR_KEYS: &[char] = &['a', 'd', 'h', 'r', 'p', 'P', 'v', 'V'];
 
 fn setting_option_column_count(width: u16) -> usize {
     if width >= THREE_COLUMN_OPTIONS_MIN_WIDTH {
@@ -5562,6 +5696,7 @@ mod tests {
     use lx_core::model::source::{Quality, SourceId};
 
     use crate::pages::components::context_menu::{MenuAction, StatusBarMenuAction};
+    use crate::pages::components::remote_collections::RemoteCollectionsWindow;
     use crate::pages::components::splitter::{GUTTER, SplitAxis, clamp_extent, divider_line};
     use crate::playlist::mode::PlayMode;
 
@@ -5580,6 +5715,7 @@ mod tests {
         SettingsRowKind, SettingsRowMeta, SettingsRows, apply_setting_choice, build_settings_rows,
         categories_width_limits, category_hit_at, category_row_ids, category_sidebar_visible,
         choice_refusal_message, columns_from_value, command_row_layout, compact_key_label,
+        key_label, truncate_display,
         embedded_command, embedded_height, embedded_items, embedded_list_for, embedded_needed_rows,
         embedded_needed_rows_for, embedded_ratio_from_pointer, ensure_row_cursor, enum_menu,
         enum_menu_label, is_accounts_panel_key, is_cover_protocol_key, list_owns_direction_keys,
@@ -6543,6 +6679,89 @@ mod tests {
         assert_eq!(layout_hits.len(), 2);
     }
 
+    /// 远程歌单窗口打开时，设置页必须独占全部按键：否则 `q` 会在窗口还开着
+    /// 的时候直接退出程序，`p` 会在背后换主题。
+    #[test]
+    fn the_remote_collections_window_takes_over_the_keyboard() {
+        let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+        let mut page = SettingsPage::new();
+        assert!(page.remote_window.is_none(), "默认不开窗");
+
+        page.remote_window = Some(RemoteCollectionsWindow::new(Vec::new()));
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('p'),
+            KeyCode::Char('v'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Down,
+        ] {
+            let event = KeyEvent::new(code, KeyModifiers::NONE);
+            assert!(
+                page.consumes_key(&event, &resolver),
+                "{code:?} 必须交给远程歌单窗口，不能被全局快捷键抢走"
+            );
+        }
+    }
+
+    /// `v` 是设置页**新增**的页面级键（查看远程歌单窗口），必须被本页吃掉。
+    #[test]
+    fn v_is_owned_by_the_settings_page() {
+        let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
+        let page = SettingsPage::new();
+        for code in [KeyCode::Char('v'), KeyCode::Char('V')] {
+            let event = KeyEvent::new(code, KeyModifiers::NONE);
+            assert!(page.consumes_key(&event, &resolver), "{code:?} 应归设置页");
+        }
+    }
+
+    /// `truncate_display` 的输出宽度必须**恒定**：调用点靠它做列对齐。
+    ///
+    /// 旧实现在截断分支直接返回，`truncate_display("晴晴晴", 4)` 只有 3 列，
+    /// 宽字符边界上整行会向左串一列。
+    #[test]
+    fn truncate_display_always_fills_the_requested_width() {
+        for (value, width) in [
+            ("晴天", 6),
+            ("晴晴晴", 6),
+            ("晴晴晴", 4),
+            ("a very long english name", 18),
+            ("", 5),
+            ("晴天", 0),
+        ] {
+            assert_eq!(
+                UnicodeWidthStr::width(truncate_display(value, width).as_str()),
+                width,
+                "{value:?} 压到 {width} 列时宽度必须正好是 {width}"
+            );
+        }
+
+        // 超宽才加省略号；没超宽原样补齐
+        assert_eq!(truncate_display("abc", 5), "abc  ");
+        assert!(truncate_display("abcdef", 5).ends_with('…'));
+    }
+
+    /// 恢复默认布局必须同时复位"用户拖过"的标记：否则高度仍按比例给足，
+    /// 看起来还是老的布局。
+    #[test]
+    fn reset_pane_ratios_restores_defaults_and_clears_the_dragged_flag() {
+        let mut page = SettingsPage::new();
+        page.apply_pane_ratios(&std::collections::HashMap::from([
+            (SETTINGS_EMBEDDED_RATIO_KEY.to_string(), 0.8_f32),
+            (SETTINGS_CATEGORIES_RATIO_KEY.to_string(), 30_f32),
+        ]));
+        assert!(page.embedded_ratio_fixed, "拖过之后高度按比例给足");
+        assert_ne!(page.embedded_ratio, EMBEDDED_RATIO_DEFAULT);
+        assert_ne!(page.categories_width, CATEGORY_SIDEBAR_WIDTH);
+
+        page.reset_pane_ratios();
+
+        assert_eq!(page.embedded_ratio, EMBEDDED_RATIO_DEFAULT);
+        assert!(!page.embedded_ratio_fixed, "复位后回到「够用就好」的自动高度");
+        assert_eq!(page.categories_width, CATEGORY_SIDEBAR_WIDTH);
+        assert!(!page.splitter.is_dragging());
+    }
+
     /// 测试用配色（不参与任何断言）。
     fn test_palette() -> RowPalette {
         RowPalette {
@@ -6578,7 +6797,13 @@ mod tests {
     /// 而是直接检查用户真正看到的那张表。
     fn real_settings_rows(config: &Config) -> SettingsRows {
         let mut rows = SettingsRows::new();
-        build_settings_rows(&mut rows, config, &test_row_inputs(), test_palette());
+        build_settings_rows(
+            &mut rows,
+            config,
+            &test_row_inputs(),
+            test_palette(),
+            crate::cover::CoverCapabilities::from_detected(None, crate::cover::ProtocolType::Halfblocks),
+        );
         rows
     }
 
@@ -6966,10 +7191,10 @@ mod tests {
     fn settings_page_owns_every_char_key_it_advertises() {
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
 
-        // 清单本身：精简后只剩主题 / 账号面板 + 内嵌列表的操作键
+        // 清单本身：主题 / 账号面板 / 远程歌单窗口 + 内嵌列表的操作键
         assert_eq!(
             SETTINGS_PAGE_CHAR_KEYS,
-            &['a', 'd', 'h', 'r', 'p', 'P'],
+            &['a', 'd', 'h', 'r', 'p', 'P', 'v', 'V'],
             "设置页吃掉的字符键清单（多一个都算死键）"
         );
 
@@ -7479,7 +7704,8 @@ mod tests {
             plan_row_activation(&toggle),
             RowPlan::Direct(SettingsRowDirectAction::ToggleMouse)
         );
-        assert_eq!(compact_key_label(&toggle.key), "Enter");
+        assert_eq!(compact_key_label(&toggle.key), "");
+        assert_eq!(key_label(&toggle.key), "[·]");
 
         // Info 行：绝不触发任何业务动作（哪怕声明了计划）
         assert_eq!(
@@ -7559,11 +7785,12 @@ mod tests {
         let resolver = KeybindingResolver::from_config(&KeybindingConfig::default());
         let page = SettingsPage::new();
 
-        // 旧版逐行字母快捷键：全部必须让出去
+        // 旧版逐行字母快捷键：全部必须让出去（`v`/`V` 是**新**加的远程歌单窗口键，
+        // 不在"已删除"之列，见 `SETTINGS_PAGE_CHAR_KEYS`）。
         let removed = [
-            't', 'g', 'w', 'c', 'e', 'N', 'f', 'R', 'Q', 'H', 'v', 'u', 'y', 'K', 'T', 'Y', '[',
-            ']', 'n', 'm', 'z', 'i', 'o', 'O', 'x', 'X', 'S', 'F', 'M', 'B', 'V', 'W', 'A', 'E',
-            'U', 'L', 'J', 'G', 'I', 'D', 'b', 'h', 'r', 'a', 'd',
+            't', 'g', 'w', 'c', 'e', 'N', 'f', 'R', 'Q', 'H', 'u', 'y', 'K', 'T', 'Y', '[', ']',
+            'n', 'm', 'z', 'i', 'o', 'O', 'x', 'X', 'S', 'F', 'M', 'B', 'W', 'A', 'E', 'U', 'L',
+            'J', 'G', 'I', 'D', 'b', 'h', 'r', 'a', 'd',
         ];
         for character in removed {
             let event = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
@@ -8371,9 +8598,10 @@ mod tests {
             line.contains("Tokyo Night ›"),
             "主题行的值必须显示当前主题 + 展开箭头（实际 {line:?}）"
         );
+        // Enter 激活这条共性写在面板标题里，行内只留安静的键位占位符
         assert!(
-            line.contains("[Enter]") || line.contains("[Enter"),
-            "键位列必须写明 Enter 可开菜单（实际 {line:?}）"
+            line.contains("[·]"),
+            "激活行的键位列应留占位符而不是逐行重复 Enter（实际 {line:?}）"
         );
     }
 
@@ -8883,7 +9111,7 @@ mod tests {
             }
             assert_eq!(
                 compact_key_label(&meta.key),
-                "Enter",
+                "",
                 "「{}」的键位列还在广告已删除的快捷键",
                 meta.label
             );

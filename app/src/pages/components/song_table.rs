@@ -3,7 +3,9 @@ use lx_core::model::song::SongInfo;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+
+use crate::pages::components::text::{pad_display, pad_display_left, truncate_width};
 
 use crate::context::AppContext;
 
@@ -324,40 +326,29 @@ fn align_for_key(key: &str) -> CellAlign {
 }
 
 /// 把 `value` 渲染成恰好 `width` 显示宽度的单元格（超宽则截断并加 `…`）。
+///
+/// 收敛到共享的 [`truncate_width`]（按显示宽度裁到 `width-1` 再补 `…`）
+/// 与 [`pad_display`] / [`pad_display_left`]（补齐到定宽）。右对齐时省略号
+/// 仍留在末尾、空格补在前面，与旧的本地实现一致。
 fn cell_aligned(value: &str, width: usize, align: CellAlign) -> String {
     if width == 0 {
         return String::new();
     }
-
     let value = value.trim();
-    let value_width = UnicodeWidthStr::width(value);
-    if value_width <= width {
-        let padding = " ".repeat(width - value_width);
+    if UnicodeWidthStr::width(value) <= width {
         return match align {
-            CellAlign::Left => format!("{value}{padding}"),
-            CellAlign::Right => format!("{padding}{value}"),
+            CellAlign::Left => pad_display(value, width),
+            CellAlign::Right => pad_display_left(value, width),
         };
     }
-
-    // 需要截断：先按显示宽度裁到 width-1，再补 `…`
-    let content_width = width - 1;
-    let mut rendered = String::new();
-    let mut rendered_width = 0;
-    for ch in value.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if rendered_width + char_width > content_width {
-            break;
-        }
-        rendered.push(ch);
-        rendered_width += char_width;
-    }
-    rendered.push('…');
-
-    let padding = " ".repeat(width.saturating_sub(rendered_width + 1));
     match align {
-        CellAlign::Left => format!("{rendered}{padding}"),
-        // 右对齐时省略号仍留在末尾，前面补空格
-        CellAlign::Right => format!("{padding}{rendered}"),
+        CellAlign::Left => pad_display(truncate_width(value, width).as_ref(), width),
+        // 右对齐：省略号在最右，剩余空格补在左边
+        CellAlign::Right => {
+            let content = truncate_width(value, width).into_owned();
+            let padding = width.saturating_sub(UnicodeWidthStr::width(content.as_str()));
+            format!("{}{content}", " ".repeat(padding))
+        }
     }
 }
 
