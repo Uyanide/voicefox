@@ -71,18 +71,27 @@ impl LyricService {
             return Ok(());
         }
         let mut lrc_lines = crate::parser::lrc::parse(&data.lyric);
-        if lrc_lines.is_empty() && !data.lyric.trim().is_empty() {
-            lrc_lines = Self::plain_text_as_lines(&data.lyric, song.duration);
-        }
+        // 逐字歌词同时从 T 位和 L 位尝试：T 位是约定字段，但部分音源
+        // （尤其是 JS 自定义音源）会把逐字歌词直接塞进 `lyric` 而
+        // `lxlyric` 为空或只有时间头行，只认 T 位会漏掉整首歌的逐字数据。
         // 逐字歌词无条件解析保留，开关判断放在 update_position（与翻译歌词
         // 的处理方式一致），播放中切换开关也能立即对当前歌生效。
-        let yrc_lines = data
-            .lxlyric
-            .as_deref()
-            .map(crate::parser::parse_karaoke)
-            .unwrap_or_default();
+        let mut yrc_lines = Self::parse_karaoke_fields(data.lxlyric.as_deref());
+        if !data.lyric.trim().is_empty() && data.lxlyric.as_deref() != Some(data.lyric.as_str()) {
+            yrc_lines.extend(Self::parse_karaoke_fields(Some(&data.lyric)));
+            let mut seen = std::collections::HashSet::new();
+            yrc_lines.retain(|line| seen.insert((line.timestamp, line.words.len())));
+            yrc_lines.sort_by_key(|line| line.timestamp);
+        }
         if lrc_lines.is_empty() && !yrc_lines.is_empty() {
             lrc_lines = Self::karaoke_as_lines(&yrc_lines);
+        } else if lrc_lines.is_empty()
+            && !data.lyric.trim().is_empty()
+            && !crate::parser::looks_like_karaoke(&data.lyric)
+        {
+            // 只有确认不是逐字歌词（且逐字解析也没结果）时，才按纯文本兜底，
+            // 否则会把时间轴源码直接显示给用户。
+            lrc_lines = Self::plain_text_as_lines(&data.lyric, song.duration);
         }
 
         // 解析翻译歌词
@@ -199,6 +208,14 @@ impl LyricService {
             .collect()
     }
 
+    /// 解析一个歌词字段中的逐字内容，空字段直接视为无逐字歌词。
+    fn parse_karaoke_fields(raw: Option<&str>) -> Vec<YrcLine> {
+        raw.filter(|raw| !raw.trim().is_empty())
+            .map(crate::parser::parse_karaoke)
+            .unwrap_or_default()
+    }
+
+    /// 逐字歌词转成可显示/可对齐的行，丢弃只有时间头没有正文的空行。
     fn karaoke_as_lines(lines: &[YrcLine]) -> Vec<LyricLine> {
         lines
             .iter()
@@ -220,6 +237,7 @@ impl LyricService {
                     duration: next_timestamp.saturating_sub(line.timestamp),
                 }
             })
+            .filter(|line| !line.text.trim().is_empty())
             .collect()
     }
 
@@ -381,6 +399,49 @@ mod tests {
         assert_eq!(state.lines[0].text, "逐字歌词");
         assert_eq!(state.yrc_words.len(), 3);
         assert_eq!(state.position_ms, 5_750);
+    }
+
+    #[tokio::test]
+    async fn keeps_raw_karaoke_markup_out_of_the_displayed_lines() {
+        // 部分音源（尤其是 JS 自定义音源）把逐字歌词塞进 `lyric`，
+        // `lxlyric` 为空：绝不能把它当成纯文本歌词直接显示。
+        struct KaraokeInLyricField;
+
+        #[async_trait]
+        impl LyricFetcher for KaraokeInLyricField {
+            async fn fetch(&self, _song: &SongInfo) -> Result<LyricData, LyricFetchError> {
+                Ok(LyricData {
+                    lyric: "LyricContent=\"[0,4810]<0,210,0>You <220,350,0>ready <1420,390,0>Yo\""
+                        .to_string(),
+                    ..LyricData::default()
+                })
+            }
+        }
+
+        let service = LyricService::new(Arc::new(KaraokeInLyricField));
+        let generation = service.prepare();
+        let song = SongInfo::new(
+            "song".to_string(),
+            SourceId::Kw,
+            "title".to_string(),
+            "artist".to_string(),
+        );
+        service
+            .load_at(&song, generation, Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        let state = service.current_state();
+        assert!(!state.lines.is_empty(), "逐字歌词应转成可显示的行");
+        let text: String = state.lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(text, "You ready Yo");
+        for line in state.lines.iter() {
+            assert!(
+                !line.text.contains('<') && !line.text.contains(','),
+                "显示文本不能残留时间标签: {:?}",
+                line.text
+            );
+        }
     }
 
     #[test]
