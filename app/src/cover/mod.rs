@@ -1,5 +1,6 @@
 //! TUI 封面：渲染职责归 app，获取/缓存职责归 runtime。
 
+pub mod accent;
 mod layout;
 mod render;
 

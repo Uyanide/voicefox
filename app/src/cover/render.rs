@@ -111,9 +111,8 @@ impl CoverRenderer {
                     // 环境无法**正向确认**终端支持图像协议 → 保守用半格。
                     //
                     // 这里刻意不再调用 `Picker::from_query_stdio*`：它要发查询并直接读 stdin，
-                    // 而本函数在事件循环启动前调用（此刻还没进 raw 模式，终端回显是开的），
-                    // 自己的查询会被回显回来当成"终端回复"，在 tmux/SSH/裸 pty 下极容易误判。
-                    // 实测（120x36 裸 pty, TERM=xterm-256color）：该查询会得出 kitty，
+                    // 对回显/中转极其敏感——0.3.19 及之前曾在 auto 分支发过查询，实测
+                    // （120x36 裸 pty, TERM=xterm-256color）会得出 kitty，
                     // 强制 sixel 时单个封面载荷达 227157 字节、98.8% 是可打印 ASCII ——
                     // 一旦选中的协议终端其实不支持，这些字节会被当文本打印、刷满整屏。
                     // 误判的代价是"满屏花屏"，保守的代价只是封面用半格渲染，因此不确定就保守。
@@ -339,8 +338,15 @@ fn spawn_workers(
                 else {
                     continue;
                 };
-                let protocol = decode_cached(&job.path, &mut decoded_cache)
-                    .map(|image| Box::new(job.picker.new_resize_protocol((*image).clone())));
+                let image = decode_cached(&job.path, &mut decoded_cache);
+                // 顺手提取主色并发布（后台线程，不阻塞渲染）：
+                // 「界面强调色跟随封面」的数据源，见 cover::accent。
+                let accent = image
+                    .as_ref()
+                    .and_then(|image| super::accent::dominant_color(image));
+                super::accent::publish(&job.path, accent);
+                let protocol =
+                    image.map(|image| Box::new(job.picker.new_resize_protocol((*image).clone())));
                 if decode_tx
                     .send(Done::Loaded {
                         id: job.id,
@@ -480,6 +486,8 @@ pub struct CoverCapabilities {
     supported: &'static [ProtocolType],
     /// 本次实际生效的协议
     active: ProtocolType,
+    /// 环境正向识别出的协议；`None` 表示认不出（半块字符兜底）。
+    detected: Option<ProtocolType>,
 }
 
 impl CoverCapabilities {
@@ -494,7 +502,10 @@ impl CoverCapabilities {
     /// 只做环境探测（与 `detect` 同一口径），不做任何 IO。
     pub fn detect(active: ProtocolType) -> Self {
         let detected = protocol_from_env(
-            std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+            std::env::var("KITTY_WINDOW_ID")
+                .ok()
+                .or_else(|| std::env::var("KITTY_PID").ok())
+                .as_deref(),
             std::env::var("TERM").ok().as_deref(),
             std::env::var("TERM_PROGRAM").ok().as_deref(),
             std::env::var("TMUX")
@@ -514,13 +525,23 @@ impl CoverCapabilities {
             Some(ProtocolType::Iterm2) => &[ProtocolType::Iterm2, ProtocolType::Halfblocks],
             _ => &[ProtocolType::Halfblocks],
         };
-        Self { supported, active }
+        Self {
+            supported,
+            active,
+            detected,
+        }
     }
 
     pub fn active(&self) -> ProtocolType {
         self.active
     }
 
+    /// 环境探测结果（`None` = 未识别）；设置行展示"auto 生效成什么"用。
+    pub fn detected(&self) -> Option<ProtocolType> {
+        self.detected
+    }
+
+    #[cfg(test)]
     pub fn supported(&self) -> &'static [ProtocolType] {
         self.supported
     }
@@ -547,9 +568,9 @@ impl CoverCapabilities {
             .unwrap_or(ProtocolType::Halfblocks)
     }
 
-    /// 配置值与生效值不一致时返回原因，用于在设置行里直接显示。
-    ///
-    /// 带上"本终端支持哪些"，用户才知道该改成什么。
+    /// 配置值与生效值不一致时返回原因（测试断言用；设置行改用
+    /// `cover_protocol_display` 的"生效协议优先"格式）。
+    #[cfg(test)]
     pub fn correction_note(&self) -> Option<String> {
         (!self.can_render(self.active)).then(|| {
             let names: Vec<&str> = self.supported().iter().copied().map(protocol_label).collect();

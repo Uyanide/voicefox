@@ -407,11 +407,11 @@ impl MainPage {
                     return AppAction::None;
                 }
                 Action::ListPageUp => {
-                    self.selected = self.selected.saturating_sub(5);
+                    self.selected = self.selected.saturating_sub(ctx.page_step());
                     return AppAction::None;
                 }
                 Action::ListPageDown => {
-                    self.selected = (self.selected + 5).min(len.saturating_sub(1));
+                    self.selected = (self.selected + ctx.page_step()).min(len.saturating_sub(1));
                     return AppAction::None;
                 }
                 Action::ListActivate => {
@@ -453,11 +453,11 @@ impl MainPage {
                 self.selected = len.saturating_sub(1);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.selected = self.selected.saturating_sub(5);
+                self.selected = self.selected.saturating_sub(ctx.page_step());
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.selected = (self.selected + 5).min(len.saturating_sub(1));
+                self.selected = (self.selected + ctx.page_step()).min(len.saturating_sub(1));
             }
             _ if super::is_song_activation_key(key) && self.selected < len => {
                 let (songs, _) = ctx.playlist.snapshot();
@@ -1021,7 +1021,12 @@ impl MainPage {
             );
         }
         if songs.is_empty() {
-            Paragraph::new("队列为空")
+            let hint = if self.queue_filter_active || !self.queue_filter.is_empty() {
+                " 队列为空\n 筛选中没有匹配的歌曲，按 Esc 清除筛选词"
+            } else {
+                " 队列为空\n 在 搜索(2) · 排行榜(3) · 歌单(4) 页按 Enter 播放，歌曲会自动加入队列"
+            };
+            Paragraph::new(hint)
                 .style(Style::new().fg(crate::theme::muted(ctx)))
                 .render(inner, buf);
             return;

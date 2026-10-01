@@ -15,6 +15,7 @@ use lx_core::traits::player::{
 };
 
 use crate::cover::CoverService;
+use crate::fmt::format_duration;
 use crate::download::DownloadManager;
 use crate::notification::DesktopNotifier;
 use crate::playlist::manager::PlaylistManager;
@@ -314,6 +315,19 @@ impl AppContext {
             .in_app_timeout
             .clamp(1, 60);
         Duration::from_secs(seconds)
+    }
+
+    /// PgUp/PgDn 键盘翻页步长（`ui.page_step`）。
+    ///
+    /// 滚轮继续用 `ui.scroll_amount`（高频小步），翻页是低频大步，两者
+    /// 语义不同。夹到 1..=100，写坏配置也不至于一步跳穿列表或卡死。
+    pub fn page_step(&self) -> usize {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui
+            .page_step
+            .clamp(1, 100)
     }
 
     pub fn persist_playback_session(&self) -> Result<(), String> {
@@ -675,11 +689,6 @@ fn fade_duration_label(value: u64) -> String {
     } else {
         format!("{value} ms")
     }
-}
-
-fn format_duration(value: Duration) -> String {
-    let total = value.as_secs();
-    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 fn parse_replaygain_mode(value: &str) -> ReplayGainMode {

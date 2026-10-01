@@ -5,6 +5,7 @@ use ratatui::style::Color;
 use ratatui_themes::{ThemeName, ThemePalette};
 
 use crate::context::AppContext;
+use lx_core::model::config::AccentFollowCover;
 
 /// 默认皮肤：使用 `[theme]` 里手工调好的槽位（与历史版本观感一致）。
 pub const SKIN_VOICEFOX: &str = "voicefox";
@@ -139,8 +140,39 @@ const BASE: Color = Color::Rgb(30, 30, 46);
 const MANTLE: Color = Color::Rgb(24, 24, 37);
 const CRUST: Color = Color::Rgb(17, 17, 27);
 
+/// 各档位把封面主色混入 accent 的比例：过高会失去可读性与主题个性，
+/// 过低则感知不到（提取色已归一化到鲜艳区间，见 cover::accent）。
+const ACCENT_COVER_BLEND_SUBTLE: f32 = 0.45;
+const ACCENT_COVER_BLEND_STRONG: f32 = 0.75;
+
 pub fn accent(ctx: &AppContext) -> Color {
-    configured(ctx, "accent", |theme| &theme.accent, MAUVE)
+    let base = configured(ctx, "accent", |theme| &theme.accent, MAUVE);
+    blend_with_cover(ctx, base)
+}
+
+/// 「界面强调色跟随封面」：把当前专辑封面提取出的主色混进 accent。
+///
+/// 只动 accent 一个槽位（`blend_with_cover` 的调用点仅此一处），层次色与
+/// 语义色保持主题原样；档位关闭 / 无封面 / 封面是灰调（无主色）时原样返回。
+fn blend_with_cover(ctx: &AppContext, base: Color) -> Color {
+    let mode = ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .ui
+        .accent_follow_cover;
+    let blend_t = match mode {
+        AccentFollowCover::Off => return base,
+        AccentFollowCover::Subtle => ACCENT_COVER_BLEND_SUBTLE,
+        AccentFollowCover::Strong => ACCENT_COVER_BLEND_STRONG,
+    };
+    let Some(path) = ctx.cover_service.image_path() else {
+        return base;
+    };
+    let Some(rgb) = crate::cover::accent::current(Some(&path)) else {
+        return base;
+    };
+    blend(base, Color::Rgb(rgb[0], rgb[1], rgb[2]), blend_t)
 }
 
 pub fn border(ctx: &AppContext) -> Color {
