@@ -13,10 +13,8 @@ use lx_core::model::song::SongInfo;
 use lx_core::model::source::Quality;
 use lx_core::traits::source::{FetchError, SongUrl};
 
-use crate::http::SendWithRetry;
-
 use super::super::http;
-use super::crypto;
+use super::session;
 
 /// eapi 签名用的路径，请求也发到同一路径。
 const PLAYER_URL_API: &str = "/api/song/enhance/player/url/v1";
@@ -82,7 +80,6 @@ async fn fetch_official_url(
     song: &SongInfo,
     quality: Quality,
 ) -> Result<Option<OfficialUrl>, FetchError> {
-    let client = http::client();
     let mut last_error: Option<FetchError> = None;
 
     for (level, achieved) in level_ladder(quality) {
@@ -91,49 +88,26 @@ async fn fetch_official_url(
             "level": level,
             "encodeType": encode_type(*achieved),
         });
-        let encrypted = crypto::eapi(PLAYER_URL_API, &data);
-
-        let resp = match super::with_cookie(client.post(PLAYER_URL_ENDPOINT))
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            )
-            .header("origin", "https://music.163.com")
-            .header("Referer", "https://music.163.com/")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!("params={encrypted}"))
-            .send_with_retry(crate::http::RETRY_ATTEMPTS)
-            .await
-        {
-            Ok(resp) => resp,
-            Err(error) => {
-                last_error = Some(FetchError::Network(error.to_string()));
-                continue;
-            }
-        };
-
-        if !resp.status().is_success() {
-            last_error = Some(FetchError::Network(format!("HTTP {}", resp.status())));
-            continue;
-        }
-
-        // 接口偶发返回非 JSON（例如风控会返回拼接的 {"msg":"参数错误","code":400}），
-        // 这种情况不当作整首失败，继续降级/走兜底。
-        let text = match resp.text().await {
-            Ok(text) => text,
-            Err(error) => {
-                last_error = Some(FetchError::Network(error.to_string()));
-                continue;
-            }
-        };
-        let json: Value = match serde_json::from_str(&text) {
+        let json = match super::eapi_post(PLAYER_URL_ENDPOINT, PLAYER_URL_API, &data).await {
             Ok(json) => json,
             Err(error) => {
-                tracing::debug!("网易云 URL 接口返回非 JSON 响应（{level} 档位）: {error}");
-                last_error = Some(FetchError::Parse(error.to_string()));
+                // 接口偶发返回非 JSON（例如风控会返回拼接的错误页），
+                // 这种情况不当作整首失败，继续降级/走兜底。
+                tracing::debug!("网易云 URL 接口请求失败（{level} 档位）: {error}");
+                last_error = Some(error);
                 continue;
             }
         };
+
+        if super::response_requires_login(&json) {
+            // 「需要登录」对整个音质阶梯结论一致，不再逐档重试；兜底公开
+            // 地址（128k）仍然可用，播放不中断。会话侧记一次失效标记，
+            // 设置页与主循环提醒据此显示「请重新扫码」，避免用户只看到
+            // 音质悄悄变差。
+            session::mark_login_expired();
+            tracing::debug!("网易云 URL 接口要求登录（{level} 档位），跳过剩余档位");
+            break;
+        }
 
         let Some(item) = json["data"].as_array().and_then(|items| items.first()) else {
             continue;

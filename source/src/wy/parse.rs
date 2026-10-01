@@ -11,9 +11,6 @@ use lx_core::model::source::SourceId;
 use lx_core::traits::source::{FetchError, ParsedLink};
 use serde_json::Value;
 
-use crate::http;
-use crate::http::SendWithRetry;
-
 use super::search;
 
 const REFERER: &str = "https://music.163.com/";
@@ -142,25 +139,10 @@ pub async fn parse(link: &str) -> Result<ParsedLink, FetchError> {
     }
 }
 
-async fn get_json(url: &str) -> Result<Value, FetchError> {
-    let json: Value = super::with_cookie(http::client().get(url))
-        .header("Referer", REFERER)
-        .send_with_retry(crate::http::RETRY_ATTEMPTS)
-        .await
-        .map_err(|error| FetchError::Network(error.to_string()))?
-        .json()
-        .await
-        .map_err(|error| FetchError::Parse(error.to_string()))?;
-    if json["code"].as_i64() != Some(200) {
-        return Err(FetchError::Other("网易云接口返回异常".to_string()));
-    }
-    Ok(json)
-}
-
 /// 单曲详情：公开接口按 id 批量查，`ids` 是 JSON 数组文本。
 pub async fn fetch_song(id: &str) -> Result<SongInfo, FetchError> {
     let url = format!("{REFERER}api/song/detail?ids=%5B{id}%5D");
-    let json = get_json(&url).await?;
+    let json = super::get_json(&url, "网易云单曲详情").await?;
     json["songs"]
         .as_array()
         .and_then(|songs| songs.first())
@@ -171,7 +153,7 @@ pub async fn fetch_song(id: &str) -> Result<SongInfo, FetchError> {
 /// 歌单元数据 + 曲目，用于链接直解与「查看歌单」。
 pub async fn fetch_playlist(id: &str) -> Result<(Playlist, Vec<SongInfo>), FetchError> {
     let url = format!("{REFERER}api/v3/playlist/detail?id={id}&n=0&s=0");
-    let json = get_json(&url).await?;
+    let json = super::get_json(&url, "网易云歌单详情").await?;
     let detail = &json["playlist"];
     let name = detail["name"]
         .as_str()
@@ -197,7 +179,7 @@ pub async fn fetch_playlist(id: &str) -> Result<(Playlist, Vec<SongInfo>), Fetch
 /// 专辑元数据 + 曲目。
 pub async fn fetch_album(id: &str) -> Result<(Playlist, Vec<SongInfo>), FetchError> {
     let url = format!("{REFERER}api/album/{id}");
-    let json = get_json(&url).await?;
+    let json = super::get_json(&url, "网易云专辑详情").await?;
     let detail = &json["album"];
     let name = detail["name"]
         .as_str()

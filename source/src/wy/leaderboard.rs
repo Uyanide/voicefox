@@ -3,20 +3,10 @@ use lx_core::model::source::SourceId;
 use lx_core::traits::source::{SearchError, SearchResult};
 use serde_json::Value;
 
-use crate::http;
-use crate::http::SendWithRetry;
-
 pub async fn get_boards() -> Result<Vec<LeaderboardInfo>, SearchError> {
-    let json: Value = super::with_cookie(http::client().get("https://music.163.com/api/toplist"))
-        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+    let json = super::get_json("https://music.163.com/api/toplist", "网易云榜单目录")
         .await
-        .map_err(|error| SearchError::Network(error.to_string()))?
-        .json()
-        .await
-        .map_err(|error| SearchError::Parse(error.to_string()))?;
-    if json["code"].as_i64().unwrap_or(-1) != 200 {
-        return Err(SearchError::Api("网易云榜单目录请求失败".to_string()));
-    }
+        .map_err(super::search_error_from_fetch)?;
     let raw_boards = json["list"]
         .as_array()
         .ok_or_else(|| SearchError::Parse("网易云榜单目录为空".to_string()))?;
@@ -46,16 +36,9 @@ pub async fn get_list(board_id: &str, page: u32, limit: u32) -> Result<SearchRes
     let requested = page.saturating_mul(limit).max(limit);
     let url =
         format!("https://music.163.com/api/v3/playlist/detail?id={board_id}&n={requested}&s=0");
-    let json: Value = super::with_cookie(http::client().get(url))
-        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+    let json = super::get_json(&url, "网易云榜单歌曲")
         .await
-        .map_err(|error| SearchError::Network(error.to_string()))?
-        .json()
-        .await
-        .map_err(|error| SearchError::Parse(error.to_string()))?;
-    if json["code"].as_i64().unwrap_or(-1) != 200 {
-        return Err(SearchError::Api("网易云榜单请求失败".to_string()));
-    }
+        .map_err(super::search_error_from_fetch)?;
     let total = json["playlist"]["trackCount"].as_u64().unwrap_or_default() as u32;
     let raw_items = json["playlist"]["tracks"]
         .as_array()

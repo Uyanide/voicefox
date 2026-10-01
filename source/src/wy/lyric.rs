@@ -3,7 +3,6 @@
 //! POST https://interface3.music.163.com/eapi/song/lyric/v1
 //! 使用 eapi 加密
 
-use crate::http::SendWithRetry;
 use std::sync::OnceLock;
 
 use lx_core::model::lyric::LyricData;
@@ -11,8 +10,7 @@ use lx_core::model::song::SongInfo;
 use lx_core::traits::source::FetchError;
 use serde_json::Value;
 
-use super::super::http;
-use super::crypto;
+use super::session;
 
 /// 从响应中提取歌词字段（.lyric）
 fn extract_lyric(root: &Value, path: &str) -> Option<String> {
@@ -48,33 +46,18 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
         "yrv": 0,
     });
 
-    let encrypted = crypto::eapi(url, &data);
-
-    let client = http::client();
-    let resp =
-        super::with_cookie(client.post("https://interface3.music.163.com/eapi/song/lyric/v1"))
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            )
-            .header("origin", "https://music.163.com")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!("params={}", encrypted))
-            .send_with_retry(crate::http::RETRY_ATTEMPTS)
-            .await
-            .map_err(|e| FetchError::Network(e.to_string()))?;
-
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| FetchError::Network(e.to_string()))?;
-
-    let json: Value = serde_json::from_str(&text).map_err(|e| FetchError::Parse(e.to_string()))?;
+    let json = super::eapi_post("https://interface3.music.163.com/eapi/song/lyric/v1", url, &data)
+        .await?;
 
     // 检查响应码
     let code = json["code"].as_i64().unwrap_or(0);
     if code != 200 {
-        // 歌词获取失败不报错，返回空
+        if super::response_requires_login(&json) {
+            session::mark_login_expired();
+        }
+        // 歌词获取失败不报错，返回空；但要留下日志，否则分不清
+        // 「真的没歌词」和「接口被风控/会话失效」。
+        tracing::debug!("网易云歌词接口返回 code={code}，按无歌词处理: {}", song.name);
         return Ok(LyricData::default());
     }
 

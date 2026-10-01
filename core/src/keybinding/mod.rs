@@ -344,6 +344,23 @@ impl Default for KeybindingConfig {
     }
 }
 
+impl KeybindingConfig {
+    /// 反查某动作当前绑定的键位展示串（页面级优先，全局兜底）。
+    ///
+    /// 查找顺序与 [`KeybindingResolver::resolve`] 一致。返回配置里的原始
+    /// 键位串（如 `"Ctrl+o"`、`"Space"`），供底栏、菜单等处的提示直接展示
+    /// ——此前这些提示是硬编码的，用户改键后会失真。动作没有绑定时返回
+    /// `None`，调用方应整体省略提示，而不是显示"未绑定"。
+    pub fn key_hint(&self, page: Option<&str>, action: Action) -> Option<&str> {
+        if let Some(page) = page
+            && let Some(key) = self.pages.get(page).and_then(|map| map.get(&action))
+        {
+            return Some(key.as_str());
+        }
+        self.global.get(&action).map(String::as_str)
+    }
+}
+
 /// 设置页的"逐行动作"绑定：这些动作已经删除（设置项改为 `Enter` 激活）。
 ///
 /// 保留这份清单有两个用途：迁移时把旧配置里的残留绑定清掉，以及测试里断言
@@ -875,6 +892,30 @@ pub fn colemak_preset() -> KeybindingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_hint_prefers_the_page_binding_and_falls_back_to_global() {
+        let mut config = KeybindingConfig::default();
+        // 全局绑定兜底。
+        assert_eq!(
+            config.key_hint(Some("main"), Action::GlobalPlayPause),
+            config.global.get(&Action::GlobalPlayPause).map(String::as_str)
+        );
+        // 页面级优先。
+        config
+            .pages
+            .get_mut("main")
+            .expect("默认表含 main 页")
+            .insert(Action::ListCycleSort, "S".to_string());
+        assert_eq!(config.key_hint(Some("main"), Action::ListCycleSort), Some("S"));
+        assert_ne!(config.key_hint(Some("local"), Action::ListCycleSort), Some("S"));
+        // 用户删除绑定后返回 None，提示应整体省略。
+        config.global.remove(&Action::GlobalPlayPause);
+        if let Some(page) = config.pages.get_mut("main") {
+            page.remove(&Action::GlobalPlayPause);
+        }
+        assert_eq!(config.key_hint(Some("main"), Action::GlobalPlayPause), None);
+    }
 
     /// 面板布局复位必须有一键入口，而且不能和强制重绘撞键。
     ///

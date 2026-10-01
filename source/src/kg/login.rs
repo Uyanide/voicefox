@@ -239,10 +239,6 @@ pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
         }
         session::save_login(&device, token, &user_id).map_err(FetchError::Other)?;
         session::clear_pending(key);
-        let mut cookies = device;
-        cookies.insert("token".to_string(), token.to_string());
-        cookies.insert("userid".to_string(), user_id.clone());
-        result.cookies = cookies;
         result.user_name = Some(user_id);
     }
     Ok(result)

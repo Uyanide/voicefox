@@ -3,7 +3,6 @@
 //! POST https://interface.music.163.com/eapi/batch
 //! 使用 eapi 加密，form-urlencoded body
 
-use crate::http::SendWithRetry;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -12,8 +11,7 @@ use lx_core::model::source::{Quality, SourceId};
 use lx_core::traits::source::{SearchError, SearchResult};
 use serde_json::Value;
 
-use super::super::http;
-use super::crypto;
+use super::session;
 
 /// 将文件大小值映射为音质（>0 则添加对应 Quality）
 fn add_quality_if_positive(qualities: &mut BTreeSet<Quality>, size: i64, quality: Quality) {
@@ -43,35 +41,21 @@ pub async fn search(keyword: &str, page: u32, limit: u32) -> Result<SearchResult
         data["total"] = serde_json::Value::Bool(true);
     }
 
-    let encrypted = crypto::eapi(url, &data);
-
-    let client = http::client();
-    let resp = super::with_cookie(client.post("https://interface.music.163.com/eapi/batch"))
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        )
-        .header("origin", "https://music.163.com")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!("params={}", encrypted))
-        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+    let json = super::eapi_post("https://interface.music.163.com/eapi/batch", url, &data)
         .await
-        .map_err(|e| SearchError::Network(e.to_string()))?;
+        .map_err(super::search_error_from_fetch)?;
 
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| SearchError::Network(e.to_string()))?;
-
-    let json: Value = serde_json::from_str(&text).map_err(|e| SearchError::Parse(e.to_string()))?;
+    // 「需要登录」时记一次会话失效，让设置页能显示「请重新扫码」。
+    if super::response_requires_login(&json) {
+        session::mark_login_expired();
+    }
 
     // 检查响应码 (code 或 result 两种格式)
     let code = json["code"].as_i64().unwrap_or(0);
     if code != 200 {
-        let msg = json["message"].as_str().unwrap_or("unknown error");
+        let msg = json["message"].as_str().unwrap_or("未知错误");
         return Err(SearchError::Api(format!(
-            "wy search error (code={}): {}",
-            code, msg
+            "网易云搜索失败 (code={code}): {msg}"
         )));
     }
 

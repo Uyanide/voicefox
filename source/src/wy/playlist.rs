@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::time::Duration;
 
 use lx_core::model::playlist::Playlist;
 use lx_core::model::playlist::PlaylistCategory;
@@ -7,9 +6,6 @@ use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
 use lx_core::traits::source::{FetchError, SearchError};
 use serde_json::Value;
-
-use crate::http;
-use crate::http::SendWithRetry;
 
 /// 网易云「我喜欢的音乐」在歌单列表里的 `specialType`。
 ///
@@ -27,49 +23,6 @@ pub fn is_favorites(playlist: &Playlist) -> bool {
     }
 }
 
-/// 网易云频控返回的业务码。形状是 HTTP 200 + `{"code":405,"message":"操作频繁，请稍候再试"}`，
-/// 因此 `send_with_retry` 这类只看传输层错误的重试完全覆盖不到它。
-const THROTTLE_CODE: i64 = 405;
-/// 频控退避重试次数与间隔（毫秒）。
-const THROTTLE_RETRIES: usize = 4;
-const THROTTLE_BACKOFF_MS: [u64; THROTTLE_RETRIES] = [600, 1_200, 2_400, 4_000];
-
-/// 带频控退避的网易云 GET。
-///
-/// 只处理「HTTP 200 但 `code` 不是 200」这一层：`code=405` 按固定阶梯退避重试，
-/// 其它业务码立刻返回可读错误，避免像以前那样把 `code=405` 的空响应当成
-/// 「这个歌单是空的」静默吞掉。
-async fn get_json(url: &str, what: &str) -> Result<Value, FetchError> {
-    let mut throttle_attempt = 0usize;
-    loop {
-        let json: Value = super::with_cookie(http::client().get(url))
-            .header("Referer", "https://music.163.com/")
-            .send_with_retry(crate::http::RETRY_ATTEMPTS)
-            .await
-            .map_err(|error| FetchError::Network(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| FetchError::Parse(error.to_string()))?;
-        let code = json["code"].as_i64();
-        if code == Some(200) {
-            return Ok(json);
-        }
-        if code == Some(THROTTLE_CODE) && throttle_attempt < THROTTLE_RETRIES {
-            let backoff = THROTTLE_BACKOFF_MS[throttle_attempt];
-            throttle_attempt += 1;
-            tracing::warn!("网易云频控（{what}），{backoff}ms 后重试");
-            tokio::time::sleep(Duration::from_millis(backoff)).await;
-            continue;
-        }
-        let message = json["message"].as_str().unwrap_or_default().trim();
-        return Err(FetchError::Other(format!(
-            "{what}失败: code={} {message}",
-            code.map(|code| code.to_string())
-                .unwrap_or_else(|| "未知".into())
-        )));
-    }
-}
-
 /// 热门歌单列表；`category` 为空表示「全部」。
 pub async fn get_list(category: &str, page: u32) -> Result<Vec<Playlist>, FetchError> {
     let category = if category.trim().is_empty() {
@@ -82,17 +35,7 @@ pub async fn get_list(category: &str, page: u32) -> Result<Vec<Playlist>, FetchE
         "https://music.163.com/api/playlist/list?cat={}&order=hot&limit=30&offset={offset}",
         urlencoding::encode(category)
     );
-    let json: Value = super::with_cookie(http::client().get(url))
-        .header("Referer", "https://music.163.com/")
-        .send_with_retry(crate::http::RETRY_ATTEMPTS)
-        .await
-        .map_err(|error| FetchError::Network(error.to_string()))?
-        .json()
-        .await
-        .map_err(|error| FetchError::Parse(error.to_string()))?;
-    if json["code"].as_i64() != Some(200) {
-        return Err(FetchError::Other("网易云热门歌单请求失败".to_string()));
-    }
+    let json = super::get_json(&url, "网易云热门歌单").await?;
     let items = json["playlists"]
         .as_array()
         .ok_or_else(|| FetchError::Parse("网易云热门歌单列表为空".to_string()))?;
@@ -104,18 +47,11 @@ pub async fn get_list(category: &str, page: u32) -> Result<Vec<Playlist>, FetchE
 /// 与热门歌单、歌单搜索一样走公开接口，和网易云音源现有的取数方式保持一致；
 /// 接口异常时返回空列表，界面上表现为「没有分类可选」，不影响其它功能。
 pub async fn get_categories() -> Result<Vec<PlaylistCategory>, FetchError> {
-    let json: Value =
-        super::with_cookie(http::client().get("https://music.163.com/api/playlist/catalogue"))
-            .header("Referer", "https://music.163.com/")
-            .send_with_retry(crate::http::RETRY_ATTEMPTS)
-            .await
-            .map_err(|error| FetchError::Network(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| FetchError::Parse(error.to_string()))?;
-    if json["code"].as_i64() != Some(200) {
-        return Err(FetchError::Other("网易云歌单分类请求失败".to_string()));
-    }
+    let json = super::get_json(
+        "https://music.163.com/api/playlist/catalogue",
+        "网易云歌单分类",
+    )
+    .await?;
 
     let groups = json["categories"].as_object().cloned().unwrap_or_default();
     let mut categories = Vec::new();
@@ -163,7 +99,7 @@ const SONG_DETAIL_BATCH: usize = 100;
 ///
 /// `page` 保留只是为了兼容既有调用方：v3 详情接口没有 offset 参数，一次取全量。
 pub async fn get_detail(id: &str, _page: u32) -> Result<Vec<SongInfo>, FetchError> {
-    let json = get_json(
+    let json = super::get_json(
         &format!("https://music.163.com/api/v3/playlist/detail?id={id}&n=0&s=0"),
         "网易云歌单详情请求",
     )
@@ -221,7 +157,7 @@ async fn get_song_details(ids: &[i64]) -> Result<Vec<SongInfo>, FetchError> {
         .collect::<Vec<_>>();
     let body = serde_json::to_string(&payload).unwrap_or_default();
     let encoded = urlencoding::encode(&body);
-    let json = get_json(
+    let json = super::get_json(
         &format!("https://music.163.com/api/v3/song/detail?c={encoded}"),
         "网易云歌曲详情请求",
     )
@@ -239,14 +175,15 @@ async fn get_song_details(ids: &[i64]) -> Result<Vec<SongInfo>, FetchError> {
 /// 用公开的 `api/user/playlist` 而不是 weapi 版本：voicefox 的网易云实现
 /// 一直走公开接口（热门歌单、歌单搜索同理），少一套加密实现也少一处失效点。
 pub async fn get_user_playlists(page: u32, limit: u32) -> Result<Vec<Playlist>, FetchError> {
-    // 未登录时先给明确提示，不必等接口返回。
-    if super::session::cookie_header().is_none() {
+    // 未登录时先给明确提示，不必等接口返回。判定口径与 sync 的
+    // `SyncProvider` 一致：只看有没有登录凭据 cookie。
+    if !super::session::is_logged_in() {
         return Err(FetchError::Other("请先在设置页登录网易云".to_string()));
     }
     let uid = user_id().await?;
     let limit = limit.max(1);
     let offset = limit.saturating_mul(page.saturating_sub(1));
-    let json = get_json(
+    let json = super::get_json(
         &format!(
             "https://music.163.com/api/user/playlist?uid={uid}&limit={limit}&offset={offset}&includeVideo=true"
         ),
@@ -287,17 +224,21 @@ pub async fn get_all_user_playlists() -> Result<Vec<Playlist>, FetchError> {
 
 /// 取当前登录账号的 uid：`api/nuser/account/get` 同时返回账号与昵称。
 async fn user_id() -> Result<String, FetchError> {
-    let json = get_json(
-        "https://music.163.com/api/nuser/account/get",
-        "网易云账号信息请求",
-    )
-    .await?;
+    let json = super::get_json(super::ACCOUNT_API, "网易云账号信息请求").await?;
     let uid = json["account"]["id"]
         .as_i64()
         .or_else(|| json["profile"]["userId"].as_i64())
         .filter(|uid| *uid > 0)
-        .map(|uid| uid.to_string());
-    uid.ok_or_else(|| FetchError::Other("网易云登录已失效，请重新扫码".to_string()))
+        .map(|uid| uid.to_string())
+        .ok_or_else(|| FetchError::Other("网易云登录已失效，请重新扫码".to_string()))?;
+    // 顺手把昵称写进会话存储，设置页的账号列表能一直显示最新昵称。
+    let name = json["profile"]["nickname"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    super::session::save_account(name, Some(uid.clone()));
+    Ok(uid)
 }
 
 pub async fn search_list(keyword: &str, page: u32) -> Result<Vec<Playlist>, SearchError> {
@@ -306,17 +247,9 @@ pub async fn search_list(keyword: &str, page: u32) -> Result<Vec<Playlist>, Sear
         "https://music.163.com/api/search/get/web?csrf_token=&s={}&type=1000&limit=30&offset={offset}",
         urlencoding::encode(keyword)
     );
-    let json: Value = super::with_cookie(http::client().get(url))
-        .header("Referer", "https://music.163.com/")
-        .send_with_retry(crate::http::RETRY_ATTEMPTS)
+    let json = super::get_json(&url, "网易云歌单搜索")
         .await
-        .map_err(|e| SearchError::Network(e.to_string()))?
-        .json()
-        .await
-        .map_err(|e| SearchError::Parse(e.to_string()))?;
-    if json["code"].as_i64() != Some(200) {
-        return Err(SearchError::Api("网易云歌单搜索失败".to_string()));
-    }
+        .map_err(super::search_error_from_fetch)?;
     Ok(json["result"]["playlists"]
         .as_array()
         .into_iter()

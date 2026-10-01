@@ -448,7 +448,6 @@ impl MusicSource for BiliSource {
                 // `poll_qr_code` 已经把会话写进存储，这里只回传给界面展示。
                 let session = self.session();
                 let mut result = QrLoginResult::new(QrLoginStatus::Success, "登录成功");
-                result.cookies = session.cookies;
                 result.user_name = session
                     .user_name
                     .or_else(|| poll.user.as_ref().map(|user| user.name.clone()));

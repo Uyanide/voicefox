@@ -159,27 +159,25 @@ impl SessionStore {
     }
 
     /// 修改会话并落盘。
+    ///
+    /// 落盘在写锁内完成：两个并发 `update` 时，若落盘在锁外，后提交者的
+    /// rename 可能先执行，最终文件反而留下先提交者的旧快照。
     pub fn update(&self, edit: impl FnOnce(&mut SourceSession)) -> Result<(), String> {
-        let snapshot = {
-            let mut session = self
-                .session
-                .write()
-                .unwrap_or_else(|error| error.into_inner());
-            edit(&mut session);
-            session.clone()
-        };
-        save_file(&self.path, &snapshot)
+        let mut session = self
+            .session
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        edit(&mut session);
+        save_file(&self.path, &session)
     }
 
     /// 整体替换会话并落盘，用于扫码登录成功后的回写。
     pub fn replace(&self, session: SourceSession) -> Result<(), String> {
-        {
-            let mut guard = self
-                .session
-                .write()
-                .unwrap_or_else(|error| error.into_inner());
-            *guard = session.clone();
-        }
+        let mut guard = self
+            .session
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        *guard = session.clone();
         save_file(&self.path, &session)
     }
 
@@ -312,6 +310,14 @@ fn save_file_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        // 会话文件是 0600，但目录若保持默认 0755，同机其他用户仍能列举出
+        // 会话文件名。目录一并收紧到 0700。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);

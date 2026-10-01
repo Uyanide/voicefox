@@ -209,16 +209,13 @@ pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
     // 成功后跟着跳转把 OAuth 链路上的 cookie 收全。
     let collected = follow_redirects(&redirect, cookies).await;
     if !collected.contains_key("uin") && !collected.contains_key("qqmusic_key") {
-        let mut failed = QrLoginResult::new(
+        return Ok(QrLoginResult::new(
             QrLoginStatus::Failed,
             "QQ 登录成功但未拿到音乐凭证，请重新扫码".to_string(),
-        );
-        failed.cookies = collected;
-        return Ok(failed);
+        ));
     }
     session::save_login(&collected).map_err(FetchError::Other)?;
     session::clear_pending(qrsig);
-    result.cookies = collected;
     result.user_name = (!nickname.trim().is_empty()).then_some(nickname);
     Ok(result)
 }

@@ -16,30 +16,18 @@ use crate::http;
 use crate::http::SendWithRetry;
 
 use super::session;
+use super::{ACCOUNT_API, REFERER, USER_AGENT};
 
 /// 扫码登录接口路径；主机在 `LOGIN_HOSTS` 里按可用性顺序尝试。
 const QR_KEY_PATH: &str = "/api/login/qrcode/unikey";
 const QR_CHECK_PATH: &str = "/api/login/qrcode/client/login";
-const ACCOUNT_API: &str = "https://music.163.com/api/nuser/account/get";
-const REFERER: &str = "https://music.163.com/";
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/3.0.18.203152";
 
-/// 探测当前网易云会话是否仍然有效。
+/// 请求账号信息，返回 (昵称, uid)。
 ///
-/// 公开接口**没有可用的会话续期端点**：实测 `api/login/token/refresh` 返回
-/// `code=400`、`api/login/refresh` 返回 `code=404`。所以这里不做「延长会话」，
-/// 只做「探测」：
-///
-/// - `Ok(true)`  会话可用；
-/// - `Ok(false)` 服务端明确表示没有登录态（`code != 200` 或拿不到 uid）；
-/// - `Err(_)`    网络/解析问题，无法判定——调用方应当继续尝试，而不是据此
-///   判定失效。
-///
-/// 无论结果如何都**不清除本地 cookie**：最终失效判定留给真正需要登录的接口。
-pub async fn refresh() -> Result<bool, FetchError> {
-    if !session::is_logged_in() {
-        return Ok(false);
-    }
+/// 与 [`refresh`] 共用：验证会话的同时把账号名写进会话存储，设置页和登录
+/// 成功页才能显示「谁登录了」（此前只写 cookie，`user_name` 永远为空）。
+/// 服务端明确表示没有登录态时记一次失效标记。
+async fn fetch_account() -> Result<(Option<String>, Option<String>), FetchError> {
     let response = super::with_cookie(http::client().get(ACCOUNT_API))
         .header("User-Agent", USER_AGENT)
         .header("Referer", REFERER)
@@ -51,12 +39,42 @@ pub async fn refresh() -> Result<bool, FetchError> {
         .await
         .map_err(|error| FetchError::Parse(error.to_string()))?;
     if json["code"].as_i64() != Some(200) {
-        return Ok(false);
+        if super::response_requires_login(&json) {
+            session::mark_login_expired();
+        }
+        return Ok((None, None));
     }
+    let name = json["profile"]["nickname"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
     let uid = json["account"]["id"]
         .as_i64()
         .or_else(|| json["profile"]["userId"].as_i64())
-        .filter(|uid| *uid > 0);
+        .filter(|uid| *uid > 0)
+        .map(|uid| uid.to_string());
+    session::save_account(name.clone(), uid.clone());
+    Ok((name, uid))
+}
+
+/// 探测当前网易云会话是否仍然有效。
+///
+/// 公开接口**没有可用的会话续期端点**：实测 `api/login/token/refresh` 返回
+/// `code=400`、`api/login/refresh` 返回 `code=404`。所以这里不做「延长会话」，
+/// 只做「探测」：
+///
+/// - `Ok(true)`  会话可用（顺带把昵称 / uid 写进会话存储）；
+/// - `Ok(false)` 服务端明确表示没有登录态（`code != 200` 或拿不到 uid）；
+/// - `Err(_)`    网络/解析问题，无法判定——调用方应当继续尝试，而不是据此
+///   判定失效。
+///
+/// 无论结果如何都**不清除本地 cookie**：最终失效判定留给真正需要登录的接口。
+pub async fn refresh() -> Result<bool, FetchError> {
+    if !session::is_logged_in() {
+        return Ok(false);
+    }
+    let (_, uid) = fetch_account().await?;
     Ok(uid.is_some())
 }
 
@@ -169,7 +187,14 @@ pub async fn check(key: &str) -> Result<QrLoginResult, FetchError> {
     }
 
     let mut result = QrLoginResult::new(status, message_for(status, &json));
-    result.cookies = cookies;
+    if status == QrLoginStatus::Success {
+        // 登录成功即拉一次账号信息：昵称写进会话存储，设置页与登录成功页
+        // 才能显示「谁登录了」。拉取失败不阻断登录——cookie 已保存，
+        // 之后任何一次 refresh 都会补齐。
+        if let Ok((name, _)) = fetch_account().await {
+            result.user_name = name;
+        }
+    }
     Ok(result)
 }
 
