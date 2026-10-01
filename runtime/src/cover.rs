@@ -28,7 +28,7 @@ impl CoverService {
     pub fn new(proxy_url: &str, timeout_secs: u64) -> Self {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs.clamp(1, 300)))
-            .user_agent("voicefox/0.3");
+            .user_agent(concat!("voicefox/", env!("CARGO_PKG_VERSION")));
         if !proxy_url.trim().is_empty()
             && let Ok(proxy) = reqwest::Proxy::all(proxy_url.trim())
         {

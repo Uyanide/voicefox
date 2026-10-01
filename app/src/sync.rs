@@ -155,8 +155,12 @@ pub async fn preview_source(
             source.display_name()
         ));
     }
-    // 会话有效性预检：已失效时立刻给出可操作的提示，不必等几十次请求跑完。
-    // 网络错误无法判定失效（`refresh` 返回 Err），交给后续接口报真正的错误。
+    // 会话有效性预检：未登录与已失效分别给出可操作的提示，不必等几十次
+    // 请求跑完。网络错误无法判定失效（`refresh` 返回 Err），交给后续接口
+    // 报真正的错误。
+    if !lx_source::wy::session::is_logged_in() {
+        return Err("尚未登录网易云，请先在设置（8）→ 账号与扫码 扫码登录".into());
+    }
     if let Ok(false) = lx_source::wy::login::refresh().await {
         return Err("网易云登录已失效，请重新扫码登录".into());
     }

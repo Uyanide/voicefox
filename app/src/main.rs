@@ -8,6 +8,7 @@ mod context;
 mod cover;
 mod data_cache;
 mod download;
+mod fmt;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod notification;
@@ -62,6 +63,8 @@ use pages::components::list_filter::ListFilter;
 use pages::components::status_bar::StatusBarSlot;
 use pages::sidebar::NavTab;
 use pages::sort::{SortMode, SortState, SortTarget, SortedListCache};
+
+use crate::fmt::format_duration;
 use storage::SavedPlayerState;
 
 enum LeaderboardResponse {
@@ -154,8 +157,13 @@ impl ClickTracker {
         if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
+        // 2px 邻域内都算同一次双击：终端/触摸板普遍存在 1-2px 手抖，
+        // 严格要求同像素会让双击频繁判定失败。
+        const DOUBLE_CLICK_SLOP: u16 = 2;
         let doubled = self.last_left_click.is_some_and(|(time, x, y)| {
-            x == event.column && y == event.row && time.elapsed() < Duration::from_millis(500)
+            x.abs_diff(event.column) <= DOUBLE_CLICK_SLOP
+                && y.abs_diff(event.row) <= DOUBLE_CLICK_SLOP
+                && time.elapsed() < Duration::from_millis(500)
         });
         self.last_left_click = if doubled {
             None
@@ -198,8 +206,8 @@ fn playback_menu_state(ctx: &AppContext) -> PlaybackMenuState {
         .map(|points| {
             format!(
                 "{} - {}",
-                format_clock(points.start),
-                format_clock(points.end)
+                format_duration(points.start),
+                format_duration(points.end)
             )
         })
         .unwrap_or_else(|| "未设置".to_string());
@@ -214,11 +222,6 @@ fn playback_menu_state(ctx: &AppContext) -> PlaybackMenuState {
         balance: config.player.balance,
         ab_loop,
     }
-}
-
-fn format_clock(value: Duration) -> String {
-    let total = value.as_secs();
-    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 fn should_go_to_main(
@@ -636,19 +639,41 @@ fn build_status_bar_menu(
         StatusBarSlot::More => (" 更多 ".to_string(), collapsed_slot_items(collapsed, ctx)),
         StatusBarSlot::Download => (
             " 下载 ".to_string(),
-            vec![
-                MenuItem::new("打开下载面板", StatusBarMenuAction::OpenDownloadsPanel)
-                    .with_hint("Ctrl+O"),
-            ],
+            vec![{
+                let mut item =
+                    MenuItem::new("打开下载面板", StatusBarMenuAction::OpenDownloadsPanel);
+                if let Some(hint) = config_key_hint(ctx, None, Action::GlobalDownloadsPanel) {
+                    item = item.with_hint(hint);
+                }
+                item
+            }],
         ),
         StatusBarSlot::Item(item) => match item {
             StatusBarItem::State => (
                 " 播放控制 ".to_string(),
                 vec![
-                    MenuItem::new("播放 / 暂停", StatusBarMenuAction::TogglePlayPause)
-                        .with_hint("Space"),
-                    MenuItem::new("上一首", StatusBarMenuAction::PreviousTrack).with_hint("b"),
-                    MenuItem::new("下一首", StatusBarMenuAction::NextTrack).with_hint("n"),
+                    {
+                        let mut item =
+                            MenuItem::new("播放 / 暂停", StatusBarMenuAction::TogglePlayPause);
+                        if let Some(hint) = config_key_hint(ctx, None, Action::GlobalPlayPause) {
+                            item = item.with_hint(hint);
+                        }
+                        item
+                    },
+                    {
+                        let mut item = MenuItem::new("上一首", StatusBarMenuAction::PreviousTrack);
+                        if let Some(hint) = config_key_hint(ctx, None, Action::GlobalPrevTrack) {
+                            item = item.with_hint(hint);
+                        }
+                        item
+                    },
+                    {
+                        let mut item = MenuItem::new("下一首", StatusBarMenuAction::NextTrack);
+                        if let Some(hint) = config_key_hint(ctx, None, Action::GlobalNextTrack) {
+                            item = item.with_hint(hint);
+                        }
+                        item
+                    },
                 ],
             ),
             // 当前歌曲直接复用歌曲菜单，避免两套歌曲操作。
@@ -669,8 +694,21 @@ fn build_status_bar_menu(
             StatusBarItem::Volume => (
                 " 音量 ".to_string(),
                 vec![
-                    MenuItem::new("音量 +5%", StatusBarMenuAction::VolumeDelta(5)).with_hint("."),
-                    MenuItem::new("音量 -5%", StatusBarMenuAction::VolumeDelta(-5)).with_hint(","),
+                    {
+                        let mut item = MenuItem::new("音量 +5%", StatusBarMenuAction::VolumeDelta(5));
+                        if let Some(hint) = config_key_hint(ctx, None, Action::GlobalVolumeUp) {
+                            item = item.with_hint(hint);
+                        }
+                        item
+                    },
+                    {
+                        let mut item =
+                            MenuItem::new("音量 -5%", StatusBarMenuAction::VolumeDelta(-5));
+                        if let Some(hint) = config_key_hint(ctx, None, Action::GlobalVolumeDown) {
+                            item = item.with_hint(hint);
+                        }
+                        item
+                    },
                     MenuItem::new("静音 / 恢复", StatusBarMenuAction::ToggleMute),
                     MenuItem::new("设为 50%", StatusBarMenuAction::SetVolume(50)),
                     MenuItem::new("设为 100%", StatusBarMenuAction::SetVolume(100)),
@@ -858,7 +896,20 @@ fn current_source_label(ctx: &AppContext) -> String {
                 .get(song.source)
                 .map(|source| source.name().to_string())
         })
-        .unwrap_or_else(|| song.source.as_str().to_string())
+        .unwrap_or_else(|| song.source.display_name().to_string())
+}
+
+/// 从键位配置反查动作的提示串（页面级优先、全局兜底）。
+///
+/// 底栏菜单、页面标题里的键位提示统一走这里：用户改键后提示跟随变化；
+/// 动作没有绑定（用户删掉了）时返回 `None`，调用方整体省略提示段。
+fn config_key_hint(ctx: &AppContext, page: Option<&str>, action: Action) -> Option<String> {
+    ctx.config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .keybindings
+        .key_hint(page, action)
+        .map(str::to_string)
 }
 
 /// 「更多」菜单：列出被宽度挤掉的可交互段，点进去仍是它们各自的菜单。
@@ -1442,7 +1493,7 @@ fn run_app(
     let mut observed_active_tab = active_tab;
 
     // 页面状态
-    let (search_source_filter, wrap_navigation, scroll_amount, enabled_sources) = {
+    let (search_source_filter, wrap_navigation, scroll_amount, page_step, enabled_sources) = {
         let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (
             if config.ui.aggregate_search {
@@ -1452,6 +1503,7 @@ fn run_app(
             },
             config.ui.wrap_navigation,
             config.ui.scroll_amount,
+            config.ui.page_step,
             config.source.enabled.clone(),
         )
     };
@@ -1459,6 +1511,7 @@ fn run_app(
         search_source_filter,
         wrap_navigation,
         scroll_amount,
+        page_step,
         &enabled_sources,
     )));
     let settings_page = Arc::new(std::sync::Mutex::new(pages::settings::SettingsPage::new()));
@@ -1545,6 +1598,7 @@ fn run_app(
     let mut last_notification_cleanup = Instant::now();
     let mut last_playback_session_save = Instant::now();
     let mut last_auto_cache_check = Instant::now();
+    let mut last_login_notice_check = Instant::now();
     let mut last_local_watch_generation = ctx.source_manager.local_source().watch_generation();
     let mut faded_generation = 0_u64;
     let mut mouse_capture_enabled = ctx
@@ -1810,19 +1864,12 @@ fn run_app(
                         *source,
                         source.display_name().to_string(),
                     )));
-                    let page_clone = Arc::clone(&page);
-                    let wake_tx = action_tx.clone();
-                    let manager = Arc::clone(&ctx.source_manager);
-                    let source_id = *source;
-                    qr_generate_task = Some(rt.spawn(async move {
-                        let result = manager.create_qr_login(source_id).await;
-                        let mut page = page_clone.lock().unwrap_or_else(|e| e.into_inner());
-                        match result {
-                            Ok(session) => page.set_qr(session),
-                            Err(error) => page.set_error(format!("生成二维码失败: {error}")),
-                        }
-                        let _ = wake_tx.send(AppAction::None);
-                    }));
+                    qr_generate_task = Some(spawn_qr_generate(
+                        rt,
+                        &ctx,
+                        Arc::clone(&page),
+                        action_tx.clone(),
+                    ));
                     qr_login_page = Some(page);
                     qr_poll_deadline = Instant::now();
                     needs_render = true;
@@ -2147,6 +2194,26 @@ fn run_app(
             qr_poll_task.take();
         }
 
+        // 二维码初始生成 / 过期自动重建：页面停在 Generating 或本地计时到期时
+        // （不必等服务端 800，见 `needs_regeneration` 的说明），补发生成任务。
+        if let Some(ref page) = qr_login_page
+            && qr_generate_task.is_none()
+        {
+            let regenerate = page
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .needs_regeneration();
+            if regenerate {
+                qr_generate_task = Some(spawn_qr_generate(
+                    rt,
+                    &ctx,
+                    Arc::clone(page),
+                    action_tx.clone(),
+                ));
+                needs_render = true;
+            }
+        }
+
         if let Some(ref page) = qr_login_page
             && qr_poll_task.is_none()
             && qr_poll_deadline.elapsed() >= Duration::from_secs(2)
@@ -2237,6 +2304,18 @@ fn run_app(
         if local_watch_generation != last_local_watch_generation {
             last_local_watch_generation = local_watch_generation;
             needs_render = true;
+        }
+
+        // 网易云会话失效提醒：播放/搜索等路径上接口返回「需要登录」时，
+        // 音源侧会记一次标记，这里消费并提醒一次（不重复轰炸）。
+        if last_login_notice_check.elapsed() >= Duration::from_secs(1) {
+            last_login_notice_check = Instant::now();
+            if lx_source::wy::session::take_expired_notice() {
+                ctx.notify(Notification::warning(
+                    "网易云登录已失效，请在设置（8）→ 账号与扫码 重新扫码",
+                ));
+                needs_render = true;
+            }
         }
 
         // borrow 很便宜，所以不受 render_interval 门控
@@ -2630,11 +2709,11 @@ fn run_app(
                     (KeyModifiers::NONE, KeyCode::Char('\\'))
                 )
             {
+                let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
                 help_page = Some(pages::help::HelpPage::from_config(
-                    &ctx.config
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .keybindings,
+                    &config.keybindings,
+                    config.ui.page_step.clamp(1, 100),
+                    config.ui.scroll_amount,
                 ));
                 needs_render = true;
                 continue;
@@ -3025,8 +3104,15 @@ fn run_app(
                     needs_render = true;
                     continue;
                 }
+                // 左/右方向键的 seek 在 Left/Right 空闲的页签生效（队列/历史/本地）；
+                // 搜索、排行榜、歌单、收藏、设置页把这两个键用在了切音源/切分类等
+                // 页面功能上，不能被全局 seek 吞掉。鼠标点进度条不受此限制。
                 (KeyModifiers::NONE, KeyCode::Right)
-                    if !text_input_active && active_tab == NavTab::Main =>
+                    if !text_input_active
+                        && matches!(
+                            active_tab,
+                            NavTab::Main | NavTab::History | NavTab::LocalMusic
+                        ) =>
                 {
                     let pos = *ctx.position.borrow();
                     ctx.seek(pos + Duration::from_secs(5));
@@ -3034,7 +3120,11 @@ fn run_app(
                     continue;
                 }
                 (KeyModifiers::NONE, KeyCode::Left)
-                    if !text_input_active && active_tab == NavTab::Main =>
+                    if !text_input_active
+                        && matches!(
+                            active_tab,
+                            NavTab::Main | NavTab::History | NavTab::LocalMusic
+                        ) =>
                 {
                     let pos = *ctx.position.borrow();
                     if pos > Duration::from_secs(5) {
@@ -3045,14 +3135,13 @@ fn run_app(
                     needs_render = true;
                     continue;
                 }
-                // 队列页面保留裸 Up/Down 给列表导航；音量调整使用 Ctrl+Up/Down，
-                // 避免全局快捷键在路由前吞掉队列的方向键。
-                (KeyModifiers::CONTROL, KeyCode::Up) if active_tab == NavTab::Main => {
+                // 音量调整全页签可用（与 `.`/`,` 一致）；裸 Up/Down 仍归列表导航。
+                (KeyModifiers::CONTROL, KeyCode::Up) if !text_input_active => {
                     persist_volume(&ctx, ctx.player.volume().saturating_add(5));
                     needs_render = true;
                     continue;
                 }
-                (KeyModifiers::CONTROL, KeyCode::Down) if active_tab == NavTab::Main => {
+                (KeyModifiers::CONTROL, KeyCode::Down) if !text_input_active => {
                     persist_volume(&ctx, ctx.player.volume().saturating_sub(5));
                     needs_render = true;
                     continue;
@@ -3206,6 +3295,7 @@ fn run_app(
                                     config.source.default,
                                     config.ui.wrap_navigation,
                                     config.ui.scroll_amount,
+                                    config.ui.page_step,
                                     &config.source.enabled,
                                 );
                         }
@@ -3735,18 +3825,21 @@ fn run_app(
                 }
                 continue;
             }
-            // 底栏滚轮：悬停在「音量」段上就是调音量；底栏上其它位置不吃滚轮，
-            // 避免"在状态栏滚动却把上面的列表滚走"。
+            // 底栏滚轮：悬停在底栏**任意**段上都调音量（常见播放器惯例）。
+            // 用现场命中而不是 Moved 缓存的 hover——未经移动直接滚轮时
+            // 缓存可能是旧值。底栏上滚轮不冒泡到列表，避免"在状态栏滚动
+            // 却把上面的列表滚走"。
             if matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             ) && ui_areas.status.contains(position)
             {
-                if ui_areas.status_hover
-                    == Some(StatusBarSlot::Item(
-                        lx_core::model::config::StatusBarItem::Volume,
-                    ))
-                {
+                let hovered = pages::components::status_bar::hit_test(
+                    &ui_areas.status_hits,
+                    mouse.column,
+                    mouse.row,
+                );
+                if hovered.is_some() {
                     let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                         5
                     } else {
@@ -4142,7 +4235,27 @@ fn draw_app(
             ),
             area,
         );
-        let status_rows = ctx
+        // 全局最小尺寸兜底：过小的窗口里固定边框（头部 4 + 标签栏 3 + 进度 1 +
+        // 状态栏 ≥1）会把内容区压到只剩残行，各组件互相挤压没法看。
+        // 显示提示页并清空全部命中区，防止鼠标打到上一帧的过期坐标。
+        const MIN_WIDTH: u16 = 60;
+        const MIN_HEIGHT: u16 = 20;
+        if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+            *ui_areas = UiAreas::default();
+            let hint = format!("窗口太小，请调整终端尺寸（至少 {MIN_WIDTH} × {MIN_HEIGHT}）");
+            let hint_width = hint.chars().count() as u16;
+            let hint_area = Rect::new(
+                area.x + area.width.saturating_sub(hint_width) / 2,
+                area.y + area.height / 2,
+                hint_width.min(area.width),
+                1,
+            );
+            let hint_paragraph = ratatui::widgets::Paragraph::new(hint)
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(Style::new().fg(crate::theme::yellow(ctx)));
+            ratatui::widgets::Widget::render(hint_paragraph, hint_area, frame.buffer_mut());
+            return;
+        }        let status_rows = ctx
             .config
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -4249,22 +4362,30 @@ fn draw_app(
                     } else {
                         String::new()
                     };
+                    // 排序键提示读真实键位配置；用户删掉绑定时整段省略。
+                    let sort_suffix = match config_key_hint(ctx, Some("local"), Action::ListCycleSort)
+                    {
+                        Some(hint) => format!(" · {hint} 切换"),
+                        None => String::new(),
+                    };
                     let block = Block::default()
                         .borders(components::hit_test::PANEL_BORDERS)
                         .border_style(Style::new().fg(crate::theme::muted(ctx)))
                         .title(if is_scanning {
                             format!(
-                                "本地音乐 ({} 首，扫描中) · 排序 {} · s 切换{}{}",
+                                "本地音乐 ({} 首，扫描中) · 排序 {}{}{}{}",
                                 songs.len(),
                                 local_state.mode.label(SortTarget::Local),
+                                sort_suffix,
                                 filter_suffix,
                                 diagnostics
                             )
                         } else {
                             format!(
-                                "本地音乐 ({} 首) · 排序 {} · s 切换{}{}",
+                                "本地音乐 ({} 首) · 排序 {}{}{}{}",
                                 songs.len(),
                                 local_state.mode.label(SortTarget::Local),
+                                sort_suffix,
                                 filter_suffix,
                                 diagnostics
                             )
@@ -4288,7 +4409,10 @@ fn draw_app(
                     }
 
                     if paths.is_empty() {
-                        Paragraph::new(Line::from(" 未配置音乐目录，请在设置（8）中添加"))
+                        Paragraph::new(Line::from(format!(
+                            " 未配置音乐目录，请在设置（{}）中添加",
+                            NavTab::Settings.shortcut_digit()
+                        )))
                             .style(Style::new().fg(Color::DarkGray))
                             .render(inner, frame.buffer_mut());
                         break 'local_content;
@@ -4302,9 +4426,19 @@ fn draw_app(
                     }
 
                     if songs.is_empty() {
-                        Paragraph::new(Line::from(" 目录下未找到音频文件，按 r 重新扫描"))
-                            .style(Style::new().fg(Color::DarkGray))
-                            .render(inner, frame.buffer_mut());
+                        let rescan_hint = match config_key_hint(
+                            ctx,
+                            Some("local"),
+                            Action::LocalRescan,
+                        ) {
+                            Some(hint) => format!("，按 {hint} 重新扫描"),
+                            None => String::new(),
+                        };
+                        Paragraph::new(Line::from(format!(
+                            " 目录下未找到音频文件{rescan_hint}"
+                        )))
+                        .style(Style::new().fg(Color::DarkGray))
+                        .render(inner, frame.buffer_mut());
                         break 'local_content;
                     }
 
@@ -4474,11 +4608,20 @@ fn draw_app(
             NavTab::LocalMusic => Some(local_state.mode.label(SortTarget::Local)),
             _ => None,
         };
+        // 排序段的键位提示按当前页面反查真实绑定（favorites/history/local 各自可配）。
+        let sort_page = match active_tab {
+            NavTab::Favorites => Some("favorites"),
+            NavTab::History => Some("history"),
+            NavTab::LocalMusic => Some("local"),
+            _ => None,
+        };
+        let sort_hint = sort_page.and_then(|page| config_key_hint(ctx, Some(page), Action::ListCycleSort));
         let status_frame = components::status_bar::render(
             main_chunks[4],
             frame.buffer_mut(),
             ctx,
             sort_status,
+            sort_hint,
             ui_areas.status_hover,
             ui_areas.status_handle_hover,
         );
@@ -4621,6 +4764,29 @@ fn calculate_qr_login_area(area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+/// 发起一次二维码生成任务（初次打开扫码页与过期自动重建共用）。
+fn spawn_qr_generate(
+    rt: &tokio::runtime::Runtime,
+    ctx: &AppContext,
+    page: Arc<std::sync::Mutex<pages::qr_login::QrLoginPage>>,
+    wake_tx: mpsc::UnboundedSender<AppAction>,
+) -> tokio::task::JoinHandle<()> {
+    let manager = Arc::clone(&ctx.source_manager);
+    let source_id = page
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .source;
+    rt.spawn(async move {
+        let result = manager.create_qr_login(source_id).await;
+        let mut page = page.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(session) => page.set_qr(session),
+            Err(error) => page.set_error(format!("生成二维码失败: {error}")),
+        }
+        let _ = wake_tx.send(AppAction::None);
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -5135,7 +5301,7 @@ fn execute_action(
             tracing::info!("JS source imported: {url}");
             let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
             sp.selected_source = 0;
-            sp.status_msg = Some("✓ 音源已加载并启用".to_string());
+            sp.set_status("✓ 音源已加载并启用");
             drop(sp);
             let save_result = {
                 let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
@@ -5145,7 +5311,7 @@ fn execute_action(
             };
             if let Err(e) = save_result {
                 let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
-                sp.status_msg = Some(format!("✗ 音源已启用，但保存配置失败: {}", e));
+                sp.set_status(format!("✗ 音源已启用，但保存配置失败: {e}"));
                 ctx.notify(Notification::error(format!("保存 JS 音源配置失败: {}", e)));
             } else {
                 let (urls, default_source) = {
@@ -5174,7 +5340,7 @@ fn execute_action(
             }
             tracing::warn!("JS source import failed: {error}");
             let mut sp = settings_page.lock().unwrap_or_else(|e| e.into_inner());
-            sp.status_msg = Some(format!("✗ 音源加载失败: {}", error));
+            sp.set_status(format!("✗ 音源加载失败: {error}"));
             ctx.notify(Notification::error(format!("JS 音源导入失败: {}", error)));
         }
         AppAction::CheckSourceHealth => {
@@ -5205,7 +5371,7 @@ fn execute_action(
             settings_page
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .status_msg = Some(if failures.is_empty() {
+                .set_status(if failures.is_empty() {
                 format!("音源检测完成：{healthy}/{total} 可用")
             } else {
                 format!(
@@ -5299,13 +5465,13 @@ fn execute_action(
                 };
                 let mut settings = settings.lock().unwrap_or_else(|e| e.into_inner());
                 if errors.is_empty() {
-                    settings.status_msg = Some(format!("本地音乐扫描完成，共 {} 首", count));
+                    settings.set_status(format!("本地音乐扫描完成，共 {count} 首"));
                     let _ = tx.send(AppAction::ShowNotification(Notification::success(format!(
                         "本地音乐扫描完成，共 {} 首",
                         count
                     ))));
                 } else {
-                    settings.status_msg = Some(format!("扫描错误: {}", errors.join("; ")));
+                    settings.set_status(format!("扫描错误: {}", errors.join("; ")));
                     for error in errors {
                         let _ = tx.send(AppAction::ShowNotification(Notification::error(error)));
                     }
@@ -5830,7 +5996,7 @@ fn start_song_playback(
             "{} - {} [{}]",
             resolved_song.name,
             resolved_song.singer,
-            resolved_song.source.as_str()
+            resolved_song.source.display_name()
         );
         let playing_title = format!("正在播放: {}", resolved_song.name);
         let _ = tx.send(AppAction::ShowNotification(
@@ -5977,7 +6143,7 @@ async fn resolve_playable_song(
             Err(error) => error,
         }
     } else {
-        format!("音源 {} 已尝试", song.source.as_str())
+        format!("音源 {} 已尝试", song.source.display_name())
     };
 
     if play_request_id.load(Ordering::SeqCst) != request_id {
@@ -6598,13 +6764,15 @@ fn spawn_playlist_request(
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
     use super::JsSourceStatus;
     use super::{
-        DeleteConfirmationAction, JsSourceFailure, delete_confirmation_action,
+        ClickTracker, DeleteConfirmationAction, JsSourceFailure, delete_confirmation_action,
         describe_js_failures, js_source_load_notification, load_js_sources, next_list_index,
         only_platform, order_fallback_candidates, playback_restore_flags, previous_list_index,
         should_expand_bili_parts, should_go_to_main, should_retry_with_other_source,
@@ -6614,6 +6782,27 @@ mod tests {
     use crate::storage::SavedPlayerState;
     use lx_core::events::NotificationLevel;
     use lx_core::model::config::SourcePolicy;
+
+    #[test]
+    fn double_click_tolerates_a_two_pixel_jitter() {
+        use crossterm::event::MouseButton;
+
+        let mut tracker = ClickTracker::default();
+        let click = |column: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 2px 以内的手抖仍算同一次双击。
+        assert!(!tracker.is_double_click(click(10, 10)));
+        assert!(tracker.is_double_click(click(12, 10)));
+        // 双击完成后重新计数：第三次点击不是双击。
+        assert!(!tracker.is_double_click(click(12, 10)));
+        // 超出邻域（>2px）是两次独立单击。
+        assert!(!tracker.is_double_click(click(18, 10)));
+        assert!(!tracker.is_double_click(click(18, 14)));
+    }
 
     #[test]
     fn local_list_navigation_wraps_at_both_ends() {

@@ -24,6 +24,7 @@ ratatui-themes.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
 image.workspace = true
+palette.workspace = true
 lofty.workspace = true
 reqwest.workspace = true
 clap.workspace = true

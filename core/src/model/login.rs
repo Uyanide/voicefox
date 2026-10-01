@@ -4,8 +4,6 @@
 //! 各平台的扫码登录流程不同，但都可以拆成「创建二维码 → 轮询状态 →
 //! 成功后回写 cookie」三步，界面因此只需要处理一套状态机。
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use super::source::SourceId;
@@ -66,14 +64,14 @@ pub struct QrLoginSession {
 }
 
 /// 轮询返回值。
+///
+/// 注意 cookie 不经过这里：登录凭据由音源侧直接写入会话存储，
+/// UI 层只拿状态与账号显示名。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QrLoginResult {
     pub status: QrLoginStatus,
     /// 供界面直接展示的状态说明。
     pub message: String,
-    /// 登录成功后写入本地存储的 cookie。
-    #[serde(default)]
-    pub cookies: BTreeMap<String, String>,
     /// 登录成功后的账号显示名。
     #[serde(default)]
     pub user_name: Option<String>,
@@ -84,7 +82,6 @@ impl QrLoginResult {
         Self {
             status,
             message: message.into(),
-            cookies: BTreeMap::new(),
             user_name: None,
         }
     }

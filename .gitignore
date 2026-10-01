@@ -9,3 +9,6 @@ heaptrack.*
 # Flutter generated files
 flutter/.dart_tool/
 flutter/build/
+
+# 本地 agent 的计划/工作文件
+.zcode/
