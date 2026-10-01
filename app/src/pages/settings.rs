@@ -10,6 +10,8 @@ use lx_core::model::source::{Quality, SourceId};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+
+use crate::fmt::format_duration;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -222,6 +224,8 @@ enum SettingsRowDirectAction {
     CycleNetworkTimeout,
     CycleCoverProtocol,
     CycleMaxFps,
+    CyclePageStep,
+    CycleAccentFollowCover,
     ToggleTrackChangeNotification,
     // ── 播放 ──
     CyclePlaybackSpeed,
@@ -596,6 +600,8 @@ pub struct SettingsPage {
     pub input_mode: bool,
     /// 导入状态消息
     pub status_msg: Option<String>,
+    /// 状态消息的设置时间；渲染 3 秒后自动消失，不再永久压住面板最后一行。
+    pub status_msg_at: Option<Instant>,
     /// JS 源列表的选中索引
     pub selected_source: usize,
     /// 本地音乐路径输入
@@ -814,6 +820,14 @@ fn build_settings_rows(
         config.ui.show_cover,
         palette,
     );
+    rows.value(
+        C::Interface,
+        K::Enum,
+        "封面主色跟随",
+        RowPlan::Direct(D::CycleAccentFollowCover),
+        config.ui.accent_follow_cover.label(),
+        palette,
+    );
     rows.toggle(
         C::Interface,
         "保留播放状态",
@@ -846,6 +860,14 @@ fn build_settings_rows(
         "最大 FPS",
         RowPlan::Direct(D::CycleMaxFps),
         &config.ui.max_fps.to_string(),
+        palette,
+    );
+    rows.value(
+        C::Interface,
+        K::Enum,
+        "翻页步长",
+        RowPlan::Direct(D::CyclePageStep),
+        &format!("{} 行", config.ui.page_step),
         palette,
     );
     rows.toggle(
@@ -1334,6 +1356,25 @@ fn build_settings_rows(
 }
 
 impl SettingsPage {
+    /// 设置状态消息并记录时间；渲染侧超过 [`STATUS_MSG_TIMEOUT`] 自动隐藏。
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status_msg = Some(message.into());
+        self.status_msg_at = Some(Instant::now());
+    }
+
+    /// 清除状态消息。
+    pub fn clear_status(&mut self) {
+        self.status_msg = None;
+        self.status_msg_at = None;
+    }
+
+    /// 手动保存配置后设置「已保存 / 失败」状态消息（统一走 [`Self::set_status`] 计时）。
+    pub fn set_saved_status(&mut self, result: anyhow::Result<()>) {
+        self.set_status(match result {
+            Ok(()) => "设置已保存".to_string(),
+            Err(error) => format!("保存设置失败: {error}"),
+        });
+    }
     /// 检查是否有任何输入模式激活（JS 源输入或本地路径输入）
     pub fn any_input_active(&self) -> bool {
         self.input_mode
@@ -1428,6 +1469,7 @@ impl SettingsPage {
             input_url: String::new(),
             input_mode: false,
             status_msg: None,
+            status_msg_at: None,
             selected_source: 0,
             local_path_input: String::new(),
             local_path_mode: false,
@@ -1537,7 +1579,7 @@ impl SettingsPage {
                         let url = self.input_url.trim().to_string();
                         self.input_mode = false;
                         self.input_url.clear();
-                        self.status_msg = Some("正在添加音源...".to_string());
+                        self.set_status("正在添加音源...".to_string());
                         return AppAction::ImportSource(url);
                     }
                     return AppAction::None;
@@ -1566,7 +1608,7 @@ impl SettingsPage {
                 if self.category == SettingsCategory::Accounts {
                     let login_sources = self.qr_login_sources(ctx);
                     if login_sources.is_empty() {
-                        self.status_msg = Some("当前没有支持扫码登录的音源".to_string());
+                        self.set_status("当前没有支持扫码登录的音源".to_string());
                     } else {
                         self.qr_login_source_index %= login_sources.len();
                         let source = login_sources[self.qr_login_source_index];
@@ -1692,7 +1734,7 @@ impl SettingsPage {
     fn set_category(&mut self, category: SettingsCategory) {
         if category != self.category {
             self.category = category;
-            self.status_msg = None;
+            self.clear_status();
         }
         self.focus = SettingsFocus::Options;
     }
@@ -1830,7 +1872,7 @@ impl SettingsPage {
             }
             RowPlan::Direct(action) => self.apply_direct_action(action, ctx),
             RowPlan::Inert => {
-                self.status_msg = Some(format!(
+                self.set_status(format!(
                     "{}：这一行只用于显示，没有可执行的设置",
                     meta.label
                 ));
@@ -1881,7 +1923,7 @@ impl SettingsPage {
                     config.player.remember_playback_state = !config.player.remember_playback_state;
                     let enabled = config.player.remember_playback_state;
                     let result = crate::config::loader::save(&config, &ctx.config_path);
-                    self.status_msg = Some(match result {
+                    self.set_status(match result {
                         Ok(()) => "设置已保存".to_string(),
                         Err(error) => format!("保存设置失败: {}", error),
                     });
@@ -1893,7 +1935,7 @@ impl SettingsPage {
                     ctx.storage.clear_playback_session()
                 };
                 if let Err(error) = result {
-                    self.status_msg = Some(format!("播放状态设置已更新，但会话保存失败: {error}"));
+                    self.set_status(format!("播放状态设置已更新，但会话保存失败: {error}"));
                 }
                 AppAction::None
             }
@@ -1902,8 +1944,7 @@ impl SettingsPage {
                     let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.network.timeout = next_network_timeout(config.network.timeout);
                     let values = (config.network.proxy_url.clone(), config.network.timeout);
-                    self.status_msg =
-                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
                     values
                 };
                 lx_source::configure_network(&proxy, timeout);
@@ -1921,7 +1962,7 @@ impl SettingsPage {
                             .to_string();
                 });
                 if self.status_msg.as_deref() == Some("设置已保存") {
-                    self.status_msg = Some("封面协议已保存，下次启动生效".to_string());
+                    self.set_status("封面协议已保存，下次启动生效".to_string());
                 }
                 AppAction::None
             }
@@ -1930,7 +1971,27 @@ impl SettingsPage {
                     config.ui.max_fps = next_fps(config.ui.max_fps);
                 });
                 if self.status_msg.as_deref() == Some("设置已保存") {
-                    self.status_msg = Some("刷新率已保存，下次启动生效".to_string());
+                    self.set_status("刷新率已保存，下次启动生效".to_string());
+                }
+                AppAction::None
+            }
+            D::CyclePageStep => {
+                self.update_config(ctx, |config| {
+                    config.ui.page_step = next_page_step(config.ui.page_step);
+                });
+                AppAction::None
+            }
+            D::CycleAccentFollowCover => {
+                // 即时生效：theme::accent 每帧读配置，无需任何运行时同步。
+                self.update_config(ctx, |config| {
+                    config.ui.accent_follow_cover = config.ui.accent_follow_cover.next();
+                });
+                if self.status_msg.as_deref() == Some("设置已保存") {
+                    let mode = {
+                        let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                        config.ui.accent_follow_cover
+                    };
+                    self.set_status(format!("封面主色跟随：{}", mode.label()));
                 }
                 AppAction::None
             }
@@ -1940,7 +2001,7 @@ impl SettingsPage {
 
             // ── 播放 ──
             D::CyclePlaybackSpeed => {
-                self.status_msg = Some(ctx.cycle_playback_speed());
+                self.set_status(ctx.cycle_playback_speed());
                 AppAction::None
             }
             D::EditAudioDevice => {
@@ -1952,27 +2013,27 @@ impl SettingsPage {
                     .audio_device
                     .clone();
                 self.audio_device_input_mode = true;
-                self.status_msg = Some("输入 libmpv 音频设备名，Enter 保存".to_string());
+                self.set_status("输入 libmpv 音频设备名，Enter 保存".to_string());
                 AppAction::None
             }
             D::CycleReplayGainMode => {
-                self.status_msg = Some(ctx.cycle_replaygain_mode());
+                self.set_status(ctx.cycle_replaygain_mode());
                 AppAction::None
             }
             D::CycleReplayGainPreamp => {
-                self.status_msg = Some(ctx.cycle_replaygain_preamp());
+                self.set_status(ctx.cycle_replaygain_preamp());
                 AppAction::None
             }
             D::CycleChannelMode => {
-                self.status_msg = Some(ctx.cycle_channel_mode());
+                self.set_status(ctx.cycle_channel_mode());
                 AppAction::None
             }
             D::CycleBalance => {
-                self.status_msg = Some(ctx.cycle_balance());
+                self.set_status(ctx.cycle_balance());
                 AppAction::None
             }
             D::ToggleReplayGainClip => {
-                self.status_msg = Some(ctx.toggle_replaygain_clip());
+                self.set_status(ctx.toggle_replaygain_clip());
                 AppAction::None
             }
             D::CycleFadeInDuration => {
@@ -1980,11 +2041,10 @@ impl SettingsPage {
                     let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.player.fade_in_ms = next_fade_duration(config.player.fade_in_ms);
                     let value = config.player.fade_in_ms;
-                    self.status_msg =
-                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
                     value
                 };
-                self.status_msg = Some(format!("淡入: {}", fade_label(duration)));
+                self.set_status(format!("淡入: {}", fade_label(duration)));
                 AppAction::None
             }
             D::CycleFadeOutDuration => {
@@ -1992,31 +2052,30 @@ impl SettingsPage {
                     let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.player.fade_out_ms = next_fade_duration(config.player.fade_out_ms);
                     let value = config.player.fade_out_ms;
-                    self.status_msg =
-                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
                     value
                 };
-                self.status_msg = Some(format!("淡出: {}", fade_label(duration)));
+                self.set_status(format!("淡出: {}", fade_label(duration)));
                 AppAction::None
             }
             D::RunFadeIn => {
-                self.status_msg = Some(ctx.fade_in_now());
+                self.set_status(ctx.fade_in_now());
                 AppAction::None
             }
             D::RunFadeOut => {
-                self.status_msg = Some(ctx.fade_out_now());
+                self.set_status(ctx.fade_out_now());
                 AppAction::None
             }
             D::SetAbLoopStart => {
-                self.status_msg = Some(ctx.set_ab_loop_start_now());
+                self.set_status(ctx.set_ab_loop_start_now());
                 AppAction::None
             }
             D::SetAbLoopEnd => {
-                self.status_msg = Some(ctx.set_ab_loop_end_now());
+                self.set_status(ctx.set_ab_loop_end_now());
                 AppAction::None
             }
             D::ClearAbLoop => {
-                self.status_msg = Some(ctx.clear_ab_loop());
+                self.set_status(ctx.clear_ab_loop());
                 AppAction::None
             }
             D::CycleHistoryLimit => {
@@ -2025,7 +2084,7 @@ impl SettingsPage {
                     config.player.history_limit = next_history_limit(config.player.history_limit);
                     let limit = config.player.history_limit;
                     let result = crate::config::loader::save(&config, &ctx.config_path);
-                    self.status_msg = Some(match result {
+                    self.set_status(match result {
                         Ok(()) => format!("历史上限: {limit}"),
                         Err(error) => format!("保存设置失败: {error}"),
                     });
@@ -2044,8 +2103,7 @@ impl SettingsPage {
                     let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.lyric.show_translation = !config.lyric.show_translation;
                     let enabled = config.lyric.show_translation;
-                    self.status_msg =
-                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
                     enabled
                 };
                 ctx.lyric_service.set_translation_enabled(enabled);
@@ -2056,8 +2114,7 @@ impl SettingsPage {
                     let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.lyric.show_yrc = !config.lyric.show_yrc;
                     let enabled = config.lyric.show_yrc;
-                    self.status_msg =
-                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
                     enabled
                 };
                 ctx.lyric_service.set_yrc_enabled(enabled);
@@ -2072,12 +2129,12 @@ impl SettingsPage {
                     .proxy_url
                     .clone();
                 self.proxy_input_mode = true;
-                self.status_msg = None;
+                self.clear_status();
                 AppAction::None
             }
             D::ReloadJsSources => AppAction::ReloadJsSources,
             D::CheckSourceHealth => {
-                self.status_msg = Some("正在检测音源…".to_string());
+                self.set_status("正在检测音源…".to_string());
                 AppAction::CheckSourceHealth
             }
 
@@ -2085,7 +2142,7 @@ impl SettingsPage {
             D::QrLoginSelected => {
                 let login_sources = self.qr_login_sources(ctx);
                 if login_sources.is_empty() {
-                    self.status_msg = Some("当前没有支持扫码登录的音源".to_string());
+                    self.set_status("当前没有支持扫码登录的音源".to_string());
                     return AppAction::None;
                 }
                 self.qr_login_source_index %= login_sources.len();
@@ -2097,7 +2154,7 @@ impl SettingsPage {
             D::ImportExternalPlaylist => {
                 self.playlist_import_input.clear();
                 self.playlist_import_mode = true;
-                self.status_msg = Some("输入 M3U/LX Music/网易云歌单路径，Enter 导入".to_string());
+                self.set_status("输入 M3U/LX Music/网易云歌单路径，Enter 导入".to_string());
                 AppAction::None
             }
 
@@ -2110,7 +2167,7 @@ impl SettingsPage {
                     config.integration.mpris = !config.integration.mpris;
                 });
                 if self.status_msg.as_deref() == Some("设置已保存") {
-                    self.status_msg = Some("MPRIS 设置已保存，下次启动生效".to_string());
+                    self.set_status("MPRIS 设置已保存，下次启动生效".to_string());
                 }
                 AppAction::None
             }
@@ -2136,7 +2193,7 @@ impl SettingsPage {
             D::EditDownloadDir => {
                 self.download_input = ctx.downloads.download_dir().display().to_string();
                 self.download_input_target = Some(DownloadInputTarget::Dir);
-                self.status_msg = Some("输入下载目录，Enter 保存，Esc 取消".to_string());
+                self.set_status("输入下载目录，Enter 保存，Esc 取消".to_string());
                 AppAction::None
             }
             D::CycleDownloadQuality => self.flip_config(ctx, |config| {
@@ -2157,7 +2214,7 @@ impl SettingsPage {
                     .filename_template
                     .clone();
                 self.download_input_target = Some(DownloadInputTarget::Template);
-                self.status_msg = Some(
+                self.set_status(
                     "输入文件名模板，支持 {name} {singer} {album} {source} {quality}".to_string(),
                 );
                 AppAction::None
@@ -2204,14 +2261,14 @@ impl SettingsPage {
                 config.local_music.max_depth = next_scan_depth(config.local_music.max_depth);
             }),
             D::ExportData => {
-                self.status_msg = Some(match ctx.storage.export_default() {
+                self.set_status(match ctx.storage.export_default() {
                     Ok(path) => format!("数据已导出: {}", path.display()),
                     Err(error) => format!("数据导出失败: {error}"),
                 });
                 AppAction::None
             }
             D::ImportData => {
-                self.status_msg = Some(match ctx.storage.import_default() {
+                self.set_status(match ctx.storage.import_default() {
                     Ok(path) => format!("数据已导入，原数据备份于: {}", path.display()),
                     Err(error) => format!("数据导入失败: {error}"),
                 });
@@ -2296,7 +2353,7 @@ impl SettingsPage {
                 SETTING_ROW_QUALITY => match quality_by_label(&value) {
                     Some(quality) => AppAction::SetQuality(quality),
                     None => {
-                        self.status_msg = Some(choice_refusal_message(&row).to_string());
+                        self.set_status(choice_refusal_message(&row).to_string());
                         AppAction::None
                     }
                 },
@@ -2306,7 +2363,7 @@ impl SettingsPage {
             action => match settings_menu_app_action(action) {
                 Some(app_action) => app_action,
                 None => {
-                    self.status_msg = Some(choice_refusal_message("").to_string());
+                    self.set_status(choice_refusal_message("").to_string());
                     AppAction::None
                 }
             },
@@ -2327,7 +2384,7 @@ impl SettingsPage {
         let (message, bands, lyric_offset, source_preferences, save_result) = {
             let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             let Some(message) = apply_setting_choice(&mut config, row, value) else {
-                self.status_msg = Some(choice_refusal_message(row).to_string());
+                self.set_status(choice_refusal_message(row).to_string());
                 return AppAction::None;
             };
             let bands = config.player.equalizer_bands.clone();
@@ -2352,7 +2409,7 @@ impl SettingsPage {
             ctx.source_manager
                 .update_source_preferences(source_preferences.0, &source_preferences.1);
         }
-        self.status_msg = Some(match save_result {
+        self.set_status(match save_result {
             Ok(()) => message,
             Err(error) => format!("{message}（但保存失败: {error}）"),
         });
@@ -2371,8 +2428,7 @@ impl SettingsPage {
                     let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
                     config.network.proxy_url = proxy.clone();
                     let timeout = config.network.timeout;
-                    self.status_msg =
-                        save_status(crate::config::loader::save(&config, &ctx.config_path));
+                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
                     timeout
                 };
                 lx_source::configure_network(&proxy, timeout);
@@ -2401,7 +2457,7 @@ impl SettingsPage {
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 let device = self.audio_device_input.trim().to_string();
                 if !device.is_empty() {
-                    self.status_msg = Some(ctx.set_audio_output_device(&device));
+                    self.set_status(ctx.set_audio_output_device(&device));
                 }
                 self.audio_device_input_mode = false;
                 self.audio_device_input.clear();
@@ -2440,7 +2496,7 @@ impl SettingsPage {
                         self.update_config(ctx, |config| {
                             config.download.dir = value.clone();
                         });
-                        self.status_msg = Some(format!("下载目录: {}", dir.display()));
+                        self.set_status(format!("下载目录: {}", dir.display()));
                     }
                     DownloadInputTarget::Template => {
                         if value.is_empty() {
@@ -2449,7 +2505,7 @@ impl SettingsPage {
                         self.update_config(ctx, |config| {
                             config.download.filename_template = value.clone();
                         });
-                        self.status_msg = Some(format!("文件名模板: {value}"));
+                        self.set_status(format!("文件名模板: {value}"));
                     }
                 }
             }
@@ -2534,9 +2590,9 @@ impl SettingsPage {
                     self.local_path_mode = false;
                     self.local_path_input.clear();
                     if let Err(error) = save_result {
-                        self.status_msg = Some(format!("目录已添加，但保存失败: {}", error));
+                        self.set_status(format!("目录已添加，但保存失败: {}", error));
                     } else {
-                        self.status_msg = Some("正在扫描本地音乐...".to_string());
+                        self.set_status("正在扫描本地音乐...".to_string());
                     }
                     return AppAction::ScanLocalMusic {
                         paths,
@@ -2689,7 +2745,7 @@ impl SettingsPage {
         match command {
             E::AddJsSource => {
                 self.input_mode = true;
-                self.status_msg = None;
+                self.clear_status();
                 AppAction::None
             }
             E::RemoveJsSource => {
@@ -2711,25 +2767,25 @@ impl SettingsPage {
                 );
                 if !confirmed {
                     self.delete_source_armed = Some(now);
-                    self.status_msg = Some("再按一次确认删除该音源，Esc 取消".to_string());
+                    self.set_status("再按一次确认删除该音源，Esc 取消".to_string());
                     return AppAction::None;
                 }
                 self.delete_source_armed = None;
                 let url = sources[self.selected_source].clone();
-                self.status_msg = Some("已移除音源".to_string());
+                self.set_status("已移除音源".to_string());
                 if self.selected_source >= sources.len().saturating_sub(1) {
                     self.selected_source = self.selected_source.saturating_sub(1);
                 }
                 AppAction::RemoveSource(url)
             }
             E::CheckSourceHealth => {
-                self.status_msg = Some("正在检测音源…".to_string());
+                self.set_status("正在检测音源…".to_string());
                 AppAction::CheckSourceHealth
             }
             E::AddLocalPath => {
                 self.local_path_mode = true;
                 self.local_path_input.clear();
-                self.status_msg = None;
+                self.clear_status();
                 AppAction::None
             }
             E::RemoveLocalPath => {
@@ -2750,7 +2806,7 @@ impl SettingsPage {
                 );
                 if !confirmed {
                     self.delete_local_path_armed = Some(now);
-                    self.status_msg = Some("再按一次确认删除该本地目录，Esc 取消".to_string());
+                    self.set_status("再按一次确认删除该本地目录，Esc 取消".to_string());
                     return AppAction::None;
                 }
                 self.delete_local_path_armed = None;
@@ -2771,7 +2827,7 @@ impl SettingsPage {
                         config.local_music.max_depth,
                     )
                 };
-                self.status_msg = Some(match save_result {
+                self.set_status(match save_result {
                     Ok(()) => format!("已移除 {}，正在重新扫描...", removed),
                     Err(error) => format!("已移除，但保存失败: {}", error),
                 });
@@ -2789,7 +2845,7 @@ impl SettingsPage {
                         config.local_music.max_depth,
                     )
                 };
-                self.status_msg = Some("正在扫描本地音乐...".to_string());
+                self.set_status("正在扫描本地音乐...".to_string());
                 AppAction::ScanLocalMusic {
                     paths,
                     max_depth,
@@ -2873,7 +2929,7 @@ impl SettingsPage {
                 (true, result)
             }
         };
-        self.status_msg = Some(match result {
+        self.set_status(match result {
             Ok(()) => format!(
                 "状态栏“{}”已{}",
                 status_bar_item_label(item),
@@ -2893,7 +2949,7 @@ impl SettingsPage {
                 .iter()
                 .position(|candidate| *candidate == item)
             else {
-                self.status_msg = Some("请先启用这个状态栏字段".to_string());
+                self.set_status("请先启用这个状态栏字段".to_string());
                 return;
             };
             let new_index = if direction < 0 {
@@ -2908,7 +2964,7 @@ impl SettingsPage {
             let result = crate::config::loader::save(&config, &ctx.config_path);
             (new_index + 1, result)
         };
-        self.status_msg = Some(match result {
+        self.set_status(match result {
             Ok(()) => format!(
                 "状态栏“{}”已移到第 {position} 位",
                 status_bar_item_label(item)
@@ -2929,7 +2985,7 @@ impl SettingsPage {
         let (position, result) = {
             let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             if !config.ui.status_bar_items.contains(&item) {
-                self.status_msg = Some("请先启用这个状态栏字段".to_string());
+                self.set_status("请先启用这个状态栏字段".to_string());
                 return;
             }
             let Some(position) =
@@ -2941,7 +2997,7 @@ impl SettingsPage {
             let result = crate::config::loader::save(&config, &ctx.config_path);
             (position + 1, result)
         };
-        self.status_msg = Some(match result {
+        self.set_status(match result {
             Ok(()) => format!(
                 "状态栏“{}”已移到第 {position} 位",
                 status_bar_item_label(item)
@@ -2988,7 +3044,7 @@ impl SettingsPage {
             login_sources.len(),
             login_sources
                 .iter()
-                .filter(|source| ctx.source_manager.is_logged_in(**source))
+                .filter(|source| source_session_valid(**source, ctx))
                 .count(),
         );
         Paragraph::new(Line::from(Span::styled(summary, Style::new().fg(muted))))
@@ -2999,13 +3055,8 @@ impl SettingsPage {
             if row >= inner.bottom() {
                 break;
             }
-            let logged_in = ctx.source_manager.is_logged_in(*source);
+            let (status, status_color) = source_login_display(*source, ctx);
             let qr_selected = selected_qr == Some(*source);
-            let (status, status_color) = if logged_in {
-                ("✓ 已登录", crate::theme::green(ctx))
-            } else {
-                ("○ 可扫码 / 未登录", crate::theme::yellow(ctx))
-            };
             let style = if qr_selected {
                 Style::new()
                     .fg(crate::theme::selection_fg(ctx))
@@ -3431,7 +3482,7 @@ impl SettingsPage {
             ctx.downloads.sync_config(&config);
             crate::config::loader::save(&config, &ctx.config_path)
         };
-        self.status_msg = Some(match result {
+        self.set_status(match result {
             Ok(()) => "设置已保存".to_string(),
             Err(error) => format!("保存设置失败: {}", error),
         });
@@ -3594,7 +3645,12 @@ impl SettingsPage {
             panes.embedded
         }
         .unwrap_or_else(|| panel_inner(area));
+        // 状态消息 3 秒后自动消失：此前会一直压住面板最后一行，直到下次操作。
+        let status_msg_visible = self
+            .status_msg_at
+            .is_some_and(|at| at.elapsed() < STATUS_MSG_TIMEOUT);
         if let Some(ref msg) = self.status_msg
+            && status_msg_visible
             && focused_inner.height > 1
         {
             Paragraph::new(Line::from(Span::styled(
@@ -4773,6 +4829,45 @@ fn qr_login_action(logged_in: bool, source: SourceId) -> AppAction {
     }
 }
 
+/// 会话是否仍可用于需要登录态的功能（账号列表的「已登录」计数口径）。
+///
+/// 网易云区分「凭据过期」：cookie 还在但接口已返回「需要登录」时不再算
+/// 已登录，否则过期会话会一直显示 ✓。
+fn source_session_valid(source: SourceId, ctx: &AppContext) -> bool {
+    if source == SourceId::Wy {
+        return lx_source::wy::session::login_health() == lx_source::wy::session::LoginHealth::LoggedIn;
+    }
+    ctx.source_manager.is_logged_in(source)
+}
+
+/// 账号列表的状态文案与配色。
+///
+/// 网易云额外显示账号昵称（登录/会话验证时保存）与「已失效」；其它音源
+/// 只能看本地有没有凭据。
+fn source_login_display(source: SourceId, ctx: &AppContext) -> (String, Color) {
+    if source == SourceId::Wy {
+        return match lx_source::wy::session::login_health() {
+            lx_source::wy::session::LoginHealth::LoggedIn => {
+                match lx_source::wy::session::account_display() {
+                    Some(name) => (format!("✓ 已登录 · {name}"), crate::theme::green(ctx)),
+                    None => ("✓ 已登录".to_string(), crate::theme::green(ctx)),
+                }
+            }
+            lx_source::wy::session::LoginHealth::Expired => {
+                ("✗ 已失效，请重新扫码".to_string(), crate::theme::red(ctx))
+            }
+            lx_source::wy::session::LoginHealth::NotLoggedIn => {
+                ("○ 可扫码 / 未登录".to_string(), crate::theme::yellow(ctx))
+            }
+        };
+    }
+    if ctx.source_manager.is_logged_in(source) {
+        ("✓ 已登录".to_string(), crate::theme::green(ctx))
+    } else {
+        ("○ 可扫码 / 未登录".to_string(), crate::theme::yellow(ctx))
+    }
+}
+
 /// 在线音源的稳定取值标识 → 音源（与菜单里的 `SourceId::as_str` 同源）。
 fn online_source(value: &str) -> Option<SourceId> {
     SourceId::all_online()
@@ -5157,11 +5252,15 @@ fn render_setting_categories(
     hits
 }
 
-fn save_status(result: anyhow::Result<()>) -> Option<String> {
-    Some(match result {
-        Ok(()) => "设置已保存".to_string(),
-        Err(error) => format!("保存设置失败: {error}"),
-    })
+/// 翻页步长档位循环：5 → 10 → 15 → 20 → 5；不在档位上的自定义值按区间
+/// 映射到下一档（与 `next_scroll_amount` 同一套写法）。
+pub(crate) fn next_page_step(current: usize) -> usize {
+    match current {
+        0..=5 => 10,
+        6..=10 => 15,
+        11..=15 => 20,
+        _ => 5,
+    }
 }
 
 pub(crate) fn next_quality(quality: Quality) -> Quality {
@@ -5201,14 +5300,34 @@ fn next_network_timeout(timeout: u64) -> u64 {
     }
 }
 
-/// 封面协议行的显示值：配置值与生效值不一致时把原因带上，用户不用翻日志。
+/// 封面协议行的显示值：**生效协议放最前**。
+///
+/// 此前以配置值开头——旧版 Shift+P 会把 iterm2 写进配置、运行期又纠正成
+/// kitty 渲染，行首的 "iterm2" 让 kitty 用户误以为探测错了终端。现在：
+///
+/// - `auto` 且探测成功 → `auto（生效 kitty）`；
+/// - `auto` 未识别 → `auto（未识别终端，生效 halfblocks）`；
+/// - 配置值与生效值不一致 → `kitty（配置 iterm2 在本终端画不出，已纠正）`；
+/// - 一致 → 原样显示配置值。
 fn cover_protocol_display(
     configured: &str,
     capabilities: crate::cover::CoverCapabilities,
 ) -> String {
-    match capabilities.correction_note() {
-        Some(note) => format!("{configured}（{note}）"),
-        None => configured.to_string(),
+    let active = crate::cover::protocol_label(capabilities.active());
+    match crate::cover::protocol_from_config(configured) {
+        None => match capabilities.detected() {
+            Some(detected) if detected == capabilities.active() => {
+                format!("auto（生效 {active}）")
+            }
+            _ => format!("auto（未识别终端，生效 {active}）"),
+        },
+        Some(configured_protocol) if configured_protocol == capabilities.active() => {
+            configured.to_string()
+        }
+        Some(configured_protocol) => format!(
+            "{active}（配置 {} 在本终端画不出，已纠正）",
+            crate::cover::protocol_label(configured_protocol)
+        ),
     }
 }
 
@@ -5261,14 +5380,12 @@ fn fade_label(value: u64) -> String {
     }
 }
 
-fn format_duration(value: std::time::Duration) -> String {
-    let total = value.as_secs();
-    format!("{:02}:{:02}", total / 60, total % 60)
-}
-
 const TWO_COLUMN_OPTIONS_MIN_WIDTH: u16 = 36;
 const THREE_COLUMN_OPTIONS_MIN_WIDTH: u16 = 72;
 /// 页面在 `ui.pane_ratios` 里的 key。
+/// 状态消息展示时长；超时自动消失，不再永久遮住面板最后一行。
+const STATUS_MSG_TIMEOUT: Duration = Duration::from_secs(3);
+
 const SETTINGS_PAGE_KEY: &str = "settings";
 /// 内嵌管理列表高度份额在 `settings` 这一页里的 ratio key。
 const SETTINGS_EMBEDDED_RATIO_KEY: &str = "embedded";
@@ -5715,11 +5832,14 @@ mod tests {
         SettingsRowKind, SettingsRowMeta, SettingsRows, apply_setting_choice, build_settings_rows,
         categories_width_limits, category_hit_at, category_row_ids, category_sidebar_visible,
         choice_refusal_message, columns_from_value, command_row_layout, compact_key_label,
+        cover_protocol_display,
         key_label, truncate_display,
         embedded_command, embedded_height, embedded_items, embedded_list_for, embedded_needed_rows,
         embedded_needed_rows_for, embedded_ratio_from_pointer, ensure_row_cursor, enum_menu,
         enum_menu_label, is_accounts_panel_key, is_cover_protocol_key, list_owns_direction_keys,
-        navigate_row_cursor, panel_inner, plan_row_activation, qr_login_action, quality_by_label,
+        navigate_row_cursor, next_page_step, panel_inner, plan_row_activation,
+        qr_login_action,
+        quality_by_label,
         render_command_row, render_embedded_row, render_setting_categories, render_setting_rows,
         reorder_status_bar_items, row_activates_with_space, row_hit_at, row_window_start,
         setting_line, setting_option_column_count, setting_option_columns, setting_row_rect,
@@ -6813,6 +6933,72 @@ mod tests {
             .iter()
             .map(|row| row.meta.label.clone())
             .collect()
+    }
+
+    #[test]
+    fn accent_follow_cover_and_page_step_rows_live_in_the_interface_category() {
+        let rows = real_settings_rows(&Config::default());
+        for label in ["封面主色跟随", "翻页步长"] {
+            let meta = rows
+                .metas()
+                .into_iter()
+                .find(|meta| meta.label == label)
+                .unwrap_or_else(|| panic!("真实行集里必须有「{label}」"));
+            assert_eq!(meta.category, SettingsCategory::Interface, "{label}");
+            assert_eq!(meta.kind, SettingsRowKind::Enum, "{label}");
+        }
+        let accent = rows
+            .metas()
+            .into_iter()
+            .find(|meta| meta.label == "封面主色跟随")
+            .expect("checked above");
+        assert_eq!(
+            plan_row_activation(&accent),
+            RowPlan::Direct(SettingsRowDirectAction::CycleAccentFollowCover),
+        );
+        let page_step = rows
+            .metas()
+            .into_iter()
+            .find(|meta| meta.label == "翻页步长")
+            .expect("checked above");
+        assert_eq!(
+            plan_row_activation(&page_step),
+            RowPlan::Direct(SettingsRowDirectAction::CyclePageStep),
+        );
+        // 档位推进函数本身。
+        assert_eq!(next_page_step(5), 10);
+        assert_eq!(next_page_step(10), 15);
+        assert_eq!(next_page_step(15), 20);
+        assert_eq!(next_page_step(20), 5);
+        assert_eq!(next_page_step(7), 15, "自定义值按区间映射");
+        // 强档位循环：关闭 → 轻微 → 明显 → 关闭。
+        use lx_core::model::config::AccentFollowCover;
+        assert_eq!(AccentFollowCover::Off.next(), AccentFollowCover::Subtle);
+        assert_eq!(AccentFollowCover::Subtle.next(), AccentFollowCover::Strong);
+        assert_eq!(AccentFollowCover::Strong.next(), AccentFollowCover::Off);
+    }
+
+    #[test]
+    fn cover_protocol_row_leads_with_the_active_protocol() {
+        use crate::cover::{CoverCapabilities, ProtocolType};
+        let kitty = CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
+        let corrected =
+            CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
+        let unknown = CoverCapabilities::from_detected(None, ProtocolType::Halfblocks);
+
+        // auto：生效协议亮出来。
+        assert_eq!(cover_protocol_display("auto", kitty), "auto（生效 kitty）");
+        assert_eq!(
+            cover_protocol_display("auto", unknown),
+            "auto（未识别终端，生效 halfblocks）"
+        );
+        // 配置与生效一致：原样显示。
+        assert_eq!(cover_protocol_display("kitty", kitty), "kitty");
+        // 旧配置残留 iterm2：行首是生效协议，配置值退居括号说明。
+        assert_eq!(
+            cover_protocol_display("iterm2", corrected),
+            "kitty（配置 iterm2 在本终端画不出，已纠正）"
+        );
     }
 
     /// **真实行集**里每一行都属于 `SETTINGS_CATEGORIES` 里的**恰好一个**分类。

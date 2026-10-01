@@ -332,11 +332,12 @@ impl LeaderboardPage {
                 self.selected = self.current_list_len().saturating_sub(1);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.selected = self.selected.saturating_sub(10);
+                self.selected = self.selected.saturating_sub(ctx.page_step());
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.selected = (self.selected + 10).min(self.current_list_len().saturating_sub(1));
+                self.selected =
+                    (self.selected + ctx.page_step()).min(self.current_list_len().saturating_sub(1));
             }
             _ if super::is_song_activation_key(key) => {
                 if self.selected_board.is_some() && !self.songs.is_empty() {
@@ -810,49 +811,10 @@ impl LeaderboardPage {
         Some((self.songs.clone(), index))
     }
 
-    #[allow(unreachable_code)]
     fn render_source_tabs(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if let Some(selector) = self.source_selector.as_ref() {
             selector.render_tabs(area, buf, ctx);
         }
-        return;
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let current = self.current_source();
-        let mut spans = vec![Span::styled(
-            " 音源：",
-            Style::new().fg(crate::theme::muted(ctx)),
-        )];
-        let mut used = 4usize;
-        for (index, source) in self.sources.iter().enumerate() {
-            let label = source_name(*source);
-            let width = label.chars().count() + 3;
-            if used + width + 10 > area.width as usize {
-                break;
-            }
-            let style = if Some(*source) == current {
-                Style::new()
-                    .fg(crate::theme::selection_fg(ctx))
-                    .bg(crate::theme::accent(ctx))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(crate::theme::muted(ctx))
-            };
-            if index > 0 {
-                spans.push(Span::raw("  "));
-                used += 2;
-            }
-            spans.push(Span::styled(format!(" {} ", label), style));
-            used += width;
-        }
-        spans.push(Span::styled(
-            "  P 切换",
-            Style::new()
-                .fg(crate::theme::accent(ctx))
-                .add_modifier(Modifier::BOLD),
-        ));
-        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     fn render_boards(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -1248,16 +1210,7 @@ fn ensure_visible(selected: usize, visible: usize, total: usize, offset: &mut us
 }
 
 fn source_name(source: SourceId) -> &'static str {
-    match source {
-        SourceId::Kw => "酷我",
-        SourceId::Kg => "酷狗",
-        SourceId::Tx => "QQ",
-        SourceId::Wy => "网易云",
-        SourceId::Mg => "咪咕",
-        SourceId::Bili => "哔哩哔哩",
-        SourceId::Local => "本地",
-        _ => "未知",
-    }
+    source.display_name()
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {

@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use crate::fmt::format_duration;
 use crate::pages::components::text::truncate_width;
 
 use crate::context::AppContext;
@@ -399,6 +400,7 @@ pub fn render(
     buf: &mut Buffer,
     ctx: &AppContext,
     sort_status: Option<&'static str>,
+    sort_hint: Option<String>,
     hovered: Option<StatusBarSlot>,
     resize_hover: bool,
 ) -> StatusBarFrame {
@@ -413,7 +415,7 @@ pub fn render(
         .status_bar_rows()
         .clamp(1, area.height.max(1));
     let background = crate::theme::mantle(ctx);
-    let segments = candidates(area, ctx, sort_status);
+    let segments = candidates(area, ctx, sort_status, sort_hint);
     // 把手占掉顶行最右边几列：从排布宽度里扣掉，段就不会被把手盖住
     // （命中因此天然互斥，"点上却变成拖高度"不可能发生）。
     let handle = resize_handle(area);
@@ -521,6 +523,7 @@ fn candidates(
     area: Rect,
     ctx: &AppContext,
     sort_status: Option<&'static str>,
+    sort_hint: Option<String>,
 ) -> Vec<(Candidate, Style)> {
     let background = crate::theme::mantle(ctx);
     let state = *ctx.player_state.borrow();
@@ -651,12 +654,15 @@ fn candidates(
                         .add_modifier(Modifier::BOLD),
                 ))
             }
+            // 键位提示由调用方从真实键位配置反查传入（用户改键后不再失真）；
+            // 没有绑定（用户删掉了 s）时省略提示段。
             StatusBarItem::Sort => sort_status.map(|sort_status| {
+                let text = match sort_hint.as_deref() {
+                    Some(hint) => format!("排序 {sort_status} ({hint})"),
+                    None => format!("排序 {sort_status}"),
+                };
                 (
-                    Candidate::fixed(
-                        StatusBarSlot::Item(item),
-                        format!("排序 {} (s)", sort_status),
-                    ),
+                    Candidate::fixed(StatusBarSlot::Item(item), text),
                     Style::new()
                         .fg(crate::theme::yellow(ctx))
                         .bg(background)
@@ -768,11 +774,6 @@ fn separator_width() -> usize {
 /// 按显示宽度截断（复用共享实现；这里只需要 `String`）。
 fn truncate(value: &str, width: usize) -> String {
     truncate_width(value, width).into_owned()
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    let seconds = duration.as_secs();
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
 #[cfg(test)]

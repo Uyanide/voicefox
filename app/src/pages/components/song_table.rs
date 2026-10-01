@@ -396,9 +396,15 @@ fn row_line(
     let last = layout.len().saturating_sub(1);
 
     let index_text = (index + 1).to_string();
-    let duration_text = format_duration(song.duration);
+    // 时长为 0（未取到）在表格里显示占位符，而不是误导性的 00:00。
+    let duration_text = if song.duration.is_zero() {
+        "--:--".to_string()
+    } else {
+        crate::fmt::format_duration(song.duration)
+    };
     let quality_text = song.quality_label();
-    let source_text = song.source.as_str();
+    // 显示中文名（网易云/酷我…）而不是原始代号 wy/kw——代号只用于配置与日志。
+    let source_text = song.source.display_name();
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(layout.len() * 2);
     for (i, rc) in layout.iter().enumerate() {
@@ -476,7 +482,7 @@ pub fn auto_fit_columns(
                 "album" => song.album_name.clone(),
                 "duration" => "00:00".to_string(),
                 "quality" => song.quality_label(),
-                "source" => song.source.as_str().to_string(),
+                "source" => song.source.display_name().to_string(),
                 _ => String::new(),
             };
             widest = widest.max(UnicodeWidthStr::width(text.as_str()));
@@ -554,13 +560,7 @@ fn column_emphasis(key: &str) -> Modifier {
     }
 }
 
-fn format_duration(duration: std::time::Duration) -> String {
-    if duration.is_zero() {
-        return "--:--".to_string();
-    }
-    let total = duration.as_secs();
-    format!("{:02}:{:02}", total / 60, total % 60)
-}
+
 
 #[cfg(test)]
 mod tests {

@@ -153,7 +153,11 @@ fn render_karaoke_line(
         Span::styled(word.text.clone(), style)
     }));
 
+    // 与普通歌词行一致：折行交给 Paragraph，span 样式跨行自动保留。
+    // 极窄面板下折成 >2 行会侵入下一句的槽位——普通行同样预留 2 行，
+    // 风险等同，不算新增暴露。
     Paragraph::new(Line::from(spans))
         .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: false })
         .render(area, buf);
 }

@@ -73,6 +73,7 @@ pub struct SearchPage {
     next_bili_parts_request_id: u64,
     wrap_navigation: bool,
     scroll_amount: usize,
+    page_step: usize,
     column_resize: Option<ColumnResizeState>,
     columns: Vec<TableColumnConfig>,
 }
@@ -82,6 +83,7 @@ impl SearchPage {
         source_filter: Option<SourceId>,
         wrap_navigation: bool,
         scroll_amount: usize,
+        page_step: usize,
         enabled_sources: &[SourceId],
     ) -> Self {
         let search_scopes = enabled_search_scopes(enabled_sources);
@@ -133,6 +135,7 @@ impl SearchPage {
             next_bili_parts_request_id: 0,
             wrap_navigation,
             scroll_amount: scroll_amount.max(1),
+            page_step: page_step.clamp(1, 100),
             column_resize: None,
             columns: Vec::new(),
         }
@@ -467,13 +470,13 @@ impl SearchPage {
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp)
                 if !self.results.is_empty() =>
             {
-                self.selected = self.selected.saturating_sub(10);
+                self.selected = self.selected.saturating_sub(self.page_step);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown)
                 if !self.results.is_empty() =>
             {
-                self.selected = (self.selected + 10).min(self.results.len().saturating_sub(1));
+                self.selected = (self.selected + self.page_step).min(self.results.len().saturating_sub(1));
                 if self.selected + 1 == self.results.len() && self.can_load_more() {
                     return AppAction::SearchMore {
                         keyword: self.result_keyword.clone(),
@@ -616,10 +619,12 @@ impl SearchPage {
         default_source: SourceId,
         wrap_navigation: bool,
         scroll_amount: usize,
+        page_step: usize,
         enabled_sources: &[SourceId],
     ) {
         self.wrap_navigation = wrap_navigation;
         self.scroll_amount = scroll_amount.max(1);
+        self.page_step = page_step.clamp(1, 100);
         self.search_scopes = enabled_search_scopes(enabled_sources);
         self.source_filter = if aggregate_search {
             None
@@ -725,7 +730,7 @@ impl SearchPage {
         // 搜索输入区
         let scope = self
             .source_filter
-            .map(|source| source.as_str().to_string())
+            .map(|source| source.display_name().to_string())
             .unwrap_or_else(|| "全部音源".to_string());
         let mode = if self.input_mode { "INSERT" } else { "NORMAL" };
         let input_block = Block::default()
@@ -880,53 +885,10 @@ impl SearchPage {
         self.render_source_selector(area, buf, ctx);
     }
 
-    #[allow(unreachable_code)]
     fn render_source_tabs(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if let Some(selector) = self.source_selector.as_ref() {
             selector.render_tabs(area, buf, ctx);
         }
-        return;
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let selected = self
-            .search_scopes
-            .iter()
-            .position(|(scope, _)| *scope == self.source_filter)
-            .unwrap_or(0);
-        let mut spans = vec![Span::styled(
-            " 音源：",
-            Style::new().fg(crate::theme::muted(ctx)),
-        )];
-        let mut used = 4usize;
-        for (index, (source, _)) in self.search_scopes.iter().enumerate() {
-            let label = source.map(|s| s.display_name()).unwrap_or("全部");
-            let width = label.chars().count() + 3;
-            if used + width + 10 > area.width as usize {
-                break;
-            }
-            let style = if index == selected {
-                Style::new()
-                    .fg(crate::theme::selection_fg(ctx))
-                    .bg(crate::theme::accent(ctx))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(crate::theme::muted(ctx))
-            };
-            if index > 0 {
-                spans.push(Span::raw("  "));
-                used += 2;
-            }
-            spans.push(Span::styled(format!(" {} ", label), style));
-            used += width;
-        }
-        spans.push(Span::styled(
-            "  P 切换",
-            Style::new()
-                .fg(crate::theme::accent(ctx))
-                .add_modifier(Modifier::BOLD),
-        ));
-        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     fn handle_source_selector(&mut self, key: KeyEvent) -> AppAction {
@@ -945,86 +907,10 @@ impl SearchPage {
         AppAction::None
     }
 
-    #[allow(unreachable_code)]
     fn render_source_selector(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if let Some(selector) = self.source_selector.as_mut() {
             selector.render_popup(area, buf, ctx, "选择音源");
         }
-        return;
-        let Some(picker) = self.source_selector.as_ref() else {
-            return;
-        };
-        let len = self.search_scopes.len();
-        if len == 0 {
-            return;
-        }
-        let width = area.width.saturating_sub(4).clamp(30, 48);
-        let rows = len.min(area.height.saturating_sub(8) as usize).max(1);
-        let height = rows as u16 + 5;
-        let popup = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        Clear.render(popup, buf);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(crate::theme::accent(ctx)))
-            .style(Style::new().bg(crate::theme::surface0(ctx)))
-            .title(" 选择音源 · P ");
-        let inner = block.inner(popup);
-        block.render(popup, buf);
-        let visible = inner.height.saturating_sub(1) as usize;
-        let selected = picker.selected;
-        let mut scroll = picker.scroll;
-        if selected < scroll {
-            scroll = selected;
-        }
-        if visible > 0 && selected >= scroll + visible {
-            scroll = selected + 1 - visible;
-        }
-        scroll = scroll.min(len.saturating_sub(visible.max(1)));
-        if let Some(p) = self.source_selector.as_mut() {
-            p.scroll = scroll;
-        }
-        for (row, (index, (_, label))) in self
-            .search_scopes
-            .iter()
-            .enumerate()
-            .skip(scroll)
-            .take(visible)
-            .enumerate()
-        {
-            let selected_row = index == selected;
-            let active = self.search_scopes[index].0 == self.source_filter;
-            let style = if selected_row {
-                Style::new()
-                    .bg(crate::theme::accent(ctx))
-                    .fg(crate::theme::selection_fg(ctx))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(crate::theme::text(ctx))
-            };
-            Paragraph::new(Line::from(vec![
-                Span::styled(if selected_row { "▶ " } else { "  " }, style),
-                Span::styled(
-                    if active { "● " } else { "○ " },
-                    Style::new().fg(crate::theme::accent(ctx)),
-                ),
-                Span::styled(*label, style),
-            ]))
-            .render(
-                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
-                buf,
-            );
-        }
-        Paragraph::new("↑/↓ 选择   Enter 应用   Esc 取消")
-            .style(Style::new().fg(crate::theme::muted(ctx)))
-            .render(
-                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
-                buf,
-            );
     }
 
     /// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。
@@ -1832,7 +1718,7 @@ mod tests {
 
     #[test]
     fn right_arrow_cycles_search_scope() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.input_mode = false;
         let resolver =
             KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
@@ -1846,7 +1732,7 @@ mod tests {
 
     #[test]
     fn brackets_cycle_search_scope_outside_input_mode() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.input_mode = false;
         let resolver =
             KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
@@ -1866,7 +1752,7 @@ mod tests {
 
     #[test]
     fn variant_picker_closes_with_escape_or_second_v() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.input_mode = false;
         page.results = vec![
             song("kw-1", SourceId::Kw, "晴天", "周杰伦"),
@@ -1896,7 +1782,7 @@ mod tests {
 
     #[test]
     fn idle_escape_stays_on_search_page() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.input_mode = false;
         let resolver =
             KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default());
@@ -1908,7 +1794,7 @@ mod tests {
 
     #[test]
     fn l_plays_the_selected_search_result() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.input_mode = false;
         page.results = vec![song("kw-1", SourceId::Kw, "晴天", "周杰伦")];
         let resolver =
@@ -1924,7 +1810,7 @@ mod tests {
 
     #[test]
     fn at_and_hash_follow_up_searches_use_selected_metadata() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.input_mode = false;
         let mut selected = song("kw-1", SourceId::Kw, "晴天", "周杰伦");
         selected.album_name = "叶惠美".to_string();
@@ -1947,7 +1833,7 @@ mod tests {
 
     #[test]
     fn selecting_bili_video_opens_part_picker_and_plays_selected_part() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         let mut video = song("BV1xx411c7mD", SourceId::Bili, "测试视频", "UP主");
         video
             .extra
@@ -2008,7 +1894,7 @@ mod tests {
 
     #[test]
     fn single_bili_part_starts_without_opening_picker() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.bili_parts_loading = Some(7);
         let mut part = song("BV1xx411c7mD", SourceId::Bili, "测试视频", "UP主");
         part.extra.insert("page".to_string(), "1".to_string());
@@ -2033,7 +1919,7 @@ mod tests {
 
     #[test]
     fn source_tab_selects_single_source_and_starts_search() {
-        let mut page = SearchPage::new(None, true, 3, SourceId::all_online());
+        let mut page = SearchPage::new(None, true, 3, 10, SourceId::all_online());
         page.input = "晴天".to_string();
 
         let action = page.select_source(2);
@@ -2050,7 +1936,7 @@ mod tests {
 
     #[test]
     fn disabled_sources_are_omitted_from_scope_navigation() {
-        let mut page = SearchPage::new(None, true, 3, &[SourceId::Kw, SourceId::Wy]);
+        let mut page = SearchPage::new(None, true, 3, 10, &[SourceId::Kw, SourceId::Wy]);
 
         page.cycle_source(1);
         assert_eq!(page.source_filter, Some(SourceId::Kw));

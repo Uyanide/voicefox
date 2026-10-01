@@ -86,6 +86,10 @@ fn default_status_bar_height() -> u8 {
     1
 }
 
+fn default_page_step() -> usize {
+    10
+}
+
 fn default_status_bar_items() -> Vec<StatusBarItem> {
     // 默认只保留用户播放时真正有用的信息；音源/JS 音源状态等诊断信息
     // 仍可在设置中手动打开，但不应该挤占每个页面的底部空间。
@@ -208,6 +212,79 @@ impl SourcePolicy {
             Self::Prefer => "优先指定平台",
             Self::Only => "只用指定平台",
         }
+    }
+}
+
+/// 「界面强调色跟随专辑封面」的强度档位。
+///
+/// 封面主色在发布前会归一化到鲜艳区间（见 app 的 cover::accent），
+/// 档位只控制它混入 accent 的比例：轻微适合想保留主题个性的场景，
+/// 明显是默认值——之前的版本提取色偏暗、混合后几乎无感，已归一化修复。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccentFollowCover {
+    /// 不跟随，accent 恒为主题/配置色。
+    Off,
+    /// 轻微：封面主色以较低比例（0.45）混入。
+    Subtle,
+    /// 明显：封面主色以较高比例（0.75）混入。
+    #[default]
+    Strong,
+}
+
+impl AccentFollowCover {
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Subtle => "subtle",
+            Self::Strong => "strong",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "关闭",
+            Self::Subtle => "轻微",
+            Self::Strong => "明显",
+        }
+    }
+
+    /// 设置页循环的下一档。
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Subtle,
+            Self::Subtle => Self::Strong,
+            Self::Strong => Self::Off,
+        }
+    }
+}
+
+/// 宽松解析「封面主色跟随」：接受 kebab-case 字符串，也接受早期示例发布过的
+/// 布尔值（`true` → `Strong`、`false` → `Off`），抄过旧示例配置的用户不会
+/// 因类型变更而整份配置解析失败。
+fn deserialize_accent_follow_cover<'de, D>(deserializer: D) -> Result<AccentFollowCover, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bool(bool),
+        Text(String),
+    }
+    match Raw::deserialize(deserializer) {
+        Ok(Raw::Bool(true)) => Ok(AccentFollowCover::Strong),
+        Ok(Raw::Bool(false)) => Ok(AccentFollowCover::Off),
+        Ok(Raw::Text(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" => Ok(AccentFollowCover::Off),
+            "subtle" => Ok(AccentFollowCover::Subtle),
+            "strong" | "true" => Ok(AccentFollowCover::Strong),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["off", "subtle", "strong"],
+            )),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -402,6 +479,15 @@ pub struct UiConfig {
     pub enable_mouse: bool,
     pub wrap_navigation: bool,
     pub scroll_amount: usize,
+    /// PgUp/PgDn 键盘翻页步长（行数）。
+    ///
+    /// 与滚轮 `scroll_amount` 语义不同：滚轮是高频小步，翻页是低频大步，
+    /// 所以分开两个字段。此前各页面硬编码 5/10/15 三种步长，已统一到这里。
+    #[serde(default = "default_page_step")]
+    pub page_step: usize,
+    /// 界面强调色跟随专辑封面主色的档位。
+    #[serde(default, deserialize_with = "deserialize_accent_follow_cover")]
+    pub accent_follow_cover: AccentFollowCover,
     pub aggregate_search: bool,
     /// 侧边导航是否使用终端原生背景，便于与透明终端主题融合。
     pub sidebar_transparent: bool,
@@ -459,6 +545,8 @@ impl Default for UiConfig {
             enable_mouse: true,
             wrap_navigation: true,
             scroll_amount: 3,
+            page_step: default_page_step(),
+            accent_follow_cover: AccentFollowCover::default(),
             aggregate_search: true,
             sidebar_transparent: false,
             sidebar_style: None,
@@ -739,9 +827,44 @@ fn legacy_config_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DownloadConfig, LocalMusicConfig, STATUS_BAR_MAX_HEIGHT, SourceId, SourcePolicy,
-        StatusBarItem, UiConfig, WebdavConfig,
+        AccentFollowCover, Config, DownloadConfig, LocalMusicConfig, STATUS_BAR_MAX_HEIGHT,
+        SourceId, SourcePolicy, StatusBarItem, UiConfig, WebdavConfig,
     };
+
+    #[test]
+    fn ui_page_step_and_accent_follow_cover_have_sane_defaults() {
+        let ui = UiConfig::default();
+        assert_eq!(ui.page_step, 10, "PgUp/PgDn 翻页步长默认 10");
+        assert_eq!(
+            ui.accent_follow_cover,
+            AccentFollowCover::Strong,
+            "封面主色跟随默认「明显」档"
+        );
+        // 页面步长与滚轮步长语义不同，默认值不应相同（滚轮 3 / 翻页 10）。
+        assert_ne!(ui.page_step, ui.scroll_amount);
+    }
+
+    #[test]
+    fn accent_follow_cover_accepts_legacy_bools_and_strings() {
+        let parse = |value: serde_json::Value| -> Result<UiConfig, serde_json::Error> {
+            serde_json::from_value(serde_json::json!({ "accent_follow_cover": value }))
+        };
+        // 早期示例发布过布尔值。
+        assert_eq!(parse(serde_json::json!(true)).unwrap().accent_follow_cover, AccentFollowCover::Strong);
+        assert_eq!(parse(serde_json::json!(false)).unwrap().accent_follow_cover, AccentFollowCover::Off);
+        // 新写法与大小写/空白宽容。
+        assert_eq!(
+            parse(serde_json::json!("strong")).unwrap().accent_follow_cover,
+            AccentFollowCover::Strong
+        );
+        assert_eq!(
+            parse(serde_json::json!(" Subtle ")).unwrap().accent_follow_cover,
+            AccentFollowCover::Subtle
+        );
+        assert_eq!(parse(serde_json::json!("off")).unwrap().accent_follow_cover, AccentFollowCover::Off);
+        // 未知取值拒绝，避免静默回退成用户不想要的档位。
+        assert!(parse(serde_json::json!("blazing")).is_err());
+    }
 
     #[test]
     fn webdav_defaults_are_disabled_and_parse_from_partial_toml() {

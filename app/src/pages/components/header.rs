@@ -1,3 +1,9 @@
+//! 顶部信息栏：左侧播放状态与时间，中间歌名 / 歌手 - 专辑。
+//!
+//! 音量、播放模式、音源、自定义音源状态只在底部状态栏展示（那里可点击、
+//! 可交互）。此前顶栏右列重复渲染同样的信息还伴随 "SOUR" 这类截断，
+//! 已整体移除，信息口径以底栏为准。
+
 use lx_core::model::source::PlayerState;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -6,9 +12,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::context::AppContext;
+use crate::fmt::format_duration;
+use crate::pages::components::text::truncate_width;
 
 pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
-    let accent = crate::theme::accent(ctx);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(crate::theme::border(ctx)));
@@ -23,22 +30,22 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         .constraints([
             Constraint::Length(24.min(inner.width / 3)),
             Constraint::Min(10),
-            Constraint::Length(28.min(inner.width / 3)),
         ])
         .split(inner);
     let state = *ctx.player_state.borrow();
+    // 状态用词与底部状态栏保持一致（播放/暂停/缓冲…），避免同一状态两个名字。
     let state_label = match state {
-        PlayerState::Playing => "PLAYING",
-        PlayerState::Paused => "PAUSED",
-        PlayerState::Loading => "LOADING",
-        PlayerState::Stopped => "STOPPED",
-        PlayerState::Idle => "IDLE",
+        PlayerState::Playing => "播放",
+        PlayerState::Paused => "暂停",
+        PlayerState::Loading => "缓冲",
+        PlayerState::Stopped => "停止",
+        PlayerState::Idle => "空闲",
     };
     let position = *ctx.position.borrow();
     let duration = *ctx.duration.borrow();
     Paragraph::new(vec![
         Line::from(Span::styled(
-            format!("[{}]", state_label),
+            format!("[{state_label}]"),
             Style::new()
                 .fg(crate::theme::yellow(ctx))
                 .add_modifier(Modifier::BOLD),
@@ -69,6 +76,11 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
             )
         },
     );
+    // 居中列宽由布局保证；这里先按显示宽度截断，超长的部分带省略号，
+    // 完整歌名仍可在详情/右键菜单看到。
+    let title_width = columns[1].width as usize;
+    let title = truncate_width(&title, title_width).into_owned();
+    let detail = truncate_width(&detail, title_width).into_owned();
     Paragraph::new(vec![
         Line::from(Span::styled(
             title,
@@ -83,46 +95,4 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     ])
     .alignment(Alignment::Center)
     .render(columns[1], buf);
-
-    let source = song
-        .as_ref()
-        .map(|song| {
-            // 锁中毒时退回原始数据渲染，避免头部每帧 panic
-            let js_index = *ctx
-                .play_js_source_index
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            js_index
-                .and_then(|index| ctx.source_manager.js_source_name(index))
-                .or_else(|| {
-                    ctx.source_manager
-                        .get(song.source)
-                        .map(|source| source.name().to_string())
-                })
-                .unwrap_or_else(|| song.source.as_str().to_string())
-        })
-        .unwrap_or_else(|| "-".to_string());
-    Paragraph::new(vec![
-        Line::from(Span::styled(
-            format!("Volume: {:>3}%", ctx.player.volume()),
-            Style::new().fg(accent),
-        )),
-        Line::from(format!(
-            "{} · {} · {}",
-            ctx.playlist.mode().label(),
-            source,
-            if ctx.source_manager.has_js_source() {
-                "SOURCE OK"
-            } else {
-                "SOURCE OFF"
-            }
-        )),
-    ])
-    .alignment(Alignment::Right)
-    .render(columns[2], buf);
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    let seconds = duration.as_secs();
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }

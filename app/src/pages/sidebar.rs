@@ -74,6 +74,25 @@ pub fn render(area: Rect, buf: &mut Buffer, active: NavTab, ctx: &crate::context
     }
 }
 
+impl NavTab {
+    /// 侧边栏的数字快捷键（1~8）。
+    ///
+    /// 提示文案（如"在设置（8）中添加"）引用这里而不是硬编码数字，
+    /// 以后调整页签顺序时提示不会失真。
+    pub const fn shortcut_digit(self) -> u8 {
+        match self {
+            Self::Main => 1,
+            Self::Search => 2,
+            Self::Leaderboard => 3,
+            Self::Playlists => 4,
+            Self::Favorites => 5,
+            Self::History => 6,
+            Self::LocalMusic => 7,
+            Self::Settings => 8,
+        }
+    }
+}
+
 pub fn hit_test(area: Rect, position: Position) -> Option<NavTab> {
     let inner = Block::default().borders(Borders::ALL).inner(area);
     NavTab::ALL

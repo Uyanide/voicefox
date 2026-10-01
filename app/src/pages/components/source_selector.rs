@@ -23,7 +23,6 @@ pub enum SourceSelectorKey {
 pub struct SourceSelector {
     items: Vec<(SourceSelectorKey, String)>,
     pub selected: usize,
-    pub scroll: usize,
     open: bool,
 }
 
@@ -31,7 +30,6 @@ impl SourceSelector {
     pub fn new(items: Vec<(SourceSelectorKey, String)>, selected: usize) -> Self {
         Self {
             selected: selected.min(items.len().saturating_sub(1)),
-            scroll: 0,
             items,
             open: false,
         }
@@ -284,73 +282,6 @@ impl SourceSelector {
 
     pub fn render_popup(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext, title: &str) {
         if !self.open || self.items.is_empty() || area.width == 0 || area.height == 0 {
-            return;
-        }
-        let popup = self.popup_rect(area);
-        Clear.render(popup, buf);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(crate::theme::accent(ctx)))
-            .style(Style::new().bg(crate::theme::surface0(ctx)))
-            .title(format!(" {} · P ", title));
-        let inner = block.inner(popup);
-        block.render(popup, buf);
-        let visible = inner.height.saturating_sub(1) as usize;
-        let start = self.selected.saturating_sub(visible.saturating_sub(1));
-        for (row, index) in (start..self.items.len()).take(visible).enumerate() {
-            let selected = index == self.selected;
-            let marker = if selected { "▶ " } else { "  " };
-            let style = if selected {
-                Style::new()
-                    .bg(crate::theme::accent(ctx))
-                    .fg(crate::theme::selection_fg(ctx))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(crate::theme::text(ctx))
-            };
-            Paragraph::new(Line::from(Span::styled(
-                format!("{}{}", marker, self.items[index].1),
-                style,
-            )))
-            .render(
-                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
-                buf,
-            );
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext, title: &str) {
-        if area.width == 0 || area.height == 0 || self.items.is_empty() {
-            return;
-        }
-        let mut spans = vec![Span::styled(
-            " 音源：",
-            Style::new().fg(crate::theme::muted(ctx)),
-        )];
-        for (i, (_, label)) in self.items.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("  "));
-            }
-            let style = if i == self.selected {
-                Style::new()
-                    .fg(crate::theme::selection_fg(ctx))
-                    .bg(crate::theme::accent(ctx))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(crate::theme::muted(ctx))
-            };
-            spans.push(Span::styled(format!(" {} ", label), style));
-        }
-        spans.push(Span::styled(
-            "  P 切换",
-            Style::new()
-                .fg(crate::theme::accent(ctx))
-                .add_modifier(Modifier::BOLD),
-        ));
-        Paragraph::new(Line::from(spans)).render(Rect::new(area.x, area.y, area.width, 1), buf);
-
-        if !self.open {
             return;
         }
         let popup = self.popup_rect(area);

@@ -198,8 +198,8 @@ impl DetailsPage {
             Some(lx_core::keybinding::Action::ListSelectDown) => self.move_down(ctx),
             Some(lx_core::keybinding::Action::ListSelectFirst) => self.select_first(),
             Some(lx_core::keybinding::Action::ListSelectLast) => self.select_last(),
-            Some(lx_core::keybinding::Action::ListPageUp) => self.page_up(),
-            Some(lx_core::keybinding::Action::ListPageDown) => self.page_down(),
+            Some(lx_core::keybinding::Action::ListPageUp) => self.page_up(ctx.page_step()),
+            Some(lx_core::keybinding::Action::ListPageDown) => self.page_down(ctx.page_step()),
             Some(lx_core::keybinding::Action::ListActivate) => return self.activate(),
             Some(lx_core::keybinding::Action::ListAddToQueue) => {
                 return self.add_selected(InsertPosition::End);
@@ -252,12 +252,12 @@ impl DetailsPage {
                 AppAction::None
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.page_up();
+                self.page_up(ctx.page_step());
                 AppAction::None
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.page_down();
+                self.page_down(ctx.page_step());
                 AppAction::None
             }
             _ => AppAction::None,
@@ -520,22 +520,20 @@ impl DetailsPage {
         }
     }
 
-    fn page_up(&mut self) {
+    fn page_up(&mut self, step: usize) {
         match self.focus {
-            DetailsFocus::Albums => self.selected_album = self.selected_album.saturating_sub(10),
-            DetailsFocus::Songs => self.selected_song = self.selected_song.saturating_sub(10),
+            DetailsFocus::Albums => self.selected_album = self.selected_album.saturating_sub(step),
+            DetailsFocus::Songs => self.selected_song = self.selected_song.saturating_sub(step),
         }
     }
 
-    fn page_down(&mut self) {
+    fn page_down(&mut self, step: usize) {
         match self.focus {
             DetailsFocus::Albums => {
-                self.selected_album =
-                    (self.selected_album + 10).min(self.albums.len().saturating_sub(1));
+                self.selected_album = (self.selected_album + step).min(self.albums.len().saturating_sub(1));
             }
             DetailsFocus::Songs => {
-                self.selected_song =
-                    (self.selected_song + 10).min(self.songs.len().saturating_sub(1));
+                self.selected_song = (self.selected_song + step).min(self.songs.len().saturating_sub(1));
             }
         }
     }

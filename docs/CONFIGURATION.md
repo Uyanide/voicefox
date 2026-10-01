@@ -57,6 +57,8 @@ timeout = 15                # HTTP 超时秒数
 enable_mouse = true
 wrap_navigation = true
 scroll_amount = 3
+page_step = 10              # PgUp/PgDn 键盘翻页步长（滚轮仍用 scroll_amount）
+accent_follow_cover = "strong"  # 界面强调色跟随封面主色：off/subtle/strong（true/false 也接受）
 aggregate_search = true     # 搜索时聚合所有已启用音源
 show_cover = true
 cover_protocol = "auto"     # auto / kitty / sixel / iterm2 / halfblocks
@@ -156,6 +158,8 @@ save_lyric = true            # 保存 .lrc 并内嵌歌词
 | `enable_mouse` | `true` | 启用鼠标支持 |
 | `wrap_navigation` | `true` | 列表选择是否循环 |
 | `scroll_amount` | `3` | 滚轮滚动步长 |
+| `page_step` | `10` | PgUp/PgDn 键盘翻页步长（1-100）。设置页「界面 → 翻页步长」可循环 5/10/15/20 |
+| `accent_follow_cover` | `"strong"` | 界面强调色跟随专辑封面主色：`off` / `subtle` / `strong`（也接受 `true`=`strong`、`false`=`off`；灰调封面自动回落主题色）。设置页「界面 → 封面主色跟随」可循环切换 |
 | `aggregate_search` | `true` | 聚合搜索所有已启用音源 |
 | `show_cover` | `true` | 显示封面 |
 | `cover_protocol` | `"auto"` | `auto` / `kitty` / `sixel` / `iterm2` / `halfblocks` |

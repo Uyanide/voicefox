@@ -849,11 +849,12 @@ impl PlaylistsPage {
                 self.selected = self.current_list_len().saturating_sub(1);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.selected = self.selected.saturating_sub(10);
+                self.selected = self.selected.saturating_sub(ctx.page_step());
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.selected = (self.selected + 10).min(self.current_list_len().saturating_sub(1));
+                self.selected =
+                    (self.selected + ctx.page_step()).min(self.current_list_len().saturating_sub(1));
             }
             _ if super::is_song_activation_key(key) => {
                 if self.selected_playlist.is_some() && !self.songs.is_empty() {
@@ -1531,42 +1532,10 @@ impl PlaylistsPage {
         self.render_scope_selector(area, buf, ctx);
     }
 
-    #[allow(unreachable_code)]
     fn render_scopes(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if let Some(selector) = self.scope_selector.as_ref() {
             selector.render_tabs(area, buf, ctx);
         }
-        return;
-        let current = scope_label(self.scopes[self.scope_index], true);
-        let total = self.scopes.len();
-        let text = format!(
-            " 音源：{}  ·  P 切换  ·  {}/{}",
-            current,
-            self.scope_index + 1,
-            total
-        );
-        let surface = crate::theme::surface0(ctx);
-        let accent = crate::theme::accent(ctx);
-        let spans = vec![
-            ratatui::text::Span::styled(
-                text,
-                ratatui::style::Style::new()
-                    .fg(ratatui::style::Color::White)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            ratatui::text::Span::styled(
-                if self.scope_selector.is_some() {
-                    " v"
-                } else {
-                    ""
-                },
-                ratatui::style::Style::new().fg(accent),
-            ),
-        ];
-        ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans))
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(ratatui::style::Style::new().bg(surface))
-            .render(area, buf);
     }
 
     fn render_playlists(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
@@ -2225,16 +2194,7 @@ fn supports_playlist_browse(source: SourceId) -> bool {
 }
 
 fn source_name(source: SourceId) -> &'static str {
-    match source {
-        SourceId::Kw => "酷我",
-        SourceId::Kg => "酷狗",
-        SourceId::Tx => "QQ",
-        SourceId::Wy => "网易云",
-        SourceId::Mg => "咪咕",
-        SourceId::Bili => "哔哩哔哩",
-        SourceId::Local => "本地",
-        _ => "未知",
-    }
+    source.display_name()
 }
 
 fn scope_label(scope: PlaylistScope, full: bool) -> &'static str {
@@ -2244,7 +2204,7 @@ fn scope_label(scope: PlaylistScope, full: bool) -> &'static str {
         // 账号歌单与音源推荐必须分开呈现：登录后两者是两套完全不同的数据
         (PlaylistScope::Account(_), _) => "我的歌单",
         (PlaylistScope::Source(source), true) => source.display_label(),
-        (PlaylistScope::Source(source), false) => source.as_str(),
+        (PlaylistScope::Source(source), false) => source.display_name(),
     }
 }
 

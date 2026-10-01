@@ -62,6 +62,11 @@ timeout = 15                # HTTP 超时秒数
 enable_mouse = true
 wrap_navigation = true
 scroll_amount = 3
+# PgUp/PgDn 键盘翻页步长（滚轮仍用 scroll_amount）
+page_step = 10
+# 界面强调色跟随专辑封面主色：off / subtle（轻微）/ strong（明显，默认）
+# 旧写法 true/false 仍然接受（true = strong，false = off）
+accent_follow_cover = "strong"
 aggregate_search = true
 show_cover = true
 cover_protocol = "auto"     # auto / kitty / sixel / iterm2 / halfblocks

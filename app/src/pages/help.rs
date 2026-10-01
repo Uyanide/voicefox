@@ -24,11 +24,18 @@ struct Section {
 pub struct HelpPage {
     sections: Vec<Section>,
     scroll: usize,
+    /// PgUp/PgDn 翻页步长与滚轮步长，构造时从 `ui` 配置注入。
+    page_step: usize,
+    scroll_amount: usize,
 }
 
 impl HelpPage {
     /// 从实际生效的键位配置构建浮层内容。
-    pub fn from_config(config: &KeybindingConfig) -> Self {
+    pub fn from_config(
+        config: &KeybindingConfig,
+        page_step: usize,
+        scroll_amount: usize,
+    ) -> Self {
         let mut sections = Vec::new();
 
         let mut global: Vec<(String, &'static str)> = config
@@ -60,6 +67,8 @@ impl HelpPage {
         Self {
             sections,
             scroll: 0,
+            page_step,
+            scroll_amount,
         }
     }
 
@@ -77,10 +86,10 @@ impl HelpPage {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.scroll = self.scroll.saturating_add(15);
+                self.scroll = self.scroll.saturating_add(self.page_step);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.scroll = self.scroll.saturating_sub(15);
+                self.scroll = self.scroll.saturating_sub(self.page_step);
             }
             (KeyModifiers::NONE, KeyCode::Char('g')) | (KeyModifiers::NONE, KeyCode::Home) => {
                 self.scroll = 0
@@ -96,10 +105,10 @@ impl HelpPage {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> bool {
         match event.kind {
             MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(3);
+                self.scroll = self.scroll.saturating_sub(self.scroll_amount.max(1));
             }
             MouseEventKind::ScrollDown => {
-                self.scroll = self.scroll.saturating_add(3);
+                self.scroll = self.scroll.saturating_add(self.scroll_amount.max(1));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // 点击浮层外关闭
@@ -198,7 +207,7 @@ mod tests {
     #[test]
     fn help_lists_global_and_all_default_pages() {
         let config = KeybindingConfig::default();
-        let help = HelpPage::from_config(&config);
+        let help = HelpPage::from_config(&config, 10, 3);
         assert_eq!(help.sections.len(), 1 + PAGE_ORDER.len());
         // 全局区包含退出动作
         assert!(
@@ -211,7 +220,7 @@ mod tests {
 
     #[test]
     fn esc_and_q_close_the_overlay() {
-        let mut help = HelpPage::from_config(&KeybindingConfig::default());
+        let mut help = HelpPage::from_config(&KeybindingConfig::default(), 10, 3);
         let resolver_free = KeybindingResolver::from_config(&KeybindingConfig::default());
         let _ = resolver_free;
         assert!(!help.handle_input(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
@@ -223,7 +232,7 @@ mod tests {
     fn custom_bindings_are_reflected() {
         let mut config = KeybindingConfig::default();
         config.global.insert(Action::GlobalQuit, "Q".to_string());
-        let help = HelpPage::from_config(&config);
+        let help = HelpPage::from_config(&config, 10, 3);
         assert!(
             help.sections[0]
                 .entries

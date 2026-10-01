@@ -95,10 +95,10 @@ impl DownloadsPanel {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.selected = (self.selected + 5).min(len.saturating_sub(1));
+                self.selected = (self.selected + ctx.page_step()).min(len.saturating_sub(1));
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.selected = self.selected.saturating_sub(5);
+                self.selected = self.selected.saturating_sub(ctx.page_step());
             }
             (KeyModifiers::NONE, KeyCode::Char('c'))
             | (KeyModifiers::NONE, KeyCode::Char('d'))
@@ -290,9 +290,13 @@ fn task_title_line(
 ) -> Line<'static> {
     let state_color = state_color(task, ctx);
     let marker = if selected { "▶ " } else { "  " };
-    let prefix = format!("{marker}{} [{}] ", task.state.label(), task.source.as_str());
+    let prefix = format!(
+        "{marker}{} [{}] ",
+        task.state.label(),
+        task.source.display_name()
+    );
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let name = truncate_to_width(&task.display_name(), width.saturating_sub(prefix_width + 8));
+    let name = truncate_to_width(&task.display_name(), width.saturating_sub(prefix_width));
     let selected_style = Style::new()
         .fg(crate::theme::selection_fg(ctx))
         .bg(crate::theme::accent(ctx))

@@ -25,6 +25,13 @@ use crate::theme;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
+/// 二维码过期后自动重建的次数上限。
+///
+/// 自动刷新是给「人还在页面前，码先过期了」准备的；超过上限仍无进展多半是
+/// 环境问题（风控/网络），继续无限重建只会静默轮询，所以停在错误态等用户
+/// 手动按 R。
+const MAX_AUTO_REGENERATIONS: u32 = 5;
+
 /// 页面状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QrLoginState {
@@ -69,6 +76,8 @@ pub struct QrLoginPage {
     next_poll_at: Instant,
     /// 连续临时失败次数，用于指数退避。
     retry_count: u32,
+    /// 本轮页面已自动重建二维码的次数（按 R 手动刷新会清零）。
+    regenerations: u32,
 }
 
 impl QrLoginPage {
@@ -80,6 +89,7 @@ impl QrLoginPage {
             polling: false,
             next_poll_at: Instant::now(),
             retry_count: 0,
+            regenerations: 0,
         }
     }
 
@@ -174,6 +184,61 @@ impl QrLoginPage {
         }
     }
 
+    /// 是否需要（重新）生成二维码：初始生成、或二维码已到期的等待/重试状态。
+    ///
+    /// 本地计时到期就判定需要重建，不必等服务端 800：最后一次轮询可能走了
+    /// 网络退避，若只认服务端结论，页面会永远停在「0 秒后过期」不上不下。
+    /// 有轮询在途时暂缓，让它的结果先行落地（结果若是过期会走自动重建）。
+    pub fn needs_regeneration(&self) -> bool {
+        if self.polling {
+            return false;
+        }
+        match &self.state {
+            QrLoginState::Generating => true,
+            QrLoginState::Waiting {
+                started,
+                expires_in,
+                ..
+            }
+            | QrLoginState::Scanned {
+                started,
+                expires_in,
+                ..
+            }
+            | QrLoginState::Retrying {
+                started,
+                expires_in,
+                ..
+            } => started.elapsed() >= Duration::from_secs(*expires_in),
+            _ => false,
+        }
+    }
+
+    /// 过期/会话失效后的自动重建；超出上限就停在错误态，等用户按 R。
+    fn request_regeneration(&mut self, reason: &str) {
+        self.polling = false;
+        if self.regenerations >= MAX_AUTO_REGENERATIONS {
+            self.state = QrLoginState::Error {
+                message: format!(
+                    "{reason}，已自动刷新 {MAX_AUTO_REGENERATIONS} 次，按 R 重新生成"
+                ),
+            };
+            return;
+        }
+        self.regenerations += 1;
+        self.state = QrLoginState::Generating;
+    }
+
+    /// 手动重新生成二维码（按 R）；清零自动刷新计数。
+    fn manual_refresh(&mut self) {
+        if matches!(self.state, QrLoginState::Generating) {
+            return;
+        }
+        self.regenerations = 0;
+        self.polling = false;
+        self.state = QrLoginState::Generating;
+    }
+
     /// 取出本轮要轮询的 (音源, key)。
     ///
     /// 返回 `Some` 时同时标记「轮询进行中」，直到 [`Self::apply_check_result`]
@@ -209,10 +274,9 @@ impl QrLoginPage {
                     user: result.user_name,
                 };
             }
-            QrLoginStatus::Expired => self.set_error("二维码已过期，请重新打开登录".to_string()),
-            QrLoginStatus::InvalidSession => {
-                self.set_error("登录会话已失效，请重新打开登录".to_string())
-            }
+            // 过期/会话失效不再停死在错误页：自动重建二维码，用户重新扫即可。
+            QrLoginStatus::Expired => self.request_regeneration("二维码已过期"),
+            QrLoginStatus::InvalidSession => self.request_regeneration("登录会话已失效"),
             QrLoginStatus::Failed => {
                 let message = if result.message.trim().is_empty() {
                     "登录失败".to_string()
@@ -286,6 +350,12 @@ impl QrLoginPage {
             (KeyModifiers::NONE, KeyCode::Esc)
             | (KeyModifiers::NONE, KeyCode::Char('q'))
             | (KeyModifiers::NONE, KeyCode::Backspace) => AppAction::GoBack,
+            (KeyModifiers::NONE, KeyCode::Char('r'))
+            | (KeyModifiers::NONE, KeyCode::Char('R'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('R')) => {
+                self.manual_refresh();
+                AppAction::None
+            }
             _ => AppAction::None,
         }
     }
@@ -300,7 +370,10 @@ impl QrLoginPage {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(accent))
-            .title(format!(" {} 扫码登录 · Esc/q 关闭 ", self.display_name))
+            .title(format!(
+                " {} 扫码登录 · Esc/q 关闭 · R 重新生成 ",
+                self.display_name
+            ))
             .style(Style::new().bg(theme::mantle(ctx)));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -317,7 +390,7 @@ impl QrLoginPage {
             ..inner
         };
         let tips = Paragraph::new(Line::from(Span::styled(
-            " Esc / q 关闭",
+            " Esc / q 关闭 · R 重新生成",
             Style::new().fg(muted),
         )));
         tips.render(
@@ -326,14 +399,21 @@ impl QrLoginPage {
         );
 
         match &self.state {
-            QrLoginState::Generating => centered(
-                body,
-                buf,
-                vec![Line::from(Span::styled(
-                    "正在生成二维码…",
-                    Style::new().fg(yellow),
-                ))],
-            ),
+            QrLoginState::Generating => {
+                let text = if self.regenerations > 0 {
+                    "正在重新生成二维码…"
+                } else {
+                    "正在生成二维码…"
+                };
+                centered(
+                    body,
+                    buf,
+                    vec![Line::from(Span::styled(
+                        text,
+                        Style::new().fg(yellow),
+                    ))],
+                )
+            }
             QrLoginState::Waiting {
                 qr_lines,
                 started,
@@ -373,8 +453,15 @@ impl QrLoginPage {
                     )));
                 }
                 lines.push(Line::from(""));
+                // 本地计时到期后主循环会立即重建，但仍有 tick 间隙；
+                // 显示「正在重新生成」而不是误导性的「0 秒后过期」。
+                let expiry_note = if remaining == 0 {
+                    "已过期，正在重新生成…".to_string()
+                } else {
+                    format!("{remaining} 秒后过期")
+                };
                 lines.push(Line::from(Span::styled(
-                    format!("{status}（{remaining} 秒后过期）"),
+                    format!("{status}（{expiry_note}）"),
                     Style::new().fg(green),
                 )));
                 centered(body, buf, lines);
@@ -613,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_and_failed_become_errors() {
+    fn expired_auto_regenerates_until_the_cap_then_needs_manual_refresh() {
         let mut page = test_page();
         page.set_qr(QrLoginSession {
             source: SourceId::Wy,
@@ -622,9 +709,20 @@ mod tests {
             image_png: None,
             expires_in: 300,
         });
+        // 过期不再停死在错误页：自动回到生成态，主循环据此重建二维码。
+        page.apply_check_result(Ok(QrLoginResult::new(QrLoginStatus::Expired, "过期")));
+        assert!(matches!(page.state, QrLoginState::Generating));
+        assert!(page.needs_regeneration());
+        for _ in 1..MAX_AUTO_REGENERATIONS {
+            page.apply_check_result(Ok(QrLoginResult::new(QrLoginStatus::Expired, "过期")));
+        }
+        assert!(matches!(page.state, QrLoginState::Generating));
+        // 超出自动上限后停在错误态，但按 R 仍可重新生成。
         page.apply_check_result(Ok(QrLoginResult::new(QrLoginStatus::Expired, "过期")));
         assert!(matches!(page.state, QrLoginState::Error { .. }));
-        assert!(!page.should_poll());
+        assert!(!page.needs_regeneration());
+        page.manual_refresh();
+        assert!(matches!(page.state, QrLoginState::Generating));
 
         let mut page = test_page();
         page.set_qr(QrLoginSession {
@@ -637,6 +735,63 @@ mod tests {
         page.apply_check_result(Err("网络错误".to_string()));
         assert!(matches!(page.state, QrLoginState::Retrying { .. }));
         assert!(page.should_poll());
+    }
+
+    #[test]
+    fn local_expiry_requests_regeneration_even_without_a_server_verdict() {
+        // 回归：最后一两次轮询走了网络退避时，本地计时先到期而服务端 800
+        // 还没拿到，旧实现会让页面永远停在「0 秒后过期」。
+        let mut page = test_page();
+        page.set_qr(QrLoginSession {
+            source: SourceId::Wy,
+            key: "k".to_string(),
+            url: "https://music.163.com/login?codekey=k".to_string(),
+            image_png: None,
+            expires_in: 300,
+        });
+        match &mut page.state {
+            QrLoginState::Waiting { started, .. } => {
+                *started = Instant::now() - Duration::from_secs(301);
+            }
+            other => panic!("应当处于等待扫码状态: {other:?}"),
+        }
+        assert!(!page.should_poll());
+        assert!(page.needs_regeneration());
+    }
+
+    #[test]
+    fn r_key_requests_a_manual_refresh() {
+        let mut page = test_page();
+        page.set_qr(QrLoginSession {
+            source: SourceId::Wy,
+            key: "k".to_string(),
+            url: "https://music.163.com/login?codekey=k".to_string(),
+            image_png: None,
+            expires_in: 300,
+        });
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        page.handle_input(key, &unresolved_resolver());
+        assert!(matches!(page.state, QrLoginState::Generating));
+        assert!(page.needs_regeneration());
+
+        // Shift+R 同样生效。
+        let mut page = test_page();
+        page.set_qr(QrLoginSession {
+            source: SourceId::Wy,
+            key: "k".to_string(),
+            url: "https://music.163.com/login?codekey=k".to_string(),
+            image_png: None,
+            expires_in: 300,
+        });
+        page.apply_check_result(Ok(QrLoginResult::new(QrLoginStatus::Scanned, "已扫码")));
+        let key = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        page.handle_input(key, &unresolved_resolver());
+        assert!(matches!(page.state, QrLoginState::Generating));
+    }
+
+    /// 测试用的键位解析器；扫码页目前不消费键位配置，任意实例均可。
+    fn unresolved_resolver() -> KeybindingResolver {
+        KeybindingResolver::from_config(&lx_core::keybinding::KeybindingConfig::default())
     }
 
     #[test]

@@ -666,49 +666,10 @@ impl FavoritesPage {
         self.render_remote_menu(buf, ctx);
     }
 
-    #[allow(unreachable_code)]
     fn render_source_tabs(&mut self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
         if let Some(selector) = self.source_selector.as_ref() {
             selector.render_tabs(area, buf, ctx);
         }
-        return;
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let current = self.current_source();
-        let mut spans = vec![Span::styled(
-            " 音源：",
-            Style::new().fg(crate::theme::muted(ctx)),
-        )];
-        let mut used = 4usize;
-        for (index, source) in self.sources.iter().enumerate() {
-            let label = source.display_name();
-            let width = label.chars().count() + 3;
-            if used + width + 10 > area.width as usize {
-                break;
-            }
-            let style = if Some(*source) == current {
-                Style::new()
-                    .fg(crate::theme::selection_fg(ctx))
-                    .bg(crate::theme::accent(ctx))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(crate::theme::muted(ctx))
-            };
-            if index > 0 {
-                spans.push(Span::raw("  "));
-                used += 2;
-            }
-            spans.push(Span::styled(format!(" {} ", label), style));
-            used += width;
-        }
-        spans.push(Span::styled(
-            "  P 切换",
-            Style::new()
-                .fg(crate::theme::accent(ctx))
-                .add_modifier(Modifier::BOLD),
-        ));
-        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
     /// 歌曲表头所在的一行（供 main.rs 判定"表头右键 → 列菜单"）。

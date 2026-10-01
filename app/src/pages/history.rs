@@ -253,11 +253,11 @@ pub fn handle_input(
                 return AppAction::None;
             }
             Action::ListPageUp => {
-                state.selected = state.selected.saturating_sub(10);
+                state.selected = state.selected.saturating_sub(ctx.page_step());
                 return AppAction::None;
             }
             Action::ListPageDown => {
-                state.selected = (state.selected + 10).min(len.saturating_sub(1));
+                state.selected = (state.selected + ctx.page_step()).min(len.saturating_sub(1));
                 return AppAction::None;
             }
             Action::ListAddToQueue => {
@@ -349,10 +349,10 @@ pub fn handle_input(
             state.selected = len.saturating_sub(1);
         }
         (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::NONE, KeyCode::PageUp) => {
-            state.selected = state.selected.saturating_sub(10);
+            state.selected = state.selected.saturating_sub(ctx.page_step());
         }
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (KeyModifiers::NONE, KeyCode::PageDown) => {
-            state.selected = (state.selected + 10).min(len.saturating_sub(1));
+            state.selected = (state.selected + ctx.page_step()).min(len.saturating_sub(1));
         }
         _ if super::is_song_activation_key(key) && len != 0 && state.selected < len => {
             let songs = view_songs(sorted, &indices);

@@ -9,10 +9,11 @@
 
 use lx_core::sync::{SyncCollection, SyncCollectionKind};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use unicode_width::UnicodeWidthStr;
 
 use crate::context::AppContext;
 use crate::pages::components::list_filter::ListFilter;
@@ -329,13 +330,19 @@ impl RemoteCollectionsWindow {
         }
 
         let footer_row = inner.bottom().saturating_sub(1);
+        // 页码右对齐、提示靠左，画在同一行：此前页码先画、提示无条件覆盖，
+        // 列表超长时页码永远看不见。
         if total > list_height {
-            let position = format!(" {} / {} ", self.selected + 1, total);
-            Paragraph::new(Line::from(Span::styled(
-                position,
-                Style::new().fg(crate::theme::overlay0(ctx)),
-            )))
-            .render(Rect::new(inner.x, footer_row, inner.width, 1), buf);
+            let position = format!("{} / {} ", self.selected + 1, total);
+            let position_width = UnicodeWidthStr::width(position.as_str()) as u16;
+            if inner.width > position_width {
+                Paragraph::new(Line::from(Span::styled(
+                    position,
+                    Style::new().fg(crate::theme::overlay0(ctx)),
+                )))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x, footer_row, inner.width, 1), buf);
+            }
         }
 
         let footer = if self.is_filtering() {

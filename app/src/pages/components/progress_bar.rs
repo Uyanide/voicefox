@@ -1,5 +1,7 @@
 //! 播放进度条
 
+use lx_core::model::source::PlayerState;
+
 use crate::context::AppContext;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -8,12 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use std::time::Duration;
 
-fn format_duration(d: Duration) -> String {
-    let total_secs = d.as_secs();
-    let mins = total_secs / 60;
-    let secs = total_secs % 60;
-    format!("{:02}:{:02}", mins, secs)
-}
+use crate::fmt::format_duration;
 
 pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let accent = crate::theme::accent(ctx);
@@ -24,6 +21,11 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let duration = *ctx.duration.borrow();
 
     if duration == Duration::ZERO {
+        // 时长未知（缓冲中）时画一段来回游走的色块；停止/空闲时保持空白。
+        // 相位由时钟无状态推导，不存任何每帧状态，就不会抖动或闪烁。
+        if *ctx.player_state.borrow() == PlayerState::Loading {
+            render_indeterminate(area, buf, ctx, accent);
+        }
         return;
     }
 
@@ -59,6 +61,49 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     ];
 
     Paragraph::new(Line::from(bar_spans)).render(area, buf);
+}
+
+/// 缓冲中（时长未知）的不确定态：一段 6 格的色块在轨道上来回游走。
+///
+/// 相位由 `SystemTime` 毫秒按固定步长量化后走三角波：同一 300ms 窗口内
+/// 渲染多少次都稳定，多帧之间自然衔接，不存任何每帧状态。
+fn render_indeterminate(
+    area: Rect,
+    buf: &mut Buffer,
+    ctx: &AppContext,
+    accent: ratatui::style::Color,
+) {
+    const STEP_MS: u128 = 300;
+    const BLOCK: usize = 6;
+    let track = area.width.saturating_sub(13) as usize;
+    if track <= BLOCK + 2 {
+        return;
+    }
+    let cycle = 2 * (track - BLOCK);
+    let phase = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_millis() / STEP_MS)
+        .unwrap_or_default() as usize)
+        % cycle;
+    let offset = if phase <= track - BLOCK {
+        phase
+    } else {
+        cycle - phase
+    };
+    let spans = vec![
+        Span::styled(" --:-- ", Style::new().fg(crate::theme::subtext0(ctx))),
+        Span::styled(
+            "░".repeat(offset),
+            Style::new().fg(crate::theme::surface1(ctx)),
+        ),
+        Span::styled("█".repeat(BLOCK), Style::new().fg(accent)),
+        Span::styled(
+            "░".repeat(track - offset - BLOCK),
+            Style::new().fg(crate::theme::surface1(ctx)),
+        ),
+        Span::styled(" --:-- ", Style::new().fg(crate::theme::subtext0(ctx))),
+    ];
+    Paragraph::new(Line::from(spans)).render(area, buf);
 }
 
 pub fn seek_position(area: Rect, column: u16, duration: Duration) -> Option<Duration> {
