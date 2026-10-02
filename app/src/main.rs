@@ -28,10 +28,10 @@ mod visualizer;
 mod theme;
 mod tmux;
 
-use media_controls::{
-    current_media_snapshot, execute_media_command, persist_volume, start_media_controls,
-    toggle_or_start_current,
-};
+use media_controls::{persist_volume, toggle_or_start_current};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use media_controls::{current_media_snapshot, execute_media_command, start_media_controls};
+
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1575,6 +1575,9 @@ fn run_app(
     let (leaderboard_tx, mut leaderboard_rx) = mpsc::unbounded_channel::<LeaderboardResponse>();
     let (playlist_tx, mut playlist_rx) = mpsc::unbounded_channel::<PlaylistResponse>();
     let mut player_event_rx = ctx.player.take_event_receiver();
+    // 平台媒体控件只存在于 Linux（MPRIS）/ Windows（SMTC）：macOS 上既不启动，
+    // 也不声明句柄（下面所有使用点本身也在这两个平台的 cfg 下）。
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let (media_handle, mut media_command_rx) = start_media_controls(&ctx, rt);
 
     // 搜索请求序列号（用于取消过时请求）
