@@ -27,6 +27,8 @@ pub enum StatusBarSlot {
     Item(StatusBarItem),
     /// 前置的下载进度指示（点击打开下载面板）。
     Download,
+    /// 前置的睡眠定时器倒计时（点击打开定时器菜单）。
+    SleepTimer,
     /// 因宽度不足被收纳的可交互段入口。
     More,
 }
@@ -113,7 +115,7 @@ pub fn is_interactive(item: StatusBarItem) -> bool {
 fn slot_is_interactive(slot: StatusBarSlot) -> bool {
     match slot {
         StatusBarSlot::Item(item) => is_interactive(item),
-        StatusBarSlot::Download | StatusBarSlot::More => true,
+        StatusBarSlot::Download | StatusBarSlot::SleepTimer | StatusBarSlot::More => true,
     }
 }
 
@@ -612,6 +614,16 @@ fn candidates(
             Candidate::fixed(StatusBarSlot::Download, text),
             Style::new()
                 .fg(crate::theme::teal(ctx))
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // 睡眠定时器启用时紧随其后展示倒计时；点击打开定时器菜单。
+    if let Some(label) = ctx.sleep_timer.status_label() {
+        out.push((
+            Candidate::fixed(StatusBarSlot::SleepTimer, label),
+            Style::new()
+                .fg(crate::theme::sapphire(ctx))
                 .bg(background)
                 .add_modifier(Modifier::BOLD),
         ));

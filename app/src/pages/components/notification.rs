@@ -230,10 +230,12 @@ fn render_toast(
     }
     lines.push(Line::from(notification.message.as_str()));
     // action 按钮只画在最新一条上：旧条目的按钮不可点（见 action_url_at）。
-    if layout.has_action && let (Some(label), Some(_)) = (
-        notification.action_label.as_ref(),
-        notification.action_url.as_ref(),
-    ) {
+    if layout.has_action
+        && let (Some(label), Some(_)) = (
+            notification.action_label.as_ref(),
+            notification.action_url.as_ref(),
+        )
+    {
         lines.push(Line::from(Span::styled(
             format!("[ {label} ]"),
             Style::new().fg(level_color),

@@ -367,6 +367,43 @@ impl Storage {
         Ok(automatic_backup)
     }
 
+    /// Export a custom playlist as an M3U8 (UTF-8) file.
+    ///
+    /// Local songs are written as absolute file paths; online songs have no
+    /// stable stream URL to persist, so they get a `voicefox:<source>:<id>`
+    /// URI — other players will skip them, and voicefox's own importer keeps
+    /// the identity line readable for debugging.
+    pub fn export_custom_playlist(&self, playlist_id: &str, path: &Path) -> Result<usize, String> {
+        let playlist = self
+            .custom_playlist(playlist_id)
+            .ok_or_else(|| "歌单不存在".to_string())?;
+        if playlist.songs.is_empty() {
+            return Err("歌单为空，没有可导出的歌曲".to_string());
+        }
+        let mut out = String::from("#EXTM3U\n");
+        for song in &playlist.songs {
+            let label = if song.singer.trim().is_empty() {
+                song.name.clone()
+            } else {
+                format!("{} - {}", song.singer, song.name)
+            };
+            out.push_str(&format!("#EXTINF:{},{}\n", song.duration.as_secs(), label));
+            let location = song
+                .file_path
+                .as_ref()
+                .filter(|value| !value.as_os_str().is_empty())
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("voicefox:{}:{}", song.source.as_str(), song.id));
+            out.push_str(&location);
+            out.push('\n');
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建导出目录失败: {error}"))?;
+        }
+        fs::write(path, out).map_err(|error| format!("写入文件失败: {error}"))?;
+        Ok(playlist.songs.len())
+    }
+
     /// Import an M3U/M3U8, LX Music JSON, or NetEase playlist export into a
     /// new custom playlist. Local entries reuse the local source's lofty
     /// metadata reader; online entries retain their source/id and therefore
@@ -2107,6 +2144,48 @@ mod tests {
         assert_eq!(songs.len(), 1);
         assert_eq!(songs[0].source, SourceId::Wy);
         assert_eq!(songs[0].id, "42");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exports_custom_playlist_as_m3u() {
+        let root = std::env::temp_dir().join(format!(
+            "voicefox-playlist-export-test-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = Storage {
+            data_dir: root.clone(),
+            favorites: RwLock::new(Vec::new()),
+            favorite_playlists: RwLock::new(Vec::new()),
+            custom_playlists: RwLock::new(Vec::new()),
+            history: RwLock::new(Vec::new()),
+            custom_playlists_update: std::sync::Mutex::new(()),
+            generation: AtomicU64::new(0),
+        };
+        let playlist = storage.create_custom_playlist("export-me").unwrap();
+        let mut song = SongInfo::new("1".into(), SourceId::Local, "Local song".into(), "A".into());
+        song.duration = std::time::Duration::from_secs(200);
+        song.file_path = Some(root.join("music.flac"));
+        storage
+            .add_songs_to_custom_playlist(&playlist.id, &[song])
+            .unwrap();
+
+        let out = root.join("out").join("mix.m3u");
+        let exported = storage.export_custom_playlist(&playlist.id, &out).unwrap();
+        assert_eq!(exported, 1);
+        let content = std::fs::read_to_string(&out).unwrap();
+        let mut lines = content.lines();
+        assert_eq!(lines.next(), Some("#EXTM3U"));
+        assert_eq!(lines.next(), Some("#EXTINF:200,A - Local song"));
+        // 本地歌曲写绝对路径，保证导出的列表在别的播放器也能直接打开。
+        let location = lines.next().unwrap();
+        assert!(location.ends_with("music.flac"), "got {location}");
+        assert!(std::path::Path::new(location).is_absolute());
+
+        // 不存在的歌单要报错而不是写空文件。
+        assert!(storage.export_custom_playlist("no-such-id", &out).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 

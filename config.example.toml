@@ -59,6 +59,8 @@ timeout = 15                # HTTP 超时秒数
 # name = "tokyo-night"
 
 [ui]
+visualizer = "off"          # 频谱可视化：off / bars（Linux 采集系统音频监视流）
+visualizer_style = "classic"  # classic / modern（cava 风格 / 紧凑现代风）
 enable_mouse = true
 wrap_navigation = true
 scroll_amount = 3
@@ -95,6 +97,7 @@ trackChange = true          # 切歌时发送桌面通知
 
 [integration]
 mpris = true                # Linux MPRIS / Waybar / 媒体键，修改后重启生效
+smtc = true                 # Windows SMTC / 硬件媒体键 / 系统媒体浮层，修改后重启生效
 
 [local_music]
 enabled = true

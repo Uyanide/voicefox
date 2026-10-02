@@ -140,6 +140,12 @@ pub enum AppAction {
     SyncNetease,
     /// 与 QQ 音乐账号进行双向增量同步（仅增加，不自动删除）。
     SyncQq,
+    /// 把本地自建歌单推送到远端音源（写回，追加不删除）。
+    PushLocalPlaylist {
+        playlist_id: String,
+    },
+    /// 把本地收藏（红心）推送到远端音源的“我喜欢”（写回，追加不删除）。
+    PushFavorites,
     /// 打开歌手详情页（从歌曲右键菜单进入）。
     ShowArtistDetails(Box<SongInfo>),
     /// 打开专辑详情页（从歌曲右键菜单或歌手页专辑列表进入）。

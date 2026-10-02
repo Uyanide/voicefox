@@ -44,11 +44,7 @@ pub fn current(path: Option<&str>) -> Option<[u8; 3]> {
     let path = path?;
     let slot = COVER_ACCENT.lock().ok()?;
     let (stored, accent) = slot.as_ref()?;
-    if stored == path {
-        *accent
-    } else {
-        None
-    }
+    if stored == path { *accent } else { None }
 }
 
 /// 提取封面主色：按 Oklch 色相分桶投票，权重偏向「饱和、中等明度」的色族，
@@ -74,10 +70,7 @@ pub fn dominant_color(image: &image::DynamicImage) -> Option<[u8; 3]> {
             f32::from(b) / 255.0,
         );
         let oklch = Oklch::from_color(srgb);
-        if oklch.chroma < MIN_CHROMA
-            || oklch.l < MIN_LIGHTNESS
-            || oklch.l > MAX_LIGHTNESS
-        {
+        if oklch.chroma < MIN_CHROMA || oklch.l < MIN_LIGHTNESS || oklch.l > MAX_LIGHTNESS {
             continue;
         }
         let hue = oklch.hue.into_positive_degrees();
@@ -113,11 +106,17 @@ fn normalize(rgb: [u8; 3]) -> [u8; 3] {
         f32::from(rgb[2]) / 255.0,
     );
     let mut oklch = Oklch::from_color(srgb);
-    oklch.l = oklch.l.clamp(NORMALIZED_LIGHTNESS.0, NORMALIZED_LIGHTNESS.1);
+    oklch.l = oklch
+        .l
+        .clamp(NORMALIZED_LIGHTNESS.0, NORMALIZED_LIGHTNESS.1);
     oklch.chroma = oklch.chroma.clamp(NORMALIZED_CHROMA.0, NORMALIZED_CHROMA.1);
     let vivid = Srgb::from_color(oklch);
     let channel = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u8;
-    [channel(vivid.red), channel(vivid.green), channel(vivid.blue)]
+    [
+        channel(vivid.red),
+        channel(vivid.green),
+        channel(vivid.blue),
+    ]
 }
 
 #[cfg(test)]
@@ -125,11 +124,9 @@ mod tests {
     use super::*;
 
     fn solid(width: u32, height: u32, rgb: [u8; 3]) -> image::DynamicImage {
-        image::DynamicImage::ImageRgba8(
-            image::RgbaImage::from_fn(width, height, |_, _| {
-                image::Rgba([rgb[0], rgb[1], rgb[2], 255])
-            }),
-        )
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(width, height, |_, _| {
+            image::Rgba([rgb[0], rgb[1], rgb[2], 255])
+        }))
     }
 
     #[test]

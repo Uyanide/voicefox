@@ -43,7 +43,11 @@ pub fn normalize_karaoke_text(content: &str) -> String {
         .replace('|', "\n")
         .lines()
         // XML 包装的收尾残留（`"/>` 或游离引号）不属于歌词正文
-        .map(|line| line.trim().trim_end_matches(['"', '\'', '/', '>', '\\']).trim_end())
+        .map(|line| {
+            line.trim()
+                .trim_end_matches(['"', '\'', '/', '>', '\\'])
+                .trim_end()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -89,10 +93,10 @@ mod tests {
     #[test]
     fn detects_karaoke_markup_in_every_known_flavour() {
         assert!(looks_like_karaoke("[0,4810]<0,210,0>You <220,350,0>ready"));
-        assert!(looks_like_karaoke("[3380,3388](3380,847,0)词(4227,847,0)许"));
         assert!(looks_like_karaoke(
-            "LyricContent=\"[0,4810]<0,210,0>You\""
+            "[3380,3388](3380,847,0)词(4227,847,0)许"
         ));
+        assert!(looks_like_karaoke("LyricContent=\"[0,4810]<0,210,0>You\""));
         assert!(looks_like_karaoke("[00:01.00]<00:01.00>你<00:01.50>好"));
         assert!(looks_like_karaoke("[21456,2914]<0,146,0>牵<146,135,0>着"));
     }
@@ -116,7 +120,11 @@ mod tests {
         assert_eq!(parsed[0].words[0].text, "You ");
         assert_eq!(parsed[0].words[0].start, 0);
         assert_eq!(
-            parsed[1].words.iter().map(|word| word.text.as_str()).collect::<String>(),
+            parsed[1]
+                .words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<String>(),
             "C'mon Yo"
         );
     }

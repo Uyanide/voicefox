@@ -573,7 +573,12 @@ impl CoverCapabilities {
     #[cfg(test)]
     pub fn correction_note(&self) -> Option<String> {
         (!self.can_render(self.active)).then(|| {
-            let names: Vec<&str> = self.supported().iter().copied().map(protocol_label).collect();
+            let names: Vec<&str> = self
+                .supported()
+                .iter()
+                .copied()
+                .map(protocol_label)
+                .collect();
             format!(
                 "本终端不支持该协议，已改用 {}；可选 {}",
                 protocol_label(self.active),
@@ -585,7 +590,11 @@ impl CoverCapabilities {
     /// 能力表的展示文案（仅测试断言用）。
     #[cfg(test)]
     pub fn supported_labels(&self) -> Vec<&'static str> {
-        self.supported().iter().copied().map(protocol_label).collect()
+        self.supported()
+            .iter()
+            .copied()
+            .map(protocol_label)
+            .collect()
     }
 }
 
@@ -960,7 +969,8 @@ mod tests {
         use super::{CoverCapabilities, ProtocolType};
 
         // kitty 终端：只认自己的协议 + 保底半格
-        let kitty = CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
+        let kitty =
+            CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
         assert_eq!(kitty.supported_labels(), ["kitty", "halfblocks"]);
         assert!(kitty.can_render(ProtocolType::Kitty));
         assert!(!kitty.can_render(ProtocolType::Sixel));
@@ -976,7 +986,8 @@ mod tests {
             "循环要能绕回来"
         );
         // 配错时给出可读原因（含"可选哪些"）
-        let corrected = CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Iterm2);
+        let corrected =
+            CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Iterm2);
         assert!(!corrected.can_render(ProtocolType::Iterm2));
         let note = corrected.correction_note().expect("配错必须有说明");
         assert!(note.contains("iterm2") && note.contains("kitty"), "{note}");
@@ -984,9 +995,13 @@ mod tests {
         assert!(kitty.correction_note().is_none());
 
         // iTerm2 终端：iterm2 有效，kitty 协议无效
-        let iterm = CoverCapabilities::from_detected(Some(ProtocolType::Iterm2), ProtocolType::Iterm2);
+        let iterm =
+            CoverCapabilities::from_detected(Some(ProtocolType::Iterm2), ProtocolType::Iterm2);
         assert_eq!(iterm.supported_labels(), ["iterm2", "halfblocks"]);
-        assert_eq!(iterm.next_supported(ProtocolType::Iterm2), ProtocolType::Halfblocks);
+        assert_eq!(
+            iterm.next_supported(ProtocolType::Iterm2),
+            ProtocolType::Halfblocks
+        );
         assert!(!iterm.can_render(ProtocolType::Sixel));
 
         // 认不出终端：只有 halfblocks 敢保证画得出来
@@ -1007,7 +1022,10 @@ mod tests {
         assert_eq!(protocol_from_config("kitty"), Some(ProtocolType::Kitty));
         assert_eq!(protocol_from_config("Iterm2"), Some(ProtocolType::Iterm2));
         assert_eq!(protocol_from_config("sixel"), Some(ProtocolType::Sixel));
-        assert_eq!(protocol_from_config("halfblocks"), Some(ProtocolType::Halfblocks));
+        assert_eq!(
+            protocol_from_config("halfblocks"),
+            Some(ProtocolType::Halfblocks)
+        );
         assert_eq!(protocol_from_config("auto"), None);
         assert_eq!(protocol_from_config(""), None);
         assert_eq!(protocol_from_config("nonsense"), None);
@@ -1019,7 +1037,10 @@ mod tests {
             ProtocolType::Iterm2,
             ProtocolType::Halfblocks,
         ] {
-            assert_eq!(protocol_from_config(protocol_label(protocol)), Some(protocol));
+            assert_eq!(
+                protocol_from_config(protocol_label(protocol)),
+                Some(protocol)
+            );
         }
     }
 
@@ -1031,10 +1052,7 @@ mod tests {
     fn unsupported_protocols_are_corrected_on_kitty_terminals() {
         use super::{ProtocolType, corrected_protocol};
 
-        for configured in [
-            ProtocolType::Sixel,
-            ProtocolType::Iterm2,
-        ] {
+        for configured in [ProtocolType::Sixel, ProtocolType::Iterm2] {
             assert_eq!(
                 corrected_protocol(configured, true),
                 ProtocolType::Kitty,

@@ -530,10 +530,12 @@ impl DetailsPage {
     fn page_down(&mut self, step: usize) {
         match self.focus {
             DetailsFocus::Albums => {
-                self.selected_album = (self.selected_album + step).min(self.albums.len().saturating_sub(1));
+                self.selected_album =
+                    (self.selected_album + step).min(self.albums.len().saturating_sub(1));
             }
             DetailsFocus::Songs => {
-                self.selected_song = (self.selected_song + step).min(self.songs.len().saturating_sub(1));
+                self.selected_song =
+                    (self.selected_song + step).min(self.songs.len().saturating_sub(1));
             }
         }
     }

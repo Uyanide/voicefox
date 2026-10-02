@@ -84,9 +84,7 @@ pub fn login_health() -> LoginHealth {
 
 /// 账号显示名（登录成功或会话验证通过时保存的昵称）。
 pub fn account_display() -> Option<String> {
-    snapshot()
-        .user_name
-        .filter(|name| !name.trim().is_empty())
+    snapshot().user_name.filter(|name| !name.trim().is_empty())
 }
 
 /// 接口返回「需要登录」时记录会话失效。

@@ -31,11 +31,7 @@ pub struct HelpPage {
 
 impl HelpPage {
     /// 从实际生效的键位配置构建浮层内容。
-    pub fn from_config(
-        config: &KeybindingConfig,
-        page_step: usize,
-        scroll_amount: usize,
-    ) -> Self {
+    pub fn from_config(config: &KeybindingConfig, page_step: usize, scroll_amount: usize) -> Self {
         let mut sections = Vec::new();
 
         let mut global: Vec<(String, &'static str)> = config

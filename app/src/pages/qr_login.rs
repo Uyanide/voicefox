@@ -219,9 +219,7 @@ impl QrLoginPage {
         self.polling = false;
         if self.regenerations >= MAX_AUTO_REGENERATIONS {
             self.state = QrLoginState::Error {
-                message: format!(
-                    "{reason}，已自动刷新 {MAX_AUTO_REGENERATIONS} 次，按 R 重新生成"
-                ),
+                message: format!("{reason}，已自动刷新 {MAX_AUTO_REGENERATIONS} 次，按 R 重新生成"),
             };
             return;
         }
@@ -408,10 +406,7 @@ impl QrLoginPage {
                 centered(
                     body,
                     buf,
-                    vec![Line::from(Span::styled(
-                        text,
-                        Style::new().fg(yellow),
-                    ))],
+                    vec![Line::from(Span::styled(text, Style::new().fg(yellow)))],
                 )
             }
             QrLoginState::Waiting {

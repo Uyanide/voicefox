@@ -15,8 +15,8 @@ use lx_core::traits::player::{
 };
 
 use crate::cover::CoverService;
-use crate::fmt::format_duration;
 use crate::download::DownloadManager;
+use crate::fmt::format_duration;
 use crate::notification::DesktopNotifier;
 use crate::playlist::manager::PlaylistManager;
 use crate::storage::{SavedPlayerState, Storage};
@@ -81,6 +81,10 @@ pub struct AppContext {
 
     // --- 存储 ---
     pub storage: Arc<Storage>,
+
+    // --- 睡眠定时器 ---
+    /// 倒计时到点后淡出并暂停；由主循环周期 poll 推进，状态栏与菜单只读。
+    pub sleep_timer: Arc<crate::sleep_timer::SleepTimerState>,
 }
 
 /// 单个 JS 音源的加载失败记录。
@@ -229,6 +233,7 @@ impl AppContext {
             notifications: std::sync::RwLock::new(VecDeque::new()),
             desktop_notifier: DesktopNotifier::new(),
             storage,
+            sleep_timer: Arc::new(crate::sleep_timer::SleepTimerState::new()),
         })
     }
 
@@ -247,7 +252,6 @@ impl AppContext {
     }
 
     /// 当前进度纪元，变化即代表期间发生过跳转。
-    #[cfg(target_os = "linux")]
     pub fn position_epoch(&self) -> u64 {
         self.position_epoch.load(Ordering::Relaxed)
     }

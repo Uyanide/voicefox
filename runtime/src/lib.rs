@@ -12,8 +12,8 @@ use voicefox_application::{ApplicationService, PlaybackEffects};
 mod cover;
 pub mod storage;
 pub use cover::{CoverService, CoverState, is_usable_remote_url, sweep_temp_files};
-pub use voicefox_application::resolve_cover_url;
 pub use storage::{SavedPlayerState, Storage};
+pub use voicefox_application::resolve_cover_url;
 
 struct RuntimePlaybackEffects {
     storage: Arc<Storage>,

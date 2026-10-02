@@ -1,5 +1,7 @@
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use lx_core::model::config::TableColumnConfig;
 use lx_core::model::song::SongInfo;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -64,13 +66,92 @@ pub struct ResolvedColumn {
 }
 
 /// 一次列宽拖拽的会话状态。
-///
-/// 只记录拖拽起点和当前正在调整的分隔线：每次鼠标拖动都用
-/// [`adjust_widths`] 在当前列宽上做增量，所以不需要缓存"拖拽前的宽度"。
 #[derive(Debug, Clone)]
 pub struct ColumnResizeState {
-    pub start_local_x: u16,
-    pub boundary_index: usize,
+    start_x: u16,
+    boundary_index: usize,
+    starting_columns: Vec<TableColumnConfig>,
+}
+
+impl ColumnResizeState {
+    fn begin(
+        columns: &[TableColumnConfig],
+        boundary_index: usize,
+        total_width: u16,
+        start_x: u16,
+    ) -> Self {
+        let mut starting_columns = columns.to_vec();
+        for resolved in compute_layout(columns, total_width) {
+            let column = &mut starting_columns[resolved.original_index];
+            column.width = resolved.width.clamp(column.min_width, column.max_width);
+        }
+        Self {
+            start_x,
+            boundary_index,
+            starting_columns,
+        }
+    }
+
+    fn resized_columns(&self, total_width: u16, pointer_x: u16) -> Vec<TableColumnConfig> {
+        adjust_widths(
+            &self.starting_columns,
+            self.boundary_index,
+            total_width,
+            i32::from(pointer_x) - i32::from(self.start_x),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnResizeOutcome {
+    NotHandled,
+    Updated,
+    Finished,
+}
+
+/// 在所有歌曲表格页面共用列宽拖拽事件处理。
+pub fn handle_column_resize(
+    state: &mut Option<ColumnResizeState>,
+    columns: &mut Vec<TableColumnConfig>,
+    event: MouseEvent,
+    header: Option<Rect>,
+    inner: Rect,
+) -> ColumnResizeOutcome {
+    if let Some(resize) = state.as_ref() {
+        // 终端和平台对“按住拖动”的事件分发并不一致：有些会发 `Drag`，
+        // 有些则直接持续发 `Moved`。两者都要实时更新，才能避免“拖住了但列宽不动”的错觉。
+        return match event.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                *columns = resize.resized_columns(inner.width, event.column);
+                ColumnResizeOutcome::Updated
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                *state = None;
+                ColumnResizeOutcome::Finished
+            }
+            _ => ColumnResizeOutcome::Updated,
+        };
+    }
+
+    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+        && header.is_some_and(|header| header.contains(Position::new(event.column, event.row)))
+    {
+        let local_x = event.column.saturating_sub(inner.x);
+        if let Some(boundary) = find_boundary(columns, inner.width, local_x) {
+            let layout = compute_layout(columns, inner.width);
+            if boundary + 1 < layout.len() {
+                *state = Some(ColumnResizeState::begin(
+                    columns,
+                    boundary,
+                    inner.width,
+                    event.column,
+                ));
+                return ColumnResizeOutcome::Updated;
+            }
+        }
+    }
+
+    ColumnResizeOutcome::NotHandled
 }
 
 pub fn adjust_widths(
@@ -143,7 +224,17 @@ pub fn load_columns_for_page(
                 .collect::<Vec<_>>()
         })
         .filter(|cs| !cs.is_empty())
-        .unwrap_or_else(|| default_columns(width))
+        .unwrap_or_else(|| default_columns_for_page(page_key, width))
+}
+
+/// 页面级默认列：本地音乐页的「来源」列恒为「本地」，信息熵为零，
+/// 默认隐藏（用户显式配置过该页列时尊重用户配置）。
+fn default_columns_for_page(page_key: &str, width: u16) -> Vec<TableColumnConfig> {
+    if page_key == "local_music" {
+        default_local_columns(width)
+    } else {
+        default_columns(width)
+    }
 }
 
 /// 校正单列配置，返回 `None` 表示这行配置应被丢弃。
@@ -168,6 +259,21 @@ pub fn default_columns(width: u16) -> Vec<TableColumnConfig> {
     } else {
         default_narrow(width)
     }
+}
+
+fn default_local_columns(width: u16) -> Vec<TableColumnConfig> {
+    let mut columns = default_columns(width);
+    for column in &mut columns {
+        if column.key == "duration" {
+            column.key = "duration_quality".to_string();
+            column.label = "播放".to_string();
+            column.width = 12;
+            column.min_width = 8;
+            column.max_width = 16;
+        }
+    }
+    columns.retain(|column| column.key != "quality" && column.key != "source");
+    columns
 }
 
 fn default_wide() -> Vec<TableColumnConfig> {
@@ -320,7 +426,7 @@ pub enum CellAlign {
 /// 该列是否按数字右对齐（`#` 与 `时长`）。
 fn align_for_key(key: &str) -> CellAlign {
     match key {
-        "index" | "duration" => CellAlign::Right,
+        "index" | "duration" | "duration_quality" => CellAlign::Right,
         _ => CellAlign::Left,
     }
 }
@@ -403,6 +509,14 @@ fn row_line(
         crate::fmt::format_duration(song.duration)
     };
     let quality_text = song.quality_label();
+    let duration_quality_text = if song.duration.is_zero() {
+        format!("--:-- · {quality_text}")
+    } else {
+        format!(
+            "{} · {quality_text}",
+            crate::fmt::format_duration(song.duration)
+        )
+    };
     // 显示中文名（网易云/酷我…）而不是原始代号 wy/kw——代号只用于配置与日志。
     let source_text = song.source.display_name();
 
@@ -417,6 +531,7 @@ fn row_line(
             "album" => &song.album_name,
             "duration" => &duration_text,
             "quality" => &quality_text,
+            "duration_quality" => &duration_quality_text,
             "source" => source_text,
             _ => "",
         };
@@ -482,6 +597,7 @@ pub fn auto_fit_columns(
                 "album" => song.album_name.clone(),
                 "duration" => "00:00".to_string(),
                 "quality" => song.quality_label(),
+                "duration_quality" => format!("00:00 · {}", song.quality_label()),
                 "source" => song.source.display_name().to_string(),
                 _ => String::new(),
             };
@@ -555,12 +671,10 @@ fn column_emphasis(key: &str) -> Modifier {
     match key {
         "name" => Modifier::BOLD,
         "singer" => Modifier::empty(),
-        "album" | "source" | "quality" | "index" | "duration" => Modifier::DIM,
+        "album" | "source" | "quality" | "index" | "duration" | "duration_quality" => Modifier::DIM,
         _ => Modifier::empty(),
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -598,6 +712,54 @@ mod tests {
     }
 
     #[test]
+    fn resizing_tracks_pointer_when_columns_are_stretched_to_fit() {
+        let columns = default_columns(100);
+        let before = compute_layout(&columns, 100);
+        let state = ColumnResizeState::begin(&columns, 1, 100, 50);
+
+        let resized = state.resized_columns(100, 55);
+        let after = compute_layout(&resized, 100);
+
+        assert_eq!(after[1].width, before[1].width + 5);
+        assert_eq!(after[2].width, before[2].width - 5);
+    }
+
+    #[test]
+    fn live_moved_events_keep_table_resize_in_sync_with_the_pointer() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut columns = default_columns(100);
+        let mut state = None;
+        let header = Some(Rect::new(0, 0, 100, 1));
+        let inner = Rect::new(0, 0, 100, 1);
+        let layout = compute_layout(&columns, 100);
+        let boundary = layout[1].start_x + layout[1].width;
+
+        let begin = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: boundary,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            handle_column_resize(&mut state, &mut columns, begin, header, inner),
+            ColumnResizeOutcome::Updated
+        );
+        assert!(state.is_some());
+
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: boundary + 5,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        let before = columns.clone();
+        let outcome = handle_column_resize(&mut state, &mut columns, moved, header, inner);
+        assert_eq!(outcome, ColumnResizeOutcome::Updated);
+        assert_ne!(columns, before, "连续的 Moved 事件必须实时更新列宽");
+    }
+
+    #[test]
     fn truncates_cjk_to_terminal_width() {
         let value = cell_aligned("一首很长的中文歌曲", 8, CellAlign::Left);
         assert_eq!(UnicodeWidthStr::width(value.as_str()), 8);
@@ -616,6 +778,36 @@ mod tests {
 
     /// 关键不变量：加了分隔符之后，一行的**显示宽度必须仍等于传入宽度**。
     /// 否则表头/数据行会撑破布局，命中测试也会跟着错位。
+    #[test]
+    fn local_defaults_combine_duration_and_quality() {
+        let columns = super::default_columns_for_page("local_music", 120);
+        assert!(columns.iter().any(|c| c.key == "duration_quality"));
+        assert!(!columns.iter().any(|c| c.key == "duration"));
+        assert!(!columns.iter().any(|c| c.key == "quality"));
+        assert!(!columns.iter().any(|c| c.key == "source"));
+        let playback = columns
+            .iter()
+            .find(|c| c.key == "duration_quality")
+            .unwrap();
+        assert_eq!(playback.label, "播放");
+        assert_eq!(playback.width, 12);
+    }
+
+    #[test]
+    fn duration_quality_renders_duration_and_quality_together() {
+        let columns = vec![TableColumnConfig {
+            key: "duration_quality".to_string(),
+            label: "播放".to_string(),
+            visible: true,
+            width: 16,
+            min_width: 8,
+            max_width: 16,
+        }];
+        let row = flatten(&row_line(&song(), 0, 16, &columns, palette()));
+        assert!(row.contains("4:29") || row.contains("04:29"));
+        assert!(row.contains("·"));
+    }
+
     #[test]
     fn rendered_width_always_matches_the_requested_width() {
         for width in [24u16, 40, 64, 80, 96, 120, 200] {
@@ -808,7 +1000,14 @@ mod tests {
     fn columns_have_a_visual_hierarchy_without_hardcoding_colors() {
         assert_eq!(column_emphasis("name"), Modifier::BOLD, "歌名是主列");
         assert_eq!(column_emphasis("singer"), Modifier::empty(), "歌手不压暗");
-        for key in ["album", "source", "quality", "index", "duration"] {
+        for key in [
+            "album",
+            "source",
+            "quality",
+            "index",
+            "duration",
+            "duration_quality",
+        ] {
             assert_eq!(
                 column_emphasis(key),
                 Modifier::DIM,

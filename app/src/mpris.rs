@@ -1,161 +1,26 @@
 //! Linux MPRIS 服务，供 Waybar、桌面媒体键和播放器控件使用。
+//!
+//! 快照 / 命令的数据结构在 [`crate::media_session`]（与 Windows SMTC 共用），
+//! 这里只做 zbus 协议翻译：把 [`MediaSnapshot`] 映射到 org.mpris.MediaPlayer2
+//! 属性，把桌面发来的 D-Bus 调用转成 [`MediaCommand`]。
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-use lx_core::model::song::SongInfo;
-use lx_core::model::source::PlayerState;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
+use crate::media_session::{MediaCommand, MediaHandle, MediaSnapshot};
+
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 
-#[derive(Debug, Clone)]
-pub enum MprisCommand {
-    Quit,
-    Play,
-    Pause,
-    Toggle,
-    Stop,
-    Next,
-    Previous,
-    SeekBy(i64),
-    SetPosition(Duration),
-    SetVolume(f64),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct MprisSnapshot {
-    playback_status: &'static str,
-    loop_status: &'static str,
-    shuffle: bool,
-    track_path: String,
-    title: String,
-    artist: String,
-    album: String,
-    art_url: String,
-    source_url: String,
-    duration_micros: i64,
-    position_micros: i64,
-    /// 当前进度所属的连续时间线，跳转会递增
-    position_epoch: u64,
-    volume: f64,
-    can_go_next: bool,
-    can_go_previous: bool,
-}
-
-impl Default for MprisSnapshot {
-    fn default() -> Self {
-        Self {
-            playback_status: "Stopped",
-            loop_status: "None",
-            shuffle: false,
-            track_path: "/org/mpris/MediaPlayer2/TrackList/NoTrack".to_string(),
-            title: String::new(),
-            artist: String::new(),
-            album: String::new(),
-            art_url: String::new(),
-            source_url: String::new(),
-            duration_micros: 0,
-            position_micros: 0,
-            position_epoch: 0,
-            volume: 0.8,
-            can_go_next: false,
-            can_go_previous: false,
-        }
-    }
-}
-
-impl MprisSnapshot {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        state: PlayerState,
-        song: Option<&SongInfo>,
-        position: Duration,
-        duration: Duration,
-        volume: u32,
-        play_mode: crate::playlist::mode::PlayMode,
-        queue_len: usize,
-        position_epoch: u64,
-    ) -> Self {
-        let playback_status = match state {
-            PlayerState::Playing | PlayerState::Loading => "Playing",
-            PlayerState::Paused => "Paused",
-            PlayerState::Idle | PlayerState::Stopped => "Stopped",
-        };
-        let loop_status = match play_mode {
-            crate::playlist::mode::PlayMode::SingleLoop => "Track",
-            crate::playlist::mode::PlayMode::ListLoop => "Playlist",
-            _ => "None",
-        };
-        let shuffle = play_mode == crate::playlist::mode::PlayMode::Random;
-        let mut snapshot = Self {
-            playback_status,
-            loop_status,
-            shuffle,
-            position_micros: micros(position),
-            position_epoch,
-            duration_micros: micros(duration),
-            volume: f64::from(volume.min(100)) / 100.0,
-            // 队列只有一首时列表循环仍可“下一首”，因此只要在播放就报告可用
-            can_go_next: queue_len > 0,
-            can_go_previous: queue_len > 0,
-            ..Self::default()
-        };
-
-        if let Some(song) = song {
-            snapshot.track_path = track_path(song);
-            snapshot.title = song.name.clone();
-            snapshot.artist = song.singer.clone();
-            snapshot.album = song.album_name.clone();
-            snapshot.art_url = song.cover_url.as_deref().map_or_else(String::new, art_url);
-            snapshot.source_url = song.file_path.as_deref().map_or_else(String::new, file_url);
-            if snapshot.duration_micros == 0 {
-                snapshot.duration_micros = micros(song.duration);
-            }
-        }
-
-        snapshot
-    }
-
-    fn can_play(&self) -> bool {
-        !self.title.is_empty()
-    }
-
-    fn can_seek(&self) -> bool {
-        self.duration_micros > 0
-    }
-
-    fn metadata_changed(&self, other: &Self) -> bool {
-        self.track_path != other.track_path
-            || self.title != other.title
-            || self.artist != other.artist
-            || self.album != other.album
-            || self.art_url != other.art_url
-            || self.source_url != other.source_url
-            || self.duration_micros != other.duration_micros
-    }
-}
-
-#[derive(Clone)]
-pub struct MprisHandle {
-    update_tx: tokio::sync::mpsc::UnboundedSender<MprisSnapshot>,
-}
-
-impl MprisHandle {
-    pub fn update(&self, snapshot: MprisSnapshot) {
-        let _ = self.update_tx.send(snapshot);
-    }
-}
-
 pub async fn start() -> anyhow::Result<(
-    MprisHandle,
-    tokio::sync::mpsc::UnboundedReceiver<MprisCommand>,
+    MediaHandle,
+    tokio::sync::mpsc::UnboundedReceiver<MediaCommand>,
 )> {
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
-    let initial = MprisSnapshot::default();
+    let (handle, update_rx) = crate::media_session::channel();
+    let initial = MediaSnapshot::default();
     let root = MediaPlayer2 {
         command_tx: command_tx.clone(),
     };
@@ -180,11 +45,11 @@ pub async fn start() -> anyhow::Result<(
         }
     });
 
-    Ok((MprisHandle { update_tx }, command_rx))
+    Ok((handle, command_rx))
 }
 
 struct MediaPlayer2 {
-    command_tx: tokio::sync::mpsc::UnboundedSender<MprisCommand>,
+    command_tx: tokio::sync::mpsc::UnboundedSender<MediaCommand>,
 }
 
 #[zbus::interface(name = "org.mpris.MediaPlayer2")]
@@ -192,7 +57,7 @@ impl MediaPlayer2 {
     fn raise(&self) {}
 
     fn quit(&self) {
-        let _ = self.command_tx.send(MprisCommand::Quit);
+        let _ = self.command_tx.send(MediaCommand::Quit);
     }
 
     #[zbus(property)]
@@ -232,38 +97,38 @@ impl MediaPlayer2 {
 }
 
 struct MprisPlayer {
-    command_tx: tokio::sync::mpsc::UnboundedSender<MprisCommand>,
-    state: MprisSnapshot,
+    command_tx: tokio::sync::mpsc::UnboundedSender<MediaCommand>,
+    state: MediaSnapshot,
 }
 
 #[zbus::interface(name = "org.mpris.MediaPlayer2.Player")]
 impl MprisPlayer {
     fn next(&self) {
-        let _ = self.command_tx.send(MprisCommand::Next);
+        let _ = self.command_tx.send(MediaCommand::Next);
     }
 
     fn previous(&self) {
-        let _ = self.command_tx.send(MprisCommand::Previous);
+        let _ = self.command_tx.send(MediaCommand::Previous);
     }
 
     fn pause(&self) {
-        let _ = self.command_tx.send(MprisCommand::Pause);
+        let _ = self.command_tx.send(MediaCommand::Pause);
     }
 
     fn play_pause(&self) {
-        let _ = self.command_tx.send(MprisCommand::Toggle);
+        let _ = self.command_tx.send(MediaCommand::Toggle);
     }
 
     fn stop(&self) {
-        let _ = self.command_tx.send(MprisCommand::Stop);
+        let _ = self.command_tx.send(MediaCommand::Stop);
     }
 
     fn play(&self) {
-        let _ = self.command_tx.send(MprisCommand::Play);
+        let _ = self.command_tx.send(MediaCommand::Play);
     }
 
     fn seek(&self, offset: i64) {
-        let _ = self.command_tx.send(MprisCommand::SeekBy(offset));
+        let _ = self.command_tx.send(MediaCommand::SeekBy(offset));
     }
 
     fn set_position(&self, track_id: OwnedObjectPath, position: i64) {
@@ -275,7 +140,7 @@ impl MprisPlayer {
         }
         let _ = self
             .command_tx
-            .send(MprisCommand::SetPosition(Duration::from_micros(
+            .send(MediaCommand::SetPosition(Duration::from_micros(
                 position as u64,
             )));
     }
@@ -356,7 +221,7 @@ impl MprisPlayer {
     fn set_volume(&self, volume: f64) {
         let _ = self
             .command_tx
-            .send(MprisCommand::SetVolume(volume.clamp(0.0, 1.0)));
+            .send(MediaCommand::SetVolume(volume.clamp(0.0, 1.0)));
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
@@ -410,7 +275,7 @@ impl MprisPlayer {
 
 async fn run_updates(
     connection: zbus::Connection,
-    mut update_rx: tokio::sync::mpsc::UnboundedReceiver<MprisSnapshot>,
+    mut update_rx: tokio::sync::mpsc::UnboundedReceiver<MediaSnapshot>,
 ) -> zbus::Result<()> {
     while let Some(snapshot) = update_rx.recv().await {
         // 单次更新失败（如 D-Bus 瞬断）只记录日志并继续，避免更新循环
@@ -424,7 +289,7 @@ async fn run_updates(
 
 async fn apply_snapshot(
     connection: &zbus::Connection,
-    snapshot: MprisSnapshot,
+    snapshot: MediaSnapshot,
 ) -> zbus::Result<()> {
     {
         let interface_ref = connection
@@ -469,70 +334,4 @@ async fn apply_snapshot(
         }
     }
     Ok(())
-}
-
-fn micros(duration: Duration) -> i64 {
-    duration.as_micros().min(i64::MAX as u128) as i64
-}
-
-fn track_path(song: &SongInfo) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    song.source.hash(&mut hasher);
-    song.id.hash(&mut hasher);
-    format!("/org/mpris/MediaPlayer2/track/{}", hasher.finish())
-}
-
-fn art_url(value: &str) -> String {
-    if value.starts_with('/') {
-        file_url(std::path::Path::new(value))
-    } else {
-        value.to_string()
-    }
-}
-
-fn file_url(path: &std::path::Path) -> String {
-    format!("file://{}", path.to_string_lossy())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{MprisSnapshot, art_url, track_path};
-    use lx_core::model::song::SongInfo;
-    use lx_core::model::source::{PlayerState, SourceId};
-    use std::time::Duration;
-
-    #[test]
-    fn snapshot_exposes_track_metadata() {
-        let mut song = SongInfo::new(
-            "42".to_string(),
-            SourceId::Bili,
-            "Song".to_string(),
-            "Artist".to_string(),
-        );
-        song.album_name = "Album".to_string();
-        song.duration = Duration::from_secs(90);
-        song.cover_url = Some("https://example.com/cover.jpg".to_string());
-        let snapshot = MprisSnapshot::new(
-            PlayerState::Playing,
-            Some(&song),
-            Duration::from_secs(3),
-            Duration::ZERO,
-            75,
-            crate::playlist::mode::PlayMode::SingleLoop,
-            3,
-            0,
-        );
-
-        assert_eq!(snapshot.playback_status, "Playing");
-        assert_eq!(snapshot.loop_status, "Track");
-        assert_eq!(snapshot.duration_micros, 90_000_000);
-        assert_eq!(snapshot.position_micros, 3_000_000);
-        assert_eq!(snapshot.track_path, track_path(&song));
-        assert!(snapshot.can_go_next);
-    }
-
-    #[test]
-    fn local_cover_path_is_exposed_as_file_uri() {
-        assert_eq!(art_url("/tmp/cover.jpg"), "file:///tmp/cover.jpg");
-    }
 }

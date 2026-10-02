@@ -20,6 +20,27 @@ pub const MIN_HEIGHT: u16 = 7;
 /// 渲染歌词显示
 /// area: 可用区域
 /// 显示当前行前后各 N 行，使当前行尽量居中
+fn truncate_song_text(text: &str, width: u16) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let max = usize::from(width.saturating_sub(8)).max(8);
+    if UnicodeWidthStr::width(text) <= max {
+        text.to_string()
+    } else {
+        let mut out = String::new();
+        let mut used = 0usize;
+        for ch in text.chars() {
+            let w = UnicodeWidthStr::width(ch.to_string().as_str());
+            if used + w > max.saturating_sub(1) {
+                break;
+            }
+            used += w;
+            out.push(ch);
+        }
+        out.push('…');
+        out
+    }
+}
+
 pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let block = Block::default()
         .borders(crate::pages::components::hit_test::PANEL_BORDERS)
@@ -31,12 +52,56 @@ pub fn render(area: Rect, buf: &mut Buffer, ctx: &AppContext) {
     let state = ctx.lyric_service.current_state();
 
     if state.is_empty || state.lines.is_empty() {
-        let text = "♫  暂无歌词";
-        let y = inner.y + inner.height / 2;
-        Paragraph::new(text)
-            .style(Style::new().fg(crate::theme::muted(ctx)))
-            .alignment(Alignment::Center)
-            .render(Rect::new(inner.x, y, inner.width, 1), buf);
+        let muted = crate::theme::muted(ctx);
+        let mut lines = vec![Line::from(Span::styled(
+            "♫  暂无歌词",
+            Style::new().fg(muted),
+        ))];
+        // 空歌词面板不空白：给当前歌曲铺一张元信息卡，
+        // 音质/时长/来源这类播放态信息在这里正好有地方住。
+        if let Some(song) = ctx
+            .current_song
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            let accent = crate::theme::accent(ctx);
+            let label = |name: &str, value: String| {
+                Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(format!("{name:<4}"), Style::new().fg(muted)),
+                    Span::styled(value, Style::new().fg(accent)),
+                ])
+            };
+            lines.push(Line::from(""));
+            lines.push(label("歌曲", truncate_song_text(&song.name, inner.width)));
+            if !song.singer.trim().is_empty() {
+                lines.push(label("歌手", truncate_song_text(&song.singer, inner.width)));
+            }
+            if !song.album_name.trim().is_empty() {
+                lines.push(label(
+                    "专辑",
+                    truncate_song_text(&song.album_name, inner.width),
+                ));
+            }
+            let quality = ctx
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .player
+                .quality;
+            lines.push(label(
+                "来源",
+                format!(
+                    "{} · 音质偏好 {}",
+                    song.source.display_name(),
+                    quality.label()
+                ),
+            ));
+        }
+        let card_height = lines.len() as u16;
+        let y = inner.y + inner.height.saturating_sub(card_height) / 2;
+        Paragraph::new(lines).render(Rect::new(inner.x, y, inner.width, card_height), buf);
         return;
     }
 

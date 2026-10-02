@@ -24,6 +24,37 @@ fn cache_path() -> PathBuf {
     crate::storage::default_data_dir().join("netease_collections.json")
 }
 
+/// 测试构建下没有磁盘缓存，指向一个必然不存在的路径即可。
+#[cfg(test)]
+fn cache_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("voicefox-test-netease-cache-absent.json")
+}
+
+/// 远程缓存文件的大小（字节）；文件不存在时为 0。
+pub fn cache_file_size() -> u64 {
+    std::fs::metadata(cache_path())
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+}
+
+/// 删除磁盘上的远程缓存文件并清空内存镜像。
+///
+/// 缓存随时可以在下次同步时重建，因此清理是安全的；正在展示的
+/// 「网易云远程歌单」窗口内容会随 generation 失效而刷新。
+pub fn clear() -> std::io::Result<()> {
+    if let Some(cache) = NETEASE_CACHE.get() {
+        cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+    match std::fs::remove_file(cache_path()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn cache() -> &'static RwLock<Vec<SyncCollection>> {
     NETEASE_CACHE.get_or_init(|| {
         let loaded = load_from_disk();

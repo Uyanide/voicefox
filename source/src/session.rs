@@ -315,8 +315,7 @@ fn save_file_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
 

@@ -24,6 +24,8 @@ voicefox 是 Rust + ratatui + libmpv 构建的终端音乐播放器。当前 `vo
 - ReplayGain、均衡器、声道、左右平衡。
 - 列表循环、单曲循环、随机、顺序、播完停止。
 - A-B 循环、淡入、淡出、无缝切换。
+- 睡眠定时器：`t` 打开菜单选择 15~120 分钟，到点自动淡出并暂停播放；启用后底栏显示倒计时，选「关闭」取消。
+- 频谱可视化：`w` 开关柱状频谱（叠加在内容区，不阻塞操作）。采集系统输出监视流（cava 同款口径），需要 `pw-record`（PipeWire）或 `parec`（pulseaudio-utils）；`[ui] visualizer = "bars"` 可默认开启。
 - 在线播放失败时支持跨音源/解析器回退。
 
 ## 歌词与下载
@@ -31,6 +33,8 @@ voicefox 是 Rust + ratatui + libmpv 构建的终端音乐播放器。当前 `vo
 支持 LRC、KRC、QRC、YRC 以及翻译/罗马音数据。下载歌词会过滤非标准 LRC 数据，避免把网易云接口原始 JSON 写入 `.lrc`。
 
 下载支持并发分片、CDN 回退、重试、大小/MD5 校验、标签、封面、标准 LRC、取消与清理。失败任务只保留在当前下载任务视图，不再重复写入持久下载历史。
+
+歌单互通：M3U/M3U8、LX Music JSON、网易云歌单 JSON 可导入为自建歌单（`--import-playlist` 或设置页）；自建歌单可导出为 M3U8（歌单页自建范围按 `Shift+E`），本地歌曲写绝对路径、在线歌曲写 `voicefox:<source>:<id>` 标识行，可在其他播放器 / 车机直接打开本地部分。
 
 ## 本地音乐
 
@@ -68,13 +72,13 @@ VoiceFox 提供独立的跨音源同步层，用于本地歌单/收藏与网易�
 
 ## 通知与平台
 
-- Linux：D-Bus 桌面通知和 MPRIS。
+- Linux：D-Bus 桌面通知和 MPRIS（Waybar、playerctl、媒体键）。
 - Windows：`Shell_NotifyIconW` 通知区气泡。
   - 使用 voicefox 应用图标，并遵循系统的提示音与勿扰设置。
   - 发送新通知前撤下本应用上一条气泡；其他应用正在显示气泡时，新通知仍可能进入 Windows 气泡队列。
   - 通知区图标在最后一次通知 10 秒后移除。
   - 不提供专辑封面、操作按钮和通知中心历史。
-- Windows SMTC / 硬件媒体键：尚未实现。
+- Windows SMTC：接入 System Media Transport Controls，硬件媒体键、系统媒体浮层和蓝牙耳机按键可控制播放/暂停/切歌/进度；封面与歌名会同步显示在系统浮层。`[integration] smtc = false` 可关闭。
 
 ## 输入法与中文输入
 
@@ -126,6 +130,15 @@ base = "default"
 | Windows | `%LOCALAPPDATA%\voicefox` |
 
 配置与会话仍使用平台配置目录。
+
+## 缓存管理
+
+设置页（全局 `8`）→「数据与本地库」分类底部提供两行缓存操作，值列显示当前体积：
+
+- **清除封面缓存**：封面统一缓存在系统缓存目录（Linux 为 `~/.cache/voicefox/covers`），清理后按需重新下载。
+- **清除网易云歌单缓存**：删除 `netease_collections.json` 歌单镜像，下次同步会自动重建。
+
+体积只在进入该分类或执行清理时统计一次，不会每帧扫描磁盘。
 
 ## 0.3.15 修复重点
 

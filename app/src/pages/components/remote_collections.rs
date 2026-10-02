@@ -17,9 +17,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::context::AppContext;
 use crate::pages::components::list_filter::ListFilter;
-use crate::pages::sort::compare_text;
 use crate::pages::components::scroll::ensure_visible;
 use crate::pages::components::text::{pad_display, pad_display_left, truncate_width};
+use crate::pages::sort::compare_text;
 
 /// 远程缓存里的网易云账号歌单（只读快照）。
 ///
@@ -112,7 +112,9 @@ impl RemoteCollectionsWindow {
 
     /// 当前选中集合的远端 id（跳转时用来定位）。
     pub fn selected_id(&self) -> Option<String> {
-        self.visible().get(self.selected).map(|item| item.id.clone())
+        self.visible()
+            .get(self.selected)
+            .map(|item| item.id.clone())
     }
 
     /// 过滤 + 排序后的可见集合。
@@ -130,9 +132,9 @@ impl RemoteCollectionsWindow {
             .collect();
         match self.sort {
             // 比较器里用免分配的 `compare_text`（以前每次比较都 to_lowercase 分配）
-            CollectionSort::Name => items.sort_by(|a, b| {
-                compare_text(&a.name, &b.name).then_with(|| a.id.cmp(&b.id))
-            }),
+            CollectionSort::Name => {
+                items.sort_by(|a, b| compare_text(&a.name, &b.name).then_with(|| a.id.cmp(&b.id)))
+            }
             CollectionSort::Songs => items.sort_by(|a, b| {
                 b.songs
                     .len()
@@ -168,9 +170,10 @@ impl RemoteCollectionsWindow {
 
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc) => RemoteCollectionsOutcome::Closed,
-            (KeyModifiers::NONE, KeyCode::Enter) => self
-                .selected_id()
-                .map_or(RemoteCollectionsOutcome::None, RemoteCollectionsOutcome::Open),
+            (KeyModifiers::NONE, KeyCode::Enter) => self.selected_id().map_or(
+                RemoteCollectionsOutcome::None,
+                RemoteCollectionsOutcome::Open,
+            ),
             (KeyModifiers::NONE, KeyCode::Char('/')) => {
                 self.filter.reset();
                 self.filter.activate();
@@ -246,11 +249,7 @@ impl RemoteCollectionsWindow {
         // 渲染函数的 `self` 借用与写入顺序必须分开：先取数据，后写状态。
         let (rows, total, normal, favorites, list_height) = {
             let all: Vec<&SyncCollection> = self.visible();
-            let list_height = inner
-                .height
-                .saturating_sub(3)
-                .min(all.len() as u16)
-                .max(1) as usize;
+            let list_height = inner.height.saturating_sub(3).min(all.len() as u16).max(1) as usize;
             let (normal, favorites) = all.iter().fold((0usize, 0usize), |counts, item| {
                 if item.kind == SyncCollectionKind::Favorites {
                     (counts.0, counts.1 + 1)
@@ -260,7 +259,13 @@ impl RemoteCollectionsWindow {
             });
             let rows: Vec<[String; 5]> = all
                 .iter()
-                .map(|item| collection_row(item, name_width))
+                .scan(None, |previous, item| {
+                    // 连续同类型的行只在第一行标类型：23 个「歌单」逐行重复
+                    // 是纯噪音，类型切换处（红心 ↔ 歌单）才值得提示一次。
+                    let row = collection_row(item, previous.as_deref(), name_width);
+                    *previous = Some(row[1].clone());
+                    Some(row)
+                })
                 .collect();
             (rows, all.len(), normal, favorites, list_height)
         };
@@ -278,12 +283,13 @@ impl RemoteCollectionsWindow {
         } else if self.filter.is_active() {
             format!(" 过滤(输入中): {query}▏")
         } else {
-            format!(" 共 {total} 个 · 过滤: {query} · 排序: {} ", self.sort_label())
+            format!(
+                " 共 {total} 个 · 过滤: {query} · 排序: {} ",
+                self.sort_label()
+            )
         };
-        Paragraph::new(Line::from(Span::styled(summary, Style::new().fg(muted)))).render(
-            Rect::new(inner.x, inner.y, inner.width, 1),
-            buf,
-        );
+        Paragraph::new(Line::from(Span::styled(summary, Style::new().fg(muted))))
+            .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
 
         let header = Line::from(vec![
             Span::raw(" "),
@@ -361,20 +367,27 @@ impl RemoteCollectionsWindow {
 /// 一行的纯文本切分：`[" ", 类型, "  ", 名称(定宽), 数量(右对齐)]`。
 ///
 /// 渲染与测试共用这一份，因此"名称被截断、数量列永远对齐"是可断言的。
-fn collection_row(item: &SyncCollection, name_width: usize) -> [String; 5] {
+fn collection_row(
+    item: &SyncCollection,
+    previous_kind: Option<&str>,
+    name_width: usize,
+) -> [String; 5] {
     let kind = if item.kind == SyncCollectionKind::Favorites {
         "红心"
     } else {
         "歌单"
     };
+    // 与上一行同类型时留白：类型列只在分组切换处出现一次。
+    let kind_cell = if previous_kind == Some(kind) {
+        "  ".to_string()
+    } else {
+        kind.to_string()
+    };
     [
         " ".to_string(),
-        kind.to_string(),
+        kind_cell,
         "  ".to_string(),
-        pad_display(
-            truncate_width(&item.name, name_width).as_ref(),
-            name_width,
-        ),
+        pad_display(truncate_width(&item.name, name_width).as_ref(), name_width),
         pad_display_left(&item.songs.len().to_string(), COUNT_COLUMN_WIDTH),
     ]
 }
@@ -506,12 +519,17 @@ mod tests {
 
     /// 渲染用的一行文本（直接取渲染用的切分函数，因此断言的是真实渲染口径）。
     fn row_text(item: &SyncCollection, name_width: usize) -> String {
-        super::collection_row(item, name_width).concat()
+        super::collection_row(item, None, name_width).concat()
     }
 
     #[test]
     fn row_layout_keeps_long_names_inside_their_column() {
-        let long = collection("9", "那些绝不会忘记的国漫主题曲", 173, SyncCollectionKind::Playlist);
+        let long = collection(
+            "9",
+            "那些绝不会忘记的国漫主题曲",
+            173,
+            SyncCollectionKind::Playlist,
+        );
         let row = row_text(&long, 12);
         // 名称列被截断且宽度固定，数字列因此永远对齐
         assert!(row.contains('…'), "超长名称应被截断: {row:?}");

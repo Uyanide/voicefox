@@ -142,6 +142,8 @@ pub enum StatusBarMenuAction {
     OpenSettingsSources,
     /// 打开下载面板。
     OpenDownloadsPanel,
+    /// 设定 / 取消（`None`）睡眠定时器，取值是分钟数。
+    SetSleepTimer(Option<u64>),
     /// 打开被「更多」收纳的某个段自己的菜单。
     OpenSlot(StatusBarSlot),
 }

@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::fmt::format_duration;
+use crate::fmt::{format_bytes, format_duration};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -24,11 +24,11 @@ use crate::pages::components::hit_test::{PANEL_BORDERS, panel_inner};
 use crate::pages::components::remote_collections::{
     RemoteCollectionsOutcome, RemoteCollectionsWindow,
 };
-use crate::pages::components::text::pad_display;
 use crate::pages::components::splitter::{
     DividerHit, GUTTER, SplitAxis, Splitter, clamp_extent, clamp_ratio, divider_line,
     split_with_gutter,
 };
+use crate::pages::components::text::pad_display;
 use crate::playlist::mode::PlayMode;
 
 /// 删除类操作（音源 / 本地目录）二次确认的窗口时长
@@ -280,6 +280,8 @@ enum SettingsRowDirectAction {
     CycleScanDepth,
     ExportData,
     ImportData,
+    ClearCoverCache,
+    ClearRemoteCache,
 }
 
 /// 枚举行的取值菜单来源。
@@ -424,7 +426,11 @@ impl SettingsRows {
         palette: RowPalette,
     ) -> SettingsRowId {
         let key = plan.key_hint();
-        let line = setting_value_line(label, value, key, palette.accent, palette.muted);
+        let line = if kind == SettingsRowKind::Action {
+            setting_action_line(label, value, key, palette.accent, palette.muted)
+        } else {
+            setting_value_line(label, value, key, palette.accent, palette.muted)
+        };
         self.push(category, kind, label, key, plan, line)
     }
 
@@ -682,6 +688,10 @@ pub struct SettingsPage {
     delete_source_armed: Option<Instant>,
     /// 删除本地目录的武装时刻，机制同上
     delete_local_path_armed: Option<Instant>,
+    /// 「清除封面缓存」行的值文案（进入数据分类 / 清理后刷新一次）。
+    cover_cache_label: String,
+    /// 「清除网易云歌单缓存」行的值文案。
+    remote_cache_label: String,
 }
 
 /// 构造设置页的全部设置行。
@@ -729,6 +739,10 @@ struct RowInputs {
     qr_login_label: String,
     /// 当前下载目录（显示文案）。
     download_dir: String,
+    /// 封面缓存行显示文案；生产路径由设置页按需刷新，避免每帧扫盘。
+    cover_cache_label: String,
+    /// 网易云远程缓存行显示文案。
+    remote_cache_label: String,
 }
 
 impl RowInputs {
@@ -766,6 +780,8 @@ impl RowInputs {
             ab_loop,
             qr_login_label,
             download_dir: ctx.downloads.download_dir().display().to_string(),
+            cover_cache_label: "计算中…".to_string(),
+            remote_cache_label: "计算中…".to_string(),
         }
     }
 }
@@ -1162,14 +1178,7 @@ fn build_settings_rows(
         "双向增量",
         palette,
     );
-    rows.value(
-        C::Accounts,
-        K::Action,
-        "导入外部歌单",
-        RowPlan::Direct(D::ImportExternalPlaylist),
-        "M3U/JSON",
-        palette,
-    );
+    // 「导入外部歌单」归数据分类：它是文件导入动作，和账号无关。
 
     // ── 通知与集成 ──
     rows.value(
@@ -1353,6 +1362,30 @@ fn build_settings_rows(
         "voicefox-export.json",
         palette,
     );
+    rows.value(
+        C::Data,
+        K::Action,
+        "导入外部歌单",
+        RowPlan::Direct(D::ImportExternalPlaylist),
+        "M3U/JSON",
+        palette,
+    );
+    rows.value(
+        C::Data,
+        K::Action,
+        "清除封面缓存",
+        RowPlan::Direct(D::ClearCoverCache),
+        &inputs.cover_cache_label,
+        palette,
+    );
+    rows.value(
+        C::Data,
+        K::Action,
+        "清除网易云歌单缓存",
+        RowPlan::Direct(D::ClearRemoteCache),
+        &inputs.remote_cache_label,
+        palette,
+    );
 }
 
 impl SettingsPage {
@@ -1508,6 +1541,8 @@ impl SettingsPage {
             remote_window_generation: 0,
             delete_source_armed: None,
             delete_local_path_armed: None,
+            cover_cache_label: "计算中…".to_string(),
+            remote_cache_label: "计算中…".to_string(),
         }
     }
 
@@ -1735,6 +1770,10 @@ impl SettingsPage {
         if category != self.category {
             self.category = category;
             self.clear_status();
+        }
+        if category == SettingsCategory::Data {
+            // 缓存体积不走每帧渲染：切进数据分类时统计一次。
+            self.refresh_cache_stats();
         }
         self.focus = SettingsFocus::Options;
     }
@@ -2274,7 +2313,44 @@ impl SettingsPage {
                 });
                 AppAction::None
             }
+            D::ClearCoverCache => {
+                let message = match lx_source::cover_cache::clear_cache() {
+                    Ok((files, bytes)) => {
+                        format!(
+                            "已清理封面缓存：{} 个文件，释放 {}",
+                            files,
+                            format_bytes(bytes)
+                        )
+                    }
+                    Err(error) => format!("清理封面缓存失败: {error}"),
+                };
+                self.refresh_cache_stats();
+                self.set_status(message);
+                AppAction::None
+            }
+            D::ClearRemoteCache => {
+                let message = match crate::remote_cache::clear() {
+                    Ok(()) => format!(
+                        "已清除网易云歌单镜像（{}），下次同步会自动重建",
+                        format_bytes(crate::remote_cache::cache_file_size())
+                    ),
+                    Err(error) => format!("清除网易云歌单缓存失败: {error}"),
+                };
+                self.refresh_cache_stats();
+                self.set_status(message);
+                AppAction::None
+            }
         }
+    }
+
+    /// 重新统计缓存体积（只在进入数据分类 / 清理后调用，避免每帧扫盘）。
+    pub fn refresh_cache_stats(&mut self) {
+        let (files, bytes) = lx_source::cover_cache::cache_stats();
+        self.cover_cache_label = format!("{} 个 · {}", files, format_bytes(bytes));
+        self.remote_cache_label = format!(
+            "{} · 歌单镜像",
+            format_bytes(crate::remote_cache::cache_file_size())
+        );
     }
 
     /// `update_config` + `AppAction::None`：省掉几十个 `{ ...; AppAction::None }`。
@@ -3501,7 +3577,9 @@ impl SettingsPage {
         // 1. 构造设置行：每一行显式声明分类。
         let palette = RowPalette { accent, muted };
         let mut rows = SettingsRows::new();
-        let inputs = RowInputs::from_context(ctx);
+        let mut inputs = RowInputs::from_context(ctx);
+        inputs.cover_cache_label = self.cover_cache_label.clone();
+        inputs.remote_cache_label = self.remote_cache_label.clone();
         build_settings_rows(
             &mut rows,
             &config,
@@ -4443,11 +4521,13 @@ fn compact_key_label(key: &str) -> String {
         .replace("Alt+", "A+")
 }
 
-/// 键位列单元格：空的（Enter 激活）行用 `[·]` 占位，保持列对齐但不喧宾夺主。
+/// 键位列单元格：Enter 激活的行只留一个安静的圆点（不带方括号——方括号
+/// 会被读成"可输入的字段"，整列都是时视觉噪音很大）；刻意保留的组合键
+/// 才用 `[S+P]` 这样的方括号形式标出"这不是 Enter"。
 fn key_label(key: &str) -> String {
     let compact = compact_key_label(key);
     if compact.is_empty() {
-        "[·]".to_string()
+        "·".to_string()
     } else {
         format!("[{compact}]")
     }
@@ -4457,7 +4537,7 @@ fn setting_line(label: &str, value: bool, key: &str, accent: Color, muted: Color
     setting_row(
         label,
         Span::styled(
-            if value { "[x]" } else { "[ ]" },
+            if value { "✓" } else { "○" },
             Style::new().fg(if value { accent } else { muted }),
         ),
         key,
@@ -4477,6 +4557,25 @@ fn setting_value_line(
         Span::styled(value.to_string(), Style::new().fg(accent)),
         key,
         muted,
+    )
+}
+
+/// 一次性动作行使用轻量的 `›` 前缀，与可编辑的当前值区分开。
+///
+/// 不把动作做成按钮：设置页仍保持统一的整行 Enter / 鼠标激活模型，
+/// 这里只增加一个视觉语义锚点。
+fn setting_action_line(
+    label: &str,
+    value: &str,
+    key: &str,
+    accent: Color,
+    _muted: Color,
+) -> Line<'static> {
+    setting_row(
+        label,
+        Span::styled(format!("› {value}"), Style::new().fg(accent)),
+        key,
+        _muted,
     )
 }
 
@@ -4835,7 +4934,8 @@ fn qr_login_action(logged_in: bool, source: SourceId) -> AppAction {
 /// 已登录，否则过期会话会一直显示 ✓。
 fn source_session_valid(source: SourceId, ctx: &AppContext) -> bool {
     if source == SourceId::Wy {
-        return lx_source::wy::session::login_health() == lx_source::wy::session::LoginHealth::LoggedIn;
+        return lx_source::wy::session::login_health()
+            == lx_source::wy::session::LoginHealth::LoggedIn;
     }
     ctx.source_manager.is_logged_in(source)
 }
@@ -5027,6 +5127,25 @@ fn apply_setting_choice(
 ///
 /// 多列布局按"行优先"填充（0 号槽位在第 1 列第 1 行…），
 /// 与 `setting_option_columns` 划分出来的列区同源。
+/// 把可操作设置行的值推到行尾（label 贴左、值贴右，中间留白）。
+///
+/// 只处理 `setting_row` 的固定结构 `[键位, label, 间隙, 值…]`，且**说明行
+/// （Info）不参与**——说明文字是句子，贴右会破坏阅读流。行宽放不下时不动。
+fn right_align_setting_value(line: &mut Line<'static>, row_width: u16, kind: SettingsRowKind) {
+    if matches!(kind, SettingsRowKind::Info) || line.spans.len() < 4 || row_width == 0 {
+        return;
+    }
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let padding = usize::from(row_width).saturating_sub(used);
+    if padding > 1 {
+        line.spans.insert(2, Span::raw(" ".repeat(padding)));
+    }
+}
+
 fn setting_row_rect(columns: &[Rect], column_count: usize, slot: usize) -> Rect {
     let column_count = column_count.max(1);
     let column = slot % column_count;
@@ -5186,6 +5305,9 @@ fn render_setting_rows(
     for (slot, row) in rows.iter().enumerate().skip(scroll).take(capacity) {
         let rect = setting_row_rect(&columns, column_count, slot - scroll);
         let mut line = row.line.clone();
+        // 双列布局下每列本来就不宽，值贴右会被截断；只在单列（宽面板）时启用。
+        let align_width = if column_count == 1 { rect.width } else { 0 };
+        right_align_setting_value(&mut line, align_width, row.meta.kind);
         highlight_setting_line(
             &mut line,
             Some(row.meta.id) == selected,
@@ -5832,19 +5954,17 @@ mod tests {
         SettingsRowKind, SettingsRowMeta, SettingsRows, apply_setting_choice, build_settings_rows,
         categories_width_limits, category_hit_at, category_row_ids, category_sidebar_visible,
         choice_refusal_message, columns_from_value, command_row_layout, compact_key_label,
-        cover_protocol_display,
-        key_label, truncate_display,
-        embedded_command, embedded_height, embedded_items, embedded_list_for, embedded_needed_rows,
-        embedded_needed_rows_for, embedded_ratio_from_pointer, ensure_row_cursor, enum_menu,
-        enum_menu_label, is_accounts_panel_key, is_cover_protocol_key, list_owns_direction_keys,
-        navigate_row_cursor, next_page_step, panel_inner, plan_row_activation,
-        qr_login_action,
-        quality_by_label,
-        render_command_row, render_embedded_row, render_setting_categories, render_setting_rows,
-        reorder_status_bar_items, row_activates_with_space, row_hit_at, row_window_start,
-        setting_line, setting_option_column_count, setting_option_columns, setting_row_rect,
-        setting_value_line, settings_menu_app_action, settings_mouse_dispatch, settings_panes,
-        shorten_source, step_index, step_row_selection, theme_picker_row,
+        cover_protocol_display, embedded_command, embedded_height, embedded_items,
+        embedded_list_for, embedded_needed_rows, embedded_needed_rows_for,
+        embedded_ratio_from_pointer, ensure_row_cursor, enum_menu, enum_menu_label,
+        is_accounts_panel_key, is_cover_protocol_key, key_label, list_owns_direction_keys,
+        navigate_row_cursor, next_page_step, panel_inner, plan_row_activation, qr_login_action,
+        quality_by_label, render_command_row, render_embedded_row, render_setting_categories,
+        render_setting_rows, reorder_status_bar_items, row_activates_with_space, row_hit_at,
+        row_window_start, setting_line, setting_option_column_count, setting_option_columns,
+        setting_row_rect, setting_value_line, settings_menu_app_action, settings_mouse_dispatch,
+        settings_panes, shorten_source, step_index, step_row_selection, theme_picker_row,
+        truncate_display,
     };
     use ratatui::buffer::Buffer;
     use ratatui::text::Line;
@@ -6877,7 +6997,10 @@ mod tests {
         page.reset_pane_ratios();
 
         assert_eq!(page.embedded_ratio, EMBEDDED_RATIO_DEFAULT);
-        assert!(!page.embedded_ratio_fixed, "复位后回到「够用就好」的自动高度");
+        assert!(
+            !page.embedded_ratio_fixed,
+            "复位后回到「够用就好」的自动高度"
+        );
         assert_eq!(page.categories_width, CATEGORY_SIDEBAR_WIDTH);
         assert!(!page.splitter.is_dragging());
     }
@@ -6904,6 +7027,8 @@ mod tests {
     /// 行表构造的测试输入：真实行集不需要播放器 / 音源管理器 / 下载管理器。
     fn test_row_inputs() -> RowInputs {
         RowInputs {
+            cover_cache_label: "0 个 · 0 B".to_string(),
+            remote_cache_label: "0 B · 歌单镜像".to_string(),
             play_mode: PlayMode::ListLoop,
             ab_loop: None,
             qr_login_label: "○样例音源".to_string(),
@@ -6922,7 +7047,10 @@ mod tests {
             config,
             &test_row_inputs(),
             test_palette(),
-            crate::cover::CoverCapabilities::from_detected(None, crate::cover::ProtocolType::Halfblocks),
+            crate::cover::CoverCapabilities::from_detected(
+                None,
+                crate::cover::ProtocolType::Halfblocks,
+            ),
         );
         rows
     }
@@ -6981,7 +7109,8 @@ mod tests {
     #[test]
     fn cover_protocol_row_leads_with_the_active_protocol() {
         use crate::cover::{CoverCapabilities, ProtocolType};
-        let kitty = CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
+        let kitty =
+            CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
         let corrected =
             CoverCapabilities::from_detected(Some(ProtocolType::Kitty), ProtocolType::Kitty);
         let unknown = CoverCapabilities::from_detected(None, ProtocolType::Halfblocks);
@@ -7186,7 +7315,7 @@ mod tests {
             ),
             (
                 SettingsCategory::Accounts,
-                &["扫码登录", "刷新远程歌单", "QQ 音乐同步", "导入外部歌单"],
+                &["扫码登录", "刷新远程歌单", "QQ 音乐同步"],
             ),
             (
                 SettingsCategory::Integration,
@@ -7891,7 +8020,7 @@ mod tests {
             RowPlan::Direct(SettingsRowDirectAction::ToggleMouse)
         );
         assert_eq!(compact_key_label(&toggle.key), "");
-        assert_eq!(key_label(&toggle.key), "[·]");
+        assert_eq!(key_label(&toggle.key), "·");
 
         // Info 行：绝不触发任何业务动作（哪怕声明了计划）
         assert_eq!(
@@ -8423,12 +8552,9 @@ mod tests {
         let hover = text_at(hits[1].rect);
         let plain = text_at(hits[2].rect);
 
-        assert!(
-            current.starts_with("▶["),
-            "当前行必须有 ▶ 前缀：{current:?}"
-        );
-        assert!(hover.starts_with("▶["), "hover 行必须有 ▶ 前缀：{hover:?}");
-        assert!(plain.starts_with(" ["), "普通行保持前导空格：{plain:?}");
+        assert!(current.starts_with("▶"), "当前行必须有 ▶ 前缀：{current:?}");
+        assert!(hover.starts_with("▶"), "hover 行必须有 ▶ 前缀：{hover:?}");
+        assert!(plain.starts_with(' '), "普通行保持前导空格：{plain:?}");
         assert_eq!(
             UnicodeWidthStr::width(current.as_str()),
             UnicodeWidthStr::width(plain.as_str()),
@@ -8784,10 +8910,10 @@ mod tests {
             line.contains("Tokyo Night ›"),
             "主题行的值必须显示当前主题 + 展开箭头（实际 {line:?}）"
         );
-        // Enter 激活这条共性写在面板标题里，行内只留安静的键位占位符
+        // Enter 激活这条共性写在面板标题里，行内只留安静的键位圆点
         assert!(
-            line.contains("[·]"),
-            "激活行的键位列应留占位符而不是逐行重复 Enter（实际 {line:?}）"
+            line.contains(" · "),
+            "激活行的键位列应留安静圆点而不是逐行重复 Enter（实际 {line:?}）"
         );
     }
 

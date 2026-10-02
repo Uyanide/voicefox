@@ -4,8 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::storage::Storage;
 
+use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
-use lx_core::sync::{SyncCollection, SyncCollectionKind, SyncCollectionSet};
+use lx_core::sync::{
+    SyncCollection, SyncCollectionKind, SyncCollectionSet, SyncEngine, SyncOptions,
+};
 use lx_source::sync::provider;
 
 /// 一次远程集合刷新的结果。
@@ -70,6 +73,11 @@ impl SyncControl {
     pub fn inc(&self) {
         self.done.fetch_add(1, Ordering::AcqRel);
     }
+    /// 直接设定绝对进度（推送执行引擎回调的是累计值而非增量）。
+    pub fn set_progress(&self, done: usize, total: usize) {
+        self.done.store(done, Ordering::Release);
+        self.total.store(total, Ordering::Release);
+    }
     pub fn progress(&self) -> (usize, usize) {
         (
             self.done.load(Ordering::Acquire),
@@ -105,7 +113,7 @@ fn diff_against_cache(remote: &[SyncCollection]) -> (usize, usize, usize) {
     })
 }
 
-fn kind_label(kind: SyncCollectionKind) -> &'static str {
+pub fn kind_label(kind: SyncCollectionKind) -> &'static str {
     match kind {
         SyncCollectionKind::Favorites => "红心",
         SyncCollectionKind::Playlist => "歌单",
@@ -245,5 +253,177 @@ pub async fn sync_source_with_control(
         updated,
         removed: if complete { removed } else { 0 },
         failed,
+    })
+}
+
+// ───────────────────── 本地 → 远端推送（写回） ─────────────────────
+
+/// 推送流程的本地一侧：自建歌单或收藏。
+#[derive(Debug, Clone)]
+pub struct LocalPushCollection {
+    pub name: String,
+    pub songs: Vec<SongInfo>,
+    /// 收藏推到目标平台的「我喜欢」，普通歌单推到歌单。
+    pub is_favorites: bool,
+}
+
+/// 远端可选目标。
+#[derive(Debug, Clone)]
+pub struct PushTargetOption {
+    pub kind: SyncCollectionKind,
+    pub id: String,
+    pub name: String,
+    pub song_count: usize,
+}
+
+/// 推送前的 Diff 预览（追加策略：只新增，不删除远端已有歌曲）。
+#[derive(Debug, Clone, Default)]
+pub struct PushPlanPreview {
+    pub target_name: String,
+    pub target_kind: String,
+    pub local_songs: usize,
+    pub remote_songs: usize,
+    pub additions: usize,
+    pub matched: usize,
+    pub unmatched: usize,
+    /// 待添加歌曲的展示样例（最多几条）。
+    pub samples: Vec<String>,
+}
+
+/// 推送执行结果。
+#[derive(Debug, Clone, Default)]
+pub struct PushReport {
+    pub target_name: String,
+    pub added: usize,
+    pub already_present: usize,
+    pub unmatched: usize,
+    /// (歌曲, 歌手, 原因)。
+    pub failed: Vec<(String, String, String)>,
+}
+
+/// 推送前置检查：平台白名单 + 登录态。
+///
+/// 与只读预览同样的取舍：写回涉及账号数据变更，未经端到端验证的平台
+/// 一律明确拒绝，而不是放进去静默失败。
+fn push_precheck(source: SourceId) -> Result<(), String> {
+    if source != SourceId::Wy {
+        return Err(format!(
+            "{}暂不支持推送写回，当前仅支持网易云音乐",
+            source.display_name()
+        ));
+    }
+    if !lx_source::wy::session::is_logged_in() {
+        return Err("尚未登录网易云，请先在设置（8）→ 账号与扫码 扫码登录".into());
+    }
+    Ok(())
+}
+
+/// 拉取远端可选目标（歌单 + 红心），供用户选择推送去处。
+pub async fn push_list_targets(source: SourceId) -> Result<Vec<PushTargetOption>, String> {
+    push_precheck(source)?;
+    let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
+    let set = provider.collect_all().await.map_err(|e| e.to_string())?;
+    let to_option = |collection: &SyncCollection| PushTargetOption {
+        kind: collection.kind,
+        id: collection.id.clone(),
+        name: collection.name.clone(),
+        song_count: collection.songs.len(),
+    };
+    let mut targets: Vec<_> = set.playlists.iter().map(to_option).collect();
+    targets.extend(set.favorites.iter().map(to_option));
+    Ok(targets)
+}
+
+/// 在远端新建一个歌单（推送选单里的「新建歌单」选项）。
+pub async fn push_create_target(source: SourceId, name: &str) -> Result<PushTargetOption, String> {
+    push_precheck(source)?;
+    let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
+    let collection = provider
+        .create_collection(SyncCollectionKind::Playlist, name)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(PushTargetOption {
+        kind: collection.kind,
+        id: collection.id,
+        name: collection.name,
+        song_count: 0,
+    })
+}
+
+/// 生成推送计划：拉取目标远端集合，与本地集合做五级匹配，产出追加 Diff。
+///
+/// 返回 `(预览, 已生成的计划)`，执行阶段直接复用计划，不再重新拉远端。
+pub async fn push_plan(
+    source: SourceId,
+    local: &LocalPushCollection,
+    target: &PushTargetOption,
+) -> Result<(PushPlanPreview, lx_core::sync::SyncPlan), String> {
+    push_precheck(source)?;
+    let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
+    let remote = provider
+        .get_collection(target.kind, &target.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let local_collection = SyncCollection {
+        kind: target.kind,
+        id: "local".to_string(),
+        name: local.name.clone(),
+        source: SourceId::Local,
+        songs: local.songs.clone(),
+    };
+    // Additive（默认策略）：只追加不删除；Mirror 会删远端歌曲，风险太高。
+    let plan = SyncEngine::plan(local_collection, remote, &SyncOptions::default())
+        .map_err(|e| e.to_string())?;
+    let sample = |song: &SongInfo| {
+        if song.singer.trim().is_empty() {
+            song.name.clone()
+        } else {
+            format!("{} — {}", song.name, song.singer)
+        }
+    };
+    let preview = PushPlanPreview {
+        target_name: target.name.clone(),
+        target_kind: kind_label(target.kind).to_string(),
+        local_songs: local.songs.len(),
+        remote_songs: target.song_count,
+        additions: plan.additions.len(),
+        matched: plan.matched_count(),
+        unmatched: plan.unmatched.len(),
+        samples: plan.additions.iter().take(8).map(sample).collect(),
+    };
+    Ok((preview, plan))
+}
+
+/// 执行推送计划。引擎在回调里报进度、检查取消标志。
+pub async fn push_execute(
+    source: SourceId,
+    plan: &lx_core::sync::SyncPlan,
+    control: &SyncControl,
+) -> Result<PushReport, String> {
+    push_precheck(source)?;
+    let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
+    control.cancelled.store(false, Ordering::Release);
+    control.done.store(0, Ordering::Release);
+    control.total.store(plan.additions.len(), Ordering::Release);
+    let report = SyncEngine::execute(
+        provider.as_ref(),
+        plan,
+        &SyncOptions::default(),
+        false,
+        &|done, total| control.set_progress(done, total),
+        &|| control.is_cancelled(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(PushReport {
+        target_name: report.collection_name,
+        added: report.added,
+        already_present: report.already_present,
+        unmatched: report.unmatched,
+        failed: report
+            .failed
+            .into_iter()
+            .map(|f| (f.song, f.artist, f.reason))
+            .collect(),
     })
 }

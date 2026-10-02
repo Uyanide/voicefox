@@ -657,7 +657,9 @@ impl MainPage {
         let layout = self.compute_layout(area, ctx);
         if let Some(target) = self.splitter.dragging().copied() {
             match event.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
+                // 终端在鼠标按住拖动时并不总是发 `Drag`：有的实现会用 `Moved` 连续
+                // 更新，若这里只处理 `Drag`，分割线会停留在旧位置，给人“卡住”的错觉。
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
                     self.update_resize_preview(target, event, area, &layout);
                     return AppAction::None;
                 }
@@ -685,54 +687,24 @@ impl MainPage {
         let queue_inner = panel_inner(layout.queue);
         let header_row = queue_inner.y;
         let table_width = queue_inner.width;
-
-        if let Some(crs) = self.column_resize.clone() {
-            match event.kind {
-                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                    let delta = (event.column as i32) - (crs.start_local_x as i32);
-                    let adjusted = super::components::song_table::adjust_widths(
-                        &self.queue_columns,
-                        crs.boundary_index,
-                        table_width,
-                        delta,
-                    );
-                    self.queue_columns = adjusted;
-                    self.column_resize = Some(super::components::song_table::ColumnResizeState {
-                        start_local_x: event.column,
-                        ..crs
-                    });
-                    return AppAction::None;
-                }
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                    self.column_resize = None;
-                    return AppAction::CommitColumnResize {
-                        page_key: "queue".to_string(),
-                        columns: self.queue_columns.clone(),
-                    };
-                }
-                _ => return AppAction::None,
+        let queue_header = Rect::new(queue_inner.x, header_row, table_width, 1);
+        match super::components::song_table::handle_column_resize(
+            &mut self.column_resize,
+            &mut self.queue_columns,
+            event,
+            Some(queue_header),
+            queue_inner,
+        ) {
+            super::components::song_table::ColumnResizeOutcome::Updated => {
+                return AppAction::None;
             }
-        } else if matches!(
-            event.kind,
-            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-        ) && event.row == header_row
-        {
-            let local_x = event.column.saturating_sub(queue_inner.x);
-            if let Some(boundary) = super::components::song_table::find_boundary(
-                &self.queue_columns,
-                table_width,
-                local_x,
-            ) {
-                let layout =
-                    super::components::song_table::compute_layout(&self.queue_columns, table_width);
-                if boundary + 1 < layout.len() {
-                    self.column_resize = Some(super::components::song_table::ColumnResizeState {
-                        start_local_x: event.column,
-                        boundary_index: boundary,
-                    });
-                    return AppAction::None;
-                }
+            super::components::song_table::ColumnResizeOutcome::Finished => {
+                return AppAction::CommitColumnResize {
+                    page_key: "queue".to_string(),
+                    columns: self.queue_columns.clone(),
+                };
             }
+            super::components::song_table::ColumnResizeOutcome::NotHandled => {}
         }
 
         let scroll_amount = ctx
@@ -785,7 +757,7 @@ impl MainPage {
                         self.selected = current.min(songs.len().saturating_sub(1));
                     }
                 }
-                MouseEventKind::Drag(MouseButton::Left) => {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
                     if let Some(from) = self.dragging {
                         drag_target = if self.queue_filter.is_empty() {
                             queue_index_at(event, layout.queue, self.scroll, songs.len())
@@ -1192,11 +1164,8 @@ fn render_cover_text(inner: Rect, buf: &mut Buffer, ctx: &AppContext) {
                 match &cover_state {
                     CoverState::Unavailable(error) => Line::from(Span::styled(
                         // 按**显示宽度**截断（错误信息是中文，chars() 会超宽撑出面板）
-                        crate::pages::components::text::truncate_width(
-                            error,
-                            inner.width as usize,
-                        )
-                        .into_owned(),
+                        crate::pages::components::text::truncate_width(error, inner.width as usize)
+                            .into_owned(),
                         Style::new().fg(crate::theme::overlay0(ctx)),
                     )),
                     CoverState::Empty => Line::from(Span::styled(

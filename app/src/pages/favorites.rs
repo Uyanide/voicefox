@@ -525,6 +525,10 @@ impl FavoritesPage {
                     return AppAction::ToggleFavoriteSong(Box::new(song));
                 }
             }
+            // 推送收藏到网易云红心（写回，追加不删除）。
+            (KeyModifiers::SHIFT, KeyCode::Char('P')) => {
+                return AppAction::PushFavorites;
+            }
             _ => {}
         }
         AppAction::None
@@ -733,51 +737,21 @@ impl FavoritesPage {
             true,
         );
         let inner = rows.inner;
-        let table_width = inner.width;
-
-        if let Some(crs) = self.column_resize.clone() {
-            match event.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    let delta = (event.column as i32) - (crs.start_local_x as i32);
-                    let adjusted = song_table::adjust_widths(
-                        &self.columns,
-                        crs.boundary_index,
-                        table_width,
-                        delta,
-                    );
-                    self.columns = adjusted;
-                    self.column_resize = Some(ColumnResizeState {
-                        start_local_x: event.column,
-                        ..crs
-                    });
-                    return AppAction::None;
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    self.column_resize = None;
-                    return AppAction::CommitColumnResize {
-                        page_key: "favorites".to_string(),
-                        columns: self.columns.clone(),
-                    };
-                }
-                _ => return AppAction::None,
+        match song_table::handle_column_resize(
+            &mut self.column_resize,
+            &mut self.columns,
+            event,
+            rows.header,
+            inner,
+        ) {
+            song_table::ColumnResizeOutcome::Updated => return AppAction::None,
+            song_table::ColumnResizeOutcome::Finished => {
+                return AppAction::CommitColumnResize {
+                    page_key: "favorites".to_string(),
+                    columns: self.columns.clone(),
+                };
             }
-        }
-
-        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(header) = rows.header
-            && header.y == event.row
-        {
-            let local_x = event.column.saturating_sub(inner.x);
-            if let Some(boundary) = song_table::find_boundary(&self.columns, table_width, local_x) {
-                let layout = song_table::compute_layout(&self.columns, table_width);
-                if boundary + 1 < layout.len() {
-                    self.column_resize = Some(ColumnResizeState {
-                        start_local_x: event.column,
-                        boundary_index: boundary,
-                    });
-                    return AppAction::None;
-                }
-            }
+            song_table::ColumnResizeOutcome::NotHandled => {}
         }
 
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))

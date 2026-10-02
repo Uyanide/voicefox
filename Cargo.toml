@@ -3,7 +3,7 @@ members = ["core", "source", "player", "lyric", "application", "runtime", "app",
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/emoeem/voicefox"
@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 
 # TUI
 ratatui = "0.30"
+realfft = "3"
 # 现成主题库：提供 16 套具名主题（Dracula / Nord / Tokyo Night / Catppuccin …）
 # 它自身依赖 ratatui ^0.30.2，与本项目同一版本，不会拉进第二份 ratatui。
 ratatui-themes = "0.3"

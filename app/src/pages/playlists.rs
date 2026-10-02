@@ -69,7 +69,10 @@ fn account_playlist(collection: &lx_core::sync::SyncCollection) -> Playlist {
         id: format!("{NETEASE_ACCOUNT_ID_PREFIX}{}", collection.id),
         name: collection.name.clone(),
         source: SourceId::Wy,
-        cover_url: collection.songs.first().and_then(|song| song.cover_url.clone()),
+        cover_url: collection
+            .songs
+            .first()
+            .and_then(|song| song.cover_url.clone()),
         song_count: collection.songs.len() as u32,
         description: None,
         play_count: None,
@@ -82,7 +85,13 @@ fn account_playlist(collection: &lx_core::sync::SyncCollection) -> Playlist {
 #[derive(Debug, Clone)]
 enum PlaylistNameInput {
     Create,
-    Rename { playlist_id: String },
+    Rename {
+        playlist_id: String,
+    },
+    /// 导出歌单：值是目标 M3U8 文件路径（预填默认位置，可直接编辑）。
+    Export {
+        playlist_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -231,8 +240,7 @@ impl PlaylistsPage {
             // 「我的歌单」只在远程缓存真有内容时出现，避免登录了但没刷新时
             // 多出一个永远空着的入口。
             .chain(
-                has_netease_account_collections()
-                    .then_some(PlaylistScope::Account(SourceId::Wy)),
+                has_netease_account_collections().then_some(PlaylistScope::Account(SourceId::Wy)),
             )
             .collect();
         let items = scopes
@@ -853,8 +861,8 @@ impl PlaylistsPage {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.selected =
-                    (self.selected + ctx.page_step()).min(self.current_list_len().saturating_sub(1));
+                self.selected = (self.selected + ctx.page_step())
+                    .min(self.current_list_len().saturating_sub(1));
             }
             _ if super::is_song_activation_key(key) => {
                 if self.selected_playlist.is_some() && !self.songs.is_empty() {
@@ -909,6 +917,27 @@ impl PlaylistsPage {
                     self.name_input_value = playlist_name;
                 }
             }
+            // 导出自建歌单为 M3U8（可被其他播放器 / 车机识别）。
+            (KeyModifiers::SHIFT, KeyCode::Char('E')) if self.is_custom_scope() => {
+                if let Some((playlist_id, playlist_name)) = self
+                    .current_playlist()
+                    .or_else(|| self.playlists.get(self.selected))
+                    .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
+                {
+                    self.name_input = Some(PlaylistNameInput::Export { playlist_id });
+                    self.name_input_value = default_m3u_path(&playlist_name);
+                }
+            }
+            // 推送自建歌单到网易云（写回，追加不删除）。
+            (KeyModifiers::SHIFT, KeyCode::Char('P')) if self.is_custom_scope() => {
+                if let Some(playlist_id) = self
+                    .current_playlist()
+                    .or_else(|| self.playlists.get(self.selected))
+                    .map(|playlist| playlist.id.clone())
+                {
+                    return AppAction::PushLocalPlaylist { playlist_id };
+                }
+            }
             (KeyModifiers::NONE, KeyCode::Char('d') | KeyCode::Delete)
                 if self.is_custom_scope() =>
             {
@@ -960,6 +989,12 @@ impl PlaylistsPage {
                             }
                             format!("已重命名为: {name}")
                         }),
+                    PlaylistNameInput::Export { playlist_id } => {
+                        let path = std::path::PathBuf::from(&name);
+                        ctx.storage
+                            .export_custom_playlist(&playlist_id, &path)
+                            .map(|count| format!("已导出 {count} 首到 {}", path.display()))
+                    }
                 };
                 return match result {
                     Ok(message) => {
@@ -1119,7 +1154,7 @@ impl PlaylistsPage {
         );
         if let Some(target) = self.splitter.dragging().copied() {
             match event.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
                     self.update_resize_preview(target, event, content_area);
                     return AppAction::None;
                 }
@@ -1145,57 +1180,28 @@ impl PlaylistsPage {
 
         if self.selected_playlist.is_some() {
             let songs_inner = panel_inner(page.songs);
-            let header_row = songs_inner.y;
-            let table_width = songs_inner.width;
-
-            if let Some(crs) = self.column_resize.clone() {
-                match event.kind {
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        let delta = (event.column as i32) - (crs.start_local_x as i32);
-                        self.song_columns = super::components::song_table::adjust_widths(
-                            &self.song_columns,
-                            crs.boundary_index,
-                            table_width,
-                            delta,
-                        );
-                        self.column_resize =
-                            Some(super::components::song_table::ColumnResizeState {
-                                start_local_x: event.column,
-                                ..crs
-                            });
-                        return AppAction::None;
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        self.column_resize = None;
-                        return AppAction::CommitColumnResize {
-                            page_key: "playlists".to_string(),
-                            columns: self.song_columns.clone(),
-                        };
-                    }
-                    _ => return AppAction::None,
+            match super::components::song_table::handle_column_resize(
+                &mut self.column_resize,
+                &mut self.song_columns,
+                event,
+                Some(Rect::new(
+                    songs_inner.x,
+                    songs_inner.y,
+                    songs_inner.width,
+                    1,
+                )),
+                songs_inner,
+            ) {
+                super::components::song_table::ColumnResizeOutcome::Updated => {
+                    return AppAction::None;
                 }
-            } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && event.row == header_row
-            {
-                let local_x = event.column.saturating_sub(songs_inner.x);
-                if let Some(boundary) = super::components::song_table::find_boundary(
-                    &self.song_columns,
-                    table_width,
-                    local_x,
-                ) {
-                    let layout = super::components::song_table::compute_layout(
-                        &self.song_columns,
-                        table_width,
-                    );
-                    if boundary + 1 < layout.len() {
-                        self.column_resize =
-                            Some(super::components::song_table::ColumnResizeState {
-                                start_local_x: event.column,
-                                boundary_index: boundary,
-                            });
-                        return AppAction::None;
-                    }
+                super::components::song_table::ColumnResizeOutcome::Finished => {
+                    return AppAction::CommitColumnResize {
+                        page_key: "playlists".to_string(),
+                        columns: self.song_columns.clone(),
+                    };
                 }
+                super::components::song_table::ColumnResizeOutcome::NotHandled => {}
             }
         }
 
@@ -1798,6 +1804,7 @@ impl PlaylistsPage {
             let title = match mode {
                 PlaylistNameInput::Create => " 创建自建歌单 ",
                 PlaylistNameInput::Rename { .. } => " 重命名自建歌单 ",
+                PlaylistNameInput::Export { .. } => " 导出歌单 M3U8（输入完整文件路径） ",
             };
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -2254,8 +2261,7 @@ mod tests {
         use crate::pages::components::source_selector::SourceSelectorKey;
 
         let mut page = PlaylistsPage::new(vec![SourceId::Wy]);
-        page.scopes
-            .push(PlaylistScope::Account(SourceId::Wy));
+        page.scopes.push(PlaylistScope::Account(SourceId::Wy));
         let account_index = page.scopes.len() - 1;
 
         let source_key = SourceSelectorKey::Source(SourceId::Wy);
@@ -2682,4 +2688,18 @@ mod tests {
         assert!(!hit.matches(list_inner.right() - 1, songs_inner.y));
         assert!(!hit.matches(songs_inner.x, songs_inner.y));
     }
+}
+
+/// 自建歌单导出路径的预填值：音乐目录（或主目录）下的「歌单名.m3u」。
+fn default_m3u_path(playlist_name: &str) -> String {
+    let file_name = format!(
+        "{}.m3u",
+        playlist_name
+            .trim()
+            .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+    );
+    let base = dirs::audio_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join(file_name).to_string_lossy().to_string()
 }

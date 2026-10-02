@@ -19,6 +19,8 @@ pub enum SyncError {
     WriteUnsupported(String),
     #[error("同步请求失败: {0}")]
     Provider(String),
+    #[error("同步已取消")]
+    Cancelled,
     #[error("同步参数无效: {0}")]
     InvalidOptions(String),
 }
@@ -145,20 +147,35 @@ impl SyncEngine {
         })
     }
 
+    /// 执行计划：逐批解析（search_song）并写入目标集合。
+    ///
+    /// `progress` 在每批写入完成后回调 `(已完成歌曲数, 计划总数)`，
+    /// 供 UI 显示进度；`should_cancel` 返回 true 时中止并返回
+    /// [`SyncError::Cancelled`]。测试里传两个空闭包即可。
     pub async fn execute<P: SyncProvider + ?Sized>(
         provider: &P,
         plan: &SyncPlan,
         options: &SyncOptions,
         allow_removals: bool,
+        progress: &(dyn Fn(usize, usize) + Send + Sync),
+        should_cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<SyncReport, SyncError> {
         if !provider.supports_write(plan.target.kind).await {
             return Err(SyncError::WriteUnsupported(provider.source_name().into()));
         }
+        let total = plan.additions.len();
         let mut added = 0;
+        let mut done = 0usize;
         let mut failed = Vec::new();
         for chunk in plan.additions.chunks(options.batch_size.max(1)) {
+            if should_cancel() {
+                return Err(SyncError::Cancelled);
+            }
             let mut resolved = Vec::new();
             for song in chunk {
+                if should_cancel() {
+                    return Err(SyncError::Cancelled);
+                }
                 let candidates = provider.search_song(song).await?;
                 if let Some(best) = best_candidate(song, &candidates, options) {
                     resolved.push(best.clone());
@@ -173,6 +190,8 @@ impl SyncEngine {
             if !resolved.is_empty() {
                 added += provider.add_songs(&plan.target, &resolved).await?;
             }
+            done += chunk.len();
+            progress(done.min(total), total);
         }
         let removed = if allow_removals
             && matches!(options.policy, SyncPolicy::Mirror)
@@ -243,5 +262,152 @@ impl SyncPlan {
             .iter()
             .filter(|item| item.target.is_some())
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::source::SourceId;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn song(id: &str, source: SourceId, name: &str, artist: &str, ms: u64) -> SongInfo {
+        let mut s = SongInfo::new(id.into(), source, name.into(), artist.into());
+        s.duration = Duration::from_millis(ms);
+        s
+    }
+
+    /// 内存版 provider：search 返回同名歌曲（跨平台 ID 不同，靠元数据匹配），
+    /// add/remove 只计数，方便断言引擎的分批与回调行为。
+    struct MockProvider {
+        add_calls: AtomicUsize,
+        batch_size_seen: AtomicUsize,
+    }
+    impl MockProvider {
+        fn new() -> Self {
+            Self {
+                add_calls: AtomicUsize::new(0),
+                batch_size_seen: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SyncProvider for MockProvider {
+        fn source_id(&self) -> SourceId {
+            SourceId::Wy
+        }
+        fn source_name(&self) -> &str {
+            "mock"
+        }
+        async fn list_collections(
+            &self,
+            _kind: SyncCollectionKind,
+        ) -> Result<Vec<SyncCollection>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn get_collection(
+            &self,
+            kind: SyncCollectionKind,
+            _id: &str,
+        ) -> Result<SyncCollection, SyncError> {
+            Ok(SyncCollection {
+                kind,
+                id: "target".into(),
+                name: "target".into(),
+                source: self.source_id(),
+                songs: Vec::new(),
+            })
+        }
+        async fn create_collection(
+            &self,
+            _kind: SyncCollectionKind,
+            _name: &str,
+        ) -> Result<SyncCollection, SyncError> {
+            Err(SyncError::WriteUnsupported("mock".into()))
+        }
+        async fn add_songs(
+            &self,
+            _collection: &SyncCollection,
+            songs: &[SongInfo],
+        ) -> Result<usize, SyncError> {
+            self.add_calls.fetch_add(1, Ordering::SeqCst);
+            self.batch_size_seen.store(songs.len(), Ordering::SeqCst);
+            Ok(songs.len())
+        }
+        async fn remove_songs(
+            &self,
+            _collection: &SyncCollection,
+            _songs: &[SongInfo],
+        ) -> Result<usize, SyncError> {
+            Ok(0)
+        }
+        async fn search_song(&self, song: &SongInfo) -> Result<Vec<SongInfo>, SyncError> {
+            Ok(vec![song.clone()])
+        }
+    }
+
+    fn two_song_plan(batch_size: usize) -> (SyncPlan, SyncOptions) {
+        let source_collection = SyncCollection {
+            kind: SyncCollectionKind::Playlist,
+            id: "local".into(),
+            name: "local".into(),
+            source: SourceId::Local,
+            songs: vec![
+                song("a1", SourceId::Local, "晴天", "周杰伦", 269_000),
+                song("a2", SourceId::Local, "七里香", "周杰伦", 275_000),
+            ],
+        };
+        let target_collection = SyncCollection {
+            kind: SyncCollectionKind::Playlist,
+            id: "target".into(),
+            name: "target".into(),
+            source: SourceId::Wy,
+            songs: Vec::new(),
+        };
+        let mut options = SyncOptions::default();
+        options.batch_size = batch_size;
+        (
+            SyncEngine::plan(source_collection, target_collection, &options).unwrap(),
+            options,
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_reports_progress_and_batches_adds() {
+        let provider = MockProvider::new();
+        let (plan, options) = two_song_plan(1);
+        let last = std::sync::Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+        let sink = std::sync::Arc::clone(&last);
+        let report = SyncEngine::execute(
+            &provider,
+            &plan,
+            &options,
+            false,
+            &move |done, total| {
+                *sink.lock().unwrap() = (done, total);
+            },
+            &|| false,
+        )
+        .await
+        .unwrap();
+        // 每首一批：两次 add，最后一笔回调 done == total。
+        assert_eq!(provider.add_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(report.added, 2);
+        assert_eq!(*last.lock().unwrap(), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn execute_honours_cancellation() {
+        let provider = MockProvider::new();
+        let (plan, options) = two_song_plan(1);
+        let cancelled = AtomicBool::new(true);
+        let result = SyncEngine::execute(&provider, &plan, &options, false, &|_, _| {}, &|| {
+            cancelled.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(matches!(result, Err(SyncError::Cancelled)));
+        assert_eq!(provider.add_calls.load(Ordering::SeqCst), 0);
     }
 }

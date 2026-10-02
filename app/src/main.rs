@@ -9,18 +9,29 @@ mod cover;
 mod data_cache;
 mod download;
 mod fmt;
+mod media_controls;
+mod media_session;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod notification;
 mod pages;
 mod playlist;
 mod remote_cache;
+mod sleep_timer;
+#[cfg(target_os = "windows")]
+mod smtc;
 mod storage;
 mod sync;
 mod ui_cursor;
+mod visualizer;
 
 mod theme;
 mod tmux;
+
+use media_controls::{
+    current_media_snapshot, execute_media_command, persist_volume, start_media_controls,
+    toggle_or_start_current,
+};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -434,6 +445,71 @@ fn table_header_and_samples(
     }
 }
 
+/// 一次"拖表头换列"的会话状态。
+#[derive(Debug, Clone)]
+struct ColumnReorderState {
+    page_key: String,
+    column_key: String,
+    /// 拖拽开始时表头的**实际**矩形。列宽与边界都要按它换算——主页面宽布局
+    /// 下队列只占右侧一栏，表头宽度和整块内容区宽度并不相等，拿内容区宽度
+    /// 去算边界会把"拖边界改宽"误判成"拖表头换列"。
+    header: Rect,
+}
+
+fn column_at_x(
+    columns: &[lx_core::model::config::TableColumnConfig],
+    width: u16,
+    local_x: u16,
+) -> Option<&lx_core::model::config::TableColumnConfig> {
+    pages::components::song_table::compute_layout(columns, width)
+        .into_iter()
+        .find(|column| {
+            local_x >= column.start_x && local_x < column.start_x.saturating_add(column.width)
+        })
+        .map(|layout| &columns[layout.original_index])
+}
+
+fn reorder_columns_at_x(
+    columns: &[lx_core::model::config::TableColumnConfig],
+    width: u16,
+    column_key: &str,
+    local_x: u16,
+) -> Vec<lx_core::model::config::TableColumnConfig> {
+    let layout = pages::components::song_table::compute_layout(columns, width);
+    let Some(source_index) = layout
+        .iter()
+        .position(|layout| columns[layout.original_index].key == column_key)
+    else {
+        return columns.to_vec();
+    };
+    let mut target_index = layout
+        .iter()
+        .position(|layout| local_x < layout.start_x.saturating_add(layout.width / 2))
+        .unwrap_or(layout.len());
+    if target_index == source_index || target_index == source_index + 1 {
+        return columns.to_vec();
+    }
+
+    let mut visible = layout
+        .iter()
+        .map(|layout| columns[layout.original_index].clone())
+        .collect::<Vec<_>>();
+    let moved = visible.remove(source_index);
+    if target_index > source_index {
+        target_index = target_index.saturating_sub(1);
+    }
+    visible.insert(target_index.min(visible.len()), moved);
+
+    let mut visible_iter = visible.into_iter();
+    let mut result = columns.to_vec();
+    for column in result.iter_mut().filter(|column| column.visible) {
+        if let Some(next) = visible_iter.next() {
+            *column = next;
+        }
+    }
+    result
+}
+
 /// 构造表头列设置菜单：显示/隐藏切换 + 自动列宽 + 恢复默认。
 ///
 /// 切换项直接把"换过 visible 之后的完整列配置"放进动作里，
@@ -441,7 +517,8 @@ fn table_header_and_samples(
 fn build_column_menu(
     active_tab: NavTab,
     origin: Position,
-    content: Rect,
+    // 表头的实际宽度（不是内容区宽度）：列配置/自动列宽必须与页面渲染同口径。
+    width: u16,
     ctx: &AppContext,
     samples: &[SongInfo],
 ) -> Option<SongContextMenu> {
@@ -450,8 +527,6 @@ fn build_column_menu(
     };
 
     let page_key = column_page_key(active_tab)?;
-    // 与页面渲染用同一个宽度口径（内容区去掉左右边框）。
-    let width = content.width.saturating_sub(2);
     let columns = {
         let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         load_columns_for_page(&config.ui.table_columns, page_key, width)
@@ -476,7 +551,10 @@ fn build_column_menu(
         ColumnMenuAction::Apply(auto_fit_columns(&columns, samples, width)),
     ));
     items.push(MenuItem::new("恢复默认列宽", ColumnMenuAction::Reset));
-    items.push(MenuItem::new("恢复默认面板布局", ColumnMenuAction::ResetLayout));
+    items.push(MenuItem::new(
+        "恢复默认面板布局",
+        ColumnMenuAction::ResetLayout,
+    ));
     Some(SongContextMenu::from_entries(
         origin,
         " 列设置 ",
@@ -505,6 +583,8 @@ fn status_bar_primary(slot: StatusBarSlot, ctx: &AppContext) -> StatusBarPrimary
         StatusBarSlot::Download => {
             StatusBarPrimary::Command(StatusBarCommand::ToggleDownloadsPanel)
         }
+        // 睡眠定时器没有"快速切换"语义（设定需要精确选档），左右键都开菜单。
+        StatusBarSlot::SleepTimer => StatusBarPrimary::OpenMenu,
         StatusBarSlot::More => StatusBarPrimary::OpenMenu,
         StatusBarSlot::Item(item) => match item {
             StatusBarItem::State => StatusBarPrimary::Action(AppAction::TogglePlayPause),
@@ -624,6 +704,37 @@ fn commit_status_bar_rows(ctx: &AppContext, rows: u16) {
     }
 }
 
+/// 睡眠定时器菜单的条目（`t` 与底栏段共用同一份构造）。
+fn sleep_timer_menu_items(ctx: &AppContext) -> Vec<MenuItem> {
+    let armed = ctx.sleep_timer.armed_minutes();
+    let mut items = Vec::new();
+    items.push(MenuItem::disabled(match ctx.sleep_timer.status_label() {
+        Some(label) => format!("当前: {label}"),
+        None => "当前: 未启用".to_string(),
+    }));
+    items.push(MenuItem::new(
+        if armed.is_none() {
+            "✓ 关闭"
+        } else {
+            "○ 关闭"
+        },
+        StatusBarMenuAction::SetSleepTimer(None),
+    ));
+    for minutes in crate::sleep_timer::PRESET_MINUTES {
+        let mark = if armed == Some(minutes) { "✓" } else { "○" };
+        items.push(MenuItem::new(
+            format!("{mark} {minutes} 分钟"),
+            StatusBarMenuAction::SetSleepTimer(Some(minutes)),
+        ));
+    }
+    items
+}
+
+/// 睡眠定时器菜单：`t` 打开；底栏段的左键 / 右键复用同一份。
+fn build_sleep_timer_menu(origin: Position, ctx: &AppContext) -> SongContextMenu {
+    SongContextMenu::from_status_items(origin, " 睡眠定时器 ", sleep_timer_menu_items(ctx))
+}
+
 /// 底栏右键菜单（左键对"打开菜单"型段也复用同一份构造）。
 fn build_status_bar_menu(
     slot: StatusBarSlot,
@@ -637,6 +748,7 @@ fn build_status_bar_menu(
 
     let (title, items) = match slot {
         StatusBarSlot::More => (" 更多 ".to_string(), collapsed_slot_items(collapsed, ctx)),
+        StatusBarSlot::SleepTimer => (" 睡眠定时器 ".to_string(), sleep_timer_menu_items(ctx)),
         StatusBarSlot::Download => (
             " 下载 ".to_string(),
             vec![{
@@ -695,7 +807,8 @@ fn build_status_bar_menu(
                 " 音量 ".to_string(),
                 vec![
                     {
-                        let mut item = MenuItem::new("音量 +5%", StatusBarMenuAction::VolumeDelta(5));
+                        let mut item =
+                            MenuItem::new("音量 +5%", StatusBarMenuAction::VolumeDelta(5));
                         if let Some(hint) = config_key_hint(ctx, None, Action::GlobalVolumeUp) {
                             item = item.with_hint(hint);
                         }
@@ -924,6 +1037,7 @@ fn collapsed_slot_items(collapsed: &[StatusBarSlot], ctx: &AppContext) -> Vec<Me
             StatusBarSlot::Download => {
                 format!("下载 ({})", ctx.downloads.snapshot().len())
             }
+            StatusBarSlot::SleepTimer => "睡眠定时器".to_string(),
             StatusBarSlot::More => continue,
             StatusBarSlot::Item(item) => match item {
                 StatusBarItem::State => "播放控制".to_string(),
@@ -1026,6 +1140,13 @@ fn execute_status_bar_action(
         }
         StatusBarMenuAction::OpenDownloadsPanel => {
             ctx.queue_status_bar_command(StatusBarCommand::ToggleDownloadsPanel);
+        }
+        StatusBarMenuAction::SetSleepTimer(minutes) => {
+            let message = match minutes {
+                Some(mins) => ctx.sleep_timer.arm(mins),
+                None => ctx.sleep_timer.cancel(),
+            };
+            ctx.notify(Notification::info(message));
         }
         StatusBarMenuAction::OpenSlot(slot) => {
             ctx.queue_status_bar_command(StatusBarCommand::OpenStatusBarMenu(slot));
@@ -1454,25 +1575,7 @@ fn run_app(
     let (leaderboard_tx, mut leaderboard_rx) = mpsc::unbounded_channel::<LeaderboardResponse>();
     let (playlist_tx, mut playlist_rx) = mpsc::unbounded_channel::<PlaylistResponse>();
     let mut player_event_rx = ctx.player.take_event_receiver();
-    #[cfg(target_os = "linux")]
-    let (mpris_handle, mut mpris_command_rx) = if ctx
-        .config
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .integration
-        .mpris
-    {
-        match rt.block_on(mpris::start()) {
-            Ok((handle, receiver)) => (Some(handle), Some(receiver)),
-            Err(error) => {
-                tracing::warn!("MPRIS unavailable: {error}");
-                ctx.notify(Notification::warning(format!("MPRIS 启动失败: {error}")).tui_only());
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
-    };
+    let (media_handle, mut media_command_rx) = start_media_controls(&ctx, rt);
 
     // 搜索请求序列号（用于取消过时请求）
     let search_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -1528,9 +1631,7 @@ fn run_app(
     settings_page
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .set_cover_capabilities(cover::CoverCapabilities::detect(
-            main_page.cover_protocol(),
-        ));
+        .set_cover_capabilities(cover::CoverCapabilities::detect(main_page.cover_protocol()));
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -1568,6 +1669,7 @@ fn run_app(
     let mut confirm_delete: Option<LocalDeleteConfirmation> = None;
     let mut local_diagnostics: Option<LocalDiagnosticsKind> = None;
     let mut song_menu: Option<SongContextMenu> = None;
+    let mut column_reorder: Option<ColumnReorderState> = None;
     let mut ui_areas = UiAreas::default();
     let mut click_tracker = ClickTracker::default();
     let mut qr_login_page: Option<Arc<std::sync::Mutex<pages::qr_login::QrLoginPage>>> = None;
@@ -1576,6 +1678,27 @@ fn run_app(
     let mut help_page: Option<pages::help::HelpPage> = None;
     // 下载面板浮层（Ctrl+o 开关）
     let mut downloads_panel = pages::downloads::DownloadsPanel::new();
+    // 频谱可视化：Some 即开启（绘制并持续采集），None 即关闭。按 w 切换。
+    let mut visualizer: Option<visualizer::Visualizer> = if ctx
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .ui
+        .visualizer_enabled()
+    {
+        match visualizer::Visualizer::start() {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::warn!("visualizer unavailable: {error:#}");
+                ctx.notify(
+                    Notification::warning(format!("频谱可视化启动失败: {error:#}")).tui_only(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     // 底栏高度拖拽会话：拖动中只改内存，松开才落盘（行数真值始终在 config 里）。
     let mut status_bar_resizing = false;
     let mut qr_poll_deadline: Instant = Instant::now();
@@ -1610,11 +1733,11 @@ fn run_app(
     // 安装 tmux 的 client-attached hook，析构时自动卸载
     let attach_watcher = tmux::AttachWatcher::install();
     let mut last_cover_redraw = Instant::now() - COVER_REDRAW_THROTTLE;
-    #[cfg(target_os = "linux")]
-    let mut last_mpris_snapshot: Option<mpris::MprisSnapshot> = None;
-    #[cfg(target_os = "linux")]
-    let mut last_mpris_update = Instant::now() - Duration::from_secs(1);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut last_media_snapshot: Option<media_session::MediaSnapshot> = None;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut last_media_update = Instant::now() - Duration::from_secs(1);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut last_position_epoch = ctx.position_epoch();
 
     // === 后台异步加载 JS 音源（不阻塞启动） ===
@@ -1738,10 +1861,10 @@ fn run_app(
             needs_render = true;
         }
 
-        #[cfg(target_os = "linux")]
-        if let Some(receiver) = mpris_command_rx.as_mut() {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(receiver) = media_command_rx.as_mut() {
             while let Ok(command) = receiver.try_recv() {
-                if execute_mpris_command(
+                if execute_media_command(
                     command,
                     &ctx,
                     rt,
@@ -1750,7 +1873,7 @@ fn run_app(
                     &settings_page,
                     &search_seq,
                 ) {
-                    tracing::info!("quit requested through MPRIS");
+                    tracing::info!("quit requested through media controls");
                     if let Err(error) = ctx.persist_playback_session() {
                         tracing::warn!("save playback session failed: {error}");
                     }
@@ -1913,6 +2036,42 @@ fn run_app(
                     }
                     let mut overlay = pages::sync_overlay::SyncOverlay::new();
                     overlay.start_for(source, Arc::clone(&ctx.storage), rt);
+                    sync_overlay = Some(overlay);
+                    needs_render = true;
+                    continue;
+                }
+                AppAction::PushLocalPlaylist { playlist_id } => {
+                    let local = ctx.storage.custom_playlist(&playlist_id).map(|playlist| {
+                        crate::sync::LocalPushCollection {
+                            name: playlist.name.clone(),
+                            songs: playlist.songs.clone(),
+                            is_favorites: false,
+                        }
+                    });
+                    match local {
+                        Some(local) => {
+                            let mut overlay = pages::sync_overlay::SyncOverlay::new();
+                            overlay.start_push_for(SourceId::Wy, local, rt);
+                            sync_overlay = Some(overlay);
+                        }
+                        None => ctx.notify(Notification::warning("歌单不存在或已被删除")),
+                    }
+                    needs_render = true;
+                    continue;
+                }
+                AppAction::PushFavorites => {
+                    let local = crate::sync::LocalPushCollection {
+                        name: "我的收藏".to_string(),
+                        songs: ctx.storage.load_favorites(),
+                        is_favorites: true,
+                    };
+                    if local.songs.is_empty() {
+                        ctx.notify(Notification::info("收藏为空，没有可推送的歌曲"));
+                        needs_render = true;
+                        continue;
+                    }
+                    let mut overlay = pages::sync_overlay::SyncOverlay::new();
+                    overlay.start_push_for(SourceId::Wy, local, rt);
                     sync_overlay = Some(overlay);
                     needs_render = true;
                     continue;
@@ -2349,20 +2508,20 @@ fn run_app(
             ctx.player.fade_out(Duration::from_millis(fade_out_ms));
             faded_generation = active_generation;
         }
-        #[cfg(target_os = "linux")]
-        if let Some(handle) = mpris_handle.as_ref() {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(handle) = media_handle.as_ref() {
             // 例行更新按 250ms 限频，但跳转要立刻放行
             let position_epoch = ctx.position_epoch();
             if position_epoch != last_position_epoch
-                || last_mpris_update.elapsed() >= Duration::from_millis(250)
+                || last_media_update.elapsed() >= Duration::from_millis(250)
             {
                 last_position_epoch = position_epoch;
-                let snapshot = current_mpris_snapshot(&ctx);
-                if last_mpris_snapshot.as_ref() != Some(&snapshot) {
+                let snapshot = current_media_snapshot(&ctx);
+                if last_media_snapshot.as_ref() != Some(&snapshot) {
                     handle.update(snapshot.clone());
-                    last_mpris_snapshot = Some(snapshot);
+                    last_media_snapshot = Some(snapshot);
                 }
-                last_mpris_update = Instant::now();
+                last_media_update = Instant::now();
             }
         }
 
@@ -2393,7 +2552,16 @@ fn run_app(
             ) || input_active
                 || notification_active
                 || qr_login_page.is_some()
-                || sync_overlay.is_some();
+                || sync_overlay.is_some()
+                // 睡眠定时器启用时倒计时每秒都在变，暂停状态下也要保持走动。
+                || ctx.sleep_timer.is_active()
+                // 频谱画的是系统混音：voicefox 暂停时柱子也可能在动（其他应用出声）。
+                || visualizer.is_some();
+            // 睡眠定时器随周期渲染一并推进：到点淡出、淡出后暂停都发生在这里。
+            if let Some(message) = ctx.sleep_timer.poll(&ctx) {
+                ctx.notify(Notification::info(message));
+                needs_render = true;
+            }
             last_periodic_render = Instant::now();
         }
 
@@ -2490,6 +2658,7 @@ fn run_app(
                 &mut sync_overlay,
                 &mut help_page,
                 &mut downloads_panel,
+                visualizer.as_ref(),
             )?;
             needs_render = false;
         }
@@ -2532,34 +2701,69 @@ fn run_app(
 
             if let Some(ref mut sync) = sync_overlay {
                 let phase = sync.state.lock().unwrap_or_else(|e| e.into_inner()).phase;
-                match key.code {
-                    KeyCode::Esc
-                        if matches!(
-                            phase,
-                            pages::sync_overlay::SyncPhase::Preparing
-                                | pages::sync_overlay::SyncPhase::Running
-                        ) =>
-                    {
-                        sync.cancel();
-                    }
-                    KeyCode::Esc => {
-                        sync_overlay = None;
-                    }
-                    KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S')
-                        if phase == pages::sync_overlay::SyncPhase::Preview =>
-                    {
-                        sync.confirm(Arc::clone(&ctx.storage), rt);
-                    }
-                    KeyCode::Char('r') | KeyCode::Char('R')
-                        if matches!(
-                            phase,
-                            pages::sync_overlay::SyncPhase::Failed
-                                | pages::sync_overlay::SyncPhase::Cancelled
-                        ) =>
-                    {
-                        sync.retry(Arc::clone(&ctx.storage), rt);
-                    }
-                    _ => {}
+                match phase {
+                    pages::sync_overlay::SyncPhase::PushPick => match (key.modifiers, key.code) {
+                        (KeyModifiers::NONE, KeyCode::Esc) => {
+                            sync_overlay = None;
+                        }
+                        (KeyModifiers::NONE, KeyCode::Up)
+                        | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+                            sync.push_move(-1);
+                        }
+                        (KeyModifiers::NONE, KeyCode::Down)
+                        | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+                            sync.push_move(1);
+                        }
+                        (KeyModifiers::NONE, KeyCode::Enter) => {
+                            if sync.push_on_create_option() {
+                                sync.push_plan_create(rt);
+                            } else {
+                                sync.push_plan_selected(rt);
+                            }
+                        }
+                        _ => {}
+                    },
+                    pages::sync_overlay::SyncPhase::PushDiff => match (key.modifiers, key.code) {
+                        (KeyModifiers::NONE, KeyCode::Esc) => {
+                            // 回到选单；重新选择目标会覆盖旧计划。
+                            sync.set_phase(pages::sync_overlay::SyncPhase::PushPick);
+                        }
+                        (KeyModifiers::NONE, KeyCode::Enter)
+                        | (KeyModifiers::NONE, KeyCode::Char('s'))
+                        | (KeyModifiers::NONE, KeyCode::Char('S')) => {
+                            sync.push_confirm(rt);
+                        }
+                        _ => {}
+                    },
+                    _ => match key.code {
+                        KeyCode::Esc
+                            if matches!(
+                                phase,
+                                pages::sync_overlay::SyncPhase::Preparing
+                                    | pages::sync_overlay::SyncPhase::Running
+                            ) =>
+                        {
+                            sync.cancel();
+                        }
+                        KeyCode::Esc => {
+                            sync_overlay = None;
+                        }
+                        KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S')
+                            if phase == pages::sync_overlay::SyncPhase::Preview =>
+                        {
+                            sync.confirm(Arc::clone(&ctx.storage), rt);
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R')
+                            if matches!(
+                                phase,
+                                pages::sync_overlay::SyncPhase::Failed
+                                    | pages::sync_overlay::SyncPhase::Cancelled
+                            ) =>
+                        {
+                            sync.retry(Arc::clone(&ctx.storage), rt);
+                        }
+                        _ => {}
+                    },
                 }
                 needs_render = true;
                 continue;
@@ -3004,6 +3208,50 @@ fn run_app(
                             );
                             needs_render = true;
                         }
+                        continue;
+                    }
+                    // 睡眠定时器：`t` 打开菜单（预设档位 + 关闭），与底栏段同源。
+                    Action::GlobalSleepTimer if !text_input_active => {
+                        song_menu = Some(build_sleep_timer_menu(
+                            Position::new(ui_areas.status.x + 2, ui_areas.status.y),
+                            &ctx,
+                        ));
+                        needs_render = true;
+                        continue;
+                    }
+                    // 频谱可视化：w 开关，状态落盘到 [ui] visualizer。
+                    Action::GlobalVisualizer if !text_input_active => {
+                        let enabling = visualizer.is_none();
+                        if enabling {
+                            match visualizer::Visualizer::start() {
+                                Ok(handle) => visualizer = Some(handle),
+                                Err(error) => {
+                                    ctx.notify(Notification::error(format!(
+                                        "频谱可视化启动失败: {error:#}"
+                                    )));
+                                }
+                            }
+                        } else {
+                            visualizer = None;
+                        }
+                        if visualizer.is_some() == enabling {
+                            let mode = if enabling { "bars" } else { "off" };
+                            let save_result = {
+                                let mut config =
+                                    ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                                config.ui.visualizer = mode.to_string();
+                                crate::config::loader::save(&config, &ctx.config_path)
+                            };
+                            let message =
+                                format!("频谱可视化: {}", if enabling { "开启" } else { "关闭" });
+                            match save_result {
+                                Ok(()) => ctx.notify(Notification::info(message)),
+                                Err(error) => ctx.notify(Notification::warning(format!(
+                                    "{message}，但保存失败: {error}"
+                                ))),
+                            }
+                        }
+                        needs_render = true;
                         continue;
                     }
                     Action::GlobalDownloadCurrent if !text_input_active => {
@@ -3675,6 +3923,7 @@ fn run_app(
                     .content
                     .contains(Position::new(mouse.column, mouse.row))
             {
+                column_reorder = None;
                 abort_all_drag_sessions(
                     &mut main_page,
                     &mut leaderboard,
@@ -3687,6 +3936,52 @@ fn run_app(
                 );
                 needs_render = true;
             }
+            if let Some(reorder) = column_reorder.clone() {
+                match mouse.kind {
+                    MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                        // 一律按"拖拽开始时表头的真实矩形"换算：主页面宽布局下
+                        // 队列只占右栏，表头比整块内容区窄，用内容区宽度会算错列位置。
+                        let width = reorder.header.width;
+                        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
+                        let current = pages::components::song_table::load_columns_for_page(
+                            &config.ui.table_columns,
+                            &reorder.page_key,
+                            width,
+                        );
+                        let local_x = mouse.column.saturating_sub(reorder.header.x);
+                        let next =
+                            reorder_columns_at_x(&current, width, &reorder.column_key, local_x);
+                        if next != current {
+                            config
+                                .ui
+                                .table_columns
+                                .insert(reorder.page_key.clone(), next);
+                        }
+                        needs_render = true;
+                        continue;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let page_key = reorder.page_key.clone();
+                        column_reorder = None;
+                        let columns = {
+                            let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                            pages::components::song_table::load_columns_for_page(
+                                &config.ui.table_columns,
+                                &page_key,
+                                reorder.header.width,
+                            )
+                        };
+                        let _ = action_tx.send(AppAction::CommitColumnResize { page_key, columns });
+                        needs_render = true;
+                        continue;
+                    }
+                    _ => {
+                        needs_render = true;
+                        continue;
+                    }
+                }
+            }
+
             if downloads_panel.is_open() {
                 let tasks = ctx.downloads.snapshot();
                 downloads_panel.handle_mouse(&mouse, &ctx, &tasks);
@@ -3956,6 +4251,54 @@ fn run_app(
                     | StatusBarMouseRoute::None => {}
                 }
             } else if ui_areas.content.contains(position) {
+                // 表头左键拖动非分隔线区域 → 调整列顺序；分隔线仍交给页面自己的
+                // ColumnResizeState 处理，因此“拖边界改宽”和“拖表头换列”不冲突。
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if let Some((header, _)) = table_header_and_samples(
+                        active_tab,
+                        ui_areas.content,
+                        &ctx,
+                        &mut main_page,
+                        &leaderboard,
+                        &playlists,
+                        &favorites_page,
+                        &search_page,
+                        &history_filter,
+                        &local_filter,
+                    ) && header.y == mouse.row
+                        && mouse.column >= header.x
+                        && mouse.column < header.right()
+                        && let Some(page_key) = column_page_key(active_tab)
+                    {
+                        // 用表头自身的宽度与起点：整块内容区宽度在主页面上包含
+                        // 左侧封面/歌词栏，会让边界判定错位，拖边界变成换列。
+                        let width = header.width;
+                        let columns = {
+                            let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+                            pages::components::song_table::load_columns_for_page(
+                                &config.ui.table_columns,
+                                page_key,
+                                width,
+                            )
+                        };
+                        let local_x = mouse.column.saturating_sub(header.x);
+                        let is_boundary =
+                            pages::components::song_table::find_boundary(&columns, width, local_x)
+                                .is_some();
+                        if !is_boundary {
+                            if let Some(column) = column_at_x(&columns, width, local_x) {
+                                column_reorder = Some(ColumnReorderState {
+                                    page_key: page_key.to_string(),
+                                    column_key: column.key.clone(),
+                                    header,
+                                });
+                                needs_render = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 // 表头右键 → 列设置菜单。与歌曲菜单共用同一个槽位与交互
                 // （渲染、键盘、点外关闭都只有一份实现）。
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
@@ -3975,7 +4318,7 @@ fn run_app(
                     && mouse.column >= header.x
                     && mouse.column < header.right()
                     && let Some(menu) =
-                        build_column_menu(active_tab, position, ui_areas.content, &ctx, &samples)
+                        build_column_menu(active_tab, position, header.width, &ctx, &samples)
                 {
                     song_menu = Some(menu);
                     needs_render = true;
@@ -4190,6 +4533,7 @@ fn run_app(
                 &mut sync_overlay,
                 &mut help_page,
                 &mut downloads_panel,
+                visualizer.as_ref(),
             )?;
             needs_render = false;
         }
@@ -4222,6 +4566,7 @@ fn draw_app(
     sync_overlay: &mut Option<pages::sync_overlay::SyncOverlay>,
     help_page: &mut Option<pages::help::HelpPage>,
     downloads_panel: &mut pages::downloads::DownloadsPanel,
+    visualizer: Option<&visualizer::Visualizer>,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         // 每帧重新收集文本插入点请求（见 ui_cursor 模块说明）。
@@ -4255,7 +4600,8 @@ fn draw_app(
                 .style(Style::new().fg(crate::theme::yellow(ctx)));
             ratatui::widgets::Widget::render(hint_paragraph, hint_area, frame.buffer_mut());
             return;
-        }        let status_rows = ctx
+        }
+        let status_rows = ctx
             .config
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -4363,11 +4709,11 @@ fn draw_app(
                         String::new()
                     };
                     // 排序键提示读真实键位配置；用户删掉绑定时整段省略。
-                    let sort_suffix = match config_key_hint(ctx, Some("local"), Action::ListCycleSort)
-                    {
-                        Some(hint) => format!(" · {hint} 切换"),
-                        None => String::new(),
-                    };
+                    let sort_suffix =
+                        match config_key_hint(ctx, Some("local"), Action::ListCycleSort) {
+                            Some(hint) => format!(" · {hint} 切换"),
+                            None => String::new(),
+                        };
                     let block = Block::default()
                         .borders(components::hit_test::PANEL_BORDERS)
                         .border_style(Style::new().fg(crate::theme::muted(ctx)))
@@ -4413,8 +4759,8 @@ fn draw_app(
                             " 未配置音乐目录，请在设置（{}）中添加",
                             NavTab::Settings.shortcut_digit()
                         )))
-                            .style(Style::new().fg(Color::DarkGray))
-                            .render(inner, frame.buffer_mut());
+                        .style(Style::new().fg(Color::DarkGray))
+                        .render(inner, frame.buffer_mut());
                         break 'local_content;
                     }
 
@@ -4426,19 +4772,14 @@ fn draw_app(
                     }
 
                     if songs.is_empty() {
-                        let rescan_hint = match config_key_hint(
-                            ctx,
-                            Some("local"),
-                            Action::LocalRescan,
-                        ) {
-                            Some(hint) => format!("，按 {hint} 重新扫描"),
-                            None => String::new(),
-                        };
-                        Paragraph::new(Line::from(format!(
-                            " 目录下未找到音频文件{rescan_hint}"
-                        )))
-                        .style(Style::new().fg(Color::DarkGray))
-                        .render(inner, frame.buffer_mut());
+                        let rescan_hint =
+                            match config_key_hint(ctx, Some("local"), Action::LocalRescan) {
+                                Some(hint) => format!("，按 {hint} 重新扫描"),
+                                None => String::new(),
+                            };
+                        Paragraph::new(Line::from(format!(" 目录下未找到音频文件{rescan_hint}")))
+                            .style(Style::new().fg(Color::DarkGray))
+                            .render(inner, frame.buffer_mut());
                         break 'local_content;
                     }
 
@@ -4601,6 +4942,24 @@ fn draw_app(
             sync.render(overlay_area, frame.buffer_mut(), ctx);
         }
 
+        // 频谱可视化：非模态叠加在内容区上（菜单/通知在其后再画，保持在上层）。
+        //
+        // 扫码登录、同步浮层、本地诊断这三类"画在频谱之前"的整屏提示必须让路：
+        // 频谱整块盖上去会把它们糊掉，看起来就像界面卡死、点什么都没反应。
+        let spectrum_blocked_by_modal =
+            local_diagnostics.is_some() || qr_login_page.is_some() || sync_overlay.is_some();
+        if !spectrum_blocked_by_modal
+            && let Some(handle) = visualizer
+            && let Some(snapshot) = handle.frame()
+        {
+            visualizer::render_data(
+                main_chunks[2],
+                frame.buffer_mut(),
+                ctx,
+                &snapshot.data,
+                &snapshot.peaks,
+            );
+        }
         components::progress_bar::render(main_chunks[3], frame.buffer_mut(), ctx);
         let sort_status = match active_tab {
             NavTab::Favorites => Some(favorites_page.sort_label()),
@@ -4615,7 +4974,8 @@ fn draw_app(
             NavTab::LocalMusic => Some("local"),
             _ => None,
         };
-        let sort_hint = sort_page.and_then(|page| config_key_hint(ctx, Some(page), Action::ListCycleSort));
+        let sort_hint =
+            sort_page.and_then(|page| config_key_hint(ctx, Some(page), Action::ListCycleSort));
         let status_frame = components::status_bar::render(
             main_chunks[4],
             frame.buffer_mut(),
@@ -4774,10 +5134,7 @@ fn spawn_qr_generate(
     wake_tx: mpsc::UnboundedSender<AppAction>,
 ) -> tokio::task::JoinHandle<()> {
     let manager = Arc::clone(&ctx.source_manager);
-    let source_id = page
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .source;
+    let source_id = page.lock().unwrap_or_else(|e| e.into_inner()).source;
     rt.spawn(async move {
         let result = manager.create_qr_login(source_id).await;
         let mut page = page.lock().unwrap_or_else(|e| e.into_inner());
@@ -4787,155 +5144,6 @@ fn spawn_qr_generate(
         }
         let _ = wake_tx.send(AppAction::None);
     })
-}
-
-#[cfg(target_os = "linux")]
-fn current_mpris_snapshot(ctx: &AppContext) -> mpris::MprisSnapshot {
-    let song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
-    mpris::MprisSnapshot::new(
-        *ctx.player_state.borrow(),
-        song.as_ref(),
-        *ctx.position.borrow(),
-        *ctx.duration.borrow(),
-        ctx.player.volume(),
-        ctx.playlist.mode(),
-        ctx.playlist.len(),
-        ctx.position_epoch(),
-    )
-}
-
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn execute_mpris_command(
-    command: mpris::MprisCommand,
-    ctx: &AppContext,
-    rt: &tokio::runtime::Runtime,
-    action_tx: &mpsc::UnboundedSender<AppAction>,
-    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
-    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
-    search_seq: &Arc<AtomicU64>,
-) -> bool {
-    use mpris::MprisCommand;
-
-    let play_entry = |entry: Option<(Arc<Vec<SongInfo>>, usize)>| {
-        if let Some((songs, index)) = entry {
-            execute_action(
-                AppAction::PlayFromQueue { songs, index },
-                ctx,
-                rt,
-                action_tx,
-                search_page,
-                settings_page,
-                search_seq,
-            );
-        }
-    };
-
-    match command {
-        MprisCommand::Quit => return true,
-        MprisCommand::Play => {
-            resume_or_start_current(ctx, rt, action_tx, search_page, settings_page, search_seq)
-        }
-        MprisCommand::Pause => ctx.player.pause(),
-        MprisCommand::Toggle => {
-            toggle_or_start_current(ctx, rt, action_tx, search_page, settings_page, search_seq)
-        }
-        MprisCommand::Stop => ctx.stop_player(),
-        MprisCommand::Next => play_entry(ctx.playlist.next_manual_entry_arc()),
-        MprisCommand::Previous => play_entry(ctx.playlist.prev_manual_entry_arc()),
-        MprisCommand::SeekBy(offset) => {
-            let current = ctx.position.borrow().as_micros();
-            let target = if offset >= 0 {
-                current.saturating_add(offset as u128)
-            } else {
-                current.saturating_sub(offset.unsigned_abs() as u128)
-            };
-            ctx.seek(Duration::from_micros(target.min(u64::MAX as u128) as u64));
-        }
-        MprisCommand::SetPosition(position) => ctx.seek(position),
-        MprisCommand::SetVolume(volume) => {
-            persist_volume(ctx, (volume.clamp(0.0, 1.0) * 100.0).round() as u32);
-        }
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn resume_or_start_current(
-    ctx: &AppContext,
-    rt: &tokio::runtime::Runtime,
-    action_tx: &mpsc::UnboundedSender<AppAction>,
-    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
-    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
-    search_seq: &Arc<AtomicU64>,
-) {
-    if *ctx.player_state.borrow() == PlayerState::Paused {
-        ctx.player.resume();
-    } else if matches!(
-        *ctx.player_state.borrow(),
-        PlayerState::Idle | PlayerState::Stopped
-    ) {
-        start_current_queue_entry(ctx, rt, action_tx, search_page, settings_page, search_seq);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn toggle_or_start_current(
-    ctx: &AppContext,
-    rt: &tokio::runtime::Runtime,
-    action_tx: &mpsc::UnboundedSender<AppAction>,
-    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
-    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
-    search_seq: &Arc<AtomicU64>,
-) {
-    // Copy the state out of the watch channel first: pause()/resume() send
-    // a new state into the same watch channel, and a live watch::Ref holds
-    // the RwLock read guard that the send needs as a write lock.
-    let state = *ctx.player_state.borrow();
-    match state {
-        PlayerState::Playing | PlayerState::Loading => ctx.player.pause(),
-        PlayerState::Paused => ctx.player.resume(),
-        PlayerState::Idle | PlayerState::Stopped => {
-            start_current_queue_entry(ctx, rt, action_tx, search_page, settings_page, search_seq);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_current_queue_entry(
-    ctx: &AppContext,
-    rt: &tokio::runtime::Runtime,
-    action_tx: &mpsc::UnboundedSender<AppAction>,
-    search_page: &Arc<std::sync::Mutex<pages::search::SearchPage>>,
-    settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
-    search_seq: &Arc<AtomicU64>,
-) {
-    let (songs, index) = ctx.playlist.snapshot_arc();
-    if songs.get(index).is_some() {
-        execute_action(
-            AppAction::PlayFromQueue { songs, index },
-            ctx,
-            rt,
-            action_tx,
-            search_page,
-            settings_page,
-            search_seq,
-        );
-    }
-}
-
-fn persist_volume(ctx: &AppContext, volume: u32) {
-    let volume = volume.clamp(0, 100);
-    ctx.player.set_volume(volume);
-    {
-        let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
-        if config.player.volume == volume {
-            return;
-        }
-        config.player.volume = volume;
-    }
-    ctx.mark_config_dirty();
 }
 
 /// 执行一个 AppAction（简化版，不再处理 Navigate/GoBack）
@@ -5623,7 +5831,10 @@ fn execute_action(
         | AppAction::QrLogout(_)
         | AppAction::QrLoginSuccess(_)
         | AppAction::SyncNetease
-        | AppAction::SyncQq => {
+        | AppAction::SyncQq
+        // 推送要开 sync_overlay（主循环本地状态），由主循环动作泵处理。
+        | AppAction::PushLocalPlaylist { .. }
+        | AppAction::PushFavorites => {
             // handled elsewhere or ignored
         }
     }
@@ -6674,7 +6885,9 @@ fn spawn_playlist_request(
                 let result = match result {
                     Ok(items) => Ok(items),
                     Err(error) if !account.is_empty() && page <= 1 => {
-                        tracing::debug!("playlist list failed, falling back to account cache: {error}");
+                        tracing::debug!(
+                            "playlist list failed, falling back to account cache: {error}"
+                        );
                         Ok(account)
                     }
                     Err(error) => Err(error),
@@ -6764,9 +6977,7 @@ fn spawn_playlist_request(
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use lx_core::model::song::SongInfo;
     use lx_core::model::source::SourceId;
 
@@ -6802,6 +7013,34 @@ mod tests {
         // 超出邻域（>2px）是两次独立单击。
         assert!(!tracker.is_double_click(click(18, 10)));
         assert!(!tracker.is_double_click(click(18, 14)));
+    }
+
+    /// 列边界命中必须按"表头实际宽度"换算，不能用整块内容区宽度：主页面
+    /// 宽布局下队列只占右侧一栏，两者宽度不同，用错就会把"拖边界改宽"误判
+    /// 成"拖表头换列"，表现就是相邻列互相卡顿。
+    #[test]
+    fn column_boundary_uses_the_header_width_not_the_content_width() {
+        use crate::pages::components::song_table::{
+            compute_layout, default_columns, find_boundary,
+        };
+        use ratatui::layout::Rect;
+
+        let header = Rect::new(40, 6, 72, 1);
+        let content_width = 150u16;
+        let columns = default_columns(header.width);
+
+        let layout = compute_layout(&columns, header.width);
+        // 第 0、1 列之间那条分隔线在表头内的局部 x。
+        let boundary = layout[0].start_x + layout[0].width;
+
+        assert!(
+            find_boundary(&columns, header.width, boundary).is_some(),
+            "按表头宽度应当命中分隔线"
+        );
+        assert!(
+            find_boundary(&columns, content_width.saturating_sub(2), boundary).is_none(),
+            "内容区宽度不能拿来判定表头分隔线"
+        );
     }
 
     #[test]

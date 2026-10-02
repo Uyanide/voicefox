@@ -85,9 +85,8 @@ pub fn store_bytes(target: &Path, bytes: &[u8]) -> io::Result<(u32, u32)> {
     let temp_path = temp_path_for(target);
     let result = (|| {
         std::fs::write(&temp_path, bytes)?;
-        let dimensions = probe_dimensions(&temp_path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "cover image is corrupt")
-        })?;
+        let dimensions = probe_dimensions(&temp_path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cover image is corrupt"))?;
         std::fs::rename(&temp_path, target)?;
         Ok(dimensions)
     })();
@@ -194,9 +193,7 @@ mod tests {
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height));
         let mut bytes = std::io::Cursor::new(Vec::new());
-        image
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
         bytes.into_inner()
     }
 
@@ -239,7 +236,11 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
 
         assert!(store_bytes(&target, b"not an image").is_err());
-        assert_eq!(std::fs::read(&target).unwrap(), b"old", "旧缓存必须原样保留");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"old",
+            "旧缓存必须原样保留"
+        );
         assert_eq!(names(&dir), ["cover.jpg"], "临时文件应已清掉");
     }
 
@@ -311,8 +312,8 @@ mod tests {
         for index in 0..6 {
             let path = dir.join(format!("{index}.jpg"));
             store_bytes(&path, &png_bytes(2, 2)).unwrap();
-            let old = std::time::SystemTime::now()
-                - std::time::Duration::from_secs(600 - index as u64);
+            let old =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(600 - index as u64);
             set_mtime(&path, old);
         }
 
@@ -326,7 +327,12 @@ mod tests {
 
     #[tokio::test]
     async fn sweeping_a_missing_directory_is_not_an_error() {
-        sweep_in(&temp_dir("sweep-missing").join("nope"), 1, super::TEMP_GRACE).await;
+        sweep_in(
+            &temp_dir("sweep-missing").join("nope"),
+            1,
+            super::TEMP_GRACE,
+        )
+        .await;
     }
 
     const TEMP_SUFFIX: &str = ".part.";
@@ -339,4 +345,32 @@ mod tests {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
     }
+}
+
+/// 缓存统计：`(文件数, 总字节)`；目录不存在时为 `(0, 0)`。
+pub fn cache_stats() -> (usize, u64) {
+    let dir = cache_dir();
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if entry.file_type().is_file() {
+            files += 1;
+            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    (files, bytes)
+}
+
+/// 清空缓存目录，返回 `(删除的文件数, 释放的字节)`。
+///
+/// 先统计再删除：删除失败时统计仍可用于日志；目录不存在视为已清理。
+pub fn clear_cache() -> std::io::Result<(usize, u64)> {
+    let stats = cache_stats();
+    if stats.0 > 0 {
+        std::fs::remove_dir_all(cache_dir())?;
+    }
+    Ok(stats)
 }

@@ -336,8 +336,8 @@ impl LeaderboardPage {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.selected =
-                    (self.selected + ctx.page_step()).min(self.current_list_len().saturating_sub(1));
+                self.selected = (self.selected + ctx.page_step())
+                    .min(self.current_list_len().saturating_sub(1));
             }
             _ if super::is_song_activation_key(key) => {
                 if self.selected_board.is_some() && !self.songs.is_empty() {
@@ -650,7 +650,7 @@ impl LeaderboardPage {
         let page = self.compute_layout(shell[1], self.boards.len());
         if let Some(target) = self.splitter.dragging().copied() {
             match event.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
                     self.update_resize_preview(target, event, shell[1]);
                     return AppAction::None;
                 }
@@ -676,57 +676,28 @@ impl LeaderboardPage {
 
         if self.selected_board.is_some() {
             let songs_inner = panel_inner(page.songs);
-            let header_row = songs_inner.y;
-            let table_width = songs_inner.width;
-
-            if let Some(crs) = self.column_resize.clone() {
-                match event.kind {
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        let delta = (event.column as i32) - (crs.start_local_x as i32);
-                        self.song_columns = super::components::song_table::adjust_widths(
-                            &self.song_columns,
-                            crs.boundary_index,
-                            table_width,
-                            delta,
-                        );
-                        self.column_resize =
-                            Some(super::components::song_table::ColumnResizeState {
-                                start_local_x: event.column,
-                                ..crs
-                            });
-                        return AppAction::None;
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        self.column_resize = None;
-                        return AppAction::CommitColumnResize {
-                            page_key: "leaderboard".to_string(),
-                            columns: self.song_columns.clone(),
-                        };
-                    }
-                    _ => return AppAction::None,
+            match super::components::song_table::handle_column_resize(
+                &mut self.column_resize,
+                &mut self.song_columns,
+                event,
+                Some(Rect::new(
+                    songs_inner.x,
+                    songs_inner.y,
+                    songs_inner.width,
+                    1,
+                )),
+                songs_inner,
+            ) {
+                super::components::song_table::ColumnResizeOutcome::Updated => {
+                    return AppAction::None;
                 }
-            } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && event.row == header_row
-            {
-                let local_x = event.column.saturating_sub(songs_inner.x);
-                if let Some(boundary) = super::components::song_table::find_boundary(
-                    &self.song_columns,
-                    table_width,
-                    local_x,
-                ) {
-                    let layout = super::components::song_table::compute_layout(
-                        &self.song_columns,
-                        table_width,
-                    );
-                    if boundary + 1 < layout.len() {
-                        self.column_resize =
-                            Some(super::components::song_table::ColumnResizeState {
-                                start_local_x: event.column,
-                                boundary_index: boundary,
-                            });
-                        return AppAction::None;
-                    }
+                super::components::song_table::ColumnResizeOutcome::Finished => {
+                    return AppAction::CommitColumnResize {
+                        page_key: "leaderboard".to_string(),
+                        columns: self.song_columns.clone(),
+                    };
                 }
+                super::components::song_table::ColumnResizeOutcome::NotHandled => {}
             }
         }
 
@@ -875,7 +846,8 @@ impl LeaderboardPage {
             if inner.width >= 34
                 && let Some(update) = board.update.as_deref()
             {
-                label = format!("{}  {}", board.name, update);
+                // 精确到秒的时间戳会占掉 1/3 宽度把榜单名截断，压缩成相对时间。
+                label = format!("{}  {}", board.name, format_board_update(update));
             }
             let text = format!("{prefix}{}", truncate_chars(&label, available));
             let style = if self.selected_board.is_none() && index == self.selected {
@@ -1217,6 +1189,54 @@ fn truncate_chars(value: &str, max: usize) -> String {
     super::components::text::truncate_width(value, max).into_owned()
 }
 
+/// 把接口返回的「YYYY-MM-DD HH:MM:SS」压缩成相对时间：
+/// 今天 → `今天 HH:MM`；今年 → `MM-DD HH:MM`；更早 → `YYYY-MM-DD`。
+/// 解析失败原样返回（不同音源的格式不保证一致）。
+fn format_board_update(raw: &str) -> String {
+    use chrono::{Datelike, Local, NaiveDateTime};
+    NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S")
+        .map(|time| {
+            let today = Local::now().date_naive();
+            let date = time.date();
+            if date == today {
+                format!("今天 {}", time.format("%H:%M"))
+            } else if date.year() == today.year() {
+                time.format("%m-%d %H:%M").to_string()
+            } else {
+                time.format("%Y-%m-%d").to_string()
+            }
+        })
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+#[cfg(test)]
+mod board_update_tests {
+    use super::format_board_update;
+
+    #[test]
+    fn compresses_timestamps_by_distance() {
+        use chrono::{Duration, Local, NaiveDateTime};
+        let fmt = |time: NaiveDateTime| time.format("%Y-%m-%d %H:%M:%S").to_string();
+
+        // 今天 → 只剩时分。
+        let today = Local::now().date_naive().and_hms_opt(9, 30, 1).unwrap();
+        assert_eq!(format_board_update(&fmt(today)), "今天 09:30");
+
+        // 今年更早 → 月-日 时分。
+        let earlier_this_year = today - Duration::days(30);
+        let expected = earlier_this_year.format("%m-%d %H:%M").to_string();
+        assert_eq!(format_board_update(&fmt(earlier_this_year)), expected);
+
+        // 去年 → 只留日期。
+        let last_year = today - Duration::days(400);
+        let expected = last_year.format("%Y-%m-%d").to_string();
+        assert_eq!(format_board_update(&fmt(last_year)), expected);
+
+        // 解析不了的原样返回（不同音源格式不保证一致）。
+        assert_eq!(format_board_update("每周四更新"), "每周四更新");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LeaderboardLoadRequest, LeaderboardPage};
@@ -1241,7 +1261,10 @@ mod tests {
         page.reset_pane_ratios();
 
         assert_eq!(page.boards_ratio_wide, super::LB_DEFAULT_BOARDS_RATIO_WIDE);
-        assert_eq!(page.boards_ratio_narrow, super::LB_DEFAULT_BOARDS_RATIO_NARROW);
+        assert_eq!(
+            page.boards_ratio_narrow,
+            super::LB_DEFAULT_BOARDS_RATIO_NARROW
+        );
         assert!(!page.splitter.is_dragging());
     }
 

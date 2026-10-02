@@ -476,7 +476,8 @@ impl SearchPage {
             | (KeyModifiers::NONE, KeyCode::PageDown)
                 if !self.results.is_empty() =>
             {
-                self.selected = (self.selected + self.page_step).min(self.results.len().saturating_sub(1));
+                self.selected =
+                    (self.selected + self.page_step).min(self.results.len().saturating_sub(1));
                 if self.selected + 1 == self.results.len() && self.can_load_more() {
                     return AppAction::SearchMore {
                         keyword: self.result_keyword.clone(),
@@ -798,13 +799,34 @@ impl SearchPage {
                 .error_message
                 .as_deref()
                 .unwrap_or("输入关键词开始搜索");
-            Paragraph::new(message)
-                .style(Style::new().fg(if self.error_message.is_some() {
-                    crate::theme::red(ctx)
-                } else {
-                    crate::theme::muted(ctx)
-                }))
-                .render(inner_area, buf);
+            let hint_style = if self.error_message.is_some() {
+                crate::theme::red(ctx)
+            } else {
+                crate::theme::muted(ctx)
+            };
+            let mut lines = vec![Line::styled(
+                message.to_string(),
+                Style::new().fg(hint_style),
+            )];
+            if self.error_message.is_none() {
+                // 空状态不是空白：把这一页的入口快捷键铺成引导卡，
+                // 新手第一次进来不用先翻帮助页。
+                let accent = crate::theme::accent(ctx);
+                let key_hint = |key: &'static str, text: &'static str| {
+                    Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(format!("{key:<6}"), Style::new().fg(accent)),
+                        Span::styled(text.to_string(), Style::new().fg(hint_style)),
+                    ])
+                };
+                lines.push(Line::from(""));
+                lines.push(key_hint("输入", "歌名 / 歌手 / 专辑关键词，Enter 搜索"));
+                lines.push(key_hint("@", "追搜选中歌曲的歌手（再按删除）"));
+                lines.push(key_hint("#", "追搜选中歌曲的专辑（再按删除）"));
+                lines.push(key_hint("←/→", "切换音源（全部 / 单音源）"));
+                lines.push(key_hint("i", "进入输入框；Esc 返回结果列表"));
+            }
+            Paragraph::new(lines).render(inner_area, buf);
             return;
         }
 
@@ -992,49 +1014,21 @@ impl SearchPage {
         let result_block = Block::default().borders(PANEL_BORDERS);
         let inner = result_block.inner(chunks[2]);
         let header_row = inner.y;
-        let table_width = inner.width;
-
-        if let Some(crs) = self.column_resize.clone() {
-            match event.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    let delta = (event.column as i32) - (crs.start_local_x as i32);
-                    let adjusted = song_table::adjust_widths(
-                        &self.columns,
-                        crs.boundary_index,
-                        table_width,
-                        delta,
-                    );
-                    self.columns = adjusted;
-                    self.column_resize = Some(ColumnResizeState {
-                        start_local_x: event.column,
-                        ..crs
-                    });
-                    return AppAction::None;
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    self.column_resize = None;
-                    return AppAction::CommitColumnResize {
-                        page_key: "search".to_string(),
-                        columns: self.columns.clone(),
-                    };
-                }
-                _ => return AppAction::None,
+        match song_table::handle_column_resize(
+            &mut self.column_resize,
+            &mut self.columns,
+            event,
+            Some(Rect::new(inner.x, header_row, inner.width, 1)),
+            inner,
+        ) {
+            song_table::ColumnResizeOutcome::Updated => return AppAction::None,
+            song_table::ColumnResizeOutcome::Finished => {
+                return AppAction::CommitColumnResize {
+                    page_key: "search".to_string(),
+                    columns: self.columns.clone(),
+                };
             }
-        }
-
-        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) && event.row == header_row
-        {
-            let local_x = event.column.saturating_sub(inner.x);
-            if let Some(boundary) = song_table::find_boundary(&self.columns, table_width, local_x) {
-                let layout = song_table::compute_layout(&self.columns, table_width);
-                if boundary + 1 < layout.len() {
-                    self.column_resize = Some(ColumnResizeState {
-                        start_local_x: event.column,
-                        boundary_index: boundary,
-                    });
-                    return AppAction::None;
-                }
-            }
+            song_table::ColumnResizeOutcome::NotHandled => {}
         }
         if chunks[0].contains((event.column, event.row).into())
             && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))

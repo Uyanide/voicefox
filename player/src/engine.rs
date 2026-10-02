@@ -749,6 +749,9 @@ impl Player for MpvEngine {
             warn!("libmpv pause failed: {error}");
             return;
         }
+        // 暂停会打断进行中的淡出：把 mpv 实际音量恢复成逻辑音量，
+        // 否则淡出到一半暂停、再恢复播放时会没有声音。
+        self.cancel_fade_internal();
         self.paused.store(true, Ordering::SeqCst);
         let _ = self.state_tx.send(PlayerState::Paused);
     }

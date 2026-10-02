@@ -530,6 +530,22 @@ pub struct UiConfig {
     /// 缺省（或页面没拖过）时各页面走自己的内置默认比例。
     #[serde(default)]
     pub pane_ratios: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
+    /// 频谱可视化：`off`（默认）或 `bars`。
+    ///
+    /// `bars` 采集系统输出监视流画柱状频谱（Linux，需要 pw-record 或
+    /// parec）；运行时按快捷键切换并落盘到这里。
+    #[serde(default)]
+    pub visualizer: String,
+    /// 频谱风格：`classic`（默认，cava-like 柱状）或 `modern`（更紧凑、降低间隙）。
+    #[serde(default)]
+    pub visualizer_style: String,
+}
+
+impl UiConfig {
+    /// 频谱可视化是否开启（未知取值一律视为关闭）。
+    pub fn visualizer_enabled(&self) -> bool {
+        self.visualizer.eq_ignore_ascii_case("bars")
+    }
 }
 
 impl UiConfig {
@@ -558,6 +574,8 @@ impl Default for UiConfig {
             status_bar_items: default_status_bar_items(),
             status_bar_height: default_status_bar_height(),
             table_columns: std::collections::HashMap::new(),
+            visualizer: "off".to_string(),
+            visualizer_style: "classic".to_string(),
             pane_ratios: std::collections::HashMap::new(),
         }
     }
@@ -603,11 +621,17 @@ impl Default for NotificationConfig {
 pub struct IntegrationConfig {
     /// Linux 上注册标准 MPRIS 服务，Waybar 可直接识别和控制。
     pub mpris: bool,
+    /// Windows 上接入 SMTC（System Media Transport Controls），
+    /// 硬件媒体键与系统媒体浮层可控制播放。
+    pub smtc: bool,
 }
 
 impl Default for IntegrationConfig {
     fn default() -> Self {
-        Self { mpris: true }
+        Self {
+            mpris: true,
+            smtc: true,
+        }
     }
 }
 
@@ -850,18 +874,31 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "accent_follow_cover": value }))
         };
         // 早期示例发布过布尔值。
-        assert_eq!(parse(serde_json::json!(true)).unwrap().accent_follow_cover, AccentFollowCover::Strong);
-        assert_eq!(parse(serde_json::json!(false)).unwrap().accent_follow_cover, AccentFollowCover::Off);
-        // 新写法与大小写/空白宽容。
         assert_eq!(
-            parse(serde_json::json!("strong")).unwrap().accent_follow_cover,
+            parse(serde_json::json!(true)).unwrap().accent_follow_cover,
             AccentFollowCover::Strong
         );
         assert_eq!(
-            parse(serde_json::json!(" Subtle ")).unwrap().accent_follow_cover,
+            parse(serde_json::json!(false)).unwrap().accent_follow_cover,
+            AccentFollowCover::Off
+        );
+        // 新写法与大小写/空白宽容。
+        assert_eq!(
+            parse(serde_json::json!("strong"))
+                .unwrap()
+                .accent_follow_cover,
+            AccentFollowCover::Strong
+        );
+        assert_eq!(
+            parse(serde_json::json!(" Subtle "))
+                .unwrap()
+                .accent_follow_cover,
             AccentFollowCover::Subtle
         );
-        assert_eq!(parse(serde_json::json!("off")).unwrap().accent_follow_cover, AccentFollowCover::Off);
+        assert_eq!(
+            parse(serde_json::json!("off")).unwrap().accent_follow_cover,
+            AccentFollowCover::Off
+        );
         // 未知取值拒绝，避免静默回退成用户不想要的档位。
         assert!(parse(serde_json::json!("blazing")).is_err());
     }

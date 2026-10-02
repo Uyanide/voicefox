@@ -46,8 +46,12 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
         "yrv": 0,
     });
 
-    let json = super::eapi_post("https://interface3.music.163.com/eapi/song/lyric/v1", url, &data)
-        .await?;
+    let json = super::eapi_post(
+        "https://interface3.music.163.com/eapi/song/lyric/v1",
+        url,
+        &data,
+    )
+    .await?;
 
     // 检查响应码
     let code = json["code"].as_i64().unwrap_or(0);
@@ -57,7 +61,10 @@ pub async fn get_lyric(song: &SongInfo) -> Result<LyricData, FetchError> {
         }
         // 歌词获取失败不报错，返回空；但要留下日志，否则分不清
         // 「真的没歌词」和「接口被风控/会话失效」。
-        tracing::debug!("网易云歌词接口返回 code={code}，按无歌词处理: {}", song.name);
+        tracing::debug!(
+            "网易云歌词接口返回 code={code}，按无歌词处理: {}",
+            song.name
+        );
         return Ok(LyricData::default());
     }
 

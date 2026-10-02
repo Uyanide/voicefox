@@ -57,6 +57,10 @@ pub enum Action {
     GlobalRedraw,
     /// 把当前页面的面板布局恢复成默认比例（Ctrl+G）
     GlobalResetLayout,
+    /// 打开睡眠定时器菜单（到点自动暂停）
+    GlobalSleepTimer,
+    /// 开关频谱可视化（覆盖内容区的柱状频谱）
+    GlobalVisualizer,
 
     // --- 通用列表动作（多个页面共用） ---
     /// 选择上一项
@@ -184,6 +188,8 @@ impl Action {
             Action::GlobalDownloadsPanel => "打开 / 关闭下载面板",
             Action::GlobalRedraw => "强制重绘界面",
             Action::GlobalResetLayout => "恢复当前页面默认面板布局",
+            Action::GlobalSleepTimer => "睡眠定时器（到点自动暂停）",
+            Action::GlobalVisualizer => "频谱可视化开关",
             Action::ListSelectUp => "选择上一项",
             Action::ListSelectDown => "选择下一项",
             Action::ListSelectFirst => "跳到第一项",
@@ -232,7 +238,7 @@ impl Action {
     }
 
     /// 动作的规范展示顺序，帮助浮层按此排序。
-    pub const ALL: [Action; 61] = [
+    pub const ALL: [Action; 63] = [
         Action::GlobalQuit,
         Action::GlobalPlayPause,
         Action::GlobalNextTrack,
@@ -250,6 +256,8 @@ impl Action {
         Action::GlobalDownloadsPanel,
         Action::GlobalRedraw,
         Action::GlobalResetLayout,
+        Action::GlobalSleepTimer,
+        Action::GlobalVisualizer,
         Action::ListSelectUp,
         Action::ListSelectDown,
         Action::ListSelectFirst,
@@ -475,6 +483,10 @@ fn default_global_bindings() -> HashMap<Action, String> {
     // 不用 Ctrl+Shift+R：多数终端把 Ctrl+Shift+<字母> 报成和 Ctrl+<字母> 同样的
     // 字节，拿不到 SHIFT 修饰位，按下去会变成强制重绘。
     m.insert(Action::GlobalResetLayout, "Ctrl+g".to_string());
+    // 睡眠定时器：单键 mnemonic（t = timer），小写 t 尚未被任何页面占用。
+    m.insert(Action::GlobalSleepTimer, "t".to_string());
+    // 频谱可视化：w = wave（波形/频谱），小写 w 尚未被占用。
+    m.insert(Action::GlobalVisualizer, "w".to_string());
     m
 }
 
@@ -899,7 +911,10 @@ mod tests {
         // 全局绑定兜底。
         assert_eq!(
             config.key_hint(Some("main"), Action::GlobalPlayPause),
-            config.global.get(&Action::GlobalPlayPause).map(String::as_str)
+            config
+                .global
+                .get(&Action::GlobalPlayPause)
+                .map(String::as_str)
         );
         // 页面级优先。
         config
@@ -907,8 +922,14 @@ mod tests {
             .get_mut("main")
             .expect("默认表含 main 页")
             .insert(Action::ListCycleSort, "S".to_string());
-        assert_eq!(config.key_hint(Some("main"), Action::ListCycleSort), Some("S"));
-        assert_ne!(config.key_hint(Some("local"), Action::ListCycleSort), Some("S"));
+        assert_eq!(
+            config.key_hint(Some("main"), Action::ListCycleSort),
+            Some("S")
+        );
+        assert_ne!(
+            config.key_hint(Some("local"), Action::ListCycleSort),
+            Some("S")
+        );
         // 用户删除绑定后返回 None，提示应整体省略。
         config.global.remove(&Action::GlobalPlayPause);
         if let Some(page) = config.pages.get_mut("main") {

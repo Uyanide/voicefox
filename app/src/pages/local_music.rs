@@ -74,9 +74,7 @@ pub fn handle_mouse(
     filter: &ListFilter,
     activate: bool,
 ) -> AppAction {
-    use crate::pages::components::song_table::{
-        ColumnResizeState, adjust_widths, compute_layout, find_boundary,
-    };
+    use crate::pages::components::song_table::{self, ColumnResizeOutcome};
 
     let all_songs = sorted_local_songs(ctx, state, cache);
     let view = LocalSongView::build(all_songs, filter.query());
@@ -84,47 +82,21 @@ pub fn handle_mouse(
     // 与渲染共用行账本；过滤行可见性统一走 `ListFilter::is_visible()`。
     let rows = PanelRows::new(area, filter.is_visible(), false, true);
     let inner = rows.inner;
-    let table_width = inner.width;
-
-    if let Some(crs) = state.column_resize.clone() {
-        match event.kind {
-            MouseEventKind::Drag(MouseButton::Left) => {
-                let delta = (event.column as i32) - (crs.start_local_x as i32);
-                let adjusted =
-                    adjust_widths(&state.columns, crs.boundary_index, table_width, delta);
-                state.columns = adjusted;
-                state.column_resize = Some(ColumnResizeState {
-                    start_local_x: event.column,
-                    ..crs
-                });
-                return AppAction::None;
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                state.column_resize = None;
-                return AppAction::CommitColumnResize {
-                    page_key: state.page_key.to_string(),
-                    columns: state.columns.clone(),
-                };
-            }
-            _ => return AppAction::None,
+    match song_table::handle_column_resize(
+        &mut state.column_resize,
+        &mut state.columns,
+        event,
+        rows.header,
+        inner,
+    ) {
+        ColumnResizeOutcome::Updated => return AppAction::None,
+        ColumnResizeOutcome::Finished => {
+            return AppAction::CommitColumnResize {
+                page_key: state.page_key.to_string(),
+                columns: state.columns.clone(),
+            };
         }
-    }
-
-    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-        && let Some(header) = rows.header
-        && header.y == event.row
-    {
-        let local_x = event.column.saturating_sub(inner.x);
-        if let Some(boundary) = find_boundary(&state.columns, table_width, local_x) {
-            let layout = compute_layout(&state.columns, table_width);
-            if boundary + 1 < layout.len() {
-                state.column_resize = Some(ColumnResizeState {
-                    start_local_x: event.column,
-                    boundary_index: boundary,
-                });
-                return AppAction::None;
-            }
-        }
+        ColumnResizeOutcome::NotHandled => {}
     }
 
     let scroll_amount = ctx
