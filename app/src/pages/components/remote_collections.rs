@@ -1,4 +1,4 @@
-//! 网易云远程歌单的**独立窗口**（只读浏览）。
+//! 远程歌单镜像的**独立窗口**（只读浏览，网易云 / QQ 音乐）。
 //!
 //! 以前这些集合挤在「设置 · 账号与扫码」面板底部的一小段里：名称被截断、
 //! 数量对不齐、条数一多就只能看到前几行，既看不出全貌也没法找。现在改成
@@ -21,12 +21,12 @@ use crate::pages::components::scroll::ensure_visible;
 use crate::pages::components::text::{pad_display, pad_display_left, truncate_width};
 use crate::pages::sort::compare_text;
 
-/// 远程缓存里的网易云账号歌单（只读快照）。
+/// 远程缓存里的账号歌单（只读快照，网易云 + QQ 音乐）。
 ///
 /// 放在这里而不是各调用点各写一遍：设置页的窗口、歌单页的「我的歌单」入口
 /// 必须看到同一份口径（只取 Playlist，丢掉红心集合——红心在收藏页）。
 pub fn account_collections() -> Vec<SyncCollection> {
-    let mut collections = crate::remote_cache::all_netease();
+    let mut collections = crate::remote_cache::all_mirrored();
     collections.retain(|collection| collection.kind != SyncCollectionKind::Favorites);
     collections
 }
@@ -233,7 +233,7 @@ impl RemoteCollectionsWindow {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(crate::theme::accent(ctx)))
-            .title(" 网易云远程歌单 ");
+            .title(" 远程歌单镜像 ");
         let inner = block.inner(popup);
         block.render(popup, buf);
         if inner.height == 0 || inner.width == 0 {

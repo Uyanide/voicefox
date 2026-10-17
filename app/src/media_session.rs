@@ -1,8 +1,9 @@
 //! 平台媒体会话的共享数据层。
 //!
-//! Linux 走 MPRIS（[`crate::mpris`]）、Windows 走 SMTC（[`crate::smtc`]），
-//! 两个后端只做"协议翻译"：往桌面/系统方向推送 [`MediaSnapshot`]，
-//! 往播放器方向回传 [`MediaCommand`]。快照与命令本身是平台无关的纯数据，
+//! Linux 走 MPRIS（[`crate::mpris`]）、Windows 走 SMTC（[`crate::smtc`]）、
+//! macOS 走 Now Playing（[`crate::nowplaying`]），各后端只做"协议翻译"：
+//! 往桌面/系统方向推送 [`MediaSnapshot`]，往播放器方向回传
+//! [`MediaCommand`]。快照与命令本身是平台无关的纯数据，
 //! 集中在这里让主循环的接入点只有一套。
 
 use std::hash::{Hash, Hasher};
@@ -155,6 +156,39 @@ impl MediaSnapshot {
 #[derive(Clone)]
 pub struct MediaHandle {
     update_tx: tokio::sync::mpsc::UnboundedSender<MediaSnapshot>,
+}
+
+/// 把 souvlaki 的控件事件翻译成播放器命令。
+///
+/// Windows SMTC 与 macOS Now Playing 两个 souvlaki 后端共用这一份；
+/// Linux MPRIS 走 zbus，事件在 [`crate::mpris`] 里直接翻译。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn translate_event(event: souvlaki::MediaControlEvent) -> Option<MediaCommand> {
+    use souvlaki::{MediaControlEvent, SeekDirection};
+
+    match event {
+        MediaControlEvent::Play => Some(MediaCommand::Play),
+        MediaControlEvent::Pause => Some(MediaCommand::Pause),
+        MediaControlEvent::Toggle => Some(MediaCommand::Toggle),
+        MediaControlEvent::Stop => Some(MediaCommand::Stop),
+        MediaControlEvent::Next => Some(MediaCommand::Next),
+        MediaControlEvent::Previous => Some(MediaCommand::Previous),
+        MediaControlEvent::Seek(SeekDirection::Forward) => Some(MediaCommand::SeekBy(5_000_000)),
+        MediaControlEvent::Seek(SeekDirection::Backward) => Some(MediaCommand::SeekBy(-5_000_000)),
+        MediaControlEvent::SeekBy(direction, amount) => {
+            let offset = i64::try_from(amount.as_micros()).unwrap_or(i64::MAX);
+            Some(MediaCommand::SeekBy(match direction {
+                SeekDirection::Forward => offset,
+                SeekDirection::Backward => -offset,
+            }))
+        }
+        MediaControlEvent::SetPosition(position) => Some(MediaCommand::SetPosition(position.0)),
+        // 音量键由系统混音器处理；打开 URI / 唤起窗口暂不支持。
+        MediaControlEvent::SetVolume(_)
+        | MediaControlEvent::OpenUri(_)
+        | MediaControlEvent::Raise
+        | MediaControlEvent::Quit => None,
+    }
 }
 
 impl MediaHandle {

@@ -17,7 +17,7 @@ use crate::pages;
 use lx_core::events::Notification;
 
 use tokio::sync::mpsc;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub(crate) fn current_media_snapshot(ctx: &AppContext) -> media_session::MediaSnapshot {
     let song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
     media_session::MediaSnapshot::new(
@@ -32,10 +32,10 @@ pub(crate) fn current_media_snapshot(ctx: &AppContext) -> media_session::MediaSn
     )
 }
 
-/// 启动平台媒体控件后端（Linux MPRIS / Windows SMTC）。
+/// 启动平台媒体控件后端（Linux MPRIS / Windows SMTC / macOS Now Playing）。
 ///
 /// 返回 `(None, None)` 表示平台不支持、配置关闭或启动失败。
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub(crate) fn start_media_controls(
     ctx: &AppContext,
     rt: &tokio::runtime::Runtime,
@@ -53,9 +53,14 @@ pub(crate) fn start_media_controls(
         {
             config.integration.smtc
         }
+        #[cfg(target_os = "macos")]
+        {
+            config.integration.now_playing
+        }
     };
-    // SMTC 不经过 tokio（souvlaki 直接开线程），参数只为与 MPRIS 路径同构。
-    #[cfg(target_os = "windows")]
+    // SMTC / Now Playing 不经过 tokio（souvlaki 直接开线程），
+    // 参数只为与 MPRIS 路径同构。
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let _ = rt;
     if !enabled {
         return (None, None);
@@ -69,6 +74,10 @@ pub(crate) fn start_media_controls(
         {
             crate::smtc::start()
         }
+        #[cfg(target_os = "macos")]
+        {
+            crate::nowplaying::start()
+        }
     };
     match result {
         Ok((handle, receiver)) => (Some(handle), Some(receiver)),
@@ -76,8 +85,10 @@ pub(crate) fn start_media_controls(
             tracing::warn!("media controls unavailable: {error:#}");
             let backend = if cfg!(target_os = "linux") {
                 "MPRIS"
-            } else {
+            } else if cfg!(target_os = "windows") {
                 "SMTC"
+            } else {
+                "Now Playing"
             };
             ctx.notify(Notification::warning(format!("{backend} 启动失败: {error:#}")).tui_only());
             (None, None)
@@ -85,7 +96,7 @@ pub(crate) fn start_media_controls(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_media_command(
     command: media_session::MediaCommand,
@@ -141,7 +152,7 @@ pub(crate) fn execute_media_command(
     false
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn resume_or_start_current(
     ctx: &AppContext,

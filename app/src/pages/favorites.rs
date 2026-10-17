@@ -553,10 +553,10 @@ impl FavoritesPage {
             .border_style(Style::new().fg(crate::theme::border(ctx)))
             .title(format!(
                 " {}收藏 {}/{} · {} · 排序 {} · P 音源 · 右键管理网易云 · / 筛选 ",
-                if self.current_source() == Some(SourceId::Wy) {
-                    "网易云 "
-                } else {
-                    ""
+                match self.current_source() {
+                    Some(SourceId::Wy) => "网易云 ",
+                    Some(SourceId::Tx) => "QQ ",
+                    _ => "",
                 },
                 filtered.len(),
                 favorites.len(),
@@ -608,15 +608,23 @@ impl FavoritesPage {
         self.viewport_height = list.height.max(1) as usize;
 
         if favorites.is_empty() {
-            let message = if self.current_source() == Some(SourceId::Wy) {
-                // 用计数判断而不是克隆整份缓存：这是每帧都会走的渲染路径。
-                if crate::remote_cache::summary_counts().0 == 0 {
-                    "暂无网易云收藏。右键打开菜单：登录 / 重新登录网易云，或刷新网易云收藏。"
-                } else {
-                    "网易云红心歌曲为空。右键刷新网易云收藏。"
+            let message = match self.current_source() {
+                Some(SourceId::Wy) => {
+                    // 用计数判断而不是克隆整份缓存：这是每帧都会走的渲染路径。
+                    if crate::remote_cache::summary_counts().0 == 0 {
+                        "暂无网易云收藏。右键打开菜单：登录 / 重新登录网易云，或刷新网易云收藏。"
+                    } else {
+                        "网易云红心歌曲为空。右键刷新网易云收藏。"
+                    }
                 }
-            } else {
-                "暂无收藏，播放时按 Ctrl+L 或列表中按 f 添加"
+                Some(SourceId::Tx) => {
+                    if crate::remote_cache::favorites_songs(SourceId::Tx).is_empty() {
+                        "暂无 QQ 音乐收藏。在设置（8）→ 账号与扫码 登录 QQ 后，选中「QQ 音乐同步」行按 Enter 拉取。"
+                    } else {
+                        "QQ 红心歌曲为空。在设置里重新同步 QQ 音乐。"
+                    }
+                }
+                _ => "暂无收藏，播放时按 Ctrl+L 或列表中按 f 添加",
             };
             Paragraph::new(message)
                 .style(Style::new().fg(crate::theme::muted(ctx)))
@@ -891,12 +899,16 @@ impl FavoritesPage {
         cache: &'a mut SortedListCache,
     ) -> &'a [SongInfo] {
         let mode = self.sort_mode;
-        if self.current_source() == Some(SourceId::Wy) {
-            // 网易云收藏不是本地收藏库：直接把远程缓存作为收藏页数据源。
-            let version = crate::remote_cache::generation();
-            return cache.get_or_build(version, mode, SortTarget::Favorites, || {
-                crate::remote_cache::favorites_songs()
-            });
+        match self.current_source() {
+            // 网易云 / QQ 收藏不是本地收藏库：直接把远程镜像缓存作为收藏页数据源。
+            Some(SourceId::Wy) | Some(SourceId::Tx) => {
+                let source = self.current_source().unwrap_or(SourceId::Wy);
+                let version = crate::remote_cache::generation();
+                return cache.get_or_build(version, mode, SortTarget::Favorites, || {
+                    crate::remote_cache::favorites_songs(source)
+                });
+            }
+            _ => {}
         }
         let version = ctx.storage.generation();
         cache.get_or_build(version, mode, SortTarget::Favorites, || {

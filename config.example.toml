@@ -24,13 +24,18 @@ history_limit = 200
 enabled = ["kw", "kg", "tx", "wy", "mg", "bili"]
 default = "kw"
 auto_toggle = true          # 播放失败时自动尝试其它音源的同曲匹配
-# 解析策略：auto（默认，JS→内置原平台→跨平台兜底）/ prefer（跨平台时优先指定平台）
+# 解析策略：auto（默认，内置原平台→JS 音源→跨平台兜底）/ prefer（跨平台时优先指定平台）
 # / only（只用指定平台解析，做不到就失败，不做跨平台兜底）
 # policy = "auto"
 # policy_platform = "wy"    # prefer / only 时生效
+# 播放地址是否「JS 音源优先」：开启后先问 JS 音源（按下面的配置顺序），
+# 失败再回退内置音源。默认关闭——单个挂死的 JS 脚本曾让本可直接播放的歌
+# 一起变慢；依赖 JS 音源解 VIP 曲目时再打开。
+# js_first = false
 
 # JS 音源脚本 URL 或本地路径（lx-music user API 协议）
-# 数组顺序即播放地址解析优先级，例如：
+# 脚本缓存目录：<配置目录>/voicefox/sources（旧版 lx-tui 目录的内容会自动迁移）
+# 数组顺序即 JS 音源之间的解析优先级，例如：
 # js_sources = ["https://ghproxy.net/raw.githubusercontent.com/pdone/lx-music-source/main/juhe/latest.js"]
 # js_sources = ["/home/user/lx-source/latest.js"]
 js_sources = []
@@ -98,6 +103,10 @@ trackChange = true          # 切歌时发送桌面通知
 [integration]
 mpris = true                # Linux MPRIS / Waybar / 媒体键，修改后重启生效
 smtc = true                 # Windows SMTC / 硬件媒体键 / 系统媒体浮层，修改后重启生效
+now_playing = true          # macOS Now Playing / 触摸栏 / 控制中心，修改后重启生效
+# ListenBrainz 用户 token（listenbrainz.org 头像 → User Profile 页可见）。
+# 留空不上报；填写后每首歌开始播放满 30 秒提交一条听歌记录。
+listenbrainz_token = ""
 
 [local_music]
 enabled = true

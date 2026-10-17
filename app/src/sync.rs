@@ -13,8 +13,8 @@ use lx_source::sync::provider;
 
 /// 一次远程集合刷新的结果。
 ///
-/// 网易云歌单现在是「只读镜像进远程缓存」，不再往本地建歌单、也不再往远端
-/// 推送，所以这里只描述读到了什么、相对缓存变了多少。
+/// 远程歌单现在是「只读镜像进远程缓存」（网易云 / QQ 音乐），不再往本地建
+/// 歌单、也不再往远端推送，所以这里只描述读到了什么、相对缓存变了多少。
 #[derive(Debug, Default, Clone)]
 pub struct NeteaseSyncReport {
     pub playlists: usize,
@@ -87,8 +87,8 @@ impl SyncControl {
 }
 
 /// 远端集合相对当前缓存的差异统计。
-fn diff_against_cache(remote: &[SyncCollection]) -> (usize, usize, usize) {
-    crate::remote_cache::with_netease(|cached| {
+fn diff_against_cache(source: SourceId, remote: &[SyncCollection]) -> (usize, usize, usize) {
+    crate::remote_cache::with_source(source, |cached| {
         let cached_by_id: HashMap<&str, &SyncCollection> =
             cached.iter().map(|item| (item.id.as_str(), item)).collect();
         let mut added = 0;
@@ -111,6 +111,7 @@ fn diff_against_cache(remote: &[SyncCollection]) -> (usize, usize, usize) {
             .count();
         (added, updated, removed)
     })
+    .unwrap_or((remote.len(), 0, 0))
 }
 
 pub fn kind_label(kind: SyncCollectionKind) -> &'static str {
@@ -120,8 +121,8 @@ pub fn kind_label(kind: SyncCollectionKind) -> &'static str {
     }
 }
 
-fn diff_rows(set: &SyncCollectionSet) -> Vec<PlaylistDiff> {
-    crate::remote_cache::with_netease(|cached| {
+fn diff_rows(source: SourceId, set: &SyncCollectionSet) -> Vec<PlaylistDiff> {
+    crate::remote_cache::with_source(source, |cached| {
         set.playlists
             .iter()
             .chain(set.favorites.iter())
@@ -147,39 +148,59 @@ fn diff_rows(set: &SyncCollectionSet) -> Vec<PlaylistDiff> {
             })
             .collect()
     })
+    .unwrap_or_default()
+}
+
+/// 把适配器错误翻译成可操作的提示：未登录统一指向设置页的扫码入口，
+/// 其余错误原样透出。
+fn sync_error_message(error: lx_core::sync::SyncError) -> String {
+    match error {
+        lx_core::sync::SyncError::NotLoggedIn(name) => {
+            format!("尚未登录{name}，请先在设置（8）→ 账号与扫码 扫码登录")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// 已接入「只读镜像」的平台。
+fn mirror_source(source: SourceId) -> Result<(), String> {
+    match source {
+        SourceId::Wy | SourceId::Tx => Ok(()),
+        _ => Err(format!(
+            "{}暂不支持远程歌单同步，当前支持网易云与 QQ 音乐",
+            source.display_name()
+        )),
+    }
 }
 
 /// 只读预览：从远端读一次，和缓存比对，说明「确认」之后会发生什么。
 ///
-/// 注意这里**不写任何远端数据**，也不再像旧版那样声称会把本地歌单上传到网易云。
+/// 注意这里**不写任何远端数据**，也不再像旧版那样声称会把本地歌单上传到云端。
 pub async fn preview_source(
     _storage: &Storage,
     source: SourceId,
 ) -> Result<NeteaseSyncPreview, String> {
+    mirror_source(source)?;
     let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
-    if source != SourceId::Wy {
-        return Err(format!(
-            "{}暂不支持远程歌单同步，当前仅支持网易云音乐",
-            source.display_name()
-        ));
-    }
     // 会话有效性预检：未登录与已失效分别给出可操作的提示，不必等几十次
     // 请求跑完。网络错误无法判定失效（`refresh` 返回 Err），交给后续接口
     // 报真正的错误。
-    if !lx_source::wy::session::is_logged_in() {
-        return Err("尚未登录网易云，请先在设置（8）→ 账号与扫码 扫码登录".into());
+    if source == SourceId::Wy {
+        if !lx_source::wy::session::is_logged_in() {
+            return Err("尚未登录网易云，请先在设置（8）→ 账号与扫码 扫码登录".into());
+        }
+        if let Ok(false) = lx_source::wy::login::refresh().await {
+            return Err("网易云登录已失效，请重新扫码登录".into());
+        }
     }
-    if let Ok(false) = lx_source::wy::login::refresh().await {
-        return Err("网易云登录已失效，请重新扫码登录".into());
-    }
-    let set = provider.collect_all().await.map_err(|e| e.to_string())?;
+    let set = provider.collect_all().await.map_err(sync_error_message)?;
     let songs = set
         .playlists
         .iter()
         .chain(set.favorites.iter())
         .map(|collection| collection.songs.len())
         .sum();
-    let (added, updated, removed) = diff_against_cache(&set.playlists);
+    let (added, updated, removed) = diff_against_cache(source, &set.playlists);
     Ok(NeteaseSyncPreview {
         playlists: set.playlists.len(),
         favorites: set.favorites.len(),
@@ -188,11 +209,11 @@ pub async fn preview_source(
         updated,
         removed,
         failed: set.failed.clone(),
-        rows: diff_rows(&set),
+        rows: diff_rows(source, &set),
     })
 }
 
-/// 执行刷新：把远端歌单写入远程缓存。
+/// 执行刷新：把远端歌单写入该平台的远程缓存。
 ///
 /// 完整性约定：只有全部歌单都拉取成功时才整体替换缓存（这样远端删掉的歌单会
 /// 跟着消失）；只要有一个歌单失败就退化为按 id 增量合并，失败歌单保留缓存里的
@@ -202,15 +223,10 @@ pub async fn sync_source_with_control(
     source: SourceId,
     control: &SyncControl,
 ) -> Result<NeteaseSyncReport, String> {
+    mirror_source(source)?;
     let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
-    if source != SourceId::Wy {
-        return Err(format!(
-            "{}暂不支持远程歌单同步，当前仅支持网易云音乐",
-            source.display_name()
-        ));
-    }
 
-    let set = provider.collect_all().await.map_err(|e| e.to_string())?;
+    let set = provider.collect_all().await.map_err(sync_error_message)?;
     let complete = set.is_complete();
     let failed = set.failed.clone();
     let playlists = set.playlists.len();
@@ -221,7 +237,7 @@ pub async fn sync_source_with_control(
         .chain(set.favorites.iter())
         .map(|collection| collection.songs.len())
         .sum();
-    let (added, updated, removed) = diff_against_cache(&set.playlists);
+    let (added, updated, removed) = diff_against_cache(source, &set.playlists);
 
     control.set_total(songs);
     if control.is_cancelled() {
@@ -230,12 +246,12 @@ pub async fn sync_source_with_control(
 
     let all = set.into_all();
     if complete {
-        crate::remote_cache::replace_netease(all);
+        crate::remote_cache::replace(source, all);
     } else {
-        crate::remote_cache::merge_netease(all);
+        crate::remote_cache::merge(source, all);
     }
 
-    for collection in crate::remote_cache::all_netease() {
+    for collection in crate::remote_cache::all(source) {
         if control.is_cancelled() {
             return Err("同步已取消".into());
         }
@@ -304,25 +320,29 @@ pub struct PushReport {
 /// 推送前置检查：平台白名单 + 登录态。
 ///
 /// 与只读预览同样的取舍：写回涉及账号数据变更，未经端到端验证的平台
-/// 一律明确拒绝，而不是放进去静默失败。
+/// 一律明确拒绝，而不是放进去静默失败。QQ 音乐的推送适配器已实现，
+/// 登录态由适配器自身的请求报错兜底。
 fn push_precheck(source: SourceId) -> Result<(), String> {
-    if source != SourceId::Wy {
-        return Err(format!(
-            "{}暂不支持推送写回，当前仅支持网易云音乐",
+    match source {
+        SourceId::Wy => {
+            if !lx_source::wy::session::is_logged_in() {
+                return Err("尚未登录网易云，请先在设置（8）→ 账号与扫码 扫码登录".into());
+            }
+            Ok(())
+        }
+        SourceId::Tx => Ok(()),
+        _ => Err(format!(
+            "{}暂不支持推送写回，当前支持网易云与 QQ 音乐",
             source.display_name()
-        ));
+        )),
     }
-    if !lx_source::wy::session::is_logged_in() {
-        return Err("尚未登录网易云，请先在设置（8）→ 账号与扫码 扫码登录".into());
-    }
-    Ok(())
 }
 
 /// 拉取远端可选目标（歌单 + 红心），供用户选择推送去处。
 pub async fn push_list_targets(source: SourceId) -> Result<Vec<PushTargetOption>, String> {
     push_precheck(source)?;
     let provider = provider(source).ok_or_else(|| "同步适配器不可用".to_string())?;
-    let set = provider.collect_all().await.map_err(|e| e.to_string())?;
+    let set = provider.collect_all().await.map_err(sync_error_message)?;
     let to_option = |collection: &SyncCollection| PushTargetOption {
         kind: collection.kind,
         id: collection.id.clone(),
@@ -363,7 +383,7 @@ pub async fn push_plan(
     let remote = provider
         .get_collection(target.kind, &target.id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(sync_error_message)?;
     let local_collection = SyncCollection {
         kind: target.kind,
         id: "local".to_string(),
@@ -414,7 +434,7 @@ pub async fn push_execute(
         &|| control.is_cancelled(),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(sync_error_message)?;
     Ok(PushReport {
         target_name: report.collection_name,
         added: report.added,

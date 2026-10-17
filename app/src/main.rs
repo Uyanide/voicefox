@@ -9,11 +9,14 @@ mod cover;
 mod data_cache;
 mod download;
 mod fmt;
+mod listenbrainz;
 mod media_controls;
 mod media_session;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod notification;
+#[cfg(target_os = "macos")]
+mod nowplaying;
 mod pages;
 mod playlist;
 mod remote_cache;
@@ -28,7 +31,7 @@ mod visualizer;
 mod theme;
 mod tmux;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use media_controls::{current_media_snapshot, execute_media_command, start_media_controls};
 use media_controls::{persist_volume, toggle_or_start_current};
 
@@ -1564,9 +1567,24 @@ fn open_external_url(url: &str) {
 /// 两次自动重传封面之间的最小间隔，client-attached hook 可能连续触发，需要防抖
 const COVER_REDRAW_THROTTLE: Duration = Duration::from_secs(2);
 
+/// 频谱可视化只在 Linux 上可用：采集走 parec / pw-record（PipeWire/Pulse
+/// 监视流），Windows / macOS 没有等价的命令行采集工具，按了只会报
+/// 「启动失败」。平台门控集中在这里，`w` 开关与启动自检共用。
+fn visualizer_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// 启动频谱可视化采集；失败时记录日志并给出 TUI 提示，返回 None。
 /// 启动初始化（配置里默认开启）与按 w 切换共用这一条路径。
 fn start_visualizer(ctx: &AppContext) -> Option<visualizer::Visualizer> {
+    if !visualizer_supported() {
+        tracing::info!("visualizer requested on a non-Linux platform; ignored");
+        ctx.notify(
+            Notification::warning("频谱可视化仅支持 Linux（依赖 parec / pw-record 采集系统输出）")
+                .tui_only(),
+        );
+        return None;
+    }
     match visualizer::Visualizer::start() {
         Ok(handle) => Some(handle),
         Err(error) => {
@@ -1594,9 +1612,9 @@ fn run_app(
     let (leaderboard_tx, mut leaderboard_rx) = mpsc::unbounded_channel::<LeaderboardResponse>();
     let (playlist_tx, mut playlist_rx) = mpsc::unbounded_channel::<PlaylistResponse>();
     let mut player_event_rx = ctx.player.take_event_receiver();
-    // 平台媒体控件只存在于 Linux（MPRIS）/ Windows（SMTC）：macOS 上既不启动，
-    // 也不声明句柄（下面所有使用点本身也在这两个平台的 cfg 下）。
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    // 平台媒体控件：Linux（MPRIS）/ Windows（SMTC）/ macOS（Now Playing）。
+    // 其余平台不启动也不声明句柄（下面所有使用点在同样的 cfg 下）。
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let (media_handle, mut media_command_rx) = start_media_controls(&ctx, rt);
 
     // 搜索请求序列号（用于取消过时请求）
@@ -1876,7 +1894,7 @@ fn run_app(
             needs_render = true;
         }
 
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if let Some(receiver) = media_command_rx.as_mut() {
             while let Ok(command) = receiver.try_recv() {
                 if execute_media_command(
@@ -2031,9 +2049,16 @@ fn run_app(
                         format!("{label}登录状态未确认，请重新打开设置查看")
                     };
                     ctx.notify(Notification::success(message));
-                    if *source == SourceId::Wy && ctx.source_manager.is_logged_in(*source) {
-                        // 网易云登录成功后立即进入远程收藏刷新，不再要求用户猜测下一步。
-                        let _ = action_tx.send(AppAction::SyncNetease);
+                    if ctx.source_manager.is_logged_in(*source) {
+                        // 登录成功后立即进入远程歌单刷新，不再要求用户猜测下一步。
+                        let sync_action = match source {
+                            SourceId::Wy => Some(AppAction::SyncNetease),
+                            SourceId::Tx => Some(AppAction::SyncQq),
+                            _ => None,
+                        };
+                        if let Some(action) = sync_action {
+                            let _ = action_tx.send(action);
+                        }
                     }
                     needs_render = true;
                     continue;
@@ -2526,7 +2551,7 @@ fn run_app(
             ctx.player.fade_out(Duration::from_millis(fade_out_ms));
             faded_generation = active_generation;
         }
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if let Some(handle) = media_handle.as_ref() {
             // 例行更新按 250ms 限频，但跳转要立刻放行
             let position_epoch = ctx.position_epoch();
@@ -6074,6 +6099,9 @@ fn start_song_playback(
             .player
             .history_limit;
         ctx.storage.add_history(&song, limit);
+        // 配置了 ListenBrainz token 时，开始播放满 30 秒上报一条听歌记录
+        //（切歌 / 暂停会让上报自动作废，见 listenbrainz::schedule）。
+        listenbrainz::schedule(rt, ctx, request_id, song.clone());
     }
     if add_history {
         let _ = action_tx.send(AppAction::ShowNotification(
@@ -6866,30 +6894,37 @@ fn spawn_playlist_request(
                 // 账号歌单（「我的歌单」入口）是远程缓存的只读镜像：列表全在
                 // 内存里，既不翻页也不发请求。
                 //
-                // 音源入口（网易云）仍然走音源自己的歌单接口：登录之后用户
+                // 音源入口（网易云 / QQ）仍然走音源自己的歌单接口：登录之后用户
                 // 既需要账号歌单，也需要音源提供的推荐歌单，两者是两套数据，
                 // 以前用缓存顶掉音源列表会让推荐歌单彻底不可见。
-                let account = if source == SourceId::Wy {
-                    crate::remote_cache::with_netease(|collections| {
-                        collections
-                            .iter()
-                            .filter(|c| c.kind == lx_core::sync::SyncCollectionKind::Playlist)
-                            .map(|c| lx_core::model::playlist::Playlist {
-                                id: format!("netease-account:{}", c.id),
-                                name: c.name.clone(),
-                                source: SourceId::Wy,
-                                cover_url: c.songs.first().and_then(|s| s.cover_url.clone()),
-                                song_count: c.songs.len() as u32,
-                                description: None,
-                                play_count: None,
-                                creator: None,
-                                link: None,
-                                extra: Default::default(),
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                } else {
-                    Vec::new()
+                let account = match source {
+                    SourceId::Wy | SourceId::Tx => {
+                        let prefix = if source == SourceId::Wy {
+                            "netease-account:"
+                        } else {
+                            "qq-account:"
+                        };
+                        crate::remote_cache::with_source(source, |collections| {
+                            collections
+                                .iter()
+                                .filter(|c| c.kind == lx_core::sync::SyncCollectionKind::Playlist)
+                                .map(|c| lx_core::model::playlist::Playlist {
+                                    id: format!("{prefix}{}", c.id),
+                                    name: c.name.clone(),
+                                    source,
+                                    cover_url: c.songs.first().and_then(|s| s.cover_url.clone()),
+                                    song_count: c.songs.len() as u32,
+                                    description: None,
+                                    play_count: None,
+                                    creator: None,
+                                    link: None,
+                                    extra: Default::default(),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
                 };
                 let result = tokio::time::timeout(
                     Duration::from_secs(12),
@@ -6951,16 +6986,24 @@ fn spawn_playlist_request(
                 } else {
                     Duration::from_secs(15)
                 };
-                let result = if source == SourceId::Wy {
+                let result = if source == SourceId::Wy || source == SourceId::Tx {
                     // 「我的歌单」入口的 id 带虚拟前缀，取缓存前要还原成远端 id
-                    let cached = crate::remote_cache::playlist(
+                    let virtual_ref = [
+                        ("netease-account:", SourceId::Wy),
+                        ("qq-account:", SourceId::Tx),
+                    ]
+                    .iter()
+                    .find_map(|(prefix, owner)| {
                         playlist_id
-                            .strip_prefix("netease-account:")
-                            .unwrap_or(&playlist_id),
-                    );
+                            .strip_prefix(prefix)
+                            .map(|remote_id| (*owner, remote_id))
+                    });
+                    let cached = virtual_ref.and_then(|(owner, remote_id)| {
+                        crate::remote_cache::playlist(owner, remote_id)
+                    });
                     if let Some(collection) = cached {
                         Ok(collection.songs)
-                    } else if playlist_id.starts_with("netease-account:") {
+                    } else if virtual_ref.is_some() {
                         // 账号歌单只存在于缓存里，缓存没有就是真没有
                         Err("该歌单不在本地缓存中，请先在设置里刷新远程歌单".to_string())
                     } else {
@@ -7350,7 +7393,7 @@ mod tests {
             eprintln!("跳过：node 不可用");
             return false;
         }
-        // loader 写脚本缓存用 dirs::config_dir()/lx-tui/sources；
+        // loader 写脚本缓存用 dirs::config_dir()/voicefox/sources；
         // engine 写 wrapper.js 用 dirs::cache_dir()/voicefox/js。
         let script_cache = lx_source::js::loader::cached_source_path("voicefox-probe");
         let engine_cache = dirs::cache_dir()

@@ -35,28 +35,41 @@ enum PlaylistScope {
     Source(SourceId),
 }
 
-/// 网易云远程歌单在页面内的**虚拟音源标识**。
+/// 远程账号歌单在页面内的**虚拟音源标识**。
 ///
 /// 账号歌单不是任何网络音源的公开歌单，但下游（歌曲加载、提示文案）只需要
 /// 一个能配对的 id，因此用这个前缀把「来自远程缓存的账号歌单」和
 /// 「当前音源接口返回的歌单」区分开，避免再去改一遍 `SourceId`。
 const NETEASE_ACCOUNT_ID_PREFIX: &str = "netease-account:";
+const QQ_ACCOUNT_ID_PREFIX: &str = "qq-account:";
 
-/// 远程缓存里的网易云账号歌单是否可用（登录并刷新过才有内容）。
+/// 平台 → 账号歌单虚拟 id 前缀。
+fn account_id_prefix(source: SourceId) -> Option<&'static str> {
+    match source {
+        SourceId::Wy => Some(NETEASE_ACCOUNT_ID_PREFIX),
+        SourceId::Tx => Some(QQ_ACCOUNT_ID_PREFIX),
+        _ => None,
+    }
+}
+
+/// 远程缓存里的账号歌单是否可用（登录并刷新过才有内容）。
 ///
 /// 这一条只做"有没有"的判断：以前这里把整个缓存深拷贝一遍只为 `is_empty()`，
 /// 缓存里有几千首歌时是白拷贝（借用判断即可）。
-fn has_netease_account_collections() -> bool {
-    crate::remote_cache::with_netease(|collections| {
-        collections
-            .iter()
-            .any(|collection| collection.kind == lx_core::sync::SyncCollectionKind::Playlist)
+fn has_account_collections() -> bool {
+    [SourceId::Wy, SourceId::Tx].iter().any(|source| {
+        crate::remote_cache::with_source(*source, |collections| {
+            collections
+                .iter()
+                .any(|collection| collection.kind == lx_core::sync::SyncCollectionKind::Playlist)
+        })
+        .unwrap_or(false)
     })
 }
 
 /// 「我的歌单」列表：取数与设置页的远程歌单窗口**同源**
 /// （`remote_collections::account_collections`），一边显示 23 个、一边 22 个
-/// 这类不一致不会再出现。
+/// 这类不一致不会再出现。网易云与 QQ 音乐的镜像合并在同一个入口里。
 fn account_playlist_list() -> Vec<Playlist> {
     crate::pages::components::remote_collections::account_collections()
         .iter()
@@ -65,10 +78,11 @@ fn account_playlist_list() -> Vec<Playlist> {
 }
 
 fn account_playlist(collection: &lx_core::sync::SyncCollection) -> Playlist {
+    let prefix = account_id_prefix(collection.source).unwrap_or(NETEASE_ACCOUNT_ID_PREFIX);
     Playlist {
-        id: format!("{NETEASE_ACCOUNT_ID_PREFIX}{}", collection.id),
+        id: format!("{prefix}{}", collection.id),
         name: collection.name.clone(),
-        source: SourceId::Wy,
+        source: collection.source,
         cover_url: collection
             .songs
             .first()
@@ -239,9 +253,7 @@ impl PlaylistsPage {
             .chain(browse_sources.iter().copied().map(PlaylistScope::Source))
             // 「我的歌单」只在远程缓存真有内容时出现，避免登录了但没刷新时
             // 多出一个永远空着的入口。
-            .chain(
-                has_netease_account_collections().then_some(PlaylistScope::Account(SourceId::Wy)),
-            )
+            .chain(has_account_collections().then_some(PlaylistScope::Account(SourceId::Wy)))
             .collect();
         let items = scopes
             .iter()
@@ -307,11 +319,12 @@ impl PlaylistsPage {
         }
         self.selected_playlist = None;
         self.sync_saved_playlists(ctx);
-        if let Some(position) = self
-            .playlists
-            .iter()
-            .position(|playlist| playlist.id == format!("{NETEASE_ACCOUNT_ID_PREFIX}{remote_id}"))
-        {
+        // remote_id 不带前缀（窗口只给远端 id）：两个平台的镜像都试着配一次。
+        if let Some(position) = self.playlists.iter().position(|playlist| {
+            [NETEASE_ACCOUNT_ID_PREFIX, QQ_ACCOUNT_ID_PREFIX]
+                .iter()
+                .any(|prefix| playlist.id == format!("{prefix}{remote_id}"))
+        }) {
             self.selected = position;
         }
     }
@@ -2324,6 +2337,13 @@ mod tests {
                 .unwrap(),
             "5270339257"
         );
+
+        // QQ 镜像的集合用自己的前缀，歌单本身仍归属 QQ 音源。
+        let mut qq_collection = collection;
+        qq_collection.source = SourceId::Tx;
+        let qq_playlist = super::account_playlist(&qq_collection);
+        assert_eq!(qq_playlist.id, "qq-account:5270339257");
+        assert_eq!(qq_playlist.source, SourceId::Tx);
     }
 
     fn playlist(id: &str, source: SourceId) -> Playlist {

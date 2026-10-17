@@ -38,6 +38,7 @@ history_limit = 200
 enabled = ["kw", "kg", "tx", "wy", "mg", "bili"]
 default = "kw"
 auto_toggle = true          # 播放失败时自动尝试其它音源的同曲匹配
+js_first = false            # true = 播放地址先问 JS 音源，失败再回退内置音源
 # JS 自定义音源（lx-music user API 协议），数组顺序即解析优先级：
 # js_sources = [
 #   "https://ghproxy.net/raw.githubusercontent.com/pdone/lx-music-source/main/juhe/latest.js",
@@ -76,6 +77,8 @@ trackChange = true          # 切歌时发送桌面通知
 
 [integration]
 mpris = true                # Linux MPRIS / Waybar / 媒体键，修改后重启生效
+now_playing = true          # macOS Now Playing / 触摸栏 / 控制中心，修改后重启生效
+listenbrainz_token = ""     # ListenBrainz 用户 token，留空不上报听歌记录
 
 [local_music]
 enabled = true
@@ -134,7 +137,8 @@ save_lyric = true            # 保存 .lrc 并内嵌歌词
 | `enabled` | 全部内置音源 | 参与搜索和换源的平台，值为 `kw` / `kg` / `tx` / `wy` / `mg` / `bili` |
 | `default` | `"kw"` | 默认音源 |
 | `auto_toggle` | `true` | 播放失败时自动尝试其它音源的同曲匹配 |
-| `js_sources` | `[]` | JS 音源脚本 URL 或本地路径，数组顺序即优先级 |
+| `js_first` | `false` | 播放地址解析顺序：默认内置原平台先行、JS 音源回退（坏掉的 JS 脚本不再拖慢可直接播放的歌）；`true` 恢复「JS 音源优先」 |
+| `js_sources` | `[]` | JS 音源脚本 URL 或本地路径，数组顺序即优先级。脚本缓存在 `<配置目录>/voicefox/sources`（旧版 `lx-tui/sources` 的内容启动时自动迁移） |
 
 ### `[lyric]` 歌词
 
@@ -208,6 +212,8 @@ save_lyric = true            # 保存 .lrc 并内嵌歌词
 |------|--------|------|
 | `mpris` | `true` | Linux MPRIS 服务（Waybar、playerctl、媒体键），修改后重启生效 |
 | `smtc` | `true` | Windows SMTC 服务（硬件媒体键、系统媒体浮层），修改后重启生效 |
+| `now_playing` | `true` | macOS Now Playing 服务（触摸栏、控制中心、耳机媒体键），修改后重启生效 |
+| `listenbrainz_token` | `""` | ListenBrainz 用户 token（listenbrainz.org 头像 → User Profile）。填写后每首歌开始播放满 30 秒提交一条听歌记录；留空关闭 |
 
 ### `[local_music]` 本地音乐
 

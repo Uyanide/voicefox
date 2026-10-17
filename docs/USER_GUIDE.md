@@ -136,7 +136,7 @@ base = "default"
 设置页（全局 `8`）→「数据与本地库」分类底部提供两行缓存操作，值列显示当前体积：
 
 - **清除封面缓存**：封面统一缓存在系统缓存目录（Linux 为 `~/.cache/voicefox/covers`），清理后按需重新下载。
-- **清除网易云歌单缓存**：删除 `netease_collections.json` 歌单镜像，下次同步会自动重建。
+- **清除歌单镜像缓存**：删除网易云（`netease_collections.json`）与 QQ 音乐（`qq_collections.json`）的歌单镜像，下次同步会自动重建。
 
 体积只在进入该分类或执行清理时统计一次，不会每帧扫描磁盘。
 

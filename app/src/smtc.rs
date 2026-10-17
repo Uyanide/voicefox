@@ -9,10 +9,7 @@
 
 use std::time::Duration;
 
-use souvlaki::{
-    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
-    SeekDirection,
-};
+use souvlaki::{MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::warn;
 
@@ -54,7 +51,7 @@ fn run_worker(
     .map_err(|error| anyhow::anyhow!("create media controls: {error}"))?;
     controls
         .attach(move |event| {
-            if let Some(command) = translate_event(event) {
+            if let Some(command) = crate::media_session::translate_event(event) {
                 let _ = command_tx.send(command);
             }
         })
@@ -115,32 +112,6 @@ fn apply_playback(controls: &mut MediaControls, snapshot: &MediaSnapshot) {
 
 fn position(snapshot: &MediaSnapshot) -> Duration {
     Duration::from_micros(snapshot.position_micros.max(0) as u64)
-}
-
-fn translate_event(event: MediaControlEvent) -> Option<MediaCommand> {
-    match event {
-        MediaControlEvent::Play => Some(MediaCommand::Play),
-        MediaControlEvent::Pause => Some(MediaCommand::Pause),
-        MediaControlEvent::Toggle => Some(MediaCommand::Toggle),
-        MediaControlEvent::Stop => Some(MediaCommand::Stop),
-        MediaControlEvent::Next => Some(MediaCommand::Next),
-        MediaControlEvent::Previous => Some(MediaCommand::Previous),
-        MediaControlEvent::Seek(SeekDirection::Forward) => Some(MediaCommand::SeekBy(5_000_000)),
-        MediaControlEvent::Seek(SeekDirection::Backward) => Some(MediaCommand::SeekBy(-5_000_000)),
-        MediaControlEvent::SeekBy(direction, amount) => {
-            let offset = i64::try_from(amount.as_micros()).unwrap_or(i64::MAX);
-            Some(MediaCommand::SeekBy(match direction {
-                SeekDirection::Forward => offset,
-                SeekDirection::Backward => -offset,
-            }))
-        }
-        MediaControlEvent::SetPosition(position) => Some(MediaCommand::SetPosition(position.0)),
-        // SMTC 窗口路径不会产生这些事件；音量键由系统混音器处理。
-        MediaControlEvent::SetVolume(_)
-        | MediaControlEvent::OpenUri(_)
-        | MediaControlEvent::Raise
-        | MediaControlEvent::Quit => None,
-    }
 }
 
 /// 创建 SMTC 依附的隐藏顶层窗口。

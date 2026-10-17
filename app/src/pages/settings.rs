@@ -1169,7 +1169,7 @@ fn build_settings_rows(
         K::Action,
         "刷新远程歌单",
         RowPlan::Direct(D::SyncNetease),
-        "双向增量",
+        "只读镜像",
         palette,
     );
     rows.value(
@@ -1177,7 +1177,7 @@ fn build_settings_rows(
         K::Action,
         "QQ 音乐同步",
         RowPlan::Direct(D::SyncQq),
-        "双向增量",
+        "只读镜像",
         palette,
     );
     // 「导入外部歌单」归数据分类：它是文件导入动作，和账号无关。
@@ -2343,10 +2343,10 @@ impl SettingsPage {
             D::ClearRemoteCache => {
                 let message = match crate::remote_cache::clear() {
                     Ok(()) => format!(
-                        "已清除网易云歌单镜像（{}），下次同步会自动重建",
+                        "已清除远程歌单镜像（{}），下次同步会自动重建",
                         format_bytes(crate::remote_cache::cache_file_size())
                     ),
-                    Err(error) => format!("清除网易云歌单缓存失败: {error}"),
+                    Err(error) => format!("清除远程歌单缓存失败: {error}"),
                 };
                 self.refresh_cache_stats();
                 self.set_status(message);
@@ -3187,12 +3187,12 @@ impl SettingsPage {
         if row < inner.bottom() {
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    " 网易云远程歌单",
+                    " 歌单镜像（网易云 / QQ）",
                     Style::new().fg(accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(
-                        "  · 已缓存 {cached_total} 个（普通 {cached_normal} / 红心 {cached_favorites}）  · 选中「刷新远程歌单」行按 Enter 刷新"
+                        "  · 已缓存 {cached_total} 个（普通 {cached_normal} / 红心 {cached_favorites}）  · 登录后选中对应「刷新 / 同步」行按 Enter 拉取"
                     ),
                     Style::new().fg(muted),
                 ),
@@ -3203,34 +3203,35 @@ impl SettingsPage {
 
         if row < inner.bottom() {
             if cached_total == 0 {
-                Paragraph::new(" 尚未读取网易云远程歌单。登录后选中「刷新远程歌单」行按 Enter。")
-                    .style(Style::new().fg(crate::theme::yellow(ctx)))
-                    .render(Rect::new(inner.x, row, inner.width, 1), buf);
+                Paragraph::new(
+                    " 尚未读取远程歌单。登录后选中「刷新远程歌单」（网易云）或「QQ 音乐同步」行按 Enter。",
+                )
+                .style(Style::new().fg(crate::theme::yellow(ctx)))
+                .render(Rect::new(inner.x, row, inner.width, 1), buf);
             } else {
                 let room = inner.bottom().saturating_sub(row) as usize;
                 let width = inner.width.saturating_sub(20) as usize;
-                let lines = crate::remote_cache::with_netease(|collections| {
-                    collections
-                        .iter()
-                        .take(room)
-                        .map(|collection| {
-                            let kind = if matches!(
-                                collection.kind,
-                                lx_core::sync::SyncCollectionKind::Favorites
-                            ) {
-                                "红心"
-                            } else {
-                                "歌单"
-                            };
-                            format!(
-                                " {}  {}  · {} 首",
-                                kind,
-                                truncate_display(&collection.name, width),
-                                collection.songs.len()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
+                let lines: Vec<String> = crate::remote_cache::all_mirrored()
+                    .iter()
+                    .take(room)
+                    .map(|collection| {
+                        let kind = if matches!(
+                            collection.kind,
+                            lx_core::sync::SyncCollectionKind::Favorites
+                        ) {
+                            "红心"
+                        } else {
+                            "歌单"
+                        };
+                        format!(
+                            " [{}] {}  {}  · {} 首",
+                            collection.source.display_name(),
+                            kind,
+                            truncate_display(&collection.name, width),
+                            collection.songs.len()
+                        )
+                    })
+                    .collect();
                 for line in lines {
                     Paragraph::new(Line::from(Span::styled(
                         line,
