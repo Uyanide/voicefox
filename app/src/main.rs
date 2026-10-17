@@ -1766,11 +1766,13 @@ fn run_app(
     // 安装 tmux 的 client-attached hook，析构时自动卸载
     let attach_watcher = tmux::AttachWatcher::install();
     let mut last_cover_redraw = Instant::now() - COVER_REDRAW_THROTTLE;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    // 媒体控件状态：三个平台（Linux MPRIS / Windows SMTC / macOS Now Playing）
+    // 共用同一套快照节流变量，声明与使用点的 cfg 必须完全一致。
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut last_media_snapshot: Option<media_session::MediaSnapshot> = None;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut last_media_update = Instant::now() - Duration::from_secs(1);
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut last_position_epoch = ctx.position_epoch();
 
     // === 后台异步加载 JS 音源（不阻塞启动） ===
