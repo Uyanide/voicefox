@@ -54,6 +54,8 @@ pub struct SourceManager {
     bili_source: Arc<BiliSource>,
     default: std::sync::RwLock<SourceId>,
     enabled: std::sync::RwLock<HashSet<SourceId>>,
+    /// 「JS 音源优先」解析顺序开关；false（默认）= 内置音源先行。
+    js_url_first: std::sync::atomic::AtomicBool,
     /// 歌词"确认无词"负缓存（上次确认时间），避免纯音乐/无词歌曲
     /// 每次播放都触发 JS 音源 + 全源聚合补全的长耗时请求。
     /// 键为 (来源，JS 平台标记，歌曲 id)。
@@ -74,16 +76,35 @@ pub fn is_local_file_song(song: &SongInfo) -> bool {
 
 /// JS 音源搜索结果对应的平台内置音源（其 `id` 即该平台的歌曲 id），
 /// JS 音源解析失败时可用它回退。
+///
+/// 覆盖全部已接入内置实现的平台；脚本侧的平台标记以各家 user API 的
+/// 惯用写法为准，`SourceId::as_str` 之外列的是常见别名。
 fn builtin_source_for_js(song: &SongInfo) -> Option<SourceId> {
     if song.source != SourceId::Local {
         return None;
     }
-    match song.extra.get("source").map(String::as_str) {
+    // 平台标记来自各家脚本，大小写不统一，这里统一按小写匹配。
+    match song
+        .extra
+        .get("source")
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("kw") => Some(SourceId::Kw),
         Some("kg") => Some(SourceId::Kg),
         Some("tx") => Some(SourceId::Tx),
         Some("wy") => Some(SourceId::Wy),
         Some("mg") => Some(SourceId::Mg),
+        // 千千（原百度音乐）
+        Some("qianqian") | Some("bd") | Some("baidu") => Some(SourceId::Qianqian),
+        Some("joox") => Some(SourceId::Joox),
+        Some("jamendo") => Some(SourceId::Jamendo),
+        // 5sing 脚本里也写作 fiveSing / 5sing
+        Some("fivesing") | Some("5sing") | Some("fivesing_kugou") => Some(SourceId::Fivesing),
+        Some("apple") | Some("applemusic") => Some(SourceId::Apple),
+        Some("bili") | Some("bilibili") => Some(SourceId::Bili),
+        // 汽水音乐（抖音）
+        Some("soda") | Some("qishui") | Some("douyin") => Some(SourceId::Soda),
         _ => None,
     }
 }
@@ -102,6 +123,7 @@ impl SourceManager {
             bili_source: Arc::clone(&bili_source),
             default: std::sync::RwLock::new(default),
             enabled: std::sync::RwLock::new(enabled.iter().copied().collect()),
+            js_url_first: std::sync::atomic::AtomicBool::new(false),
             lyric_negative_cache: std::sync::Mutex::new(HashMap::new()),
         };
         // 注册内置音源
@@ -792,7 +814,8 @@ impl SourceManager {
     }
 
     /// 获取歌曲播放地址。
-    /// 在线歌曲优先使用 JS 音源，失败或未导入时回退到对应内置音源。
+    /// 默认先用歌曲所属平台的内置音源，失败后依次尝试 JS 音源；
+    /// `js_url_first` 开启时恢复旧的「JS 音源优先」顺序。
     pub async fn get_song_url(
         &self,
         song: &SongInfo,
@@ -801,6 +824,19 @@ impl SourceManager {
         self.get_song_url_from_js_index(song, quality, 0)
             .await
             .map(|(url, _)| url)
+    }
+
+    /// 「JS 音源优先」开关（默认关闭：内置音源先行，JS 作为回退换源）。
+    ///
+    /// 单个挂死的 JS 音源曾让酷我、网易云这些本可直接解析的歌一起变慢；
+    /// 依赖 JS 音源解 VIP 曲目的用户可以用这个开关恢复旧行为。
+    pub fn set_js_url_first(&self, js_first: bool) {
+        self.js_url_first
+            .store(js_first, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn js_url_first(&self) -> bool {
+        self.js_url_first.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 从指定 JS 音源索引开始解析播放地址。
@@ -851,8 +887,23 @@ impl SourceManager {
                 .await
                 .map(|url| (url, None));
         }
-        // 在线歌曲优先使用 JS 音源。
+
+        // js_start_index > 0 说明上一轮已经解析过一次（播放失败后从下一个
+        // JS 音源继续）：这一轮直接从 JS 扫起，不再重复请求内置音源。
+        let js_first = self.js_url_first() || js_start_index > 0;
+        let mut builtin_error: Option<String> = None;
+        let mut builtin_attempted = false;
         let mut js_errors = Vec::new();
+
+        // 默认内置音源先行：单个挂死的 JS 音源不再拖慢本可直接播放的歌。
+        if !js_first && let Some(builtin) = self.builtin_fallback_source(song) {
+            builtin_attempted = true;
+            match builtin.get_song_url(song, quality).await {
+                Ok(result) => return Ok((result, None)),
+                Err(error) => builtin_error = Some(error.to_string()),
+            }
+        }
+
         for (index, js_source) in self
             .js_sources()
             .into_iter()
@@ -865,48 +916,43 @@ impl SourceManager {
             }
         }
 
-        if song.source == SourceId::Local {
-            // JS 音源搜到的歌：其 id 就是搜索时记录的平台歌曲 id，
-            // JS 音源全部失败后回退到该平台的内置音源。
-            let fallback_error = if js_errors.is_empty() {
-                FetchError::Other("未加载任何 JS 音源".to_string())
-            } else {
-                FetchError::Other(format!("JS 音源失败: {}", js_errors.join("; ")))
-            };
-            let fallback =
-                builtin_source_for_js(song).and_then(|id| self.sources.get(&id).map(Arc::clone));
-            return match fallback {
-                None => Err(fallback_error),
-                Some(source) => source
-                    .get_song_url(song, quality)
-                    .await
-                    .map(|url| (url, None))
-                    .map_err(|error| {
-                        FetchError::Other(format!(
-                            "{fallback_error}; 内置{}音源失败: {error}",
-                            source.name()
-                        ))
-                    }),
+        // 错误汇总：JS 音源实际尝试过才提 JS；JS 搜到的歌一个源都没有时
+        // 保留原来的「未加载任何 JS 音源」提示。
+        let js_note = (!js_errors.is_empty())
+            .then(|| format!("JS 音源失败: {}", js_errors.join("; ")))
+            .or_else(|| (song.source == SourceId::Local).then(|| "未加载任何 JS 音源".to_string()));
+
+        // 全部失败后内置音源兜底（内置音源先行模式下上面已经试过，不再重复）。
+        if let Some(source) = self
+            .builtin_fallback_source(song)
+            .filter(|_| !builtin_attempted)
+        {
+            return match source.get_song_url(song, quality).await {
+                Ok(result) => Ok((result, None)),
+                Err(error) => match js_note {
+                    Some(note) => Err(FetchError::Other(format!(
+                        "{note}; 内置{}音源失败: {error}",
+                        source.name()
+                    ))),
+                    None => Err(error),
+                },
             };
         }
 
-        let source = self
-            .sources
-            .get(&song.source)
-            .map(Arc::clone)
-            .ok_or_else(|| FetchError::Other("歌曲来源不可用".to_string()))?;
-        match source.get_song_url(song, quality).await {
-            Ok(result) => Ok((result, None)),
-            Err(builtin_error) => {
-                if !js_errors.is_empty() {
-                    Err(FetchError::Other(format!(
-                        "JS 音源失败: {}; 内置音源失败: {builtin_error}",
-                        js_errors.join("; ")
-                    )))
-                } else {
-                    Err(builtin_error)
-                }
-            }
+        if !builtin_attempted {
+            return Err(FetchError::Other(
+                js_note.unwrap_or_else(|| "歌曲来源不可用".to_string()),
+            ));
+        }
+        match (builtin_error, js_note) {
+            (Some(builtin_error), Some(js_note)) => Err(FetchError::Other(format!(
+                "{js_note}; 内置音源失败: {builtin_error}"
+            ))),
+            (Some(builtin_error), None) => Err(FetchError::Other(builtin_error)),
+            // builtin_attempted 为 true 时必然已经失败返回，这里只是兜底。
+            (None, js_note) => Err(FetchError::Other(
+                js_note.unwrap_or_else(|| "歌曲来源不可用".to_string()),
+            )),
         }
     }
 
@@ -1426,6 +1472,9 @@ mod tests {
     #[tokio::test]
     async fn song_url_uses_js_sources_in_order_until_one_succeeds() {
         let manager = SourceManager::new(SourceId::Kw, SourceId::all_online());
+        // 本用例锁定的是「JS 优先」模式下的顺序语义；默认顺序（内置先行）
+        // 在下面的 builtin_source_resolves_before_js_sources 里锁定。
+        manager.set_js_url_first(true);
         let generation = manager.begin_js_source_request(true);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let source = |name, succeeds| {
@@ -1465,6 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn song_url_can_resume_from_the_next_js_source() {
         let manager = SourceManager::new(SourceId::Kw, SourceId::all_online());
+        manager.set_js_url_first(true);
         let generation = manager.begin_js_source_request(true);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let source = |name| {
@@ -1500,6 +1550,182 @@ mod tests {
             *calls.lock().unwrap_or_else(|e| e.into_inner()),
             vec!["juhe", "grass"]
         );
+    }
+
+    /// 默认顺序（内置音源先行）：单个坏掉的 JS 音源不再拦在本可直接解析的
+    /// 歌前面；JS 音源仍在其后参与回退。
+    #[tokio::test]
+    async fn builtin_source_resolves_before_js_sources() {
+        let mut manager = SourceManager::new(SourceId::Kw, SourceId::all_online());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = |name, succeeds| {
+            Arc::new(StubJsSource {
+                name,
+                succeeds,
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn MusicSource>
+        };
+        // 覆盖内置酷我音源：立即失败的可记录桩。
+        manager.register(source("kw-builtin", false));
+        let generation = manager.begin_js_source_request(true);
+        assert!(manager.set_js_sources_if_current(generation, vec![source("juhe", true)]));
+        let song = SongInfo::new(
+            "song-id".to_string(),
+            SourceId::Kw,
+            "song".to_string(),
+            "artist".to_string(),
+        );
+
+        assert!(!manager.js_url_first(), "默认必须是内置音源先行");
+        let result = manager
+            .get_song_url(&song, Quality::High320)
+            .await
+            .expect("内置失败后应由 JS 音源兜底");
+
+        assert_eq!(result.url, "https://example.com/juhe.mp3");
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|e| e.into_inner()),
+            vec!["kw-builtin", "juhe"],
+            "必须先试内置音源，失败后才轮到 JS 音源"
+        );
+    }
+
+    /// 可指定平台 id 的可记录桩：验证 JS 搜到的歌按 extra[source] 回到平台
+    /// 内置音源时用（`StubJsSource` 的 id 固定为 Kw）。
+    struct PlatformStub {
+        id: SourceId,
+        name: &'static str,
+        succeeds: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl MusicSource for PlatformStub {
+        fn id(&self) -> SourceId {
+            self.id
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn search(
+            &self,
+            _keyword: &str,
+            _page: u32,
+            _limit: u32,
+        ) -> Result<SearchResult, SearchError> {
+            Err(SearchError::Other("unused".to_string()))
+        }
+
+        async fn get_song_url(
+            &self,
+            _song: &SongInfo,
+            quality: Quality,
+        ) -> Result<SongUrl, FetchError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(self.name);
+            if !self.succeeds {
+                return Err(FetchError::NotFound);
+            }
+            Ok(SongUrl {
+                url: format!("https://example.com/{}.mp3", self.name),
+                quality,
+                duration: Duration::from_secs(180),
+                cover_url: None,
+                qualities: vec![quality],
+                headers: vec![],
+                size: None,
+                size_is_advisory: false,
+                md5: None,
+                candidate_urls: vec![],
+                max_chunk_size: 0,
+            })
+        }
+
+        async fn get_lyric(&self, _song: &SongInfo) -> Result<LyricData, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        async fn get_cover_url(&self, _song: &SongInfo) -> Result<String, FetchError> {
+            Err(FetchError::NotFound)
+        }
+
+        fn supported_qualities(&self) -> Vec<Quality> {
+            vec![Quality::High320]
+        }
+    }
+
+    /// JS 音源搜到的歌（Local + extra[source]）同样内置先行。
+    #[tokio::test]
+    async fn js_sourced_songs_prefer_their_platform_builtin_source() {
+        let mut manager = SourceManager::new(SourceId::Wy, SourceId::all_online());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let builtin = Arc::new(PlatformStub {
+            id: SourceId::Wy,
+            name: "wy-builtin",
+            succeeds: true,
+            calls: Arc::clone(&calls),
+        });
+        manager.register(builtin);
+        let generation = manager.begin_js_source_request(true);
+        let juhe = Arc::new(PlatformStub {
+            id: SourceId::Kw,
+            name: "juhe",
+            succeeds: true,
+            calls: Arc::clone(&calls),
+        });
+        assert!(manager.set_js_sources_if_current(generation, vec![juhe as Arc<dyn MusicSource>],));
+        let mut song = SongInfo::new(
+            "wy-id".to_string(),
+            SourceId::Local,
+            "song".to_string(),
+            "artist".to_string(),
+        );
+        song.extra.insert("source".to_string(), "wy".to_string());
+
+        let result = manager
+            .get_song_url(&song, Quality::High320)
+            .await
+            .expect("平台内置音源应直接解析");
+
+        assert_eq!(result.url, "https://example.com/wy-builtin.mp3");
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|e| e.into_inner()),
+            vec!["wy-builtin"],
+            "内置音源命中后不应再请求 JS 音源"
+        );
+    }
+
+    #[test]
+    fn js_platform_tags_map_to_builtin_sources() {
+        let tag = |platform: &str| {
+            let mut song = song_with(SourceId::Local);
+            song.extra
+                .insert("source".to_string(), platform.to_string());
+            super::builtin_source_for_js(&song)
+        };
+
+        assert_eq!(tag("kw"), Some(SourceId::Kw));
+        assert_eq!(tag("kg"), Some(SourceId::Kg));
+        assert_eq!(tag("tx"), Some(SourceId::Tx));
+        assert_eq!(tag("wy"), Some(SourceId::Wy));
+        assert_eq!(tag("mg"), Some(SourceId::Mg));
+        // 千千（脚本里也写作 bd / baidu）
+        assert_eq!(tag("qianqian"), Some(SourceId::Qianqian));
+        assert_eq!(tag("bd"), Some(SourceId::Qianqian));
+        assert_eq!(tag("joox"), Some(SourceId::Joox));
+        assert_eq!(tag("jamendo"), Some(SourceId::Jamendo));
+        assert_eq!(tag("5sing"), Some(SourceId::Fivesing));
+        assert_eq!(tag("Fivesing"), Some(SourceId::Fivesing), "大小写不敏感");
+        assert_eq!(tag("apple"), Some(SourceId::Apple));
+        assert_eq!(tag("bilibili"), Some(SourceId::Bili));
+        assert_eq!(tag("qishui"), Some(SourceId::Soda));
+        assert_eq!(tag("unknown-platform"), None);
+        // 普通歌曲不参与映射
+        assert_eq!(super::builtin_source_for_js(&song_with(SourceId::Kw)), None);
     }
 
     #[test]

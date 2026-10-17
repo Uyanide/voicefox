@@ -172,6 +172,7 @@ impl AppContext {
             config.source.default,
             &config.source.enabled,
         ));
+        source_manager.set_js_url_first(config.source.js_first);
         let bili_source = source_manager.bili_source();
 
         let lyric_service = Arc::new(LyricService::new(Arc::new(

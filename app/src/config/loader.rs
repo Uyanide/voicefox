@@ -214,6 +214,13 @@ fn migrate_legacy_config(config: &mut Config) -> bool {
         config.version = 16;
         changed = true;
     }
+    if config.version < 17 {
+        // 新增 source.js_first、integration.now_playing、
+        // integration.listenbrainz_token，字段均有 serde 默认值，旧配置
+        // 提升版本即可（js_first=false 保持内置音源先行的默认顺序）。
+        config.version = 17;
+        changed = true;
+    }
     if config.version > CURRENT_CONFIG_VERSION {
         // 用户可能带着更高版本的配置降级运行：只警告不 panic（debug_assert
         // 会在开发构建直接崩溃），字段由 serde default 兜底。

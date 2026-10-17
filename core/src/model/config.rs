@@ -4,7 +4,7 @@ use super::source::{Quality, SourceId};
 use crate::keybinding::KeybindingConfig;
 use crate::traits::player::EqualizerBand;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 16;
+pub const CURRENT_CONFIG_VERSION: u32 = 17;
 
 /// 侧边栏背景样式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -185,10 +185,11 @@ impl Default for PlayerConfig {
 ///
 /// 只影响"这首歌去哪里拿播放地址"，不影响搜索默认音源（`source.default`）——
 /// 两者混在一起会让用户分不清"换的是这首歌"还是"以后都用它"。
+/// 「JS 音源还是内置音源先行」是另一个独立开关：[`SourceConfig::js_first`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourcePolicy {
-    /// 现状：JS 音源（配置顺序）→ 内置原平台 → 跨平台严格匹配兜底。
+    /// 默认：内置原平台 → JS 音源（配置顺序）→ 跨平台严格匹配兜底。
     #[default]
     Auto,
     /// 跨平台兜底时，把指定平台的同曲排到候选最前；其余顺序不变。
@@ -298,12 +299,17 @@ pub struct SourceConfig {
     /// JS 音源脚本 URL 或本地路径列表（lx-music user API 协议）
     #[serde(default)]
     pub js_sources: Vec<String>,
-    /// 解析策略；默认 `auto` 与历史行为完全一致。
+    /// 解析策略；默认 `auto`。
     #[serde(default)]
     pub policy: SourcePolicy,
     /// 解析策略作用的平台；`auto` 时忽略。
     #[serde(default)]
     pub policy_platform: Option<SourceId>,
+    /// 「JS 音源优先」：开启后播放地址先问 JS 音源（配置顺序），失败再回退
+    /// 内置音源。默认关闭——单个挂死的 JS 音源曾让本可直接播放的歌一起变慢；
+    /// 依赖 JS 音源解 VIP 曲目的用户可以打开这个开关恢复旧行为。
+    #[serde(default)]
+    pub js_first: bool,
 }
 
 impl Default for SourceConfig {
@@ -315,6 +321,7 @@ impl Default for SourceConfig {
             js_sources: vec![],
             policy: SourcePolicy::Auto,
             policy_platform: None,
+            js_first: false,
         }
     }
 }
@@ -624,6 +631,14 @@ pub struct IntegrationConfig {
     /// Windows 上接入 SMTC（System Media Transport Controls），
     /// 硬件媒体键与系统媒体浮层可控制播放。
     pub smtc: bool,
+    /// macOS 上接入 Now Playing（MPRemoteCommandCenter），
+    /// 触摸栏 / 耳机按键 / 控制中心可控制播放。
+    #[serde(alias = "now_playing")]
+    pub now_playing: bool,
+    /// ListenBrainz 用户 token（ui 头像页右上角「Profile」里可见）。
+    /// 留空表示不上报听歌记录；填写后开始播放 30 秒上报一次 listen。
+    #[serde(default)]
+    pub listenbrainz_token: String,
 }
 
 impl Default for IntegrationConfig {
@@ -631,6 +646,8 @@ impl Default for IntegrationConfig {
         Self {
             mpris: true,
             smtc: true,
+            now_playing: true,
+            listenbrainz_token: String::new(),
         }
     }
 }
