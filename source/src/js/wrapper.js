@@ -11,7 +11,14 @@ const { Console } = require('console');
 const { URL, URLSearchParams } = require('url');
 
 const protocolWrite = (value) => {
-    process.stdout.write(JSON.stringify(value) + '\n');
+    // process.stdout.write 是异步的，紧跟的 process.exit 会把还没刷出的
+    // 消息整个丢掉 —— initError 就是这样被吞成"子进程已退出"的。
+    // fs.writeSync(1, ...) 同步写完才返回，协议消息不会丢。
+    try {
+        fs.writeSync(1, JSON.stringify(value) + '\n');
+    } catch (_) {
+        // 父进程已关闭 stdout（EPIPE）：消息无处可去，等 stdin end 退出即可。
+    }
 };
 
 globalThis.console = new Console({

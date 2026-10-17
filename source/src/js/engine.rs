@@ -7,9 +7,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// 诊断信息里保留的子进程 stderr 尾部长度（字节）。
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
 
 /// JS 引擎：封装一个 Node.js 子进程运行用户音源脚本
 pub struct JsEngine {
@@ -26,6 +29,8 @@ pub struct JsEngine {
     source_path: String,
     /// 脚本通过 EVENT_NAMES.inited 声明的能力
     init_info: Mutex<Option<serde_json::Value>>,
+    /// 子进程 stderr 的最后若干字节，崩溃原因只在这里（界面上报错要带上）。
+    stderr_tail: Arc<Mutex<String>>,
 }
 
 impl JsEngine {
@@ -62,11 +67,11 @@ impl JsEngine {
 
         let mut command = Command::new("node");
         configure_background_command(&mut command);
-        // 清空子进程环境变量，仅白名单恢复必要项：PATH 用于查找 node，
-        // HOME/USERPROFILE 为用户目录；wrapper.js 只用 Node 内置模块，
-        // 不依赖其他环境变量，故意不保留 NODE_PATH 以防注入。
+        // 清空子进程环境变量，仅按白名单恢复启动所必需的项。wrapper.js 只用
+        // Node 内置模块，不依赖其他环境变量；NODE_OPTIONS / NODE_PATH 仍然
+        // 故意不保留，防止外部注入。
         command.env_clear();
-        for key in ["PATH", "HOME", "USERPROFILE"] {
+        for key in child_env_keys() {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
@@ -76,9 +81,18 @@ impl JsEngine {
             command.arg("--allow-net");
         }
         command
-            .arg(format!("--allow-fs-read={wrapper_path_string}"))
-            .arg(format!("--allow-fs-read={source_path}"))
+            .arg(format!(
+                "--allow-fs-read={}",
+                permission_path(wrapper_path_string)
+            ))
+            .arg(format!("--allow-fs-read={}", permission_path(source_path)))
             .arg("--disable-proto=throw");
+        // 脚本常用 __dirname 相对读取同目录的资源文件，只授权单个文件会让
+        // 这类脚本初始化时 ERR_ACCESS_DENIED；目录授权必须是带结尾斜杠的
+        // 前缀，Node 的权限树才认。
+        if let Some(source_dir) = readable_source_dir(source_path) {
+            command.arg(format!("--allow-fs-read={source_dir}"));
+        }
         let mut child = command
             .arg(wrapper_path_string)
             .arg(source_path)
@@ -92,23 +106,38 @@ impl JsEngine {
         let stdout = child.stdout.take().ok_or("无法获取子进程 stdout")?;
         let stderr = child.stderr.take().ok_or("无法获取子进程 stderr")?;
 
-        // 后台线程读取 stderr 并输出到 tracing（避免管道堵塞）
-        std::thread::spawn(move || {
-            let mut stderr = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match stderr.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim().to_string();
-                        if !trimmed.is_empty() {
-                            tracing::debug!("JS engine stderr: {}", trimmed);
+        // 后台线程读取 stderr：边逐行输出到 tracing（避免管道堵塞），边把
+        // 尾部留进环形缓冲 —— 子进程启动即崩溃时（Windows 缺 SystemRoot、
+        // 脚本语法错误等）原因全在这里，界面上报错必须带上。
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        {
+            let stderr_tail = Arc::clone(&stderr_tail);
+            std::thread::spawn(move || {
+                let mut stderr = BufReader::new(stderr);
+                let mut line = String::new();
+                let mut tail: Vec<u8> = Vec::with_capacity(STDERR_TAIL_BYTES);
+                loop {
+                    line.clear();
+                    match stderr.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            tail.extend_from_slice(line.as_bytes());
+                            if tail.len() > STDERR_TAIL_BYTES {
+                                let overflow = tail.len() - STDERR_TAIL_BYTES;
+                                tail.drain(..overflow);
+                            }
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                tracing::debug!("JS engine stderr: {trimmed}");
+                            }
                         }
                     }
                 }
-            }
-        });
+                if let Ok(mut guard) = stderr_tail.lock() {
+                    *guard = String::from_utf8_lossy(&tail).trim().to_string();
+                }
+            });
+        }
 
         let (output_tx, output_rx) = std::sync::mpsc::channel();
         let reader_handle = std::thread::spawn(move || {
@@ -135,14 +164,15 @@ impl JsEngine {
             req_id: AtomicU64::new(0),
             source_path: source_path.to_string(),
             init_info: Mutex::new(None),
+            stderr_tail,
         };
 
         engine
             .ping()
-            .map_err(|e| format!("JS 引擎启动失败: {}", e))?;
+            .map_err(|e| format!("JS 引擎启动失败: {e}{}", engine.exit_diagnostics()))?;
         engine
             .wait_initialized()
-            .map_err(|e| format!("JS 音源初始化失败: {}", e))?;
+            .map_err(|e| format!("JS 音源初始化失败: {e}{}", engine.exit_diagnostics()))?;
 
         Ok(engine)
     }
@@ -320,10 +350,100 @@ impl JsEngine {
             .map_err(|error| match error {
                 std::sync::mpsc::RecvTimeoutError::Timeout => timeout_message.to_string(),
                 std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                    "JS 引擎子进程已退出".to_string()
+                    format!("JS 引擎子进程已退出{}", self.exit_diagnostics())
                 }
             })
     }
+
+    /// 子进程退出码与 stderr 尾部，拼在错误消息里给用户看真正的原因。
+    ///
+    /// 进程还活着（例如刚超时）时只带 stderr；已经退出时再带上退出状态。
+    fn exit_diagnostics(&self) -> String {
+        let stderr = self
+            .stderr_tail
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let status = self.child.lock().ok().and_then(|mut child| {
+            child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok())
+                .flatten()
+        });
+        let stderr_note = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("，Node 输出: {stderr}")
+        };
+        // 尾部截断标记，避免"原因看起来是完整的但开头没了"造成误读。
+        let stderr_note = if stderr.len() >= STDERR_TAIL_BYTES {
+            format!("…{stderr_note}")
+        } else {
+            stderr_note
+        };
+        match status {
+            Some(status) => format!("（退出状态: {status}{stderr_note}）"),
+            None if stderr_note.is_empty() => String::new(),
+            None => format!("（子进程仍在运行{stderr_note}）"),
+        }
+    }
+}
+
+/// 子进程环境变量白名单。
+///
+/// Linux 上 PATH/HOME 足够。Windows 的 node.exe 还要 `SystemRoot` 才能初始化
+/// SXS / CryptoAPI / Winsock：没有它进程立刻退出，而 `CREATE_NO_WINDOW` 又把
+/// 系统报错框藏掉了，表现成一句空的「子进程已退出」（issue #44）。
+/// 列表里的键互不为大小写变体——Windows 环境块大小写不敏感，重复键会让
+/// `CreateProcess` 失败。
+fn child_env_keys() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            "SystemRoot",
+            "SystemDrive",
+            "TEMP",
+            "TMP",
+            "PATHEXT",
+            "ComSpec",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "PATH",
+        ]
+    } else {
+        &["PATH", "HOME"]
+    }
+}
+
+/// `--allow-fs-read` 的路径口径：Windows 下统一成正斜杠。
+///
+/// Node 的权限树按路径前缀节点匹配，反斜杠路径（尤其作为目录前缀授权时）
+/// 经常对不上实际读取路径，`readFileSync` 直接 `ERR_ACCESS_DENIED`。
+fn permission_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+/// 音源脚本所在目录的授权前缀（含结尾斜杠）。
+fn readable_source_dir(source_path: &str) -> Option<String> {
+    let dir = std::path::Path::new(source_path).parent()?;
+    let dir = dir.to_str()?;
+    if dir.is_empty() {
+        return None;
+    }
+    let mut normalized = permission_path(dir);
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    Some(normalized)
 }
 
 impl Drop for JsEngine {
@@ -382,10 +502,73 @@ fn configure_background_command(command: &mut Command) {
 
 #[cfg(test)]
 mod tests {
+    use super::{child_env_keys, permission_path, readable_source_dir};
+
     #[test]
     fn wrapper_disables_dynamic_string_code_generation() {
         let wrapper = include_str!("wrapper.js");
         assert!(wrapper.contains("strings: false"));
         assert!(!wrapper.contains("strings: true"));
+    }
+
+    #[test]
+    fn env_whitelist_has_no_case_insensitive_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for key in child_env_keys() {
+            assert!(
+                seen.insert(key.to_ascii_lowercase()),
+                "Windows 环境块大小写不敏感，白名单里的 {key} 会造成重复键"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_env_whitelist_keeps_node_requirements() {
+        let keys = child_env_keys();
+        for required in ["SystemRoot", "PATH", "TEMP", "USERPROFILE"] {
+            assert!(keys.contains(&required), "Windows 白名单缺 {required}");
+        }
+        assert!(
+            !keys.contains(&"NODE_OPTIONS") && !keys.contains(&"NODE_PATH"),
+            "注入面变量必须继续排除"
+        );
+    }
+
+    #[test]
+    fn fs_read_paths_are_normalized_for_the_permission_tree() {
+        // POSIX 路径原样返回（反斜杠在 Unix 是合法文件名字符，不能动）。
+        assert_eq!(
+            permission_path("/tmp/voicefox/wrapper.js"),
+            "/tmp/voicefox/wrapper.js"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_paths_use_forward_slashes() {
+        assert_eq!(
+            permission_path("C:\\Users\\u\\AppData\\Local\\voicefox\\js\\wrapper.js"),
+            "C:/Users/u/AppData/Local/voicefox/js/wrapper.js"
+        );
+    }
+
+    #[test]
+    fn source_dir_grant_is_a_trailing_slash_prefix() {
+        assert_eq!(
+            readable_source_dir("/home/u/sources/juhe.js").as_deref(),
+            Some("/home/u/sources/")
+        );
+        // 相对文件名没有可授权的目录
+        assert_eq!(readable_source_dir("juhe.js"), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn source_dir_grant_normalizes_separators() {
+        assert_eq!(
+            readable_source_dir("C:\\sources\\juhe.js").as_deref(),
+            Some("C:/sources/")
+        );
     }
 }
