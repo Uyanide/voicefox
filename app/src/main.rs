@@ -9,6 +9,7 @@ mod cover;
 mod data_cache;
 mod download;
 mod fmt;
+mod instance_lock;
 mod listenbrainz;
 mod media_controls;
 mod media_session;
@@ -1435,6 +1436,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(path) = cli.import_data.as_deref() {
+        let _lock = instance_lock::acquire(&storage::default_data_dir())?;
         let backup = storage::Storage::new()
             .import_data(path)
             .map_err(anyhow::Error::msg)?;
@@ -1443,6 +1445,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(path) = cli.import_playlist.as_deref() {
+        let _lock = instance_lock::acquire(&storage::default_data_dir())?;
         let report = storage::Storage::new()
             .import_external_playlist(path)
             .map_err(anyhow::Error::msg)?;
@@ -1461,6 +1464,7 @@ fn main() -> anyhow::Result<()> {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
+    let _instance_lock = instance_lock::acquire(&storage::default_data_dir())?;
 
     // 构建 tokio runtime（多线程）
     let rt = tokio::runtime::Runtime::new()?;
@@ -1831,6 +1835,9 @@ fn run_app(
             &settings_page,
             &search_seq,
         );
+    } else {
+        // 没有恢复队列时，从持久化状态载入的调度器同步为空列表
+        ctx.playlist.set_playlist(Vec::new(), 0);
     }
 
     // === 初始扫描本地音乐 ===
@@ -5420,10 +5427,23 @@ fn execute_action(
             });
         }
         AppAction::PlaySong { songs, index } => {
-            begin_song_from_list(songs, index, false, ctx, rt, action_tx);
+            begin_song_from_list(songs, index, false, false, ctx, rt, action_tx);
         }
         AppAction::PlaySongAfterFailure { songs, index } => {
-            begin_song_from_list(songs, index, true, ctx, rt, action_tx);
+            begin_song_from_list(songs, index, true, false, ctx, rt, action_tx);
+        }
+        AppAction::PlayExpandedFromQueue {
+            songs,
+            index,
+            replaced,
+            after_failure,
+        } => {
+            let Some(song) = songs.get(index).cloned() else {
+                return;
+            };
+            ctx.playlist
+                .expand_playlist(songs, index, &replaced, !after_failure);
+            start_song_playback(song, true, None, true, ctx, rt, action_tx);
         }
         AppAction::PlayFromQueue { songs, index } => {
             begin_song_from_arc(songs, index, false, ctx, rt, action_tx);
@@ -5439,7 +5459,7 @@ fn execute_action(
             paused,
         } => {
             if let Some(song) = songs.get(index).cloned() {
-                ctx.playlist.set_playlist(songs, index);
+                ctx.playlist.restore_playlist(songs, index);
                 ctx.play_attempted_sources
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5913,10 +5933,12 @@ fn execute_action(
     }
 }
 
+/// `from_queue`：`index` 处的歌已由切歌路径从当前队列选出并登记，分 P 展开后不再算作点歌。
 fn begin_song_from_list(
     songs: Vec<SongInfo>,
     index: usize,
     after_failure: bool,
+    from_queue: bool,
     ctx: &AppContext,
     rt: &tokio::runtime::Runtime,
     action_tx: &mpsc::UnboundedSender<AppAction>,
@@ -5988,7 +6010,14 @@ fn begin_song_from_list(
                     index
                 }
             };
-            let action = if after_failure {
+            let action = if from_queue {
+                AppAction::PlayExpandedFromQueue {
+                    songs,
+                    index: next_index,
+                    replaced: Box::new(song),
+                    after_failure,
+                }
+            } else if after_failure {
                 AppAction::PlaySongAfterFailure {
                     songs,
                     index: next_index,
@@ -6005,9 +6034,9 @@ fn begin_song_from_list(
     }
 
     if after_failure {
-        ctx.playlist.set_playlist_after_failure(songs, index);
+        ctx.playlist.start_playlist_after_failure(songs, index);
     } else {
-        ctx.playlist.set_playlist(songs, index);
+        ctx.playlist.start_playlist(songs, index);
     }
     // 已尝试音源集合与 JS 音源索引由 start_song_playback 在递增请求代次后清空
     start_song_playback(song, true, None, true, ctx, rt, action_tx);
@@ -6029,7 +6058,15 @@ fn begin_song_from_arc(
         return;
     };
     if should_expand_bili_parts(&song) {
-        begin_song_from_list(songs.to_vec(), index, after_failure, ctx, rt, action_tx);
+        begin_song_from_list(
+            songs.to_vec(),
+            index,
+            after_failure,
+            true,
+            ctx,
+            rt,
+            action_tx,
+        );
         return;
     }
     if after_failure {

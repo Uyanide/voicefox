@@ -13,6 +13,7 @@ use std::time::Duration;
 use lx_core::model::playlist::Playlist;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::SourceId;
+use lx_source::manager::is_local_file_song;
 
 /// 播放历史的紧凑存储条目。
 ///
@@ -1078,6 +1079,26 @@ impl Storage {
         }
     }
 
+    /// 读取随机播放调度器状态。文件不存在时返回 None，解析失败时隔离该文件后返回 None。
+    pub fn load_shuffle_state<T: DeserializeOwned>(&self) -> Option<T> {
+        let path = self.data_dir.join("shuffle_state.json");
+        let json = fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&json) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                tracing::warn!("随机播放状态解析失败，已隔离该文件: {error}");
+                Self::quarantine_corrupt_file(&path, &error.to_string());
+                None
+            }
+        }
+    }
+
+    pub fn save_shuffle_state<T: Serialize>(&self, state: &T) -> Result<(), String> {
+        let path = self.data_dir.join("shuffle_state.json");
+        let json = serde_json::to_vec(state).map_err(|error| error.to_string())?;
+        save_atomic_relaxed(&path, &json)
+    }
+
     /// 把解析失败的数据文件改名保留现场，避免随后一次保存用空数据覆盖原文件。
     fn quarantine_corrupt_file(path: &Path, reason: &str) {
         let timestamp = std::time::SystemTime::now()
@@ -1597,14 +1618,39 @@ fn ensure_unique_custom_playlist_name(
     Ok(())
 }
 
+/// 自定义歌单判定两首歌是否为同一首。
+///
+/// 同音源同 id 即为同一首。JS 音源的搜索结果都标记为 `SourceId::Local`，真实平台记在
+/// `extra["source"]`，需再比较平台，否则不同平台的同数字 id 会被视为同一首。
+/// 本地文件按路径判定，CUE 各轨共用同一个音频文件，需再比较轨号。
 pub fn same_song_identity(left: &SongInfo, right: &SongInfo) -> bool {
-    if left.source == right.source && !left.id.is_empty() && left.id == right.id {
+    if left.source == right.source
+        && !left.id.is_empty()
+        && left.id == right.id
+        && same_js_platform(left, right)
+    {
         return true;
     }
-    left.source == lx_core::model::source::SourceId::Local
-        && right.source == lx_core::model::source::SourceId::Local
+    left.source == SourceId::Local
+        && right.source == SourceId::Local
         && left.file_path.is_some()
         && left.file_path == right.file_path
+        && left.extra.get("cue_track") == right.extra.get("cue_track")
+}
+
+/// 两首都不是 JS 音源结果，或平台标记相同（不区分大小写）
+fn same_js_platform(left: &SongInfo, right: &SongInfo) -> bool {
+    match (js_platform(left), js_platform(right)) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// JS 音源结果的平台标记。标记为 `SourceId::Local` 却不是本地文件的即 JS 音源结果
+fn js_platform(song: &SongInfo) -> Option<&str> {
+    (song.source == SourceId::Local && !is_local_file_song(song))
+        .then(|| song.extra.get("source").map_or("", String::as_str))
 }
 
 pub fn local_song_matches_path(song: &SongInfo, path: &Path) -> bool {
@@ -1844,6 +1890,25 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_state_round_trips_and_corrupt_files_are_quarantined() {
+        let data_dir = temp_dir("shuffle-state");
+        let storage = storage_at(&data_dir);
+        assert!(storage.load_shuffle_state::<Vec<u64>>().is_none());
+
+        storage.save_shuffle_state(&vec![1_u64, 2, 3]).unwrap();
+        assert_eq!(
+            storage.load_shuffle_state::<Vec<u64>>(),
+            Some(vec![1, 2, 3])
+        );
+
+        let path = data_dir.join("shuffle_state.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        assert!(storage.load_shuffle_state::<Vec<u64>>().is_none());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn custom_playlists_store_network_and_local_songs_and_support_editing() {
         let data_dir = std::env::temp_dir().join(format!(
             "voicefox-custom-playlist-test-{}-{}",
@@ -1956,6 +2021,43 @@ mod tests {
             Storage::load_file(&data_dir.join("custom_playlists.json"));
         assert_eq!(persisted[0].songs.len(), 3);
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn js_results_from_different_platforms_are_different_songs() {
+        let js = |platform: &str| {
+            let mut song = song("123", SourceId::Local, "歌", "人");
+            song.extra.insert("source".into(), platform.into());
+            song
+        };
+        assert!(!same_song_identity(&js("kw"), &js("wy")));
+        assert!(same_song_identity(&js("kw"), &js("KW")));
+        let local_file = song("123", SourceId::Local, "歌", "人");
+        assert!(!same_song_identity(&js("kw"), &local_file));
+        assert!(same_song_identity(&local_file, &local_file.clone()));
+    }
+
+    #[test]
+    fn cue_tracks_of_one_audio_file_are_different_songs() {
+        let cue = |track: &str| {
+            let mut song = song(
+                &format!("/music/album.cue#{track}"),
+                SourceId::Local,
+                "歌",
+                "人",
+            );
+            song.file_path = Some(PathBuf::from("/music/album.flac"));
+            song.extra.insert("cue_track".into(), track.into());
+            song
+        };
+        assert!(!same_song_identity(&cue("01"), &cue("02")));
+        assert!(same_song_identity(&cue("01"), &cue("01")));
+        let mut whole = song("/music/album.flac", SourceId::Local, "歌", "人");
+        whole.file_path = Some(PathBuf::from("/music/album.flac"));
+        assert!(!same_song_identity(&cue("01"), &whole));
+        let mut renamed = whole.clone();
+        renamed.id = "other".into();
+        assert!(same_song_identity(&whole, &renamed));
     }
 
     #[test]
