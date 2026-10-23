@@ -1412,6 +1412,8 @@ fn main() -> anyhow::Result<()> {
     notification::run_if_helper();
 
     tmux::prepare_ratatui_image_environment();
+    // 封面探测子进程与主程序共用二进制，同样须先于 CLI 解析分流。
+    cover::run_if_probe();
 
     // 解析 CLI
     let cli = cli::Cli::parse();
@@ -1666,16 +1668,15 @@ fn run_app(
         let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
         (config.ui.cover_protocol.clone(), config.ui.show_cover)
     };
+    let mut cover_graphics = cover::graphics_requested(&cover_protocol);
     let mut main_page = pages::main_page::MainPage::new(cover::CoverRenderer::detect(
         &cover_protocol,
         cover_enabled,
     ));
-    // 封面协议能力只探测这一次（与 `CoverRenderer::detect` 同一口径）：设置页
-    // 的 `Shift+P` 循环据它跳过本终端画不出的协议，并在行内显示已纠正的原因。
     settings_page
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .set_cover_capabilities(cover::CoverCapabilities::detect(main_page.cover_protocol()));
+        .set_cover_graphics_available(main_page.cover_graphics_available());
     let mut leaderboard =
         pages::leaderboard::LeaderboardPage::new(ctx.source_manager.leaderboard_sources());
     let mut playlists = pages::playlists::PlaylistsPage::new(ctx.source_manager.playlist_sources());
@@ -1964,6 +1965,23 @@ fn run_app(
                 main_page.release_cover_image();
             }
             cover_enabled = cover_requested;
+            needs_render = true;
+        }
+
+        let graphics_requested = cover::graphics_requested(
+            &ctx.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .ui
+                .cover_protocol,
+        );
+        if graphics_requested != cover_graphics {
+            if main_page.set_cover_graphics(graphics_requested) {
+                // 全量重绘以覆盖终端里残留的图形
+                let size = terminal.size()?;
+                terminal.resize(Rect::new(0, 0, size.width, size.height))?;
+            }
+            cover_graphics = graphics_requested;
             needs_render = true;
         }
 
