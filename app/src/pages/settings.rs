@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::fmt::{format_bytes, format_duration};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use crate::context::AppContext;
@@ -130,6 +130,8 @@ enum SettingsRowKind {
     Input,
     /// 纯说明 / 只读展示：可选中，但 Enter 不触发任何业务动作。
     Info,
+    /// 分类内的小节标题：纯视觉分组，不进光标、不可点击、不参与命中。
+    Header,
 }
 
 /// 一条设置行的元数据。
@@ -147,6 +149,8 @@ struct SettingsRowMeta {
     kind: SettingsRowKind,
     /// 激活计划：键盘 `Enter`/`Space` 与鼠标点击**共用**的唯一决策点。
     plan: RowPlan,
+    /// 这一行的人话说明（说明栏与搜索共用）。查表写入，见 [`row_help`]。
+    help: Option<&'static str>,
 }
 
 /// 渲染时记录的"行矩形 + 行 id"。
@@ -223,27 +227,20 @@ enum SettingsRowDirectAction {
     ToggleShowCover,
     ToggleCoverGraphics,
     ToggleRememberPlaybackState,
-    CycleNetworkTimeout,
-    CycleMaxFps,
-    CyclePageStep,
     CycleAccentFollowCover,
     ToggleTrackChangeNotification,
     // ── 播放 ──
-    CyclePlaybackSpeed,
     EditAudioDevice,
     CycleReplayGainMode,
     CycleReplayGainPreamp,
     CycleChannelMode,
     CycleBalance,
     ToggleReplayGainClip,
-    CycleFadeInDuration,
-    CycleFadeOutDuration,
     RunFadeIn,
     RunFadeOut,
     SetAbLoopStart,
     SetAbLoopEnd,
     ClearAbLoop,
-    CycleHistoryLimit,
     // ── 音源与歌词 ──
     ToggleAutoSource,
     ToggleLyricTranslation,
@@ -257,28 +254,20 @@ enum SettingsRowDirectAction {
     SyncQq,
     ImportExternalPlaylist,
     // ── 通知与集成 ──
-    CycleScrollAmount,
     ToggleMpris,
     ToggleInAppNotification,
-    CycleInAppTimeout,
     ToggleDesktopNotification,
     ToggleNotificationAlbumCover,
     // ── 下载 ──
     EditDownloadDir,
-    CycleDownloadQuality,
     EditFilenameTemplate,
     ToggleMultipart,
-    CycleMultipartMinSize,
-    CycleDownloadConcurrency,
-    CycleConcurrentSongs,
-    CycleMaxRetries,
     ToggleVerifySize,
     ToggleSkipExisting,
     ToggleWriteTags,
     ToggleEmbedCover,
     ToggleSaveLyric,
     // ── 数据与本地库 ──
-    CycleScanDepth,
     ExportData,
     ImportData,
     ClearCoverCache,
@@ -302,6 +291,22 @@ enum SettingsEnumPicker {
     LyricOffset,
     /// 在线音源的启用开关（菜单里每项各自打 ✓）。
     EnabledSources,
+    // 数值档位菜单：候选值来自下面的 `*_STEPS` 常量，选中即写入配置。
+    NetworkTimeout,
+    MaxFps,
+    PageStep,
+    PlaybackSpeed,
+    FadeIn,
+    FadeOut,
+    HistoryLimit,
+    ScrollAmount,
+    InAppTimeout,
+    ScanDepth,
+    MultipartMinSize,
+    DownloadConcurrency,
+    ConcurrentSongs,
+    MaxRetries,
+    DownloadQuality,
 }
 
 impl SettingsEnumPicker {
@@ -319,6 +324,21 @@ impl SettingsEnumPicker {
             Self::StatusBarItems => SETTING_ROW_STATUS_BAR_ITEM,
             Self::LyricOffset => SETTING_ROW_LYRIC_OFFSET,
             Self::EnabledSources => SETTING_ROW_SOURCE_ENABLED,
+            Self::NetworkTimeout => SETTING_ROW_NETWORK_TIMEOUT,
+            Self::MaxFps => SETTING_ROW_MAX_FPS,
+            Self::PageStep => SETTING_ROW_PAGE_STEP,
+            Self::PlaybackSpeed => SETTING_ROW_PLAYBACK_SPEED,
+            Self::FadeIn => SETTING_ROW_FADE_IN,
+            Self::FadeOut => SETTING_ROW_FADE_OUT,
+            Self::HistoryLimit => SETTING_ROW_HISTORY_LIMIT,
+            Self::ScrollAmount => SETTING_ROW_SCROLL_AMOUNT,
+            Self::InAppTimeout => SETTING_ROW_IN_APP_TIMEOUT,
+            Self::ScanDepth => SETTING_ROW_SCAN_DEPTH,
+            Self::MultipartMinSize => SETTING_ROW_MULTIPART_MIN_SIZE,
+            Self::DownloadConcurrency => SETTING_ROW_DOWNLOAD_CONCURRENCY,
+            Self::ConcurrentSongs => SETTING_ROW_CONCURRENT_SONGS,
+            Self::MaxRetries => SETTING_ROW_MAX_RETRIES,
+            Self::DownloadQuality => SETTING_ROW_DOWNLOAD_QUALITY,
         }
     }
 }
@@ -359,6 +379,7 @@ struct RowPalette {
 }
 
 /// 一行设置项：元数据 + 渲染行。行 id 由 builder 分配。
+#[derive(Clone)]
 struct SettingsRow {
     meta: SettingsRowMeta,
     line: Line<'static>,
@@ -371,6 +392,146 @@ struct SettingsRow {
 #[derive(Default)]
 struct SettingsRows {
     rows: Vec<SettingsRow>,
+}
+
+/// 每条设置行的人话说明：说明栏展示、`/` 搜索匹配共用这一份。
+///
+/// 以 `(分类, 标签)` 为键（同一标签在不同分类语义不同）；返回 `None` 的行
+/// 说明栏退回展示分类简介。文案里注明生效方式（立即生效 / 重启生效）。
+fn row_help(category: SettingsCategory, label: &str) -> Option<&'static str> {
+    use SettingsCategory as C;
+    match (category, label) {
+        // ── 界面 ──
+        (C::Interface, "界面主题") => {
+            Some("整套配色方案，按 Enter 从主题库选择；修改立即生效。")
+        }
+        (C::Interface, "鼠标控制") => {
+            Some("允许鼠标点击/拖拽操作界面。关闭后终端里的鼠标选择恢复正常，需重启生效。")
+        }
+        (C::Interface, "聚合搜索") => {
+            Some("搜索时同时请求所有启用的音源并合并结果，关闭则只搜默认音源。")
+        }
+        (C::Interface, "循环导航") => {
+            Some("列表导航首尾相接：在第一项按 ↑ 跳到最后一项，反之亦然。")
+        }
+        (C::Interface, "封面显示") => Some("在播放页与列表里展示歌曲封面。"),
+        (C::Interface, "封面主色跟随") => {
+            Some("界面强调色跟随当前封面主色变化；关闭则固定用主题色。")
+        }
+        (C::Interface, "保留播放状态") => {
+            Some("退出时记住队列、进度与当前歌曲，下次启动接着播。")
+        }
+        (C::Interface, "网络超时") => {
+            Some("请求音源接口的超时时间；超时自动重试一次。修改立即生效。")
+        }
+        (C::Interface, "高清封面") => {
+            Some("用终端图形协议渲染高分辨率封面（需要终端支持，占带宽更多）。")
+        }
+        (C::Interface, "最大 FPS") => Some("界面刷新率上限；调低可省 CPU。保存后重启生效。"),
+        (C::Interface, "翻页步长") => Some("PageUp/PageDown 一次滚动的行数。"),
+        (C::Interface, "切歌通知") => Some("切换歌曲时弹出应用内通知显示歌名。"),
+        (C::Interface, "状态栏字段") => {
+            Some("选择底栏显示哪些信息（音质/音源/进度…），菜单里逐项勾选。")
+        }
+        // ── 播放 ──
+        (C::Playback, "播放音质") => Some("优先请求的音质档位；VIP 歌曲会自动降级到可播档位。"),
+        (C::Playback, "播放速度") => Some("全局播放速度，对在线与本地歌曲都生效，立即应用。"),
+        (C::Playback, "音频设备") => {
+            Some("libmpv 音频输出设备名，auto 为自动选择；填系统设备名（如 alsa/pipewire）。")
+        }
+        (C::Playback, "ReplayGain") => Some("按音轨/专辑标签自动调整音量，让不同歌曲响度接近。"),
+        (C::Playback, "RG 预放大") => Some("ReplayGain 之上的整体增益微调。"),
+        (C::Playback, "声道模式") => Some("强制单声道/立体声或自动；单声道适合单边耳机。"),
+        (C::Playback, "左右平衡") => Some("左右声道音量平衡，0 为居中。"),
+        (C::Playback, "ReplayGain 削波保护") => Some("增益过大时自动限幅，防止爆音。"),
+        (C::Playback, "淡入时长") => Some("歌曲开始时的音量淡入时间，0 为关闭。"),
+        (C::Playback, "淡出时长") => Some("歌曲结束/暂停时的音量淡出时间，0 为关闭。"),
+        (C::Playback, "均衡器") => Some("内置预设均衡器（流行/摇滚/古典…），关闭则平直输出。"),
+        (C::Playback, "淡入当前歌曲") => Some("立刻对正在播放的歌曲执行一次淡入。"),
+        (C::Playback, "淡出当前歌曲") => Some("立刻对正在播放的歌曲执行一次淡出。"),
+        (C::Playback, "A-B 循环起点") => Some("把当前播放位置标记为循环起点。"),
+        (C::Playback, "A-B 循环终点") => {
+            Some("把当前播放位置标记为循环终点，起终点之间循环播放。")
+        }
+        (C::Playback, "清除 A-B") => Some("取消已设置的 A-B 循环。"),
+        (C::Playback, "播放模式") => Some("列表循环 / 单曲循环 / 随机播放。"),
+        (C::Playback, "历史上限") => Some("播放历史最多保留的条数，超出自动裁剪旧记录。"),
+        // ── 音源与歌词 ──
+        (C::Sources, "默认音源") => Some("搜索、播放首先使用的音源。"),
+        (C::Sources, "自动换源") => Some("当前音源拿不到播放地址时自动尝试其它启用的音源。"),
+        (C::Sources, "解析策略") => {
+            Some("在线解析用哪个平台：自动 / 优先指定平台 / 只用指定平台。")
+        }
+        (C::Sources, "音源开关") => Some("逐个启用/停用在线音源；至少保留一个。"),
+        (C::Sources, "歌词翻译") => Some("有译文时在歌词下方显示翻译。"),
+        (C::Sources, "逐字歌词") => Some("优先使用逐字滚动歌词（YRC），不支持时退回逐行。"),
+        (C::Sources, "歌词偏移") => Some("整体提前(+)/延后(-)歌词显示，用于修正不同步。"),
+        (C::Sources, "网络代理") => {
+            Some("HTTP(S) 代理地址（如 http://127.0.0.1:7890），留空直连；修改立即生效。")
+        }
+        (C::Sources, "重新加载 JS 音源") => {
+            Some("重新加载全部自定义 JS 音源脚本（改完脚本不用重启）。")
+        }
+        (C::Sources, "音源体检") => Some("逐个测试已启用音源的搜索/解析可用性并汇报结果。"),
+        // ── 账号与扫码 ──
+        (C::Accounts, "扫码登录") => {
+            Some("对下方列表选中的音源发起/退出扫码登录；下方列表 ↑↓ 选择。")
+        }
+        (C::Accounts, "刷新远程歌单") => {
+            Some("把网易云账号的歌单只读镜像到本地缓存（不写回远端）。")
+        }
+        (C::Accounts, "QQ 音乐同步") => {
+            Some("把 QQ 音乐账号的歌单只读镜像到本地缓存（不写回远端）。")
+        }
+        // ── 通知与集成 ──
+        (C::Integration, "滚动步长") => Some("滚轮一格滚动的行数。"),
+        (C::Integration, "MPRIS") => Some("向桌面环境暴露播放控制（锁屏/媒体键），需重启生效。"),
+        (C::Integration, "TUI 通知") => Some("在界面内弹出事件通知（切歌/下载完成等）。"),
+        (C::Integration, "TUI 通知时长") => Some("应用内通知停留的秒数。"),
+        (C::Integration, "桌面通知") => {
+            Some("用系统通知中心弹通知（macOS/Windows/Linux 桌面）。")
+        }
+        (C::Integration, "通知封面") => Some("桌面通知附带歌曲封面图。"),
+        // ── 下载 ──
+        (C::Download, "下载目录") => Some("下载文件保存的目录。"),
+        (C::Download, "下载音质") => Some("下载时请求的音质；「跟随播放」用播放音质设置。"),
+        (C::Download, "文件名模板") => {
+            Some("下载文件命名规则，支持 {name} {singer} {album} {source} {quality}。")
+        }
+        (C::Download, "多线程分片") => Some("大文件分多块并行下载以加速。"),
+        (C::Download, "分片阈值") => Some("文件超过该大小才启用分片下载。"),
+        (C::Download, "分片并发") => Some("单个文件同时下载的分片数。"),
+        (C::Download, "同时下载") => Some("同时进行的下载任务数。"),
+        (C::Download, "失败重试") => Some("下载失败后的自动重试次数。"),
+        (C::Download, "校验文件大小") => Some("下载完成后核对文件大小，不符则判定失败。"),
+        (C::Download, "跳过已下载") => Some("同名同大小文件已存在时跳过。"),
+        (C::Download, "写入标签") => Some("把歌名/歌手/封面等元数据写进音频文件标签。"),
+        (C::Download, "嵌入封面") => Some("把封面图嵌进音频文件。"),
+        (C::Download, "保存歌词") => Some("下载时把歌词存成同名 .lrc 文件。"),
+        // ── 数据与本地库 ──
+        (C::Data, "扫描深度") => Some("本地音乐目录递归扫描的最大层数，0 为不限。"),
+        (C::Data, "导出数据") => Some("把收藏/历史/歌单等导出为 JSON 备份文件。"),
+        (C::Data, "导入数据") => Some("从导出的 JSON 备份恢复，原数据自动备份。"),
+        (C::Data, "导入外部歌单") => Some("导入 M3U/JSON 格式的外部歌单文件。"),
+        (C::Data, "清除封面缓存") => Some("删除已缓存的封面图（下次播放自动重新下载）。"),
+        (C::Data, "清除网易云歌单缓存") => {
+            Some("清空远程歌单镜像缓存（含 QQ），下次同步自动重建。")
+        }
+        _ => None,
+    }
+}
+
+/// 分类的整体简介：光标停在没有逐行说明的行（或空分类）时展示。
+fn category_help(category: SettingsCategory) -> &'static str {
+    match category {
+        SettingsCategory::Interface => "界面外观与操作习惯：主题、封面、导航、刷新率。",
+        SettingsCategory::Playback => "播放行为：音质、速度、声道、淡入淡出与 A-B 循环。",
+        SettingsCategory::Sources => "在线音源与歌词：默认音源、换源策略、JS 音源脚本。",
+        SettingsCategory::Accounts => "账号登录与远程歌单镜像：扫码、只读同步两个平台。",
+        SettingsCategory::Integration => "与应用外世界的连接：系统通知、MPRIS 媒体控制。",
+        SettingsCategory::Download => "下载行为：位置、命名、并发与文件选项。",
+        SettingsCategory::Data => "本地数据管理：本地库扫描、备份导入导出、缓存清理。",
+    }
 }
 
 impl SettingsRows {
@@ -388,6 +549,11 @@ impl SettingsRows {
         line: Line<'static>,
     ) -> SettingsRowId {
         let id = SettingsRowId(self.rows.len() as u32);
+        let help = if kind == SettingsRowKind::Header {
+            None
+        } else {
+            row_help(category, label)
+        };
         self.rows.push(SettingsRow {
             meta: SettingsRowMeta {
                 id,
@@ -396,10 +562,27 @@ impl SettingsRows {
                 category,
                 kind,
                 plan,
+                help,
             },
             line,
         });
         id
+    }
+
+    /// 小节标题行：只负责视觉分组，没有键位、没有激活计划。
+    fn header(&mut self, category: SettingsCategory, title: &str, palette: RowPalette) {
+        let line = Line::from(Span::styled(
+            format!(" ─ {title} "),
+            Style::new().fg(palette.accent).add_modifier(Modifier::BOLD),
+        ));
+        self.push(
+            category,
+            SettingsRowKind::Header,
+            title,
+            "-",
+            RowPlan::Inert,
+            line,
+        );
     }
 
     /// 布尔开关行（Enter / Space / 点击都能切换）。
@@ -494,6 +677,22 @@ const SETTING_ROW_STATUS_BAR_ITEM: &str = "status-bar-item";
 const SETTING_ROW_LYRIC_OFFSET: &str = "lyric-offset";
 /// 在线音源启用开关：一行对应多个取值（每个音源一个开关）。
 const SETTING_ROW_SOURCE_ENABLED: &str = "source-enabled";
+// 数值档位取值菜单的行标识（与上面的枚举行同一套"行 + 取值"契约）。
+const SETTING_ROW_NETWORK_TIMEOUT: &str = "network-timeout";
+const SETTING_ROW_MAX_FPS: &str = "max-fps";
+const SETTING_ROW_PAGE_STEP: &str = "page-step";
+const SETTING_ROW_PLAYBACK_SPEED: &str = "playback-speed";
+const SETTING_ROW_FADE_IN: &str = "fade-in";
+const SETTING_ROW_FADE_OUT: &str = "fade-out";
+const SETTING_ROW_HISTORY_LIMIT: &str = "history-limit";
+const SETTING_ROW_SCROLL_AMOUNT: &str = "scroll-amount";
+const SETTING_ROW_IN_APP_TIMEOUT: &str = "in-app-timeout";
+const SETTING_ROW_SCAN_DEPTH: &str = "scan-depth";
+const SETTING_ROW_MULTIPART_MIN_SIZE: &str = "multipart-min-size";
+const SETTING_ROW_DOWNLOAD_CONCURRENCY: &str = "download-concurrency";
+const SETTING_ROW_CONCURRENT_SONGS: &str = "concurrent-songs";
+const SETTING_ROW_MAX_RETRIES: &str = "max-retries";
+const SETTING_ROW_DOWNLOAD_QUALITY: &str = "download-quality";
 
 /// 取值菜单里可选的音质档位（与 `next_quality` 的循环顺序一致）。
 const QUALITY_CHOICES: [Quality; 4] = [
@@ -641,6 +840,8 @@ pub struct SettingsPage {
     category: SettingsCategory,
     /// 窄屏单栏视图当前层级（宽屏不使用）。
     narrow_pane: NarrowPane,
+    /// `/` 设置搜索：跨分类匹配标签与说明，Enter 直接跳到该行所在分类。
+    search: crate::pages::components::list_filter::ListFilter,
     /// 设置行的键盘光标（当前分类内）。
     row_cursor: Option<SettingsRowId>,
     /// 鼠标悬停的设置行（只影响高亮，不改键盘光标）。
@@ -780,16 +981,41 @@ fn build_settings_rows(
     use SettingsRowKind as K;
 
     // 每一行都显式声明自己的**激活计划**：
-    // - `RowPlan::Menu(...)`：Enter / Space / 点击打开取值菜单（候选值可枚举）；
-    // - `RowPlan::Direct(...)`：Enter / Space / 点击直接执行（开关、循环档位、
-    //   输入浮层、一次性动作），执行时复用既有 `AppAction` / 写配置分支。
+    // - `RowPlan::Menu(...)`：Enter / Space / 点击打开取值菜单（候选值可枚举，
+    //   包括全部数值档位——不再有"按一下变一档"的循环键）；
+    // - `RowPlan::Direct(...)`：Enter / Space / 点击直接执行（开关、输入浮层、
+    //   一次性动作），执行时复用既有 `AppAction` / 写配置分支。
     //
     // 这里**没有**"按键回灌"这一档：行内快捷键已全部删除，键位列一律显示
-    // `Enter`。
+    // `Enter`。小节标题行（`rows.header`）只做视觉分组，不进光标。
 
     // ── 界面 ──
     // 主题入口放第一行：这是"我要换主题"时第一个该看到的东西。
+    rows.header(C::Interface, "外观", palette);
     theme_picker_row(rows, config, palette);
+    rows.toggle(
+        C::Interface,
+        "封面显示",
+        RowPlan::Direct(D::ToggleShowCover),
+        config.ui.show_cover,
+        palette,
+    );
+    rows.toggle(
+        C::Interface,
+        "高清封面",
+        RowPlan::Direct(D::ToggleCoverGraphics),
+        crate::cover::graphics_requested(&config.ui.cover_protocol),
+        palette,
+    );
+    rows.value(
+        C::Interface,
+        K::Enum,
+        "封面主色跟随",
+        RowPlan::Direct(D::CycleAccentFollowCover),
+        config.ui.accent_follow_cover.label(),
+        palette,
+    );
+    rows.header(C::Interface, "操作", palette);
     rows.toggle(
         C::Interface,
         "鼠标控制",
@@ -811,57 +1037,28 @@ fn build_settings_rows(
         config.ui.wrap_navigation,
         palette,
     );
-    rows.toggle(
-        C::Interface,
-        "封面显示",
-        RowPlan::Direct(D::ToggleShowCover),
-        config.ui.show_cover,
-        palette,
-    );
     rows.value(
         C::Interface,
         K::Enum,
-        "封面主色跟随",
-        RowPlan::Direct(D::CycleAccentFollowCover),
-        config.ui.accent_follow_cover.label(),
-        palette,
-    );
-    rows.toggle(
-        C::Interface,
-        "保留播放状态",
-        RowPlan::Direct(D::ToggleRememberPlaybackState),
-        config.player.remember_playback_state,
-        palette,
-    );
-    rows.value(
-        C::Interface,
-        K::Enum,
-        "网络超时",
-        RowPlan::Direct(D::CycleNetworkTimeout),
-        &format!("{} 秒", config.network.timeout),
-        palette,
-    );
-    rows.toggle(
-        C::Interface,
-        "高清封面",
-        RowPlan::Direct(D::ToggleCoverGraphics),
-        crate::cover::graphics_requested(&config.ui.cover_protocol),
+        "翻页步长",
+        RowPlan::Menu(SettingsEnumPicker::PageStep),
+        &format!("{} 行", config.ui.page_step),
         palette,
     );
     rows.value(
         C::Interface,
         K::Enum,
         "最大 FPS",
-        RowPlan::Direct(D::CycleMaxFps),
+        RowPlan::Menu(SettingsEnumPicker::MaxFps),
         &config.ui.max_fps.to_string(),
         palette,
     );
-    rows.value(
+    rows.header(C::Interface, "状态与网络", palette);
+    rows.toggle(
         C::Interface,
-        K::Enum,
-        "翻页步长",
-        RowPlan::Direct(D::CyclePageStep),
-        &format!("{} 行", config.ui.page_step),
+        "保留播放状态",
+        RowPlan::Direct(D::ToggleRememberPlaybackState),
+        config.player.remember_playback_state,
         palette,
     );
     rows.toggle(
@@ -884,8 +1081,17 @@ fn build_settings_rows(
         ),
         palette,
     );
+    rows.value(
+        C::Interface,
+        K::Enum,
+        "网络超时",
+        RowPlan::Menu(SettingsEnumPicker::NetworkTimeout),
+        &format!("{} 秒", config.network.timeout),
+        palette,
+    );
 
     // ── 播放 ──
+    rows.header(C::Playback, "基础", palette);
     rows.value(
         C::Playback,
         K::Enum,
@@ -898,32 +1104,33 @@ fn build_settings_rows(
         C::Playback,
         K::Enum,
         "播放速度",
-        RowPlan::Direct(D::CyclePlaybackSpeed),
+        RowPlan::Menu(SettingsEnumPicker::PlaybackSpeed),
         &format!("{:.2}x", config.player.playback_speed),
         palette,
     );
+    rows.value(
+        C::Playback,
+        K::Enum,
+        "播放模式",
+        RowPlan::Menu(SettingsEnumPicker::PlayMode),
+        inputs.play_mode.label(),
+        palette,
+    );
+    rows.value(
+        C::Playback,
+        K::Enum,
+        "历史上限",
+        RowPlan::Menu(SettingsEnumPicker::HistoryLimit),
+        &config.player.history_limit.to_string(),
+        palette,
+    );
+    rows.header(C::Playback, "音频", palette);
     rows.value(
         C::Playback,
         K::Input,
         "音频设备",
         RowPlan::Direct(D::EditAudioDevice),
         &config.player.audio_device,
-        palette,
-    );
-    rows.value(
-        C::Playback,
-        K::Enum,
-        "ReplayGain",
-        RowPlan::Direct(D::CycleReplayGainMode),
-        &config.player.replaygain_mode,
-        palette,
-    );
-    rows.value(
-        C::Playback,
-        K::Enum,
-        "RG 预放大",
-        RowPlan::Direct(D::CycleReplayGainPreamp),
-        &format!("{:+.1} dB", config.player.replaygain_preamp),
         palette,
     );
     rows.value(
@@ -942,6 +1149,22 @@ fn build_settings_rows(
         &format!("{:+.2}", config.player.balance),
         palette,
     );
+    rows.value(
+        C::Playback,
+        K::Enum,
+        "ReplayGain",
+        RowPlan::Direct(D::CycleReplayGainMode),
+        &config.player.replaygain_mode,
+        palette,
+    );
+    rows.value(
+        C::Playback,
+        K::Enum,
+        "RG 预放大",
+        RowPlan::Direct(D::CycleReplayGainPreamp),
+        &format!("{:+.1} dB", config.player.replaygain_preamp),
+        palette,
+    );
     rows.toggle(
         C::Playback,
         "ReplayGain 削波保护",
@@ -952,8 +1175,17 @@ fn build_settings_rows(
     rows.value(
         C::Playback,
         K::Enum,
+        "均衡器",
+        RowPlan::Menu(SettingsEnumPicker::Equalizer),
+        crate::context::equalizer_label(&config.player.equalizer_bands),
+        palette,
+    );
+    rows.header(C::Playback, "淡入淡出", palette);
+    rows.value(
+        C::Playback,
+        K::Enum,
         "淡入时长",
-        RowPlan::Direct(D::CycleFadeInDuration),
+        RowPlan::Menu(SettingsEnumPicker::FadeIn),
         &fade_label(config.player.fade_in_ms),
         palette,
     );
@@ -961,16 +1193,8 @@ fn build_settings_rows(
         C::Playback,
         K::Enum,
         "淡出时长",
-        RowPlan::Direct(D::CycleFadeOutDuration),
+        RowPlan::Menu(SettingsEnumPicker::FadeOut),
         &fade_label(config.player.fade_out_ms),
-        palette,
-    );
-    rows.value(
-        C::Playback,
-        K::Enum,
-        "均衡器",
-        RowPlan::Menu(SettingsEnumPicker::Equalizer),
-        crate::context::equalizer_label(&config.player.equalizer_bands),
         palette,
     );
     rows.value(
@@ -989,6 +1213,7 @@ fn build_settings_rows(
         "执行",
         palette,
     );
+    rows.header(C::Playback, "A-B 循环", palette);
     let ab_loop_set = inputs.ab_loop.is_some();
     let ab_start_label = inputs
         .ab_loop
@@ -1024,24 +1249,9 @@ fn build_settings_rows(
         if ab_loop_set { "执行" } else { "未设置" },
         palette,
     );
-    rows.value(
-        C::Playback,
-        K::Enum,
-        "播放模式",
-        RowPlan::Menu(SettingsEnumPicker::PlayMode),
-        inputs.play_mode.label(),
-        palette,
-    );
-    rows.value(
-        C::Playback,
-        K::Enum,
-        "历史上限",
-        RowPlan::Direct(D::CycleHistoryLimit),
-        &config.player.history_limit.to_string(),
-        palette,
-    );
 
     // ── 音源与歌词 ──
+    rows.header(C::Sources, "音源", palette);
     rows.value(
         C::Sources,
         K::Enum,
@@ -1078,6 +1288,24 @@ fn build_settings_rows(
         ),
         palette,
     );
+    // 重新加载 JS 音源此前只有状态栏菜单入口：现在这一行就是它的入口。
+    rows.value(
+        C::Sources,
+        K::Action,
+        "重新加载 JS 音源",
+        RowPlan::Direct(D::ReloadJsSources),
+        "执行",
+        palette,
+    );
+    rows.value(
+        C::Sources,
+        K::Action,
+        "音源体检",
+        RowPlan::Direct(D::CheckSourceHealth),
+        "检测",
+        palette,
+    );
+    rows.header(C::Sources, "歌词", palette);
     rows.toggle(
         C::Sources,
         "歌词翻译",
@@ -1100,6 +1328,7 @@ fn build_settings_rows(
         &format!("{:+} ms", config.lyric.offset),
         palette,
     );
+    rows.header(C::Sources, "网络", palette);
     let proxy_label = if config.network.proxy_url.is_empty() {
         "未设置".to_string()
     } else {
@@ -1113,25 +1342,9 @@ fn build_settings_rows(
         &proxy_label,
         palette,
     );
-    // 重新加载 JS 音源此前只有状态栏菜单入口：现在这一行就是它的入口。
-    rows.value(
-        C::Sources,
-        K::Action,
-        "重新加载 JS 音源",
-        RowPlan::Direct(D::ReloadJsSources),
-        "执行",
-        palette,
-    );
-    rows.value(
-        C::Sources,
-        K::Action,
-        "音源体检",
-        RowPlan::Direct(D::CheckSourceHealth),
-        "检测",
-        palette,
-    );
 
     // ── 账号与扫码 ──
+    rows.header(C::Accounts, "登录渠道", palette);
     rows.value(
         C::Accounts,
         K::Action,
@@ -1140,12 +1353,13 @@ fn build_settings_rows(
         &inputs.qr_login_label,
         palette,
     );
+    rows.header(C::Accounts, "歌单镜像（只读同步）", palette);
     rows.value(
         C::Accounts,
         K::Action,
         "刷新远程歌单",
         RowPlan::Direct(D::SyncNetease),
-        "只读镜像",
+        "网易云",
         palette,
     );
     rows.value(
@@ -1153,25 +1367,19 @@ fn build_settings_rows(
         K::Action,
         "QQ 音乐同步",
         RowPlan::Direct(D::SyncQq),
-        "只读镜像",
+        "QQ音乐",
         palette,
     );
     // 「导入外部歌单」归数据分类：它是文件导入动作，和账号无关。
 
     // ── 通知与集成 ──
+    rows.header(C::Integration, "应用内", palette);
     rows.value(
         C::Integration,
         K::Enum,
         "滚动步长",
-        RowPlan::Direct(D::CycleScrollAmount),
+        RowPlan::Menu(SettingsEnumPicker::ScrollAmount),
         &config.ui.scroll_amount.to_string(),
-        palette,
-    );
-    rows.toggle(
-        C::Integration,
-        "MPRIS",
-        RowPlan::Direct(D::ToggleMpris),
-        config.integration.mpris,
         palette,
     );
     // TUI 通知原来是"一个键管两个字段"（`o` 开关 / `O` 秒数）。删掉行内快捷键后
@@ -1187,8 +1395,16 @@ fn build_settings_rows(
         C::Integration,
         K::Enum,
         "TUI 通知时长",
-        RowPlan::Direct(D::CycleInAppTimeout),
+        RowPlan::Menu(SettingsEnumPicker::InAppTimeout),
         &format!("{} 秒", config.notification.in_app_timeout.clamp(1, 60)),
+        palette,
+    );
+    rows.header(C::Integration, "系统集成", palette);
+    rows.toggle(
+        C::Integration,
+        "MPRIS",
+        RowPlan::Direct(D::ToggleMpris),
+        config.integration.mpris,
         palette,
     );
     rows.toggle(
@@ -1207,6 +1423,7 @@ fn build_settings_rows(
     );
 
     // ── 下载 ──
+    rows.header(C::Download, "位置与命名", palette);
     rows.value(
         C::Download,
         K::Input,
@@ -1219,7 +1436,7 @@ fn build_settings_rows(
         C::Download,
         K::Enum,
         "下载音质",
-        RowPlan::Direct(D::CycleDownloadQuality),
+        RowPlan::Menu(SettingsEnumPicker::DownloadQuality),
         &config
             .download
             .quality
@@ -1235,6 +1452,7 @@ fn build_settings_rows(
         &shorten_source(&config.download.filename_template, 22),
         palette,
     );
+    rows.header(C::Download, "传输", palette);
     rows.toggle(
         C::Download,
         "多线程分片",
@@ -1246,7 +1464,7 @@ fn build_settings_rows(
         C::Download,
         K::Enum,
         "分片阈值",
-        RowPlan::Direct(D::CycleMultipartMinSize),
+        RowPlan::Menu(SettingsEnumPicker::MultipartMinSize),
         &format!("{} MB", config.download.multipart_min_size_mb),
         palette,
     );
@@ -1254,7 +1472,7 @@ fn build_settings_rows(
         C::Download,
         K::Enum,
         "分片并发",
-        RowPlan::Direct(D::CycleDownloadConcurrency),
+        RowPlan::Menu(SettingsEnumPicker::DownloadConcurrency),
         &config.download.concurrency.to_string(),
         palette,
     );
@@ -1262,7 +1480,7 @@ fn build_settings_rows(
         C::Download,
         K::Enum,
         "同时下载",
-        RowPlan::Direct(D::CycleConcurrentSongs),
+        RowPlan::Menu(SettingsEnumPicker::ConcurrentSongs),
         &format!("{} 首", config.download.concurrent_songs),
         palette,
     );
@@ -1270,10 +1488,11 @@ fn build_settings_rows(
         C::Download,
         K::Enum,
         "失败重试",
-        RowPlan::Direct(D::CycleMaxRetries),
+        RowPlan::Menu(SettingsEnumPicker::MaxRetries),
         &format!("{} 次", config.download.max_retries),
         palette,
     );
+    rows.header(C::Download, "文件选项", palette);
     rows.toggle(
         C::Download,
         "校验文件大小",
@@ -1311,6 +1530,7 @@ fn build_settings_rows(
     );
 
     // ── 数据与本地库 ──
+    rows.header(C::Data, "本地库", palette);
     let scan_depth_label = if config.local_music.max_depth == 0 {
         "不限".to_string()
     } else {
@@ -1320,10 +1540,11 @@ fn build_settings_rows(
         C::Data,
         K::Enum,
         "扫描深度",
-        RowPlan::Direct(D::CycleScanDepth),
+        RowPlan::Menu(SettingsEnumPicker::ScanDepth),
         &scan_depth_label,
         palette,
     );
+    rows.header(C::Data, "备份与导入", palette);
     rows.value(
         C::Data,
         K::Action,
@@ -1348,6 +1569,7 @@ fn build_settings_rows(
         "M3U/JSON",
         palette,
     );
+    rows.header(C::Data, "缓存", palette);
     rows.value(
         C::Data,
         K::Action,
@@ -1423,6 +1645,18 @@ impl SettingsPage {
         // 远程歌单窗口 / 取值菜单都是模态的：打开期间全部按键先给它们，
         // 否则 `q`（全局退出）会在窗口还开着的时候直接退出程序。
         if self.remote_window.is_some() || self.menu.is_some() {
+            return true;
+        }
+        // 搜索输入态：除 Ctrl/Alt 组合外的键都归搜索（要拿它们拼关键词）。
+        if self.search.is_active()
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return true;
+        }
+        // `/` 是设置页的搜索入口，不能被全局键位抢走。
+        if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Char('/') {
             return true;
         }
         // Bare number keys are reserved for navigation (1-8 select sidebar
@@ -1503,6 +1737,7 @@ impl SettingsPage {
             focus: SettingsFocus::Options,
             category: SettingsCategory::Interface,
             narrow_pane: NarrowPane::Categories,
+            search: crate::pages::components::list_filter::ListFilter::new(),
             row_cursor: None,
             hover_row: None,
             row_metas: Vec::new(),
@@ -1619,6 +1854,22 @@ impl SettingsPage {
             // （`Space` 对开关与取值行等价）或鼠标点击激活，不再有逐行字母快捷键。
             // 这里剩下的每一个键都有明确归属 —— 不会出现"按下去没反应、
             // 也不传给全局"的死键。
+
+            // `/` 搜索：跨分类找设置项。正在输入时输入与导航都归搜索视图。
+            if self.search.is_active() {
+                return self
+                    .handle_search_keys(&key, ctx)
+                    .unwrap_or(AppAction::None);
+            }
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Char('/') {
+                self.search.activate();
+                // 窄屏分类列表视图下先进入 Rows 视图，搜索结果才看得见。
+                if !self.wide_layout() {
+                    self.narrow_pane = NarrowPane::Rows;
+                }
+                self.focus = SettingsFocus::Options;
+                return AppAction::None;
+            }
 
             // `P`（裸 `'P'`）→ 进入「账号与扫码」分类；已经在该分类里时改为
             // 对当前选中音源执行扫码登录 / 退出登录。
@@ -1741,11 +1992,57 @@ impl SettingsPage {
         category_sidebar_visible(self.last_area.width)
     }
 
-    /// 切换分类：焦点回到设置行光标。
+    /// 搜索视图是否可见（正在输入，或已有关键词作为过滤条件）。
+    fn search_visible(&self) -> bool {
+        self.search.is_visible()
+    }
+
+    /// 搜索命中行的 id：跨全部分类，按「标签 / 说明 / 分类名」不区分大小写匹配。
+    fn search_row_ids(&self) -> Vec<SettingsRowId> {
+        search_row_ids(&self.row_metas, self.search.query())
+    }
+
+    /// 退出搜索并清空关键词（换分类 / 激活某行之后调用）。
+    fn exit_search(&mut self) {
+        self.search.reset();
+    }
+
+    /// 搜索视图的按键：输入归 ListFilter，↑/↓ 在命中行间移动，
+    /// Enter 激活当前行（并跳回它所在分类），Esc 完全退出。
+    fn handle_search_keys(&mut self, key: &KeyEvent, ctx: &AppContext) -> Option<AppAction> {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                self.move_row_cursor(false);
+                Some(AppAction::None)
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                self.move_row_cursor(true);
+                Some(AppAction::None)
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                // Enter 先退出输入态（ListFilter 的语义），再激活当前行。
+                self.search.deactivate();
+                Some(self.activate_cursor_row(ctx))
+            }
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.exit_search();
+                self.row_cursor =
+                    ensure_row_cursor(&self.row_metas, self.category, self.row_cursor);
+                Some(AppAction::None)
+            }
+            _ => {
+                self.search.handle_input(key);
+                Some(AppAction::None)
+            }
+        }
+    }
+
+    /// 切换分类：焦点回到设置行光标；搜索视图随之退出（结果是分类内的行）。
     ///
     /// 内嵌管理列表只跟随它所属的分类出现（`embedded_list_for`），
     /// 因此换分类时必须把焦点交还 `Options`，否则会出现"列表不可见却占着方向键"。
     fn set_category(&mut self, category: SettingsCategory) {
+        self.exit_search();
         if category != self.category {
             self.category = category;
             self.clear_status();
@@ -1795,6 +2092,17 @@ impl SettingsPage {
         if list_owns_direction_keys(self.focus) {
             return None;
         }
+        // 已有关键词但不在输入态的搜索视图：Esc 清空退出（优先于窄屏返回）。
+        if self.search_visible()
+            && matches!(
+                (key.modifiers, key.code),
+                (KeyModifiers::NONE, KeyCode::Esc)
+            )
+        {
+            self.exit_search();
+            self.row_cursor = ensure_row_cursor(&self.row_metas, self.category, self.row_cursor);
+            return Some(AppAction::None);
+        }
         // 窄屏单栏：先分类列表，Enter 进入后才操作设置项。
         if !self.wide_layout() {
             match self.narrow_pane {
@@ -1818,7 +2126,10 @@ impl SettingsPage {
             (KeyModifiers::NONE, KeyCode::Down) => {
                 self.move_row_cursor(true);
                 // ↓ 到底后再按一次：焦点进入分类内容里的内嵌管理列表。
-                self.enter_embedded_list_if_at_last_row();
+                // 搜索视图没有内嵌列表，不进入。
+                if !self.search_visible() {
+                    self.enter_embedded_list_if_at_last_row();
+                }
                 Some(AppAction::None)
             }
             (KeyModifiers::NONE, KeyCode::Enter) => Some(self.activate_cursor_row(ctx)),
@@ -1858,7 +2169,16 @@ impl SettingsPage {
     }
 
     /// ↑/↓ 移动行光标（让位判断在 `navigate_row_cursor` 里，与测试同源）。
+    /// 搜索视图下光标在**命中行**之间移动（跨分类）。
     fn move_row_cursor(&mut self, forward: bool) {
+        if self.search_visible() {
+            if list_owns_direction_keys(self.focus) {
+                return;
+            }
+            let ids = self.search_row_ids();
+            self.row_cursor = step_row_selection_in(&ids, self.row_cursor, forward);
+            return;
+        }
         self.row_cursor = navigate_row_cursor(
             self.focus,
             &self.row_metas,
@@ -1879,10 +2199,18 @@ impl SettingsPage {
     ///
     /// 激活方式由行元数据里的 `RowPlan` 决定：打开取值菜单，或直接执行动作。
     /// 设置页里没有"回灌按键"这条路，因此删掉的行内快捷键不可能再被触发。
+    /// 搜索视图里激活某行时，先跳回它所在分类并退出搜索——用户接着的
+    /// ↑/↓ 自然落在那个分类里，不会悬在跨分类结果列表上。
     fn activate_settings_row(&mut self, id: SettingsRowId, ctx: &AppContext) -> AppAction {
         let Some(meta) = self.row_metas.iter().find(|meta| meta.id == id).cloned() else {
             return AppAction::None;
         };
+        if self.search_visible() {
+            self.exit_search();
+            if meta.category != self.category {
+                self.set_category(meta.category);
+            }
+        }
         match plan_row_activation(&meta) {
             RowPlan::Menu(picker) => {
                 self.open_enum_menu(picker, ctx);
@@ -1957,17 +2285,6 @@ impl SettingsPage {
                 }
                 AppAction::None
             }
-            D::CycleNetworkTimeout => {
-                let (proxy, timeout) = {
-                    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
-                    config.network.timeout = next_network_timeout(config.network.timeout);
-                    let values = (config.network.proxy_url.clone(), config.network.timeout);
-                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
-                    values
-                };
-                lx_source::configure_network(&proxy, timeout);
-                AppAction::None
-            }
             D::ToggleCoverGraphics => {
                 let enabled = {
                     let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
@@ -1983,21 +2300,6 @@ impl SettingsPage {
                 {
                     self.set_status("高清封面已开启（写入 auto），下次启动时探测终端".to_string());
                 }
-                AppAction::None
-            }
-            D::CycleMaxFps => {
-                self.update_config(ctx, |config| {
-                    config.ui.max_fps = next_fps(config.ui.max_fps);
-                });
-                if self.status_msg.as_deref() == Some("设置已保存") {
-                    self.set_status("刷新率已保存，下次启动生效".to_string());
-                }
-                AppAction::None
-            }
-            D::CyclePageStep => {
-                self.update_config(ctx, |config| {
-                    config.ui.page_step = next_page_step(config.ui.page_step);
-                });
                 AppAction::None
             }
             D::CycleAccentFollowCover => {
@@ -2019,10 +2321,6 @@ impl SettingsPage {
             }),
 
             // ── 播放 ──
-            D::CyclePlaybackSpeed => {
-                self.set_status(ctx.cycle_playback_speed());
-                AppAction::None
-            }
             D::EditAudioDevice => {
                 self.audio_device_input = ctx
                     .config
@@ -2055,28 +2353,6 @@ impl SettingsPage {
                 self.set_status(ctx.toggle_replaygain_clip());
                 AppAction::None
             }
-            D::CycleFadeInDuration => {
-                let duration = {
-                    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
-                    config.player.fade_in_ms = next_fade_duration(config.player.fade_in_ms);
-                    let value = config.player.fade_in_ms;
-                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
-                    value
-                };
-                self.set_status(format!("淡入: {}", fade_label(duration)));
-                AppAction::None
-            }
-            D::CycleFadeOutDuration => {
-                let duration = {
-                    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
-                    config.player.fade_out_ms = next_fade_duration(config.player.fade_out_ms);
-                    let value = config.player.fade_out_ms;
-                    self.set_saved_status(crate::config::loader::save(&config, &ctx.config_path));
-                    value
-                };
-                self.set_status(format!("淡出: {}", fade_label(duration)));
-                AppAction::None
-            }
             D::RunFadeIn => {
                 self.set_status(ctx.fade_in_now());
                 AppAction::None
@@ -2095,21 +2371,6 @@ impl SettingsPage {
             }
             D::ClearAbLoop => {
                 self.set_status(ctx.clear_ab_loop());
-                AppAction::None
-            }
-            D::CycleHistoryLimit => {
-                let limit = {
-                    let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
-                    config.player.history_limit = next_history_limit(config.player.history_limit);
-                    let limit = config.player.history_limit;
-                    let result = crate::config::loader::save(&config, &ctx.config_path);
-                    self.set_status(match result {
-                        Ok(()) => format!("历史上限: {limit}"),
-                        Err(error) => format!("保存设置失败: {error}"),
-                    });
-                    limit
-                };
-                ctx.storage.trim_history(limit);
                 AppAction::None
             }
 
@@ -2178,9 +2439,6 @@ impl SettingsPage {
             }
 
             // ── 通知与集成 ──
-            D::CycleScrollAmount => self.flip_config(ctx, |config| {
-                config.ui.scroll_amount = next_scroll_amount(config.ui.scroll_amount);
-            }),
             D::ToggleMpris => {
                 self.update_config(ctx, |config| {
                     config.integration.mpris = !config.integration.mpris;
@@ -2192,14 +2450,6 @@ impl SettingsPage {
             }
             D::ToggleInAppNotification => self.flip_config(ctx, |config| {
                 config.notification.in_app = !config.notification.in_app;
-            }),
-            D::CycleInAppTimeout => self.flip_config(ctx, |config| {
-                config.notification.in_app_timeout = match config.notification.in_app_timeout {
-                    0..=2 => 4,
-                    3..=4 => 6,
-                    5..=6 => 8,
-                    _ => 2,
-                };
             }),
             D::ToggleDesktopNotification => self.flip_config(ctx, |config| {
                 config.notification.enable = !config.notification.enable;
@@ -2215,15 +2465,6 @@ impl SettingsPage {
                 self.set_status("输入下载目录，Enter 保存，Esc 取消".to_string());
                 AppAction::None
             }
-            D::CycleDownloadQuality => self.flip_config(ctx, |config| {
-                config.download.quality = match config.download.quality {
-                    None => Some(config.player.quality),
-                    Some(Quality::Low128) => Some(Quality::High320),
-                    Some(Quality::High320) => Some(Quality::Flac),
-                    Some(Quality::Flac) => Some(Quality::Flac24),
-                    Some(Quality::Flac24) => None,
-                };
-            }),
             D::EditFilenameTemplate => {
                 self.download_input = ctx
                     .config
@@ -2240,24 +2481,6 @@ impl SettingsPage {
             }
             D::ToggleMultipart => self.flip_config(ctx, |config| {
                 config.download.multipart = !config.download.multipart;
-            }),
-            D::CycleMultipartMinSize => self.flip_config(ctx, |config| {
-                config.download.multipart_min_size_mb = next_step(
-                    &[1, 2, 5, 10, 20, 50],
-                    config.download.multipart_min_size_mb,
-                );
-            }),
-            D::CycleDownloadConcurrency => self.flip_config(ctx, |config| {
-                config.download.concurrency =
-                    next_step(&[1, 2, 4, 8, 16], config.download.concurrency as u64) as usize;
-            }),
-            D::CycleConcurrentSongs => self.flip_config(ctx, |config| {
-                config.download.concurrent_songs =
-                    next_step(&[1, 2, 3, 4], config.download.concurrent_songs as u64) as usize;
-            }),
-            D::CycleMaxRetries => self.flip_config(ctx, |config| {
-                config.download.max_retries =
-                    next_step(&[0, 1, 2, 3, 5], config.download.max_retries as u64) as u32;
             }),
             D::ToggleVerifySize => self.flip_config(ctx, |config| {
                 config.download.verify_size = !config.download.verify_size;
@@ -2276,9 +2499,6 @@ impl SettingsPage {
             }),
 
             // ── 数据与本地库 ──
-            D::CycleScanDepth => self.flip_config(ctx, |config| {
-                config.local_music.max_depth = next_scan_depth(config.local_music.max_depth);
-            }),
             D::ExportData => {
                 self.set_status(match ctx.storage.export_default() {
                     Ok(path) => format!("数据已导出: {}", path.display()),
@@ -2429,7 +2649,8 @@ impl SettingsPage {
     /// 把菜单里选中的"设置行 + 取值"写进配置并立即生效。
     ///
     /// 写盘沿用设置页既有的"枚举即时生效、无需重启"语义；需要运行时同步的几行
-    /// （均衡器 → 播放器、歌词偏移 → 歌词服务、默认音源 / 音源开关 → 音源管理器）
+    /// （均衡器 → 播放器、歌词偏移 → 歌词服务、默认音源 / 音源开关 → 音源管理器、
+    /// 网络超时 → 音源 HTTP 客户端、播放速度 → 播放器、历史上限 → 历史裁剪）
     /// 在落盘后按原先循环键的同一路径同步，保证与旧行为一致。
     fn apply_setting_choice_action(
         &mut self,
@@ -2437,7 +2658,16 @@ impl SettingsPage {
         value: &str,
         ctx: &AppContext,
     ) -> AppAction {
-        let (message, bands, lyric_offset, source_preferences, save_result) = {
+        let (
+            message,
+            bands,
+            lyric_offset,
+            source_preferences,
+            network,
+            speed,
+            history_limit,
+            save_result,
+        ) = {
             let mut config = ctx.config.write().unwrap_or_else(|e| e.into_inner());
             let Some(message) = apply_setting_choice(&mut config, row, value) else {
                 self.set_status(choice_refusal_message(row).to_string());
@@ -2446,12 +2676,18 @@ impl SettingsPage {
             let bands = config.player.equalizer_bands.clone();
             let lyric_offset = config.lyric.offset;
             let source_preferences = (config.source.default, config.source.enabled.clone());
+            let network = (config.network.proxy_url.clone(), config.network.timeout);
+            let speed = config.player.playback_speed;
+            let history_limit = config.player.history_limit;
             let save_result = crate::config::loader::save(&config, &ctx.config_path);
             (
                 message,
                 bands,
                 lyric_offset,
                 source_preferences,
+                network,
+                speed,
+                history_limit,
                 save_result,
             )
         };
@@ -2464,6 +2700,17 @@ impl SettingsPage {
         if matches!(row, SETTING_ROW_DEFAULT_SOURCE | SETTING_ROW_SOURCE_ENABLED) {
             ctx.source_manager
                 .update_source_preferences(source_preferences.0, &source_preferences.1);
+        }
+        if row == SETTING_ROW_NETWORK_TIMEOUT {
+            // 超时变化要重建音源 HTTP 客户端才生效（与旧循环键同一路径）。
+            lx_source::configure_network(&network.0, network.1);
+        }
+        if row == SETTING_ROW_PLAYBACK_SPEED {
+            self.set_status(ctx.set_playback_speed_value(speed));
+            return AppAction::None;
+        }
+        if row == SETTING_ROW_HISTORY_LIMIT {
+            ctx.storage.trim_history(history_limit);
         }
         self.set_status(match save_result {
             Ok(()) => message,
@@ -3588,7 +3835,13 @@ impl SettingsPage {
         let wide = category_sidebar_visible(area.width);
         let narrow_categories = !wide && self.narrow_pane == NarrowPane::Categories;
         let show_rows = wide || !narrow_categories;
-        let embedded = embedded_list_for(self.category);
+        // 搜索视图没有内嵌列表：全部内容行都给搜索结果。
+        let search_visible = self.search_visible();
+        let embedded = if search_visible {
+            None
+        } else {
+            embedded_list_for(self.category)
+        };
         let embedded_fixed = self.embedded_ratio_is_fixed();
         let embedded_needed = if show_rows {
             embedded.map(|list| {
@@ -3614,18 +3867,54 @@ impl SettingsPage {
         // 渲染与命中同源：悬停/拖拽抓取都只认这一份矩形。
         self.last_panes = panes;
 
-        // 3. 记录元数据账本并让行光标合法（换分类后落到新分类第一行）。
+        // 3. 记录元数据账本并让行光标合法（换分类后落到新分类第一行；
+        //    搜索视图则落到第一条命中行）。
         self.row_metas = rows.metas();
-        self.row_cursor = ensure_row_cursor(&self.row_metas, self.category, self.row_cursor);
-        let visible_rows = rows.rows_in(self.category);
+        self.row_cursor = if search_visible {
+            ensure_search_cursor(&self.row_metas, self.search.query(), self.row_cursor)
+        } else {
+            ensure_row_cursor(&self.row_metas, self.category, self.row_cursor)
+        };
+        // 搜索视图显示跨分类的命中行（每行前缀标注来源分类）；
+        // 平时显示当前分类的行（含小节标题）。
+        let search_matches: Vec<SettingsRow> = if search_visible {
+            rows.rows
+                .iter()
+                .filter(|row| {
+                    row.meta.kind != SettingsRowKind::Header
+                        && search_matches_meta(&row.meta, self.search.query())
+                })
+                .map(|row| {
+                    let mut matched = row.clone();
+                    // 前缀插在键位列之后：行首的选中 ▶ 替换逻辑不受影响。
+                    matched.line.spans.insert(
+                        1,
+                        Span::styled(
+                            format!("[{}] ", row.meta.category.label()),
+                            Style::new().fg(muted),
+                        ),
+                    );
+                    matched
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let visible_rows: Vec<&SettingsRow> = if search_visible {
+            search_matches.iter().collect()
+        } else {
+            rows.rows_in(self.category)
+        };
 
         // 4. 面板标题里的操作提示按当前视图给出。
-        let hint = if narrow_categories {
-            "↑/↓分类 · Enter进入 · ←/→切换"
+        let hint = if search_visible {
+            "↑/↓选择 · Enter激活 · Esc退出搜索"
+        } else if narrow_categories {
+            "↑/↓分类 · Enter进入 · ←/→切换 · / 搜索"
         } else if panes.embedded.is_some() {
-            "←/→分类 · ↑/↓选择 · Enter确认 · ↓到底进入列表"
+            "←/→分类 · ↑/↓选择 · Enter确认 · ↓到底进入列表 · / 搜索"
         } else {
-            "←/→分类 · ↑/↓选择 · Enter确认"
+            "←/→分类 · ↑/↓选择 · Enter确认 · / 搜索"
         };
         // 主题入口所在的分类：标题里直接带上"主题: <当前主题>"。
         // 用户不必猜"换主题的选项埋在哪个分类里"，标题上就能看见。
@@ -3673,7 +3962,20 @@ impl SettingsPage {
             ),
             None => Vec::new(),
         };
-        self.row_hits = match panes.rows {
+        // 搜索视图：输入行占设置行区第一行，行列表相应下移一格。
+        let rows_area = panes.rows.map(|mut rows_area| {
+            if search_visible && rows_area.height > 2 {
+                self.search.render(
+                    Rect::new(rows_area.x, rows_area.y, rows_area.width, 1),
+                    buf,
+                    ctx,
+                );
+                rows_area.y += 1;
+                rows_area.height -= 1;
+            }
+            rows_area
+        });
+        self.row_hits = match rows_area {
             Some(rows_area) => render_setting_rows(
                 &visible_rows,
                 rows_area,
@@ -3705,6 +4007,11 @@ impl SettingsPage {
             }
             _ => EmbeddedHits::default(),
         };
+
+        // 6.2 底部说明栏：展示选中（或悬停）行的说明，没有逐行说明时退回分类简介。
+        if let Some(desc_area) = panes.desc {
+            self.render_desc_pane(desc_area, buf, ctx);
+        }
 
         // 6.5 两条分界线：坐标与拖拽命中同一份 `panes`，画在自己那一格 gutter 上。
         self.render_resize_dividers(&panes, buf, accent, crate::theme::surface1(ctx));
@@ -4001,6 +4308,54 @@ impl SettingsPage {
             },
             None => AppAction::None,
         }
+    }
+
+    /// 底部说明栏：`标题行 + 最多 2 行说明`，说明按显示宽度折行。
+    ///
+    /// 展示优先级：悬停行 > 光标行 > 分类简介。说明栏不抢焦点、没有按键，
+    /// 只是让"这一行是干什么的"不用猜。
+    fn render_desc_pane(&self, area: Rect, buf: &mut Buffer, ctx: &AppContext) {
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(crate::theme::border(ctx)))
+            .title(" ⓘ 说明 ");
+        let inner = block.inner(area);
+        block.render(area, buf);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        // 悬停优先：鼠标扫过的行即时换说明，光标行兜底。
+        let id = self.hover_row.or(self.row_cursor);
+        let meta = id.and_then(|id| self.row_metas.iter().find(|meta| meta.id == id));
+        let (title, body) = match meta {
+            Some(meta) => (
+                meta.label.clone(),
+                meta.help
+                    .map(str::to_string)
+                    .unwrap_or_else(|| category_help(meta.category).to_string()),
+            ),
+            None => (
+                self.category.label().to_string(),
+                category_help(self.category).to_string(),
+            ),
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                format!(" {title}"),
+                Style::new()
+                    .fg(crate::theme::accent(ctx))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(" {}", wrap_help_line(&body, inner.width as usize, 0)),
+                Style::new().fg(crate::theme::text(ctx)),
+            )),
+            Line::from(Span::styled(
+                format!(" {}", wrap_help_line(&body, inner.width as usize, 1)),
+                Style::new().fg(crate::theme::text(ctx)),
+            )),
+        ];
+        Paragraph::new(lines).render(inner, buf);
     }
 
     /// 画两条分界线：坐标来自 [`SettingsPanes::dividers`]，与拖拽命中同一份。
@@ -4894,6 +5249,128 @@ fn enum_menu(
                 })
                 .collect(),
         ),
+        // ── 数值档位 ──
+        SettingsEnumPicker::NetworkTimeout => steps_menu(
+            " 网络超时 ",
+            &TIMEOUT_STEPS,
+            config.network.timeout,
+            |step| format!("{step} 秒"),
+        ),
+        SettingsEnumPicker::MaxFps => steps_menu(
+            " 最大 FPS ",
+            &FPS_STEPS,
+            config.ui.max_fps as u64,
+            |step| {
+                if step == 0 {
+                    "不限".to_string()
+                } else {
+                    step.to_string()
+                }
+            },
+        ),
+        SettingsEnumPicker::PageStep => steps_menu(
+            " 翻页步长 ",
+            &PAGE_STEP_STEPS,
+            config.ui.page_step as u64,
+            |step| format!("{step} 行"),
+        ),
+        SettingsEnumPicker::PlaybackSpeed => EnumMenu::new(
+            " 播放速度 ",
+            SPEED_STEPS
+                .iter()
+                .map(|&speed| EnumChoice {
+                    value: format!("{speed:.2}"),
+                    label: format!("{speed:.2}x"),
+                    selected: (speed - config.player.playback_speed).abs() < f64::EPSILON,
+                })
+                .collect(),
+        ),
+        SettingsEnumPicker::FadeIn => steps_menu(
+            " 淡入时长 ",
+            &FADE_STEPS,
+            config.player.fade_in_ms,
+            fade_label,
+        ),
+        SettingsEnumPicker::FadeOut => steps_menu(
+            " 淡出时长 ",
+            &FADE_STEPS,
+            config.player.fade_out_ms,
+            fade_label,
+        ),
+        SettingsEnumPicker::HistoryLimit => steps_menu(
+            " 历史上限 ",
+            &HISTORY_STEPS,
+            config.player.history_limit as u64,
+            |step| format!("{step} 条"),
+        ),
+        SettingsEnumPicker::ScrollAmount => steps_menu(
+            " 滚动步长 ",
+            &SCROLL_STEPS,
+            config.ui.scroll_amount as u64,
+            |step| format!("{step} 行"),
+        ),
+        SettingsEnumPicker::InAppTimeout => steps_menu(
+            " TUI 通知时长 ",
+            &IN_APP_TIMEOUT_STEPS,
+            config.notification.in_app_timeout,
+            |step| format!("{step} 秒"),
+        ),
+        SettingsEnumPicker::ScanDepth => steps_menu(
+            " 扫描深度 ",
+            &SCAN_DEPTH_STEPS,
+            config.local_music.max_depth as u64,
+            |step| {
+                if step == 0 {
+                    "不限".to_string()
+                } else {
+                    step.to_string()
+                }
+            },
+        ),
+        SettingsEnumPicker::MultipartMinSize => steps_menu(
+            " 分片阈值 ",
+            &MULTIPART_MIN_SIZE_STEPS,
+            config.download.multipart_min_size_mb,
+            |step| format!("{step} MB"),
+        ),
+        SettingsEnumPicker::DownloadConcurrency => steps_menu(
+            " 分片并发 ",
+            &DOWNLOAD_CONCURRENCY_STEPS,
+            config.download.concurrency as u64,
+            |step| step.to_string(),
+        ),
+        SettingsEnumPicker::ConcurrentSongs => steps_menu(
+            " 同时下载 ",
+            &CONCURRENT_SONGS_STEPS,
+            config.download.concurrent_songs as u64,
+            |step| format!("{step} 首"),
+        ),
+        SettingsEnumPicker::MaxRetries => steps_menu(
+            " 失败重试 ",
+            &MAX_RETRIES_STEPS,
+            config.download.max_retries as u64,
+            |step| {
+                if step == 0 {
+                    "不重试".to_string()
+                } else {
+                    format!("{step} 次")
+                }
+            },
+        ),
+        SettingsEnumPicker::DownloadQuality => {
+            // 「跟随播放」用空值表示；其余档位与播放音质同一套标签。
+            let mut choices = vec![EnumChoice {
+                value: String::new(),
+                label: "跟随播放".to_string(),
+                selected: config.download.quality.is_none(),
+            }];
+            choices.extend(QUALITY_CHOICES.iter().map(|quality| EnumChoice {
+                value: quality.label().to_string(),
+                label: quality.label().to_string(),
+                selected: config.download.quality == Some(*quality),
+            }));
+            EnumMenu::new(" 下载音质 ", choices)
+        }
     }
 }
 
@@ -5101,6 +5578,111 @@ fn apply_setting_choice(
                 Some(format!("状态栏“{label}”已显示"))
             }
         }
+        // ── 数值档位：值必须是档位表里的一个，写入前先解析校验 ──
+        SETTING_ROW_NETWORK_TIMEOUT => {
+            let timeout = parse_step_choice(value, &TIMEOUT_STEPS)?;
+            config.network.timeout = timeout;
+            Some(format!("网络超时: {timeout} 秒"))
+        }
+        SETTING_ROW_MAX_FPS => {
+            let fps = parse_step_choice(value, &FPS_STEPS)? as u32;
+            config.ui.max_fps = fps;
+            Some(format!(
+                "最大 FPS: {}",
+                if fps == 0 {
+                    "不限".into()
+                } else {
+                    fps.to_string()
+                }
+            ))
+        }
+        SETTING_ROW_PAGE_STEP => {
+            let step = parse_step_choice(value, &PAGE_STEP_STEPS)? as usize;
+            config.ui.page_step = step;
+            Some(format!("翻页步长: {step} 行"))
+        }
+        SETTING_ROW_PLAYBACK_SPEED => {
+            let speed: f64 = value.parse().ok()?;
+            if !SPEED_STEPS.contains(&speed) {
+                return None;
+            }
+            config.player.playback_speed = speed;
+            Some(format!("播放速度: {speed:.2}x"))
+        }
+        SETTING_ROW_FADE_IN => {
+            let duration = parse_step_choice(value, &FADE_STEPS)?;
+            config.player.fade_in_ms = duration;
+            Some(format!("淡入: {}", fade_label(duration)))
+        }
+        SETTING_ROW_FADE_OUT => {
+            let duration = parse_step_choice(value, &FADE_STEPS)?;
+            config.player.fade_out_ms = duration;
+            Some(format!("淡出: {}", fade_label(duration)))
+        }
+        SETTING_ROW_HISTORY_LIMIT => {
+            let limit = parse_step_choice(value, &HISTORY_STEPS)? as usize;
+            config.player.history_limit = limit;
+            Some(format!("历史上限: {limit} 条"))
+        }
+        SETTING_ROW_SCROLL_AMOUNT => {
+            let amount = parse_step_choice(value, &SCROLL_STEPS)? as usize;
+            config.ui.scroll_amount = amount;
+            Some(format!("滚动步长: {amount} 行"))
+        }
+        SETTING_ROW_IN_APP_TIMEOUT => {
+            let timeout = parse_step_choice(value, &IN_APP_TIMEOUT_STEPS)?;
+            config.notification.in_app_timeout = timeout;
+            Some(format!("TUI 通知时长: {timeout} 秒"))
+        }
+        SETTING_ROW_SCAN_DEPTH => {
+            let depth = parse_step_choice(value, &SCAN_DEPTH_STEPS)? as u32;
+            config.local_music.max_depth = depth;
+            Some(format!(
+                "扫描深度: {}",
+                if depth == 0 {
+                    "不限".into()
+                } else {
+                    depth.to_string()
+                }
+            ))
+        }
+        SETTING_ROW_MULTIPART_MIN_SIZE => {
+            let size = parse_step_choice(value, &MULTIPART_MIN_SIZE_STEPS)?;
+            config.download.multipart_min_size_mb = size;
+            Some(format!("分片阈值: {size} MB"))
+        }
+        SETTING_ROW_DOWNLOAD_CONCURRENCY => {
+            let concurrency = parse_step_choice(value, &DOWNLOAD_CONCURRENCY_STEPS)? as usize;
+            config.download.concurrency = concurrency;
+            Some(format!("分片并发: {concurrency}"))
+        }
+        SETTING_ROW_CONCURRENT_SONGS => {
+            let songs = parse_step_choice(value, &CONCURRENT_SONGS_STEPS)? as usize;
+            config.download.concurrent_songs = songs;
+            Some(format!("同时下载: {songs} 首"))
+        }
+        SETTING_ROW_MAX_RETRIES => {
+            let retries = parse_step_choice(value, &MAX_RETRIES_STEPS)? as u32;
+            config.download.max_retries = retries;
+            Some(if retries == 0 {
+                "失败重试: 不重试".into()
+            } else {
+                format!("失败重试: {retries} 次")
+            })
+        }
+        SETTING_ROW_DOWNLOAD_QUALITY => {
+            // 空值 = 跟随播放；否则必须是已知音质标签。
+            let quality = if value.is_empty() {
+                None
+            } else {
+                Some(quality_by_label(value)?)
+            };
+            config.download.quality = quality;
+            Some(match quality {
+                None => "下载音质: 跟随播放".to_string(),
+                Some(quality) => format!("下载音质: {}", quality.label()),
+            })
+        }
         _ => None,
     }
 }
@@ -5114,7 +5696,10 @@ fn apply_setting_choice(
 /// 只处理 `setting_row` 的固定结构 `[键位, label, 间隙, 值…]`，且**说明行
 /// （Info）不参与**——说明文字是句子，贴右会破坏阅读流。行宽放不下时不动。
 fn right_align_setting_value(line: &mut Line<'static>, row_width: u16, kind: SettingsRowKind) {
-    if matches!(kind, SettingsRowKind::Info) || line.spans.len() < 4 || row_width == 0 {
+    if matches!(kind, SettingsRowKind::Info | SettingsRowKind::Header)
+        || line.spans.len() < 4
+        || row_width == 0
+    {
         return;
     }
     let used: usize = line
@@ -5154,10 +5739,76 @@ fn category_hit_at(
 }
 
 /// 分类内的行 id（显示顺序 = 构造顺序）。
+/// 按显示宽度把说明文字折成第 `line_index` 行（每行最多 `width` 列）。
+///
+/// 中文等宽字符占 2 列，按 `UnicodeWidthStr::width` 累加；返回空串表示
+/// 文本没有更多内容。用于说明栏的两行排版。
+fn wrap_help_line(text: &str, width: usize, line_index: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut current_line = 0usize;
+    let mut column = 0usize;
+    let mut start = 0usize;
+    let mut end = 0usize;
+    for (index, ch) in text.char_indices() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if column > 0 && column + ch_width > width {
+            if current_line == line_index {
+                return text[start..end].to_string();
+            }
+            current_line += 1;
+            column = 0;
+            start = index;
+        }
+        column += ch_width;
+        end = index + ch.len_utf8();
+    }
+    if current_line == line_index {
+        text[start..].to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// 当前分类的可交互行 id（小节标题不可选中，跳过）。
 fn category_row_ids(metas: &[SettingsRowMeta], category: SettingsCategory) -> Vec<SettingsRowId> {
     metas
         .iter()
-        .filter(|meta| meta.category == category)
+        .filter(|meta| meta.category == category && meta.kind != SettingsRowKind::Header)
+        .map(|meta| meta.id)
+        .collect()
+}
+
+/// 搜索是否命中一行：标签 / 说明 / 分类名，不区分大小写。
+fn search_matches(meta: &SettingsRowMeta, category_label: &str, needle: &str) -> bool {
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    meta.label.to_lowercase().contains(&needle)
+        || meta
+            .help
+            .is_some_and(|help| help.to_lowercase().contains(&needle))
+        || category_label.to_lowercase().contains(&needle)
+}
+
+/// 搜索是否命中一行（元数据版，渲染与 id 过滤共用同一口径）。
+fn search_matches_meta(meta: &SettingsRowMeta, query: &str) -> bool {
+    search_matches(meta, meta.category.label(), query.trim())
+}
+
+/// 搜索命中行的 id（跨全部分类，小节标题不参与）。
+fn search_row_ids(metas: &[SettingsRowMeta], query: &str) -> Vec<SettingsRowId> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    metas
+        .iter()
+        .filter(|meta| {
+            meta.kind != SettingsRowKind::Header
+                && search_matches(meta, meta.category.label(), query.trim())
+        })
         .map(|meta| meta.id)
         .collect()
 }
@@ -5169,7 +5820,15 @@ fn step_row_selection(
     current: Option<SettingsRowId>,
     forward: bool,
 ) -> Option<SettingsRowId> {
-    let ids = category_row_ids(metas, category);
+    step_row_selection_in(&category_row_ids(metas, category), current, forward)
+}
+
+/// ↑/↓ 在一份显式的行 id 列表里移动（分类行 / 搜索命中行共用）。
+fn step_row_selection_in(
+    ids: &[SettingsRowId],
+    current: Option<SettingsRowId>,
+    forward: bool,
+) -> Option<SettingsRowId> {
     if ids.is_empty() {
         return None;
     }
@@ -5185,6 +5844,19 @@ fn step_row_selection(
         position.saturating_sub(1)
     };
     Some(ids[next])
+}
+
+/// 搜索视图的光标合法化：不在命中行里就落到第一条命中行。
+fn ensure_search_cursor(
+    metas: &[SettingsRowMeta],
+    query: &str,
+    cursor: Option<SettingsRowId>,
+) -> Option<SettingsRowId> {
+    let ids = search_row_ids(metas, query);
+    match cursor {
+        Some(id) if ids.contains(&id) => Some(id),
+        _ => ids.first().copied(),
+    }
 }
 
 /// ↑/↓ 的行光标结果：**子列表聚焦时原样返回（让位）**，否则移动光标。
@@ -5290,18 +5962,23 @@ fn render_setting_rows(
         // 双列布局下每列本来就不宽，值贴右会被截断；只在单列（宽面板）时启用。
         let align_width = if column_count == 1 { rect.width } else { 0 };
         right_align_setting_value(&mut line, align_width, row.meta.kind);
-        highlight_setting_line(
-            &mut line,
-            Some(row.meta.id) == selected,
-            hovered == Some(row.meta.id),
-            accent,
-            selection_fg,
-        );
+        // 小节标题不可选中也不可悬停：只渲染，不进命中账本。
+        if row.meta.kind != SettingsRowKind::Header {
+            highlight_setting_line(
+                &mut line,
+                Some(row.meta.id) == selected,
+                hovered == Some(row.meta.id),
+                accent,
+                selection_fg,
+            );
+        }
         Paragraph::new(line).render(rect, buf);
-        hits.push(SettingsRowHit {
-            rect,
-            id: row.meta.id,
-        });
+        if row.meta.kind != SettingsRowKind::Header {
+            hits.push(SettingsRowHit {
+                rect,
+                id: row.meta.id,
+            });
+        }
     }
     hits
 }
@@ -5357,17 +6034,6 @@ fn render_setting_categories(
     hits
 }
 
-/// 翻页步长档位循环：5 → 10 → 15 → 20 → 5；不在档位上的自定义值按区间
-/// 映射到下一档（与 `next_scroll_amount` 同一套写法）。
-pub(crate) fn next_page_step(current: usize) -> usize {
-    match current {
-        0..=5 => 10,
-        6..=10 => 15,
-        11..=15 => 20,
-        _ => 5,
-    }
-}
-
 pub(crate) fn next_quality(quality: Quality) -> Quality {
     match quality {
         Quality::Low128 => Quality::High320,
@@ -5377,71 +6043,56 @@ pub(crate) fn next_quality(quality: Quality) -> Quality {
     }
 }
 
-/// 在一组候选值里循环取值；当前值不在候选里时回到第一个。
-fn next_step(values: &[u64], current: u64) -> u64 {
-    match values.iter().position(|value| *value == current) {
-        Some(index) => values[(index + 1) % values.len()],
-        None => values[0],
-    }
+// ── 数值档位表：取值菜单与说明文案的唯一数据源 ──────────────────────────────
+// 档位同时是菜单候选项；当前值不在档位上（如手改配置文件）时菜单不打 ✓，
+// 选一个档位即写回。
+
+/// 网络超时（秒）。
+const TIMEOUT_STEPS: [u64; 5] = [5, 10, 15, 30, 60];
+/// 界面刷新率上限（FPS）。
+const FPS_STEPS: [u64; 4] = [10, 20, 30, 60];
+/// PageUp/PageDown 翻页行数。
+const PAGE_STEP_STEPS: [u64; 4] = [5, 10, 15, 20];
+/// 播放速度。
+const SPEED_STEPS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+/// 淡入/淡出时长（毫秒），0 = 关闭。
+const FADE_STEPS: [u64; 5] = [0, 250, 500, 1000, 2000];
+/// 播放历史上限。
+const HISTORY_STEPS: [u64; 5] = [25, 50, 100, 200, 500];
+/// 滚轮步长（行）。
+const SCROLL_STEPS: [u64; 4] = [1, 3, 5, 10];
+/// 应用内通知时长（秒）。
+const IN_APP_TIMEOUT_STEPS: [u64; 4] = [2, 4, 6, 8];
+/// 本地库扫描深度（层），0 = 不限。
+const SCAN_DEPTH_STEPS: [u64; 6] = [0, 1, 2, 4, 8, 16];
+/// 分片下载阈值（MB）。
+const MULTIPART_MIN_SIZE_STEPS: [u64; 6] = [1, 2, 5, 10, 20, 50];
+/// 单文件分片并发。
+const DOWNLOAD_CONCURRENCY_STEPS: [u64; 5] = [1, 2, 4, 8, 16];
+/// 同时下载任务数。
+const CONCURRENT_SONGS_STEPS: [u64; 4] = [1, 2, 3, 4];
+/// 下载失败重试次数。
+const MAX_RETRIES_STEPS: [u64; 5] = [0, 1, 2, 3, 5];
+
+/// 由数值档位构造取值菜单：`value` 是写入配置的原始数字，`label` 是显示文案。
+fn steps_menu(title: &str, steps: &[u64], current: u64, label: impl Fn(u64) -> String) -> EnumMenu {
+    EnumMenu::new(
+        title,
+        steps
+            .iter()
+            .map(|&step| EnumChoice {
+                value: step.to_string(),
+                label: label(step),
+                selected: step == current,
+            })
+            .collect(),
+    )
 }
 
-fn next_history_limit(limit: usize) -> usize {
-    match limit {
-        0..=25 => 50,
-        26..=50 => 100,
-        51..=100 => 200,
-        101..=200 => 500,
-        _ => 25,
-    }
-}
-
-fn next_network_timeout(timeout: u64) -> u64 {
-    match timeout {
-        0..=5 => 10,
-        6..=10 => 15,
-        11..=15 => 30,
-        16..=30 => 60,
-        _ => 5,
-    }
-}
-
-fn next_fps(fps: u32) -> u32 {
-    match fps {
-        0..=10 => 20,
-        11..=20 => 30,
-        21..=30 => 60,
-        _ => 10,
-    }
-}
-
-fn next_scroll_amount(amount: usize) -> usize {
-    match amount {
-        0..=1 => 3,
-        2..=3 => 5,
-        4..=5 => 10,
-        _ => 1,
-    }
-}
-
-fn next_scan_depth(depth: u32) -> u32 {
-    match depth {
-        0 => 1,
-        1 => 2,
-        2 => 4,
-        3..=4 => 8,
-        5..=8 => 16,
-        _ => 0,
-    }
-}
-
-fn next_fade_duration(value: u64) -> u64 {
-    match value {
-        0 => 250,
-        1..=250 => 500,
-        251..=500 => 1_000,
-        501..=1_000 => 2_000,
-        _ => 0,
-    }
+/// 数值选择解析：值必须是该档位表里的一个，否则拒绝（配置不会被污染）。
+fn parse_step_choice(value: &str, steps: &[u64]) -> Option<u64> {
+    let parsed: u64 = value.parse().ok()?;
+    steps.contains(&parsed).then_some(parsed)
 }
 
 fn fade_label(value: u64) -> String {
@@ -5478,6 +6129,10 @@ const EMBEDDED_RATIO_MAX: f32 = 0.8;
 const EMBEDDED_MIN_HEIGHT: u16 = 5;
 /// 分类内容里设置行区至少保留的行数（内嵌列表不能把它挤没）。
 const ROWS_MIN_HEIGHT: u16 = 4;
+/// 底部说明栏高度（含自己的上边框）：上边框 + 3 行文字。
+const DESC_PANE_HEIGHT: u16 = 4;
+/// 内容区矮于这个行数就不显示说明栏（设置行优先）。
+const DESC_MIN_CONTENT_HEIGHT: u16 = 14;
 /// JS 音源列表的命令行标签（渲染与命中同源）。
 const JS_SOURCE_COMMANDS: &[(&str, char)] =
     &[("[a] 添加", 'a'), ("[d] 移除", 'd'), ("[h] 检测", 'h')];
@@ -5618,12 +6273,15 @@ struct SettingsPanes {
     ///
     /// 这是**含边框**的整块矩形；它的内容区一律走 `panel_inner`。
     categories: Option<Rect>,
-    /// 分类内容区（设置行区 + 1 行 gutter + 内嵌列表区）。
+    /// 分类内容区（设置行区 + 1 行 gutter + 内嵌列表区 + 说明栏）。
     content: Option<Rect>,
     /// 分类内容里的设置行区（窄屏分类列表视图为 `None`）。
     rows: Option<Rect>,
     /// 当前分类内嵌的管理列表区（该分类没有内嵌列表时为 `None`）。
     embedded: Option<Rect>,
+    /// 底部说明栏：横跨设置行与内嵌列表，展示选中行的说明。
+    /// 内容区太矮放不下时为 `None`（宁可不显示也不挤没设置行）。
+    desc: Option<Rect>,
     /// 分类栏与内容之间的纵向分界线；空间不足（`clamp_extent` 退化）时为
     /// `None` —— 此时既不画也不可拖，绝不覆盖内容。
     category_divider: Option<DividerHit>,
@@ -5640,6 +6298,7 @@ impl SettingsPanes {
             content: None,
             rows: None,
             embedded: None,
+            desc: None,
             category_divider: None,
             embedded_divider: None,
         }
@@ -5833,9 +6492,21 @@ fn settings_panes(
             content: None,
             rows: None,
             embedded: None,
+            desc: None,
             category_divider,
             embedded_divider: None,
         };
+    };
+
+    // 底部说明栏：贴内容区底边、横跨设置行与内嵌列表，固定占
+    // `DESC_PANE_HEIGHT` 行（含自己的上边框）+ 1 行 gutter。内容区太矮时
+    // 放弃说明栏 —— 宁可不显示，也不能把设置行挤没。
+    let (content, desc) = if show_rows && content.height >= DESC_MIN_CONTENT_HEIGHT {
+        let rows_extent = content.height - DESC_PANE_HEIGHT - GUTTER;
+        let (content, desc) = split_with_gutter(content, SplitAxis::Horizontal, rows_extent);
+        (content, Some(desc))
+    } else {
+        (content, None)
     };
 
     let Some(needed) = embedded_needed else {
@@ -5845,6 +6516,7 @@ fn settings_panes(
             content: Some(content),
             rows: Some(content),
             embedded: None,
+            desc,
             category_divider,
             embedded_divider: None,
         };
@@ -5869,6 +6541,7 @@ fn settings_panes(
         content: Some(content),
         rows: Some(rows),
         embedded: (height > 0).then_some(embedded),
+        desc,
         category_divider,
         embedded_divider,
     }
@@ -5896,9 +6569,11 @@ mod tests {
         CATEGORY_SIDEBAR_WIDTH, CATEGORY_SIDEBAR_WIDTH_MAX, CATEGORY_SIDEBAR_WIDTH_MIN,
         EMBEDDED_MIN_HEIGHT, EMBEDDED_RATIO_DEFAULT, EMBEDDED_RATIO_MAX, EMBEDDED_RATIO_MIN,
         EmbeddedCommand, EmbeddedHits, EnumMenu, JS_SOURCE_COMMANDS, KEY_COLUMN_WIDTH,
-        LABEL_COLUMN_WIDTH, LOCAL_PATH_COMMANDS, LYRIC_OFFSET_CHOICES, NarrowPane, ROWS_MIN_HEIGHT,
-        RowInputs, RowPalette, RowPlan, SETTING_ROW_DEFAULT_SOURCE, SETTING_ROW_EQUALIZER,
-        SETTING_ROW_LYRIC_OFFSET, SETTING_ROW_SOURCE_ENABLED, SETTING_ROW_SOURCE_POLICY,
+        LABEL_COLUMN_WIDTH, LOCAL_PATH_COMMANDS, LYRIC_OFFSET_CHOICES, NarrowPane, PAGE_STEP_STEPS,
+        ROWS_MIN_HEIGHT, RowInputs, RowPalette, RowPlan, SETTING_ROW_DEFAULT_SOURCE,
+        SETTING_ROW_EQUALIZER, SETTING_ROW_FADE_IN, SETTING_ROW_HISTORY_LIMIT,
+        SETTING_ROW_LYRIC_OFFSET, SETTING_ROW_MAX_FPS, SETTING_ROW_NETWORK_TIMEOUT,
+        SETTING_ROW_PLAYBACK_SPEED, SETTING_ROW_SOURCE_ENABLED, SETTING_ROW_SOURCE_POLICY,
         SETTING_ROW_SOURCE_POLICY_PLATFORM, SETTING_ROW_STATUS_BAR_ITEM, SETTING_ROW_THEME,
         SETTINGS_CATEGORIES, SETTINGS_CATEGORIES_RATIO_KEY, SETTINGS_EMBEDDED_RATIO_KEY,
         SETTINGS_PAGE_CHAR_KEYS, STATUS_BAR_CHECKBOX_WIDTH, SettingsCategory, SettingsEnumPicker,
@@ -5908,15 +6583,16 @@ mod tests {
         category_hit_at, category_row_ids, category_sidebar_visible, choice_refusal_message,
         columns_from_value, command_row_layout, compact_key_label, embedded_command,
         embedded_height, embedded_items, embedded_list_for, embedded_needed_rows,
-        embedded_needed_rows_for, embedded_ratio_from_pointer, ensure_row_cursor, enum_menu,
-        enum_menu_label, is_accounts_panel_key, key_label, list_owns_direction_keys,
-        navigate_row_cursor, next_page_step, panel_inner, plan_row_activation, qr_login_action,
-        quality_by_label, render_command_row, render_embedded_row, render_setting_categories,
-        render_setting_rows, reorder_status_bar_items, row_activates_with_space, row_hit_at,
-        row_window_start, setting_line, setting_option_column_count, setting_option_columns,
+        embedded_needed_rows_for, embedded_ratio_from_pointer, ensure_row_cursor,
+        ensure_search_cursor, enum_menu, enum_menu_label, is_accounts_panel_key, key_label,
+        list_owns_direction_keys, navigate_row_cursor, panel_inner, plan_row_activation,
+        qr_login_action, quality_by_label, render_command_row, render_embedded_row,
+        render_setting_categories, render_setting_rows, reorder_status_bar_items,
+        row_activates_with_space, row_hit_at, row_window_start, search_matches_meta,
+        search_row_ids, setting_line, setting_option_column_count, setting_option_columns,
         setting_row_rect, setting_value_line, settings_menu_app_action, settings_mouse_dispatch,
         settings_panes, shorten_source, step_index, step_row_selection, theme_picker_row,
-        truncate_display,
+        truncate_display, wrap_help_line,
     };
     use ratatui::buffer::Buffer;
     use ratatui::text::Line;
@@ -5955,9 +6631,15 @@ mod tests {
         assert_eq!(rows.width, inner.width - categories.width - GUTTER);
         assert_eq!(embedded.x, rows.x);
         assert_eq!(embedded.width, rows.width);
-        // 设置行区 + 分界线 gutter + 内嵌列表区正好铺满内容区。
-        assert_eq!(rows.height + embedded.height + GUTTER, inner.height);
-        assert_eq!(embedded.bottom(), inner.bottom());
+        // 说明栏占掉内容区底部：设置行 + 分界线 gutter + 内嵌列表只分剩余部分。
+        let content = wide.content.expect("必须有内容区");
+        let desc = wide.desc.expect("内容区够高时必须有说明栏");
+        assert_eq!(rows.height + embedded.height + GUTTER, content.height);
+        assert_eq!(embedded.bottom(), content.bottom());
+        // 说明栏贴整个内容区底边，横跨设置行与内嵌列表。
+        assert_eq!(content.height + GUTTER + desc.height, inner.height);
+        assert_eq!(desc.bottom(), inner.bottom());
+        assert_eq!(desc.width, content.width);
         assert!(rows.height > 0, "设置行区必须看得见");
 
         // 窄屏：分类列表视图只有分类栏；进入分类后只有内容（设置行 + 内嵌列表）。
@@ -5972,6 +6654,10 @@ mod tests {
         );
         assert!(list_view.rows.is_none());
         assert!(list_view.embedded.is_none());
+        assert!(
+            list_view.desc.is_none(),
+            "分类列表视图没有内容区，也没有说明栏"
+        );
         assert_eq!(list_view.categories, Some(panel_inner(narrow_area)));
 
         let rows_view = settings_panes(
@@ -5989,12 +6675,15 @@ mod tests {
         let rows = rows_view.rows.expect("进入分类后必须显示设置行");
         let embedded = rows_view.embedded.expect("内嵌列表必须可见");
         assert_eq!(rows.width, panel_inner(narrow_area).width);
+        let content = rows_view.content.expect("必须有内容区");
+        assert_eq!(rows.height + embedded.height + GUTTER, content.height);
+        let desc = rows_view.desc.expect("内容区够高时必须有说明栏");
         assert_eq!(
-            rows.height + embedded.height + GUTTER,
+            content.height + GUTTER + desc.height,
             panel_inner(narrow_area).height
         );
-        // 四周全框：inner = (1,1,78,22)，故内嵌列表底边 = 23
-        assert_eq!(embedded.bottom(), 23);
+        // 四周全框：inner = (1,1,78,22)，说明栏底边 = 23
+        assert_eq!(desc.bottom(), 23);
     }
 
     /// 分类内容里没有内嵌列表时（播放 / 通知与集成 / 下载），设置行区拿走整块内容区。
@@ -6013,16 +6702,22 @@ mod tests {
             let area = Rect::new(0, 0, 120, 30);
             let panes = settings_panes(area, true, true, None, 0.5, CATEGORY_SIDEBAR_WIDTH);
             let inner = panel_inner(area);
+            // 说明栏占掉底部 DESC_PANE_HEIGHT + gutter，设置行拿走其余全部。
+            let content = panes.content.expect("没有内嵌列表的分类也必须有内容区");
             assert_eq!(
                 panes.rows,
                 Some(Rect::new(
-                    inner.x + CATEGORY_SIDEBAR_WIDTH + GUTTER,
-                    inner.y,
-                    inner.width - CATEGORY_SIDEBAR_WIDTH - GUTTER,
-                    inner.height,
+                    content.x,
+                    content.y,
+                    content.width,
+                    content.height,
                 )),
                 "没有内嵌列表的分类：设置行区拿走整块内容区"
             );
+            assert_eq!(content.width, inner.width - CATEGORY_SIDEBAR_WIDTH - GUTTER);
+            let desc = panes.desc.expect("内容区够高时必须有说明栏");
+            assert_eq!(content.height + GUTTER + desc.height, inner.height);
+            assert_eq!(desc.bottom(), inner.bottom());
             assert!(panes.embedded.is_none());
         }
     }
@@ -6141,7 +6836,11 @@ mod tests {
 
         // 两块 + gutter 恰好用满分栏方向，没有一格被重复占用。
         assert_eq!(categories.width + GUTTER + rows.width, inner.width);
-        assert_eq!(rows.height + GUTTER + embedded.height, inner.height);
+        // 纵向：设置行 + gutter + 内嵌列表 = 内容区；内容区 + gutter + 说明栏 = inner。
+        let content = panes.content.expect("必须有内容区");
+        let desc = panes.desc.expect("内容区够高时必须有说明栏");
+        assert_eq!(rows.height + GUTTER + embedded.height, content.height);
+        assert_eq!(content.height + GUTTER + desc.height, inner.height);
 
         // 窄屏只有横向那一条；窄屏分类列表视图一条都没有。
         let narrow = Rect::new(0, 0, 80, 24);
@@ -6423,8 +7122,8 @@ mod tests {
             after.rows.expect("设置行区").height
                 + after.embedded.expect("内嵌列表").height
                 + GUTTER,
-            panel_inner(area).height,
-            "两块 + gutter 始终铺满内容区"
+            after.content.expect("内容区").height,
+            "两块 + gutter 始终铺满内容区（说明栏之外）"
         );
 
         // 内容最后一行：渲染出来必须仍能被点中，而 gutter 那一行不属于任何行。
@@ -7034,14 +7733,11 @@ mod tests {
             .expect("checked above");
         assert_eq!(
             plan_row_activation(&page_step),
-            RowPlan::Direct(SettingsRowDirectAction::CyclePageStep),
+            RowPlan::Menu(SettingsEnumPicker::PageStep),
+            "翻页步长现在是取值菜单，不再是循环键"
         );
-        // 档位推进函数本身。
-        assert_eq!(next_page_step(5), 10);
-        assert_eq!(next_page_step(10), 15);
-        assert_eq!(next_page_step(15), 20);
-        assert_eq!(next_page_step(20), 5);
-        assert_eq!(next_page_step(7), 15, "自定义值按区间映射");
+        // 档位表就是菜单候选：顺序与旧循环路径一致。
+        assert_eq!(PAGE_STEP_STEPS, [5, 10, 15, 20]);
         // 强档位循环：关闭 → 轻微 → 明显 → 关闭。
         use lx_core::model::config::AccentFollowCover;
         assert_eq!(AccentFollowCover::Off.next(), AccentFollowCover::Subtle);
@@ -7102,11 +7798,13 @@ mod tests {
         }
         assert_eq!(seen.len(), metas.len(), "分类并集必须正好覆盖全部真实行");
 
-        // 4. 分类栏用的 `category_row_ids` 与真实行表同源（渲染与光标同一条口径）
+        // 4. 分类栏用的 `category_row_ids` 与真实行表同源（渲染与光标同一条口径）。
+        //    小节标题不进光标：两条口径都在"可交互行"这个集合上对齐。
         for category in SETTINGS_CATEGORIES {
             let ids: Vec<SettingsRowId> = rows
                 .rows_in(category)
                 .iter()
+                .filter(|row| row.meta.kind != SettingsRowKind::Header)
                 .map(|row| row.meta.id)
                 .collect();
             assert_eq!(category_row_ids(&metas, category), ids, "行序必须一致");
@@ -7122,14 +7820,17 @@ mod tests {
         let rows = real_settings_rows(&Config::default());
         let labels = labels_in(&rows, SettingsCategory::Download);
         let expected = [
+            "位置与命名",
             "下载目录",
             "下载音质",
             "文件名模板",
+            "传输",
             "多线程分片",
             "分片阈值",
             "分片并发",
             "同时下载",
             "失败重试",
+            "文件选项",
             "校验文件大小",
             "跳过已下载",
             "写入标签",
@@ -7141,8 +7842,12 @@ mod tests {
             "下载分类的设置项必须一个不少（顺序 = 构造顺序）"
         );
 
-        // 每一项都能真的被激活，不是只读摆设
-        for row in rows.rows_in(SettingsCategory::Download) {
+        // 每一项都能真的被激活，不是只读摆设（小节标题只是视觉分组，除外）
+        for row in rows
+            .rows_in(SettingsCategory::Download)
+            .into_iter()
+            .filter(|row| row.meta.kind != SettingsRowKind::Header)
+        {
             assert_ne!(
                 row.meta.kind,
                 SettingsRowKind::Info,
@@ -7911,6 +8616,7 @@ mod tests {
             category: SettingsCategory::Playback,
             kind,
             plan,
+            help: None,
         };
 
         // 取值行：计划就是它的取值菜单
@@ -9191,6 +9897,20 @@ mod tests {
             ("解析策略", SettingsEnumPicker::SourcePolicy),
             ("音源开关", SettingsEnumPicker::EnabledSources),
             ("歌词偏移", SettingsEnumPicker::LyricOffset),
+            ("网络超时", SettingsEnumPicker::NetworkTimeout),
+            ("最大 FPS", SettingsEnumPicker::MaxFps),
+            ("播放速度", SettingsEnumPicker::PlaybackSpeed),
+            ("淡入时长", SettingsEnumPicker::FadeIn),
+            ("淡出时长", SettingsEnumPicker::FadeOut),
+            ("历史上限", SettingsEnumPicker::HistoryLimit),
+            ("滚动步长", SettingsEnumPicker::ScrollAmount),
+            ("TUI 通知时长", SettingsEnumPicker::InAppTimeout),
+            ("扫描深度", SettingsEnumPicker::ScanDepth),
+            ("分片阈值", SettingsEnumPicker::MultipartMinSize),
+            ("分片并发", SettingsEnumPicker::DownloadConcurrency),
+            ("同时下载", SettingsEnumPicker::ConcurrentSongs),
+            ("失败重试", SettingsEnumPicker::MaxRetries),
+            ("下载音质", SettingsEnumPicker::DownloadQuality),
         ] {
             let meta = rows
                 .metas()
@@ -9212,7 +9932,6 @@ mod tests {
                 SettingsRowDirectAction::ToggleRememberPlaybackState,
             ),
             ("音频设备", SettingsRowDirectAction::EditAudioDevice),
-            ("播放速度", SettingsRowDirectAction::CyclePlaybackSpeed),
             ("自动换源", SettingsRowDirectAction::ToggleAutoSource),
             ("网络代理", SettingsRowDirectAction::EditProxy),
             ("重新加载 JS 音源", SettingsRowDirectAction::ReloadJsSources),
@@ -9236,8 +9955,13 @@ mod tests {
             );
         }
 
-        // 真实行集里没有一行是只读的（否则删除快捷键后它就再也点不动了）
-        for meta in rows.metas() {
+        // 真试行集里没有一行是只读的（否则删除快捷键后它就再也点不动了）；
+        // 小节标题（Header）除外——它本来就只是视觉分组。
+        for meta in rows
+            .metas()
+            .into_iter()
+            .filter(|meta| meta.kind != SettingsRowKind::Header)
+        {
             assert_ne!(
                 plan_row_activation(&meta),
                 RowPlan::Inert,
@@ -9256,7 +9980,11 @@ mod tests {
     fn no_real_settings_row_depends_on_a_per_row_shortcut() {
         let rows = real_settings_rows(&Config::default());
         let mut enter_rows = 0;
-        for meta in rows.metas() {
+        for meta in rows
+            .metas()
+            .into_iter()
+            .filter(|meta| meta.kind != SettingsRowKind::Header)
+        {
             assert!(
                 matches!(
                     plan_row_activation(&meta),
@@ -9534,5 +10262,220 @@ mod tests {
         page.focus = SettingsFocus::Options;
         page.narrow_pane = NarrowPane::Rows;
         assert_eq!(page.narrow_pane, NarrowPane::Rows);
+    }
+
+    // ── 设置页重设计（说明栏 / 搜索 / 小节标题 / 档位菜单）的回归测试 ──────
+
+    /// 真实行集里每一条可交互行都必须有说明文案——说明栏与搜索都靠它。
+    #[test]
+    fn every_real_setting_row_has_help_text() {
+        let rows = real_settings_rows(&Config::default());
+        let missing = rows
+            .metas()
+            .into_iter()
+            .filter(|meta| meta.kind != SettingsRowKind::Header)
+            .filter(|meta| meta.help.is_none())
+            .map(|meta| format!("{}::{:?}", meta.label, meta.category))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "这些设置行缺说明文案：{missing:?}（在 row_help 里补上）"
+        );
+        // 小节标题没有说明（它不是设置项）。
+        assert!(
+            rows.metas()
+                .into_iter()
+                .filter(|meta| meta.kind == SettingsRowKind::Header)
+                .all(|meta| meta.help.is_none())
+        );
+    }
+
+    /// 搜索匹配：标签、说明、分类名三种来源，且不区分大小写。
+    #[test]
+    fn search_matches_label_help_and_category() {
+        let rows = real_settings_rows(&Config::default());
+        let metas = rows.metas();
+        let find = |label: &str| {
+            metas
+                .iter()
+                .find(|meta| meta.label == label)
+                .unwrap_or_else(|| panic!("行集里必须有「{label}」"))
+                .clone()
+        };
+
+        // 标签命中
+        let proxy = find("网络代理");
+        assert!(search_matches_meta(&proxy, "代理"));
+        assert!(search_matches_meta(&proxy, "网络代理"));
+        // 说明命中：「下载目录」的说明里有"保存"
+        let dir = find("下载目录");
+        assert!(search_matches_meta(&dir, "保存"));
+        // 分类名命中：搜「下载」能带出整个下载分类
+        assert!(search_matches_meta(&dir, "下载"));
+        // 大小写不敏感
+        let mpris = find("MPRIS");
+        assert!(search_matches_meta(&mpris, "mpris"));
+        // 搜不到
+        assert!(!search_matches_meta(&proxy, "不存在的词"));
+        // 空关键词不算命中
+        assert!(!search_matches_meta(&proxy, "  "));
+    }
+
+    /// 搜索命中行跨分类、跳过小节标题；光标合法化也只认命中行。
+    #[test]
+    fn search_row_ids_span_categories_and_skip_headers() {
+        let rows = real_settings_rows(&Config::default());
+        let metas = rows.metas();
+
+        // 「下载」会命中整个下载分类（分类名匹配）+ 说明里含"下载"的其它行。
+        let ids = search_row_ids(&metas, "下载");
+        assert!(!ids.is_empty(), "「下载」至少命中下载分类");
+        let all_download = ids.iter().all(|id| metas.iter().any(|meta| &meta.id == id));
+        assert!(all_download);
+        // 命中里没有小节标题。
+        assert!(ids.iter().all(|id| {
+            metas
+                .iter()
+                .find(|meta| meta.id == *id)
+                .is_some_and(|meta| meta.kind != SettingsRowKind::Header)
+        }));
+        // 空关键词 → 空命中；光标合法化落到第一条命中行。
+        assert!(search_row_ids(&metas, "").is_empty());
+        assert_eq!(
+            ensure_search_cursor(&metas, "下载", None),
+            ids.first().copied()
+        );
+        assert_eq!(
+            ensure_search_cursor(&metas, "下载", Some(SettingsRowId(u32::MAX))),
+            ids.first().copied(),
+            "无效光标（不在命中里）回到第一条命中行"
+        );
+    }
+
+    /// 数值档位菜单：✓ 落在当前值上；当前值不在档位上时无 ✓（手改配置的场景）。
+    #[test]
+    fn ladder_menus_mark_the_current_value() {
+        let mut config = Config::default();
+        config.network.timeout = 15;
+        let menu = enum_menu(
+            SettingsEnumPicker::NetworkTimeout,
+            &config,
+            PlayMode::ListLoop,
+        );
+        assert_eq!(menu.title, " 网络超时 ");
+        let selected: Vec<&str> = menu
+            .choices
+            .iter()
+            .filter(|choice| choice.selected)
+            .map(|choice| choice.value.as_str())
+            .collect();
+        assert_eq!(selected, vec!["15"]);
+
+        // 不在档位上（手改配置文件成 12 秒）：无 ✓，菜单仍显示全部档位。
+        config.network.timeout = 12;
+        let menu = enum_menu(
+            SettingsEnumPicker::NetworkTimeout,
+            &config,
+            PlayMode::ListLoop,
+        );
+        assert!(menu.choices.iter().all(|choice| !choice.selected));
+
+        // 播放速度：浮点档位
+        config.player.playback_speed = 1.25;
+        let menu = enum_menu(
+            SettingsEnumPicker::PlaybackSpeed,
+            &config,
+            PlayMode::ListLoop,
+        );
+        assert_eq!(menu.choices.iter().filter(|c| c.selected).count(), 1);
+        assert!(
+            menu.choices
+                .iter()
+                .find(|c| c.selected)
+                .is_some_and(|c| c.label == "1.25x")
+        );
+
+        // 下载音质：默认跟随播放（None）→ ✓ 在「跟随播放」
+        let menu = enum_menu(
+            SettingsEnumPicker::DownloadQuality,
+            &config,
+            PlayMode::ListLoop,
+        );
+        assert_eq!(
+            menu.choices.first().map(|c| c.label.as_str()),
+            Some("跟随播放")
+        );
+        assert!(menu.choices.first().is_some_and(|c| c.selected));
+    }
+
+    /// 档位选择的解析：只接受档位表里的值，乱值拒绝（配置不被污染）。
+    #[test]
+    fn step_choices_only_accept_ladder_values() {
+        let mut config = Config::default();
+        assert!(apply_setting_choice(&mut config, SETTING_ROW_NETWORK_TIMEOUT, "30").is_some());
+        assert_eq!(config.network.timeout, 30);
+        assert!(apply_setting_choice(&mut config, SETTING_ROW_NETWORK_TIMEOUT, "13").is_none());
+        assert!(apply_setting_choice(&mut config, SETTING_ROW_MAX_FPS, "10").is_some());
+        assert!(apply_setting_choice(&mut config, SETTING_ROW_MAX_FPS, "11").is_none());
+        assert!(apply_setting_choice(&mut config, SETTING_ROW_FADE_IN, "0").is_some());
+        assert_eq!(config.player.fade_in_ms, 0);
+        assert!(
+            apply_setting_choice(&mut config, SETTING_ROW_HISTORY_LIMIT, "100").is_some(),
+            "历史上限档位"
+        );
+        assert!(apply_setting_choice(&mut config, SETTING_ROW_PLAYBACK_SPEED, "1.50").is_some());
+        assert!(apply_setting_choice(&mut config, SETTING_ROW_PLAYBACK_SPEED, "1.10").is_none());
+    }
+
+    /// 小节标题不进光标：分类行 id 与 ↑/↓ 导航都跳过 Header 行。
+    #[test]
+    fn header_rows_are_not_selectable() {
+        let rows = real_settings_rows(&Config::default());
+        let metas = rows.metas();
+        // 构造顺序里确有小节标题（界面分类第一个是「外观」）。
+        assert_eq!(metas[0].kind, SettingsRowKind::Header);
+        assert_eq!(metas[0].label, "外观");
+        // 分类行 id 不含标题。
+        let ids = category_row_ids(&metas, SettingsCategory::Interface);
+        let interface_headers = metas
+            .iter()
+            .filter(|meta| {
+                meta.category == SettingsCategory::Interface && meta.kind == SettingsRowKind::Header
+            })
+            .count();
+        let interface_total = metas
+            .iter()
+            .filter(|meta| meta.category == SettingsCategory::Interface)
+            .count();
+        assert!(interface_headers > 0, "界面分类有小节标题");
+        assert_eq!(ids.len(), interface_total - interface_headers);
+        // 光标从 None 出发落在第一条可交互行（跳过标题）。
+        assert_eq!(
+            ensure_row_cursor(&metas, SettingsCategory::Interface, None),
+            ids.first().copied()
+        );
+    }
+
+    /// 说明栏折行：按显示宽度（中文占 2 列）切分，第 0/1 行各自返回对应片段。
+    #[test]
+    fn wrap_help_line_splits_by_display_width() {
+        let text = "请求音源接口的超时时间，超时自动重试一次。";
+        // 宽度 10（5 个汉字）→ 两行。
+        let first = wrap_help_line(text, 10, 0);
+        let second = wrap_help_line(text, 10, 1);
+        assert_eq!(first.chars().count(), 5);
+        assert_eq!(second.chars().count(), 5);
+        assert_eq!(
+            format!("{first}{second}"),
+            text[..text
+                .char_indices()
+                .nth(10)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len())]
+                .to_string()
+        );
+        // 宽度足够时第 0 行是全文，第 1 行为空。
+        assert_eq!(wrap_help_line("短文案", 40, 0), "短文案");
+        assert_eq!(wrap_help_line("短文案", 40, 1), "");
     }
 }

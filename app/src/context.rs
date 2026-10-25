@@ -397,6 +397,16 @@ impl AppContext {
         self.persist_control_update(format!("播放速度: {speed:.2}x"))
     }
 
+    /// 设置页取值菜单选中某一档速度：写配置并立即应用到播放器。
+    pub fn set_playback_speed_value(&self, speed: f64) -> String {
+        {
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
+            config.player.playback_speed = speed;
+        }
+        self.player.set_playback_speed(speed);
+        self.persist_control_update(format!("播放速度: {speed:.2}x"))
+    }
+
     pub fn set_audio_output_device(&self, device: &str) -> String {
         let device = if device.trim().is_empty() {
             "auto"
