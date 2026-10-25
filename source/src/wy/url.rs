@@ -4,6 +4,11 @@
 //! （加密方式与搜索、歌词一致，见 `crypto::eapi`），一次请求即可拿到
 //! 播放地址 + `size` + `md5`，下载侧因此能做完整性校验。
 //!
+//! 实际请求发到 `interface3.music.163.com/eapi/...`（与歌词接口同一约定）。
+//! 曾经错发到 `music.163.com/api/...`：该地址对 eapi 请求一律返回
+//! 「参数错误」且 body 重复两遍，导致官方地址永远失败、全部静默降级到
+//! 128k 兜底地址（实测 2026-10 公网）。
+//!
 //! 兜底：接口无版权/风控拿不到地址时，退回公开重定向 URL
 //! `https://music.163.com/song/media/outer/url?id={id}.mp3`，代价是拿不到 size。
 
@@ -16,9 +21,10 @@ use lx_core::traits::source::{FetchError, SongUrl};
 use super::super::http;
 use super::session;
 
-/// eapi 签名用的路径，请求也发到同一路径。
+/// eapi 签名用的路径；实际 POST 地址见 [`PLAYER_URL_ENDPOINT`]。
 const PLAYER_URL_API: &str = "/api/song/enhance/player/url/v1";
-const PLAYER_URL_ENDPOINT: &str = "https://music.163.com/api/song/enhance/player/url/v1";
+const PLAYER_URL_ENDPOINT: &str =
+    "https://interface3.music.163.com/eapi/song/enhance/player/url/v1";
 
 /// 校验兜底地址可播放性的单次请求上限。
 ///

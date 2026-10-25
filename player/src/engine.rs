@@ -127,8 +127,13 @@ impl MpvEngine {
                 if let Err(error) = init.set_option("demuxer-max-back-bytes", 4 * 1024 * 1024) {
                     warn!("libmpv demuxer-max-back-bytes option unavailable: {error}");
                 }
-                if let Err(error) = init.set_option("cache-size", 16 * 1024) {
-                    warn!("libmpv cache-size option unavailable: {error}");
+                // cache-size 是 demuxer-max-bytes 的旧版 KB 别名，新版 mpv 已移除；
+                // 上面两个 demuxer 选项在受支持的构建上都能命中，这里只是兜底。
+                match init.set_option("cache-size", 16 * 1024) {
+                    Err(Error::Raw(mpv_error::OptionNotFound)) => {
+                        debug!("libmpv 无旧版 cache-size 选项（已由 demuxer-max-bytes 覆盖）");
+                    }
+                    result => result?,
                 }
                 Ok(())
             })

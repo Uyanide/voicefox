@@ -1520,6 +1520,15 @@ fn init_logging(level: &str, config_path: &Path) {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("voicefox.log");
+    // 无轮转的 append 日志三个月能攒到上百 MB；超过上限时把旧文件挪成
+    // .old（直接覆盖上一份备份）再从头写，既限制占用又保留最近一份现场。
+    const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
+    if let Ok(metadata) = std::fs::metadata(&log_path)
+        && metadata.len() > MAX_LOG_BYTES
+    {
+        let backup = log_path.with_extension("log.old");
+        let _ = std::fs::rename(&log_path, &backup);
+    }
     let writer = match OpenOptions::new().create(true).append(true).open(log_path) {
         Ok(file) => BoxMakeWriter::new(file),
         Err(_) => BoxMakeWriter::new(std::io::sink),

@@ -178,3 +178,41 @@ async fn report_which_endpoints_work() {
         Err(error) => panic!("get_all_user_playlists() 失败: {error}"),
     }
 }
+
+/// 回归守卫：官方播放地址接口必须走通。
+///
+/// 曾经错发到 `music.163.com/api/...`（该地址对 eapi 请求一律返回
+/// 「参数错误」且 body 重复两遍），导致所有播放都静默降级到 128k 兜底
+/// 地址——表现为 `SongUrl` 永远没有 size/md5。正确端点是
+/// `interface3.music.163.com/eapi/...`，可播歌曲应当返回 CDN 地址 + size + md5。
+#[tokio::test]
+#[ignore = "需要联网，手动执行"]
+async fn official_song_url_endpoint_returns_cdn_url() {
+    use lx_core::model::song::SongInfo;
+    use lx_core::model::source::Quality;
+    use lx_core::traits::source::MusicSource;
+    use lx_source::wy::WySource;
+
+    // 以下 id 来自 2026-10 实测可播的普通（非 VIP）曲目；版权下架时换一批即可。
+    for id in ["27901099", "27890836", "32019269"] {
+        let mut song = SongInfo::new(id.into(), SourceId::Wy, "probe".into(), "probe".into());
+        song.qualities.insert(Quality::Low128);
+        let url = WySource::new()
+            .get_song_url(&song, Quality::Low128)
+            .await
+            .expect("get_song_url 不应整体失败");
+        let official = url.url.contains("music.126.net") && url.size.is_some() && url.md5.is_some();
+        println!(
+            "  id={id} quality={:?} size={:?} md5={} url_host={} official={official}",
+            url.quality,
+            url.size,
+            url.md5.is_some(),
+            url.url.split('/').nth(2).unwrap_or("?"),
+        );
+        if official {
+            // 只要有一首拿到官方 CDN 地址 + 完整性信息，即证明官方接口在用。
+            return;
+        }
+    }
+    panic!("三首探针曲目都没有拿到官方 CDN 地址，官方 URL 接口疑似又退回兜底");
+}
