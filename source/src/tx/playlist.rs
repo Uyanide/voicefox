@@ -45,8 +45,40 @@ pub async fn get_detail(id: &str) -> Result<Vec<SongInfo>, FetchError> {
     get_detail_with_meta(id).await.map(|(_, songs)| songs)
 }
 
+/// 歌单详情单页歌曲数（接口单次上限）与翻页上限（10 页 = 1 万首封顶）。
+const DETAIL_PAGE_SIZE: u64 = 1000;
+const DETAIL_MAX_PAGES: u64 = 10;
+
 /// 歌单详情 + 元数据：链接直解需要歌单名与封面。
+///
+/// 详情接口单次最多返回 1000 首，超长歌单（实测存在 1981 首）必须按
+/// `song_begin` 翻页补全，否则镜像会静默丢歌。
 pub async fn get_detail_with_meta(id: &str) -> Result<(Playlist, Vec<SongInfo>), FetchError> {
+    let disstid = id.parse::<u64>().unwrap_or_default();
+    let mut all_songs: Vec<SongInfo> = Vec::new();
+    let mut playlist: Option<Playlist> = None;
+    for page in 0..DETAIL_MAX_PAGES {
+        let (meta, songs) = fetch_detail_page(disstid, page * DETAIL_PAGE_SIZE).await?;
+        let complete = songs.len() < DETAIL_PAGE_SIZE as usize;
+        if playlist.is_none() {
+            playlist = Some(meta);
+        }
+        let done = songs.is_empty() || complete;
+        all_songs.extend(songs);
+        if done {
+            break;
+        }
+    }
+    let mut playlist = playlist.ok_or_else(|| FetchError::Parse("QQ 歌单详情为空".to_string()))?;
+    playlist.song_count = all_songs.len() as u32;
+    Ok((playlist, all_songs))
+}
+
+/// 拉取详情的某一页：返回（歌单元数据，本页歌曲）。元数据以首页为准。
+async fn fetch_detail_page(
+    disstid: u64,
+    song_begin: u64,
+) -> Result<(Playlist, Vec<SongInfo>), FetchError> {
     let body = serde_json::json!({
         "comm": {
             "ct": 20,
@@ -58,12 +90,12 @@ pub async fn get_detail_with_meta(id: &str) -> Result<(Playlist, Vec<SongInfo>),
             "module": "music.srfDissInfo.aiDissInfo",
             "method": "uniform_get_Dissinfo",
             "param": {
-                "disstid": id.parse::<u64>().unwrap_or_default(),
+                "disstid": disstid,
                 "enc_host_uin": "",
                 "tag": 1,
                 "userInfo": 1,
-                "song_begin": 0,
-                "song_num": 1000,
+                "song_begin": song_begin,
+                "song_num": DETAIL_PAGE_SIZE,
                 "onlysonglist": 0
             }
         }
@@ -98,8 +130,8 @@ pub async fn get_detail_with_meta(id: &str) -> Result<(Playlist, Vec<SongInfo>),
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("QQ 歌单 {id}"));
-    let mut playlist = Playlist::new(id, name, SourceId::Tx);
+        .unwrap_or_else(|| format!("QQ 歌单 {disstid}"));
+    let mut playlist = Playlist::new(disstid.to_string(), name, SourceId::Tx);
     playlist.song_count = songs.len() as u32;
     playlist.cover_url = detail["dirinfo"]["picurl"]
         .as_str()
@@ -111,7 +143,7 @@ pub async fn get_detail_with_meta(id: &str) -> Result<(Playlist, Vec<SongInfo>),
         .as_str()
         .or_else(|| detail["hostname"].as_str())
         .map(str::to_string);
-    playlist.link = Some(format!("https://y.qq.com/n/ryqq/playlist/{id}"));
+    playlist.link = Some(format!("https://y.qq.com/n/ryqq/playlist/{disstid}"));
     Ok((playlist, songs))
 }
 
@@ -157,7 +189,13 @@ pub async fn get_album_songs(
     Ok(songs)
 }
 
-/// 当前登录账号的个人歌单。
+/// 当前登录账号的个人歌单 = 创建的歌单 + 收藏的歌单。
+///
+/// 旧的 `fcg_user_created_diss.fcg`（带 `.fcg` 后缀）已下线，请求只会得到
+/// 404 + 空 body；创建歌单改走无后缀的 `fcg_user_created_diss`，收藏歌单走
+/// 网页版个人中心的 `fcg_get_profile_order_asset.fcg`（reqtype=3）。两份列表
+/// 任一失败都整体报错：同步层靠「全部成功」才允许整体替换镜像缓存，半份
+/// 成功的列表会把缺的歌单当成远端已删除。
 pub async fn get_user_playlists(page: u32, limit: u32) -> Result<Vec<Playlist>, FetchError> {
     if !super::session::is_logged_in() {
         return Err(FetchError::Other("请先在设置页登录 QQ 音乐".to_string()));
@@ -167,28 +205,113 @@ pub async fn get_user_playlists(page: u32, limit: u32) -> Result<Vec<Playlist>, 
         .filter(|value| !value.is_empty())
         .ok_or_else(|| FetchError::Other("QQ 登录缺少账号 ID，请重新扫码".to_string()))?;
     let begin = limit.max(1) * page.saturating_sub(1);
-    let url = format!(
-        "https://c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss.fcg?format=json&hostuin={uin}&sin={begin}&ein={}&g_tk=5381&loginUin={uin}",
-        begin + limit.max(1) - 1
+    let size = limit.max(1);
+
+    let created_url = format!(
+        "https://c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss?hostUin=0&hostuin={uin}\
+&sin={begin}&size={size}&g_tk=5381&loginUin={uin}&format=json&inCharset=utf8\
+&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=0"
     );
-    let json: Value = super::with_cookie(http::client().get(url))
-        .header("Referer", "https://y.qq.com/")
-        .send_with_retry(crate::http::RETRY_ATTEMPTS)
-        .await
-        .map_err(|error| FetchError::Network(error.to_string()))?
-        .json()
-        .await
-        .map_err(|error| FetchError::Parse(error.to_string()))?;
-    if json["code"].as_i64().unwrap_or(-1) != 0 {
+    let created = decode_json(
+        super::with_cookie(http::client().get(created_url))
+            .header("Referer", "https://y.qq.com/")
+            .send_with_retry(crate::http::RETRY_ATTEMPTS)
+            .await
+            .map_err(|error| FetchError::Network(error.to_string()))?,
+    )
+    .await?;
+    if created["code"].as_i64().unwrap_or(-1) != 0 {
         return Err(FetchError::Other(
             "获取 QQ 个人歌单失败，登录可能已失效".to_string(),
         ));
     }
-    let items = json["data"]["disslist"]
+
+    let collected_url = format!(
+        "https://c.y.qq.com/fav/fcgi-bin/fcg_get_profile_order_asset.fcg?format=json\
+&inCharset=utf8&outCharset=utf-8&platform=yqq.json&needNewCode=0&loginUin={uin}\
+&hostUin=0&notice=0&g_tk=5381&ct=20&cid=205360956&userid={uin}&reqtype=3\
+&sin={begin}&ein={}",
+        begin + size - 1
+    );
+    let collected = decode_json(
+        super::with_cookie(http::client().get(collected_url))
+            .header("Referer", "https://y.qq.com/")
+            .send_with_retry(crate::http::RETRY_ATTEMPTS)
+            .await
+            .map_err(|error| FetchError::Network(error.to_string()))?,
+    )
+    .await?;
+    if collected["code"].as_i64().unwrap_or(-1) != 0 {
+        return Err(FetchError::Other(
+            "获取 QQ 收藏歌单失败，登录可能已失效".to_string(),
+        ));
+    }
+
+    let mut result = created_playlists(&created);
+    for item in collected["data"]["cdlist"].as_array().into_iter().flatten() {
+        if let Some(playlist) = parse_user_playlist(item)
+            && !result.iter().any(|existing| existing.id == playlist.id)
+        {
+            result.push(playlist);
+        }
+    }
+    Ok(result)
+}
+
+/// 创建列表里真正能镜像的歌单：`dirid=201` 是「我喜欢」（红心，单独走
+/// `get_favorites`，否则会以两种 kind 重复进缓存）；`tid=0` 的是 QZone 背景
+/// 音乐 / 本地上传这类系统目录，没有全局 id，详情接口也按 disstid 拉不到。
+fn created_playlists(created: &Value) -> Vec<Playlist> {
+    created["data"]["disslist"]
         .as_array()
-        .or_else(|| json["data"]["list"].as_array())
-        .ok_or_else(|| FetchError::Other("QQ 个人歌单列表为空".to_string()))?;
-    Ok(items.iter().filter_map(parse_user_playlist).collect())
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item["dirid"].as_u64() != Some(201) && value_u64(&item["tid"]).unwrap_or_default() != 0
+        })
+        .filter_map(parse_user_playlist)
+        .collect()
+}
+
+/// QQ 网关对下线/受限接口会直接返回 404 + 空 body 或 JSONP，reqwest 的
+/// `.json()` 在这种场景只给一句没有信息量的 "error decoding response body"。
+/// 统一按文本取回、剥壳再解析，失败时带上状态码与 body 开头。
+async fn decode_json(response: reqwest::Response) -> Result<Value, FetchError> {
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| FetchError::Network(error.to_string()))?;
+    let body = strip_jsonp(&text);
+    serde_json::from_str(&body).map_err(|error| {
+        let snippet: String = body.chars().take(120).collect();
+        FetchError::Parse(format!("HTTP {status}: {error}，body 开头：{snippet}"))
+    })
+}
+
+/// 全部个人歌单（创建 + 收藏），自动翻页。
+///
+/// 同步镜像依赖**完整**列表：只拉第一页时，第 101 个之后的歌单会被
+/// 「全部成功才整体替换」的镜像逻辑当成远端已删除而清掉（与网易云的
+/// `get_all_user_playlists` 同一套约定）。
+pub async fn get_all_user_playlists() -> Result<Vec<Playlist>, FetchError> {
+    const PAGE_SIZE: u32 = 100;
+    const MAX_PAGES: u32 = 20;
+    let mut all: Vec<Playlist> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for page in 1..=MAX_PAGES {
+        let items = get_user_playlists(page, PAGE_SIZE).await?;
+        let received = items.len();
+        for item in items {
+            if seen.insert(item.id.clone()) {
+                all.push(item);
+            }
+        }
+        if received < PAGE_SIZE as usize {
+            break;
+        }
+    }
+    Ok(all)
 }
 
 /// 新建 QQ 音乐个人歌单。
@@ -366,6 +489,8 @@ pub async fn remove_songs_from_playlist(
     }
 }
 
+/// 兼容两套字段命名：创建歌单接口用 `diss_name`/`song_cnt`/`listen_num`
+/// 这类下划线风格，收藏歌单接口用 `dissname`/`songnum`/`listennum`。
 fn parse_user_playlist(item: &Value) -> Option<Playlist> {
     let id = {
         let id = value_string(&item["dissid"]);
@@ -377,6 +502,7 @@ fn parse_user_playlist(item: &Value) -> Option<Playlist> {
     };
     let name = item["dissname"]
         .as_str()
+        .or_else(|| item["diss_name"].as_str())
         .or_else(|| item["title"].as_str())?
         .trim()
         .to_string();
@@ -387,14 +513,20 @@ fn parse_user_playlist(item: &Value) -> Option<Playlist> {
     playlist.cover_url = item["logo"]
         .as_str()
         .or_else(|| item["picurl"].as_str())
+        .or_else(|| item["diss_cover"].as_str())
         .filter(|url| !url.is_empty())
         .map(|url| url.replace("http://", "https://"));
     playlist.song_count = value_u64(&item["songnum"])
         .or_else(|| value_u64(&item["song_count"]))
+        .or_else(|| value_u64(&item["song_cnt"]))
+        .or_else(|| value_u64(&item["song_num"]))
         .unwrap_or_default() as u32;
-    playlist.play_count = value_u64(&item["listennum"]).or_else(|| value_u64(&item["visitnum"]));
+    playlist.play_count = value_u64(&item["listennum"])
+        .or_else(|| value_u64(&item["visitnum"]))
+        .or_else(|| value_u64(&item["listen_num"]));
     playlist.creator = item["creatorname"]
         .as_str()
+        .or_else(|| item["nickname"].as_str())
         .or_else(|| item["creator"]["name"].as_str())
         .map(str::to_string);
     playlist.link = Some(format!("https://y.qq.com/n/ryqq/playlist/{id}"));
@@ -506,7 +638,7 @@ pub async fn get_category_list(category: &str, page: u32) -> Result<Vec<Playlist
 /// 歌单搜索：老版 `client_music_search_songlist`，响应是 JSONP，需要剥壳。
 pub async fn search_playlists(keyword: &str, page: u32) -> Result<Vec<Playlist>, SearchError> {
     let url = format!(
-        "http://c.y.qq.com/soso/fcgi-bin/client_music_search_songlist?query={}&page_no={}&num_per_page=20&format=json&remoteplace=txt.yqq.playlist&flag_qc=0",
+        "https://c.y.qq.com/soso/fcgi-bin/client_music_search_songlist?query={}&page_no={}&num_per_page=20&format=json&remoteplace=txt.yqq.playlist&flag_qc=0",
         urlencoding::encode(keyword),
         page.saturating_sub(1)
     );
@@ -638,4 +770,75 @@ pub async fn get_favorites() -> Result<(Playlist, Vec<SongInfo>), FetchError> {
         .unwrap_or(songs.len() as u64) as u32;
     playlist.link = Some("https://y.qq.com/n/ryqq/songDetail/".into());
     Ok((playlist, songs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_collected_playlist_shape() {
+        // fcg_get_profile_order_asset.fcg 的 cdlist：dissid 是数字，字段无下划线。
+        let item = json!({
+            "dissid": 6800944944_i64,
+            "dissname": "劲爆嗨曲中文dj舞曲",
+            "songnum": 71,
+            "listennum": 12345,
+            "logo": "http://img.example/logo.jpg",
+            "nickname": "某位用户",
+        });
+        let playlist = parse_user_playlist(&item).expect("should parse");
+        assert_eq!(playlist.id, "6800944944");
+        assert_eq!(playlist.name, "劲爆嗨曲中文dj舞曲");
+        assert_eq!(playlist.song_count, 71);
+        assert_eq!(playlist.play_count, Some(12345));
+        assert_eq!(playlist.creator.as_deref(), Some("某位用户"));
+        assert_eq!(
+            playlist.cover_url.as_deref(),
+            Some("https://img.example/logo.jpg")
+        );
+    }
+
+    #[test]
+    fn parses_created_playlist_shape() {
+        // fcg_user_created_diss 的 disslist：id 在 tid，字段带下划线。
+        let item = json!({
+            "dirid": 3,
+            "tid": 7758023113_i64,
+            "diss_name": "我的自建歌单",
+            "diss_cover": "http://img.example/cover.jpg",
+            "song_cnt": 12,
+            "listen_num": 0,
+        });
+        let playlist = parse_user_playlist(&item).expect("should parse");
+        assert_eq!(playlist.id, "7758023113");
+        assert_eq!(playlist.name, "我的自建歌单");
+        assert_eq!(playlist.song_count, 12);
+        assert_eq!(
+            playlist.cover_url.as_deref(),
+            Some("https://img.example/cover.jpg")
+        );
+    }
+
+    #[test]
+    fn created_playlists_skip_favorites_and_system_dirs() {
+        // dirid=201 是「我喜欢」（红心单独走 get_favorites）；tid=0 的是
+        // QZone 背景音乐 / 本地上传这类没有全局 id 的系统目录。
+        let created = json!({
+            "code": 0,
+            "data": {
+                "disslist": [
+                    { "dirid": 205, "tid": 0, "diss_name": "QZone背景音乐", "song_cnt": 0 },
+                    { "dirid": 201, "tid": 7758023113_i64, "diss_name": "我喜欢", "song_cnt": 267 },
+                    { "dirid": 206, "tid": 0, "diss_name": "本地上传", "song_cnt": 0 },
+                    { "dirid": 3, "tid": 6800944944_i64, "diss_name": "自建歌单", "song_cnt": 5 },
+                ]
+            }
+        });
+        let playlists = created_playlists(&created);
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].id, "6800944944");
+        assert_eq!(playlists[0].name, "自建歌单");
+    }
 }

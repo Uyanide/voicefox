@@ -237,3 +237,43 @@ async fn link_parsing_works() {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "需要联网 + QQ 登录态，手动执行"]
+async fn qq_sync_provider_collects_all_collections() {
+    use lx_source::sync::provider;
+
+    let Some(provider) = provider(SourceId::Tx) else {
+        println!("QQ 同步适配器不可用");
+        return;
+    };
+    match provider.collect_all().await {
+        Ok(set) => {
+            println!(
+                "普通歌单 {} 个 · 红心 {} 个 · 失败 {} 个",
+                set.playlists.len(),
+                set.favorites.len(),
+                set.failed.len()
+            );
+            for collection in set.playlists.iter().chain(set.favorites.iter()).take(10) {
+                println!(
+                    "  [{}] {} · {} 首",
+                    if matches!(
+                        collection.kind,
+                        lx_core::sync::SyncCollectionKind::Favorites
+                    ) {
+                        "红心"
+                    } else {
+                        "歌单"
+                    },
+                    collection.name,
+                    collection.songs.len()
+                );
+            }
+            for (name, reason) in &set.failed {
+                println!("  ? {name} — {reason}");
+            }
+        }
+        Err(error) => println!("QQ 歌单拉取失败: {error}"),
+    }
+}

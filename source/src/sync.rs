@@ -104,6 +104,53 @@ impl TxSyncProvider {
             source: tx::TxSource::new(),
         }
     }
+
+    /// 拉取全部远端集合：普通歌单（创建 + 收藏）与红心。
+    ///
+    /// 与网易云侧同一套约定：单个歌单详情失败只跳过该歌单并记进 `failed`，
+    /// 绝不能用 `unwrap_or_default()` 吞掉——那会把失败歌单当成「0 首歌」，
+    /// 而默认 `collect_all` 的 `failed` 恒为空会让同步走整体替换，
+    /// 一次网络抖动就清空该歌单在镜像缓存里的全部歌曲。
+    async fn fetch_user_collections(&self) -> Result<SyncCollectionSet, SyncError> {
+        if !self.source.is_logged_in() {
+            return Err(SyncError::NotLoggedIn(self.source_name().into()));
+        }
+        let playlists = tx::playlist::get_all_user_playlists()
+            .await
+            .map_err(map_error)?;
+        let mut normal = Vec::with_capacity(playlists.len() + 1);
+        let mut favorites = Vec::new();
+        let mut failed = Vec::new();
+        for playlist in playlists {
+            match tx::playlist::get_detail(&playlist.id).await {
+                Ok(songs) => normal.push(collection_from(
+                    SyncCollectionKind::Playlist,
+                    playlist,
+                    songs,
+                )),
+                Err(error) => {
+                    tracing::warn!("QQ音乐歌单「{}」拉取失败: {error}", playlist.name);
+                    failed.push((playlist.name, error.to_string()));
+                }
+            }
+        }
+        match tx::playlist::get_favorites().await {
+            Ok((playlist, songs)) => favorites.push(collection_from(
+                SyncCollectionKind::Favorites,
+                playlist,
+                songs,
+            )),
+            Err(error) => {
+                tracing::warn!("QQ音乐「我喜欢」拉取失败: {error}");
+                failed.push(("我喜欢".to_string(), error.to_string()));
+            }
+        }
+        Ok(SyncCollectionSet {
+            playlists: normal,
+            favorites,
+            failed,
+        })
+    }
 }
 
 fn map_error(error: impl ToString) -> SyncError {
@@ -350,24 +397,16 @@ impl SyncProvider for TxSyncProvider {
         &self,
         kind: SyncCollectionKind,
     ) -> Result<Vec<SyncCollection>, SyncError> {
-        if !self.source.is_logged_in() {
-            return Err(SyncError::NotLoggedIn(self.source_name().into()));
-        }
-        if kind == SyncCollectionKind::Favorites {
-            let (playlist, songs) = tx::playlist::get_favorites().await.map_err(map_error)?;
-            return Ok(vec![collection_from(kind, playlist, songs)]);
-        }
-        let playlists = tx::playlist::get_user_playlists(1, 100)
-            .await
-            .map_err(map_error)?;
-        let mut result = Vec::with_capacity(playlists.len());
-        for playlist in playlists {
-            let songs = tx::playlist::get_detail(&playlist.id)
-                .await
-                .unwrap_or_default();
-            result.push(collection_from(kind, playlist, songs));
-        }
-        Ok(result)
+        let mut collections = self.fetch_user_collections().await?;
+        Ok(match kind {
+            SyncCollectionKind::Playlist => std::mem::take(&mut collections.playlists),
+            SyncCollectionKind::Favorites => std::mem::take(&mut collections.favorites),
+        })
+    }
+
+    /// 覆写默认实现：逐歌单上报局部失败，整体替换只在全部成功时发生。
+    async fn collect_all(&self) -> Result<SyncCollectionSet, SyncError> {
+        self.fetch_user_collections().await
     }
 
     async fn get_collection(
