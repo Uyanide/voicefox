@@ -518,8 +518,8 @@ fn default_page_bindings() -> HashMap<String, HashMap<Action, String>> {
 
     // --- 主页（队列） ---
     let mut main = HashMap::new();
-    main.insert(Action::ListSelectUp, "k".to_string());
-    main.insert(Action::ListSelectDown, "j".to_string());
+    main.insert(Action::ListSelectUp, "Up".to_string());
+    main.insert(Action::ListSelectDown, "Down".to_string());
     main.insert(Action::ListSelectFirst, "g".to_string());
     main.insert(Action::ListSelectLast, "G".to_string());
     main.insert(Action::ListPageUp, "Ctrl+u".to_string());
